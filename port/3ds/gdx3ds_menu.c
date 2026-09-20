@@ -15,6 +15,7 @@
  * gdx3ds_os_poll_input latched this frame (this TU never calls hidScanInput — a
  * second scan per frame would eat the game's key-down edges).
  */
+#include "gfx/gdx3ds_native_cfg.h"
 #include "gdx3ds_menu.h"
 #include "gdx3ds_dynlod.h"
 #include "gdx3ds_fps_hud.h"
@@ -382,8 +383,33 @@ static void PaintDbg(void) {
     /* LOCKED-60 Task I: the bridge stage on the submitting core (needs the render thread). */
     PaintRow(18, "(%c) BRIDGE MAIN core-0 pre-pass (reboot)",
              gdx3ds_config_get_int("debug", "bridgemain", 1) ? 'x' : ' ');
-    PaintRow(20, "toggles apply live and persist");
-    PaintRow(21, "to gdiffuser.ini [debug].");
+    /* [native] levers (09-fx-integration-plan.md §6.2): read once at boot by each track. The
+     * glyphs are the raw ini keys with the `all` master applied; x = on, - = verify (2). */
+    {
+        char st[5];
+        const int all = gdx3ds_native_raw("all", 0);
+        const int v[4] = { gdx3ds_native_lever("interp", 0), gdx3ds_native_lever("machines", 0),
+                           gdx3ds_native_lever("track", 0), gdx3ds_native_fx_mask() };
+        int i;
+        for (i = 0; i < 4; i++) {
+            st[i] = v[i] == 0 ? ' ' : (v[i] == 2 && i < 3 ? '-' : 'x');
+        }
+        st[4] = 0;
+        PaintRow(22, "(%c) NATIVE     %s interp/mach/trk/fx (reboot)", all ? 'x' : ' ', st);
+    }
+    {
+        char st[4];
+        const int v[3] = { gdx3ds_native_lever("fx_sink", 0), gdx3ds_native_lever("fx_sprites", 0),
+                           gdx3ds_native_lever("fx_hud", 0) };
+        int i;
+        for (i = 0; i < 3; i++) {
+            st[i] = v[i] == 0 ? ' ' : (v[i] == 2 ? '-' : 'x');
+        }
+        st[3] = 0;
+        PaintRow(24, "(%c) NATIVE FX  %s sink/sprites/hud (reboot)", gdx3ds_native_fx_mask() ? 'x' : ' ', st);
+    }
+    PaintRow(26, "toggles apply live and persist");
+    PaintRow(27, "to gdiffuser.ini [debug].");
 }
 
 static void PaintAbout(void) {

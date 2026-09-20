@@ -1,0 +1,74 @@
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index 8179b9f..a5adc0e 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -52,6 +52,7 @@
+ // gdx3ds_lus_carve target adds that directory to this TU's include path).
+ // Desktop builds never see this include or the packed path.
+ #include "gdx3ds_vbopack.h"
++#include "gdx3ds_verify.h"
+ #endif
+ 
+ std::stack<std::string> currentDir;
+@@ -4917,6 +4918,29 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+     // gdx_s7_geo_diag_enabled forces legacy: the verbose geometry diagnostics
+     // ([geodiag]/[pit-uv-probe]/uvprobe UV ranges) live in the legacy loop, so
+     // armed diagnostics keep full fidelity. Killswitch: [debug] triloop=0.
++    if (gdx3ds_verify_active()) { /* [nverify] temporary diagnostic (interp track) */
++        Gdx3dsVerifyTri vt;
++        memset(&vt, 0, sizeof(vt));
++        const auto& t0 = mRdp->texture_tile[effective_tile[0]];
++        const auto& l0 = mRdp->LoadedTextureAt(t0.tmem_index);
++        vt.tile0 = effective_tile[0]; vt.tile1 = effective_tile[1]; vt.firstTile = mRdp->first_tile_index; vt.isRect = is_rect;
++        vt.uls0 = t0.uls; vt.ult0 = t0.ult; vt.lrs0 = t0.lrs; vt.lrt0 = t0.lrt;
++        vt.texW0 = tex_width[0]; vt.texH0 = tex_height[0]; vt.texW20 = tex_width2[0]; vt.texH20 = tex_height2[0];
++        vt.texW1 = tex_width[1]; vt.texH1 = tex_height[1]; vt.tm = tm; vt.vu = v1->u; vt.vv = v1->v;
++        vt.shifts0 = t0.shifts; vt.shiftt0 = t0.shiftt; vt.line0 = l0.line_size_bytes; vt.size0 = l0.size_bytes;
++        vt.full0 = l0.full_image_line_size_bytes; vt.orig0 = l0.orig_size_bytes;
++        vt.scaleS = mRsp->texture_scaling_factor.s; vt.scaleT = mRsp->texture_scaling_factor.t;
++        vt.omh = mRdp->other_mode_h; vt.oml = mRdp->other_mode_l; vt.geo = mRsp->geometry_mode;
++        vt.variant = (unsigned)mF3dex2Variant;
++        vt.vpx = mRdp->viewport.x; vt.vpy = mRdp->viewport.y; vt.vpw = mRdp->viewport.width; vt.vph = mRdp->viewport.height;
++        gdx3ds_verify_note_tri(&vt);
++    }
++    if (mBufVboNumTris == 0) {
++        sGdxPackDst = gdx_s7_geo_diag_enabled ? nullptr : gdx3ds_vbopack_begin(&sGdxPackParams);
++        sGdxPackBatch = (sGdxPackDst != nullptr);
++        GDX_TRI2_CNT(Batch);
++        GDX_TRI2_LAP(Begin);
++    }
+     if (sGdxPackBatch) {
+         GDX_TRI2_CNT(Packed);
+         // Combiner-input evaluation, verbatim from the legacy loop's switch (the
+@@ -9676,6 +9700,31 @@ static void gfx_step() {
+     auto& cmd = g_exec_stack.currCmd();
+     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
+ #ifdef __3DS__
++    if (gdx3ds_verify_active()) { /* [nverify] temporary diagnostic (interp track) */
++        gdx3ds_verify_note_cmd((unsigned)cmd->words.w0, (unsigned)cmd->words.w1);
++    }
++#endif
++
++    // [perf-dispatch] one indexed load; the entry is read fully before the handler runs so a
++    // mid-command table rebuild (G_LOAD_UCODE) cannot pull it out from under us.
++    const GfxFlatDispatchEntry entry = sFlatDispatch[(uint8_t)opcode];
++
++    // [perf-s7]/[texrect] draw-state memo dirty tracking: per-opcode contribution precomputed
++    // into entry.dirty at table build (branchless OR replaces the legacy whitelist branch).
++    sGfxS7DirtyMask |= entry.dirty;
++
++#ifdef USE_GBI_TRACE
++    if (cmd->words.trace.valid &&
++        Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gEnableGFXTrace", 0)) {
++#define TRACE                                  \
++    "\n====================================\n" \
++    " - CMD: {:02X}\n"                         \
++    " - Path: {}:{}\n"                         \
++    " - W0: {:08X}\n"                          \
++    " - W1: {:08X}\n"                          \
++    "===================================="
++        SPDLOG_INFO(TRACE, (uint8_t)opcode, cmd->words.trace.file, cmd->words.trace.idx, cmd->words.w0, cmd->words.w1);
++    }
+ #endif
+ 
+     if ((entry.flags & kGfxFlatFlagOtrPointerGuard) != 0) {

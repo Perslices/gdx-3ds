@@ -2,10 +2,10 @@
 
 Shadow headers that satisfy libultraship's desktop header leaks when compiling the
 carve for 3DS (see docs/research/spike-lus-carve-report.md). Include this directory
-BEFORE libultraship/include. Real third-party headers (nlohmann/json.hpp,
-BS_thread_pool.hpp, tinyxml2.h) are NOT vendored here — fetch them at configure time
-or vendor under your stream's directory.
+BEFORE the vendored LUS headers (port/3ds/vendor/lus/include). Real third-party headers
+(nlohmann/json.hpp, BS_thread_pool.hpp, tinyxml2.h) are NOT vendored here — they live in
+port/3ds/gfx/third_party/.
 
-port/3ds/patches/lus-newlib-portability.patch must be applied to the libultraship/
-submodule working tree (git apply) before compiling the carve; it lands in the LUS
-fork properly during integration.
+No patch step: the carve is vendored at port/3ds/vendor/lus/ with all 38 lus-*.patch —
+lus-newlib-portability.patch included — already folded in. See
+port/3ds/vendor/lus/PROVENANCE.md.

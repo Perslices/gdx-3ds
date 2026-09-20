@@ -31,13 +31,19 @@
 #include "ship/resource/ResourceManager.h"
 #include "fast/Fast3dWindow.h"
 
+#include "gfx/gdx3ds_native_cfg.h"
 #include "gdx3ds_audio.h"
 #include "gdx3ds_config.h"
 #include "gdx3ds_filelog.h" // H-HARDWARE: SD sink for the tracers (svc goes nowhere on hardware)
 #include "gdx3ds_fps_hud.h" // FPS-HUD: bottom-screen counter (debug.fps, default ON)
 #include "gdx3ds_menu.h"    // MENU: v1 bottom-screen touch menu ([menu] enabled, default ON)
+#include "gdx3ds_oracle.h"  // ORACLE: true frame capture + [fh] receipts (after EndFrame)
+#include "gdx3ds_dynlod.h"  // ORACLE: dynlod tier pin under .gdxrec replay
+#include "gdx_input_rec.h"  // ORACLE: .gdxrec record/replay ([debug] input_record / input_replay)
+#include "gdx_determinism.h" // ORACLE: Math_Rand seeds / boot-hold tick pin ([debug] rand_seed1 ...)
 #include "gdx3ds_fs.h"
 #include "gdx3ds_os.h"
+#include "gdx3ds_net.h"          // HWLINK: WiFi dev link ([net] enabled, DEFAULT OFF)
 #include "gdx3ds_renderthread.h" // RENDER THREAD (LOCKED-60 Task H): core-2 fork/join
 
 #include <cstdint>
@@ -69,6 +75,8 @@ void gdx_vi_tick(void);
 void gdx_dispatch(void);
 void gdx_vi_present_fallback(void);
 void gdx_controller_poll(void);
+unsigned long long gdx_input_tick(void); // ORACLE: input tick (input_bridge.c)
+int gdx_input_game_mode(void);           // ORACLE: GET_MODE(gGameMode) (input_bridge.c)
 void gdx_fixed_aspect_tick(void);
 void gdx_rdram_init(void);
 void gdx_register_host_range(void* ptr, size_t size);
@@ -94,6 +102,9 @@ int  gdx3ds_quit_requested(void);    // lus_glue/gdx3ds_input_glue.c (script QUI
 // AUDIOFIX: ndsp-vs-null-sink outcome for the always-on boot receipt below (diagnostic
 // export from port/3ds/audio/gdx3ds_audio_ndsp.c, not part of the frozen contract).
 int gdx3ds_audio_output_active(void);
+// HOMEFIX: is a C3D frame open on the citro3d backend (render-thread state, racy read;
+// receipts only). port/3ds/gfx/gfx_citro3d.cpp.
+int gdx3ds_gfx_frame_active(void);
 
 // M1-RACE-FREEZE watchdog counters (port/n64_sched.c, port/n64_audio_hle.c).
 extern volatile uint32_t gdx_watch_audio_tick_enter;
@@ -144,6 +155,9 @@ static volatile int sWatchStage = 0;
 // returns, while crt0/__appExit unwinds — the thread is detached and never joined)
 // cannot write through stdio/SD state that is being torn down under it.
 static volatile int sWatchdogQuiet = 0;
+// HOMEFIX: the APT hook signals this so the watchdog leaves its 5 s sleep at once and enters
+// the suspended-mode poll (aptWatchTick below) while main is inside libctru's transition.
+static Handle sWatchdogWake = 0;
 
 // HEAP-WATCH: leak triage without a debugger. The watchdog beat already carries heapUsed;
 // this keeps a baseline (taken at beat 12, ~60 s, after the boot loads settle) and a
@@ -180,13 +194,113 @@ extern "C" void gdx3ds_heapwatch_stats(unsigned long* usedKb, unsigned long* hwm
     if (triggers) { *triggers = sHeapTriggers; }
 }
 
+// HOMEFIX (native/homefix): APT transition state, owned by aptLifecycleHook (main), read by
+// the watchdog. 0 running, 1 HOME/POWER-suspended, 2 lid-sleeping. The tick is the state
+// change; every [apt] receipt carries t=+ms since it.
+static volatile int sAptState = 0;
+static volatile uint64_t sAptStateTick = 0;
+static int sAptWatch = 1;     // [debug] apt_watch (default 1): suspended-mode watchdog poll
+static int sAptHookFirst = 1; // [debug] apt_hook_first (default 1): re-arm our hook ahead of citro3d's
+
+static unsigned long aptMsSince(uint64_t tick) {
+    return (unsigned long)((svcGetSystemTick() - tick) / (uint64_t)CPU_TICKS_PER_MSEC);
+}
+
+// Suspended-mode poll: runs on the WATCHDOG thread every 100 ms while sAptState != 0. Main
+// is inside libctru (aptJumpToHomeMenu / aptWaitForWakeUp / aptHandleSleep) and cannot log,
+// so this is the only receipt writer left. It logs every flip of aptIsActive() (clears when
+// APT_JumpToHomeMenu ran, i.e. the jump completed and the HOME menu owns the screen; sets
+// again on the wake, BEFORE GSPGPU_AcquireRight / RestoreVramSysArea and the restore hook),
+// gspHasGpuRight() (ReleaseRight ran / AcquireRight ran) and aptShouldClose() (a close
+// order arrived while parked: the [exit] chain is expected next), plus a 1 s heartbeat.
+// Every line is flushed. Reading a log that ends here:
+//   ends before "apt inactive"                -> died inside the suspend transition
+//                                                 (SaveVramSysArea / screen transfer / DSP sleep)
+//   ends on "parked" beats, no "WAKE observed" -> the process died or was killed while parked
+//                                                 in the HOME menu (nothing of ours runs there)
+//   ends after "WAKE observed", no "[apt] restore" -> GSPGPU_AcquireRight / RestoreVramSysArea
+//                                                 or citro3d's ONRESTORE hook (runs before ours)
+//   "CLOSE order pending" then nothing          -> the close path: see the [exit] chain
+static void aptWatchTick(void) {
+    static int lastState = 0;
+    static int lastActive = -1;
+    static int lastGpu = -1;
+    static int lastClose = -1;
+    static uint64_t lastBeatTick = 0;
+    const int state = sAptState;
+    const int active = aptIsActive() ? 1 : 0;
+    const int gpu = gspHasGpuRight() ? 1 : 0;
+    const int close = aptShouldClose() ? 1 : 0;
+    char msg[224];
+    if (state == 0) {
+        if (lastState != 0) {
+            std::snprintf(msg, sizeof(msg),
+                          "[apt] watch: transition complete t=+%lums active=%d gpu=%d close=%d",
+                          aptMsSince(sAptStateTick), active, gpu, close);
+            svcOutputDebugString(msg, strlen(msg));
+            gdx3ds_filelog_write(msg, strlen(msg));
+            gdx3ds_filelog_flush();
+        }
+        lastState = 0;
+        lastActive = lastGpu = lastClose = -1;
+        return;
+    }
+    const uint64_t now = svcGetSystemTick();
+    const char* why = nullptr;
+    if (lastState == 0) {
+        why = "entered";
+    } else if (active != lastActive) {
+        why = active ? "WAKE observed (main past the APT wait; AcquireRight/RestoreVramSysArea/restore hook next)"
+                     : "apt inactive (jump handed to the HOME menu)";
+    } else if (gpu != lastGpu) {
+        why = gpu ? "gpu right acquired" : "gpu right released";
+    } else if (close != lastClose) {
+        why = close ? "CLOSE order pending ([exit] chain expected)" : "close order cleared";
+    } else if (now - lastBeatTick >= (uint64_t)CPU_TICKS_PER_MSEC * 1000u) {
+        why = "parked";
+    }
+    if (why != nullptr) {
+        lastBeatTick = now;
+        std::snprintf(msg, sizeof(msg),
+                      "[apt] watch %s state=%d t=+%lums active=%d gpu=%d close=%d rtIdle=%d frameOpen=%d",
+                      why, state, aptMsSince(sAptStateTick), active, gpu, close, gdx3ds_rt_idle(),
+                      gdx3ds_gfx_frame_active());
+        svcOutputDebugString(msg, strlen(msg));
+        gdx3ds_filelog_write(msg, strlen(msg));
+        gdx3ds_filelog_flush();
+    }
+    lastState = state;
+    lastActive = active;
+    lastGpu = gpu;
+    lastClose = close;
+}
+
 static void watchdogThreadMain(void*) {
     uint32_t lastFrame = 0;
     uint32_t beat = 0;
+    const uint64_t beatTicks = (uint64_t)CPU_TICKS_PER_MSEC * 5000u; // 5 s
+    uint64_t nextBeat = svcGetSystemTick() + beatTicks;
     for (;;) {
-        svcSleepThread(5000000000LL); // 5 s
+        // HOMEFIX: 5 s sleep as before, but interruptible by the APT hook (sWatchdogWake) and
+        // shortened to 100 ms while an APT transition is in progress (suspended-mode poll).
+        const bool fine = sAptWatch && sAptState != 0;
+        if (sWatchdogWake != 0) {
+            svcWaitSynchronization(sWatchdogWake, fine ? 100000000LL : 5000000000LL);
+        } else {
+            svcSleepThread(fine ? 100000000LL : 5000000000LL);
+        }
         if (sWatchdogQuiet) {
             continue;
+        }
+        if (sAptWatch) {
+            aptWatchTick();
+        }
+        {
+            const uint64_t now = svcGetSystemTick();
+            if ((int64_t)(now - nextBeat) < 0) {
+                continue; // woken early (hook signal / fine poll): not a beat yet
+            }
+            nextBeat = now + beatTicks;
         }
         const uint32_t frame = sWatchFrame;
         struct mallinfo mi = mallinfo();
@@ -221,6 +335,20 @@ static void watchdogThreadMain(void*) {
                               (unsigned long)mi.uordblks,
                               (unsigned long)mi.fordblks,
                               (unsigned long)sHeapHwm, (unsigned long)sHeapBaseline);
+        // HWLINK: one extra field so a silent host is distinguishable from a wedged game
+        // (0 down / 1 log link / 2 log + control client). Omitted entirely when [net]
+        // enabled = 0, which keeps the pre-hwlink [watchdog] line byte-identical.
+        if (n > 0) {
+            const int netState = gdx3ds_net_state();
+            if (netState >= 0) {
+                n += std::snprintf(msg + n, sizeof(msg) - (size_t)n, " net=%d", netState);
+            }
+        }
+        // HOMEFIX: apt=<state> only while a transition is in progress (0 = line unchanged).
+        if (n > 0 && sAptState != 0) {
+            n += std::snprintf(msg + n, sizeof(msg) - (size_t)n, " apt=%d active=%d gpu=%d", sAptState,
+                               aptIsActive() ? 1 : 0, gspHasGpuRight() ? 1 : 0);
+        }
         if (n > 0) {
             svcOutputDebugString(msg, n);
             gdx3ds_filelog_write(msg, (size_t)n); // sink is thread-safe (recursive lock)
@@ -276,8 +404,39 @@ static void aptLogReceipt(const char* msg) {
 
 // HOME-crash fix (docs/research/home-crash-audit.md, "## Fix"): everything the suspend
 // transition needs from us, in the order libctru requires. Runs on the main thread inside
-// aptJumpToHomeMenu / the sleep handler, BEFORE aptDspSleep -> ndspFinalize (suspend) and
-// AFTER aptDspWakeup -> ndspInitialize (restore). svc + filelog receipts only.
+// aptJumpToHomeMenu / the sleep handler, BEFORE GSPGPU_SaveVramSysArea -> aptScreenTransfer
+// -> aptDspSleep (ndspFinalize) -> GSPGPU_ReleaseRight (suspend). The RESTORE hook runs
+// inside aptWaitForWakeUp AFTER GSPGPU_AcquireRight + RestoreVramSysArea and BEFORE
+// aptDspWakeup -> ndspInitialize (libctru 2.7.0 apt.c aptWaitForWakeUp: hooks first, DSP
+// wakeup after — the audit's "after ndspInitialize" was wrong; gdx3ds_audio_resume only
+// does CPU-side list surgery + a flag, which is legal there). svc + filelog receipts only.
+//
+// HOMEFIX (native/homefix, hw run E 2026-09-20, docs/research/native/homefix-progress.md):
+// a HOME press with the native levers on ended log.txt after `[apt] audio parked` + two
+// frozen watchdog beats — no restore, no [exit] chain, no Luma dump. Nothing between those
+// receipts is ours (the hook had finished; the backlight step is a no-op with the bottom
+// screen on), so every hook step below is now bracketed by a flushed stage receipt that
+// also samples aptIsActive / gspHasGpuRight / render-thread idle / C3D frame open, and the
+// watchdog polls the same state every 100 ms while main is inside libctru (aptWatchTick).
+static void aptStepReceipt(const char* phase, int step, const char* what) {
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+                  "[apt] %s step=%d %s (t=+%lums active=%d gpu=%d rtIdle=%d frameOpen=%d)", phase, step,
+                  what, aptMsSince(sAptStateTick), aptIsActive() ? 1 : 0, gspHasGpuRight() ? 1 : 0,
+                  gdx3ds_rt_idle(), gdx3ds_gfx_frame_active());
+    aptLogReceipt(msg);
+}
+
+static void aptStateSet(int state) {
+    if (state != 0) {
+        sAptStateTick = svcGetSystemTick(); // t=+0 at the hook entry; kept through "transition complete"
+    }
+    sAptState = state;
+    if (sWatchdogWake != 0) {
+        svcSignalEvent(sWatchdogWake); // watchdog: leave the 5 s sleep, start/stop the fine poll
+    }
+}
+
 static void aptAudioSuspend(void) {
     int drainParked = 0;
     int producerParked = 0;
@@ -288,20 +447,28 @@ static void aptAudioSuspend(void) {
     aptLogReceipt(msg);
 }
 
-// RENDER THREAD: the APT pump runs at the loop top AFTER the join, so the render thread is
-// parked on its command semaphore with no C3D frame open by construction. The receipt
-// proves it; if a job were ever in flight here (a future reordering), wait for it before
-// libctru saves the VRAM sys area / releases the GPU right (bounded by one frame).
+// RENDER THREAD: the frame loop joins the render thread at the loop top BEFORE aptMainLoop
+// whenever a HOME/close request is already visible (ahead mode) or always (pipe/sync), so
+// the thread is normally parked on its command semaphore with no C3D frame open (idle=1).
+// idle=0 is the ahead-mode case where the pump ran without that join: a lid-close sleep
+// (aptShouldJumpToHome() is false for sleep), or a HOME flag that landed between the
+// loop-top check and aptMainLoop. Then THIS join is the only thing that keeps the render
+// thread's C3D_FrameEnd -> gxCmdQueueRun from racing libctru — which is why the hook must
+// run BEFORE citro3d's (see the re-arm after InitWindow): citro3d's ONSUSPEND does
+// gxCmdQueueWait + gxCmdQueueStop + gxCmdQueueClear on the queue the render thread is
+// still filling, and gxCmdQueueClear svcBreak(USERBREAK_PANIC)s if the queue is running.
 static void aptRenderThreadPark(void) {
     if (gdx3ds_rt_mode() == 0) {
         return;
     }
     const int idle = gdx3ds_rt_idle();
+    const uint64_t t0 = svcGetSystemTick();
     if (!idle) {
         gdx3ds_rt_join_idle();
     }
-    char msg[64];
-    std::snprintf(msg, sizeof(msg), "[apt] render thread parked (idle=%d)", idle);
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "[apt] render thread parked (idle=%d join=%lums frameOpen=%d)", idle,
+                  aptMsSince(t0), gdx3ds_gfx_frame_active());
     aptLogReceipt(msg);
 }
 
@@ -345,31 +512,65 @@ static void aptRestoreCpuState(void) {
     aptLogReceipt(msg);
 }
 
+// Suspend side (HOME/POWER and lid sleep share it; only HOME lights the bottom panel).
+static void aptSuspendSteps(const char* phase, bool forHomeMenu) {
+    aptStepReceipt(phase, 1, "render thread park");
+    aptRenderThreadPark();
+    aptStepReceipt(phase, 2, "audio park");
+    aptAudioSuspend();
+    aptStepReceipt(phase, 3, "net suspend");
+    gdx3ds_net_suspend(); // SOC sockets do not survive a suspend: drop them first
+    if (forHomeMenu) {
+        aptStepReceipt(phase, 4, "backlight for HOME menu");
+        aptBacklightForHome();
+    }
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+                  forHomeMenu ? "[apt] %s hook done -> libctru (SaveVramSysArea, screen transfer, DSP sleep, "
+                                "ReleaseRight, JumpToHomeMenu, wait) t=+%lums"
+                              : "[apt] %s hook done -> libctru (ReplySleepNotificationComplete, wait) t=+%lums",
+                  phase, aptMsSince(sAptStateTick));
+    aptLogReceipt(msg);
+}
+
+// Restore side. Runs BEFORE libctru's aptDspWakeup (HOME) / after the LCD un-black (sleep).
+static void aptRestoreSteps(const char* phase) {
+    aptStepReceipt(phase, 1, "cpu state");
+    aptRestoreCpuState();
+    aptStepReceipt(phase, 2, "audio resume");
+    aptAudioResume();
+    aptStepReceipt(phase, 3, "net resume");
+    gdx3ds_net_resume();
+    aptStepReceipt(phase, 4, "backlight restore");
+    aptBacklightRestore();
+    char msg[160];
+    std::snprintf(msg, sizeof(msg), "[apt] %s hook done -> libctru (DSP wakeup), frame loop resumes t=+%lums",
+                  phase, aptMsSince(sAptStateTick));
+    aptLogReceipt(msg);
+}
+
 static void aptLifecycleHook(APT_HookType hook, void* param) {
     (void)param;
     switch (hook) {
         case APTHOOK_ONSUSPEND:
+            aptStateSet(1);
             aptLogReceipt("[apt] suspend (HOME/POWER -> HOME menu)");
-            aptRenderThreadPark();
-            aptAudioSuspend();
-            aptBacklightForHome();
+            aptSuspendSteps("suspend", true);
             break;
         case APTHOOK_ONRESTORE:
             aptLogReceipt("[apt] restore (resumed from HOME menu)");
-            aptRestoreCpuState();
-            aptAudioResume();
-            aptBacklightRestore();
+            aptRestoreSteps("restore");
+            aptStateSet(0);
             break;
         case APTHOOK_ONSLEEP:
+            aptStateSet(2);
             aptLogReceipt("[apt] sleep (lid closed)");
-            aptRenderThreadPark();
-            aptAudioSuspend();
+            aptSuspendSteps("sleep", false);
             break;
         case APTHOOK_ONWAKEUP:
             aptLogReceipt("[apt] wakeup (lid opened)");
-            aptRestoreCpuState();
-            aptAudioResume();
-            aptBacklightRestore();
+            aptRestoreSteps("wakeup");
+            aptStateSet(0);
             break;
         case APTHOOK_ONEXIT:
             aptLogReceipt("[apt] exit hook (close order acknowledged, aptExit running)");
@@ -712,6 +913,86 @@ static void emitMemCensus(Ship::Context* ctx, unsigned long frameNum, const char
     (void)why;
 }
 
+// ORACLE ([debug] keys, docs/research/native/oracle-progress.md):
+//   det=1            master switch: defaults rand_seed1=0x1234abcd rand_seed2=0x0fedcba9
+//                    boot_hold_ticks=230 det_audio=1 unless the individual key is set
+//   rand_seed1/2     Math_Rand1/2Init seeds (0x-hex or decimal); absent = original osGetTime()
+//   boot_hold_ticks  boot-logo hold counted in host ticks instead of wall clock (0 = original)
+//   det_audio        deterministic audioRandom counter
+//   input_record=1   record rec/<input_record_name|rec0>.gdxrec from tick 0
+//   input_replay=X   replay rec/X.gdxrec from tick 0 (wins over gdx-autoinput.txt)
+//   replay_quit=1    leave the frame loop at "[rec] end" (self-terminating parity runs)
+// Receipts: "[det] ..." and "[rec] ..." lines.
+static void oracleReplayEnded() {
+    gdx3ds_oracle_request_quit("[rec] end with replay_quit=1");
+}
+
+static void oracleInitDeterminismAndRec() {
+    const int det = gdx3ds_config_get_bool("debug", "det", 0);
+    const char* seed1Str = gdx3ds_config_get_string("debug", "rand_seed1", det ? "0x1234abcd" : "");
+    const char* seed2Str = gdx3ds_config_get_string("debug", "rand_seed2", det ? "0x0fedcba9" : "");
+    const int seed1Have = seed1Str != nullptr && seed1Str[0] != '\0';
+    const int seed2Have = seed2Str != nullptr && seed2Str[0] != '\0';
+    const unsigned seed1 = seed1Have ? (unsigned)std::strtoul(seed1Str, nullptr, 0) : 0u;
+    const unsigned seed2 = seed2Have ? (unsigned)std::strtoul(seed2Str, nullptr, 0) : 0u;
+    const int bootHold = gdx3ds_config_get_int("debug", "boot_hold_ticks", det ? 230 : 0);
+    const int audioPin = gdx3ds_config_get_bool("debug", "det_audio", det);
+    gdx_det_init(seed1Have, seed1, seed2Have, seed2, bootHold, audioPin);
+    {
+        char msg[192];
+        int n = std::snprintf(msg, sizeof(msg), "[det] init det=%d seed1=%s%08x seed2=%s%08x boot_hold_ticks=%d audio=%d",
+                              det, seed1Have ? "0x" : "none:", seed1, seed2Have ? "0x" : "none:", seed2, bootHold,
+                              audioPin);
+        if (n > 0) {
+            svcOutputDebugString(msg, n);
+            gdx3ds_filelog_write(msg, (size_t)n);
+        }
+    }
+
+    gdx3ds_native_boot_receipt(); // [native] all= interp= machines= track= fx_sink= fx_sprites= fx_hud= fx=
+
+    const char* replayName = gdx3ds_config_get_string("debug", "input_replay", "");
+    const int replayOn = replayName != nullptr && replayName[0] != '\0';
+    char pins[128];
+    std::snprintf(pins, sizeof(pins), "renderthread=%d rival_detail_auto=%d stereo=%d fh_every=%d",
+                  gdx3ds_config_get_int("debug", "renderthread", 1),
+                  replayOn ? 0 : (gdx3ds_config_get_bool("perf", "rival_detail_auto", 1) ? 1 : 0),
+                  gdx3ds_config_get_bool("stereo", "enabled", 0) ? 1 : 0, gdx3ds_config_get_int("debug", "fh_every", 0));
+    GdxInputRecHeader hdr;
+    hdr.build = gdx3ds_oracle_build_id();
+    hdr.seed1Have = seed1Have;
+    hdr.seed1 = seed1;
+    hdr.seed2Have = seed2Have;
+    hdr.seed2 = seed2;
+    hdr.pins = pins;
+    gdx_input_rec_init(&hdr);
+
+    /* ORACLE .gdxrec paths are ABSOLUTE (gdx3ds_fs_base_path() == "sdmc:/3ds/gdiffuser/").
+     * They used to be the bare relative "rec/<name>.gdxrec", which only resolves when the
+     * loader happens to set the process cwd to the gdiffuser directory: true under Azahar
+     * Qt, false under the Azahar libretro core (RetroArch lane), where every replay run
+     * silently logged "[rec] replay open failed: rec/<name>.gdxrec" and then ran on
+     * physical/autoinput input — i.e. a parity gate that compared two non-replays. */
+    if (gdx3ds_config_get_bool("debug", "input_record", 0)) {
+        char path[192];
+        std::snprintf(path, sizeof(path), "%srec/%s.gdxrec", gdx3ds_fs_base_path(),
+                      gdx3ds_config_get_string("debug", "input_record_name", "rec0"));
+        gdx_input_rec_start_record(path);
+    }
+    if (replayOn) {
+        char path[192];
+        std::snprintf(path, sizeof(path), "%srec/%s.gdxrec", gdx3ds_fs_base_path(), replayName);
+        if (gdx_replay_start(path) == 0) {
+            // DYNLOD tier depends on svcGetSystemTick() deltas (plan §3 item 3): pinned under replay.
+            gdx3ds_dynlod_set_auto(0);
+            logStep("[rec] replay: [perf] rival_detail_auto pinned to 0 for this run");
+            if (gdx3ds_config_get_bool("debug", "replay_quit", 0)) {
+                gdx_input_rec_set_end_callback(oracleReplayEnded);
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     svcOutputDebugString("main entered", 12);
     gdx_port_log_tap = &portLogSvcTap;
@@ -749,9 +1030,18 @@ int main(int argc, char** argv) {
     // svc/console; everything from here lands in sdmc:/3ds/gdiffuser/log.txt when
     // debug.filelog=1.
     gdx3ds_filelog_init();
+    // HWLINK: dev link before the window so boot logSteps reach the host. [net] enabled=0
+    // (the default) makes this an immediate return — no SOC buffer, no thread, no receipt.
+    gdx3ds_net_init(argc, argv);
     // APT lifecycle receipts (see aptLifecycleHook above): registered as early as the
     // filelog allows, so even a HOME/POWER press during boot leaves its trace.
     aptHook(&sAptHookCookie, aptLifecycleHook, nullptr);
+    // HOMEFIX killswitches (receipt below, after the window is up).
+    sAptWatch = gdx3ds_config_get_bool("debug", "apt_watch", 1) ? 1 : 0;
+    sAptHookFirst = gdx3ds_config_get_bool("debug", "apt_hook_first", 1) ? 1 : 0;
+    if (R_FAILED(svcCreateEvent(&sWatchdogWake, RESET_ONESHOT))) {
+        sWatchdogWake = 0; // watchdog falls back to plain sleeps (no early wake)
+    }
     logStep("gdx3ds_os_window_init");
     int width = 0;
     int height = 0;
@@ -765,6 +1055,10 @@ int main(int argc, char** argv) {
     // MENU (menu.enabled, default ON): takes over the bottom-screen layout (tab bar +
     // pages, fps line pinned as row 1); the HUD detects it and hands its line over.
     gdx3ds_menu_init();
+    // ORACLE: capture oracle, determinism pins and the .gdxrec recorder/replayer — all before the
+    // first controller poll (line 0 of a recording == tick 0) and before the game seeds its RNGs.
+    gdx3ds_oracle_init();
+    oracleInitDeterminismAndRec();
     logStep("window up; gdx_dev_gates_init_env");
 
     // 2. Developer gates (desktop parity has these first; safe after window).
@@ -803,6 +1097,27 @@ int main(int argc, char** argv) {
     logStep("Fast3dWindow + InitWindow");
     auto window = std::make_shared<Fast::Fast3dWindow>(nullptr);
     ctx->InitWindow(window);
+    // HOMEFIX: aptHook is LIFO (libctru apt.c: the newest cookie becomes aptFirstHook and
+    // runs first). C3D_Init (inside InitWindow above) registered citro3d's hook AFTER ours,
+    // so on every suspend citro3d's gxCmdQueueWait/Stop/Clear ran BEFORE our render-thread
+    // join — with the render thread mid-frame (ahead mode, idle=0) that clears a queue the
+    // thread is still filling and lets its C3D_FrameEnd -> gxCmdQueueRun submit GPU work
+    // after libctru's "GPU idle" point (SaveVramSysArea / screen transfer / ReleaseRight).
+    // Re-arm ours at the head: join first, then citro3d drains a queue nobody touches.
+    // On restore the order is ours first (CPU/audio/net only, no GPU state) then citro3d's
+    // dirty-all; nothing of ours depends on citro3d's flags being set first.
+    if (sAptHookFirst) {
+        aptUnhook(&sAptHookCookie);
+        aptHook(&sAptHookCookie, aptLifecycleHook, nullptr);
+    }
+    {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "[apt] hooks: ours %s citro3d's (debug.apt_hook_first=%d), suspended-mode watchdog poll=%d "
+                      "(debug.apt_watch), wake event=%d",
+                      sAptHookFirst ? "ahead of" : "behind", sAptHookFirst, sAptWatch, sWatchdogWake != 0 ? 1 : 0);
+        logStep(msg);
+    }
 
     // 6. Audio: ndsp backend first (audio STATUS.md R6 ordering), then the dedicated
     //    audio thread (it waits for the decomp's gAudioContextInitialized internally).
@@ -1007,7 +1322,10 @@ int main(int argc, char** argv) {
     GdxRtCallbacks rtCb;
     rtCb.startFrame = [] { sRtWindow->StartFrame(); };
     rtCb.presentFallback = [] { gdx_vi_present_fallback(); };
-    rtCb.endFrame = [] { sRtWindow->EndFrame(); };
+    rtCb.endFrame = [] {
+        sRtWindow->EndFrame();
+        gdx3ds_oracle_after_endframe(); // ORACLE: frame N is complete once armed (FrameSync inside)
+    };
     const int rtMode = gdx3ds_rt_init(&rtCb); // 0 off, 1 sync, 2 pipe, 3 ahead
     // QUIET MODE (MENU-PERF): the recurring svc telemetry below (the every-64th "frame N"
     // heartbeat, the [present] scanout oracle, the [mem-census] line) is gated behind
@@ -1040,7 +1358,7 @@ int main(int argc, char** argv) {
             sWatchStage = 9;
             gdx3ds_rt_join_idle();
         }
-        if (!aptMainLoop()) {
+        if (!aptMainLoop() || gdx3ds_oracle_quit_requested()) {
             logStep("[apt] shutdown requested — leaving frame loop");
             gdx3ds_filelog_flush(); // receipt must survive even if teardown wedges
             break;
@@ -1100,6 +1418,8 @@ int main(int argc, char** argv) {
         }
         GDX_HB("hb:save_tick", 6);
         gdx_disk_save_tick();
+        // ORACLE: stamp this frame's (frame, tick, mode) before its EndFrame is issued.
+        gdx3ds_oracle_frame_mark((unsigned long)frameNum, (unsigned long)gdx_input_tick() - 1u, gdx_input_game_mode());
         if (rtMode != 0) {
             GDX_HB("hb:end_frame", 7);
             gdx3ds_rt_frame_end(); // END: present fallback + EndFrame on the render thread
@@ -1107,6 +1427,7 @@ int main(int argc, char** argv) {
             gdx_vi_present_fallback();
             GDX_HB("hb:end_frame", 7);
             w->EndFrame();
+            gdx3ds_oracle_after_endframe(); // ORACLE (rtMode 0 twin of the render-thread hook)
         }
 
         // Present-path oracle (m1-boot-debug): the top-screen framebuffers live on the
@@ -1155,6 +1476,9 @@ int main(int argc, char** argv) {
         if (verboseTelemetry && frameNum > 8 && (frameNum & 255) == 2) {
             emitMemCensus(ctx.get(), (unsigned long)frameNum, "periodic");
         }
+        // HWLINK: execute at most one pending control command on the MAIN thread (the net
+        // thread only parses and posts). Idle cost is one file-static load.
+        gdx3ds_net_tick((unsigned long)frameNum);
         if (sHeapTriggerPending && frameNum > 8) {
             sHeapTriggerPending = 0;
             sHeapTriggers = sHeapTriggers + 1;
@@ -1278,6 +1602,7 @@ int main(int argc, char** argv) {
     gdx3ds_audio_shutdown(); // joins the drain, then ndspExit (cancel-aware when suspended)
     aptLogReceipt("[exit] audio_shutdown done");
     aptLogReceipt("[exit] render_thread_join enter");
+    gdx_input_rec_stop(); // ORACLE: close a .gdxrec recording (flush) before teardown
     gdx3ds_rt_shutdown(); // QUIT + threadJoin on its own event (no shared-event spin)
     aptLogReceipt("[exit] render_thread_join done");
     aptLogReceipt("[exit] window_shutdown enter");
@@ -1285,10 +1610,17 @@ int main(int argc, char** argv) {
     aptLogReceipt("[exit] window_shutdown done");
     gdx3ds_fs_shutdown();
     aptLogReceipt("[exit] fs_shutdown done");
+    // HWLINK: last drain of the log ring to the host, then both sockets + socExit.
+    gdx3ds_net_shutdown();
+    aptLogReceipt("[exit] net_shutdown done");
     // Final flush: "exiting" and everything teardown logged must be on the SD card
     // before crt0/__appExit — a clean close then shows "[apt] exit hook ..." from the
     // ONEXIT hook inside aptExit() as the very last line.
     gdx3ds_filelog_flush();
+    // HWLINK: a RELOAD staged a new .3dsx and asked for a self-relaunch. Strictly last —
+    // after socExit and the final flush — so hb:ldr sees a process that holds nothing.
+    // No-op unless RELOAD ran; degrades to a plain exit when hb:ldr is absent.
+    gdx3ds_net_relaunch_if_requested();
     return 0;
 }
 

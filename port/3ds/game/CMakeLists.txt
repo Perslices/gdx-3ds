@@ -48,6 +48,8 @@ target_compile_options(gdx3ds_cxd4_rsp PRIVATE -w -fno-strict-aliasing -fwrapv)
 add_library(gdx3ds_game OBJECT ${GAME_SOURCES} ${GDX_GAME_CORE_SOURCES}
     gdx3ds_us_linkstubs.c   # EK=OFF stand-ins for n64_leo.c/EkLinkStubs.c symbols
     gdx3ds_livery_diag.c    # SHIP-LIVERY-2 [livery] game-state receipts (weak-called by gfx)
+    gdx3ds_track_gbi.c      # [native] track: real GBI emitters behind gdx3ds_track_shim.h
+    gdx3ds_fx_gbi.c         # [native] fx: real GBI emitters behind gdx3ds_fx_shim_begin.h
 )
 
 target_include_directories(gdx3ds_game PRIVATE
@@ -55,6 +57,7 @@ target_include_directories(gdx3ds_game PRIVATE
     "${DECOMP}/include"
     "${DECOMP}/src"
     "${GDX_PORT_DIR}/../include"   # Torch-generated asset headers (arrays + #defines)
+    "${CMAKE_CURRENT_SOURCE_DIR}/../gfx" # [native] track shim header (course.c, decomp-native-track-shim.patch)
 )
 
 target_compile_definitions(gdx3ds_game PRIVATE
@@ -64,6 +67,8 @@ target_compile_definitions(gdx3ds_game PRIVATE
     ASSET_VERSION=us
     ASSET_REVISION=rev0
     GDX_PLATFORM_3DS=1
+    GDX_NATIVE_TRACK=1     # course.c includes gdx3ds_track_shim.h (runtime-gated: [native] track)
+    GDX_NATIVE_FX=1        # racer.c includes gdx3ds_fx_shim.h (runtime-gated: [native] fx_sink)
 )
 
 # Same UB-hardening/legacy-quieting as the desktop gdiffuser_game (see port/CMakeLists.txt).
@@ -90,6 +95,8 @@ add_library(gdx3ds_glue OBJECT
     "${GDX_PORT_DIR}/enhancements/events/GameEvents.cpp"   # decomp racer.c references GameEvents_FireOnBoostStart
     "${GDX_PORT_DIR}/input_bridge.c"
     "${GDX_PORT_DIR}/gdx_input_script.c"
+    "${GDX_PORT_DIR}/gdx_input_rec.c"     # ORACLE: .gdxrec record/replay
+    "${GDX_PORT_DIR}/gdx_determinism.c"   # ORACLE: determinism pins
     "${GDX_PORT_DIR}/n64_gfx_bridge.cpp"
     "${GDX_PORT_DIR}/gdx_interp.cpp"
     "${GDX_PORT_DIR}/n64_gfx_convert.cpp"

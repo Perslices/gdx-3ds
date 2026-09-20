@@ -1,0 +1,41 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -14,6 +14,15 @@
+ #include ASSET_HEADER(machine_global_gfx.h)
+ #include ASSET_HEADER(machine_models.h)
+ 
++#if defined(PORT) && defined(GDX_NATIVE_FX)
++/* [native] fx (port/3ds/gfx/gdx3ds_fx_shim.h): the six ring-buffer effect classes of Racer_Draw
++   (explosions, debris, flying sparks, collision sparks, smoke, fall explosions) are recorded by a
++   GBI shim active only inside the bracket below and replayed natively by the interpreter at a
++   marker. Runtime-gated on [native] fx_sink; inactive, every redefined macro emits the original
++   GBI via helpers compiled with this same gbi.h. The C bodies are unchanged. */
++#include "gdx3ds_fx_shim.h"
++#endif
++
+ s32 gTotalRacers;
+ Racer* sLastRacer;
+ Racer* sRivalRacer;
+@@ -6477,6 +6486,10 @@
+             }
+         }
+     }
++#if defined(PORT) && defined(GDX_NATIVE_FX)
++#include "gdx3ds_fx_shim_begin.h"
++    GDXFX_BEGIN(playerIndex);
++#endif
+     gSPDisplayList(gfx++, D_4007FB8);
+ 
+     for (var_s3 = gExplosions1Count, var_s7 = (gExplosions1Index - 1) & 0x1F;
+@@ -6852,6 +6865,10 @@
+             gEffectsVtxPtr += 4;
+         }
+     }
++#if defined(PORT) && defined(GDX_NATIVE_FX)
++    GDXFX_END();
++#include "gdx3ds_fx_shim_end.h"
++#endif
+ 
+ #ifndef EXPANSION_KIT
+     if (gRaceIntroTimer != 0) {

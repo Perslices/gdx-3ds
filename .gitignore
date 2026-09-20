@@ -102,8 +102,15 @@ logs/
 /tools/o2r_harness/golden_out/
 build-3ds/
 build-3ds-clean/
+build-3ds-*/
 build-host-stub/
 build-port-host/
 # Local CIA packaging binaries (makerom, bannertool) -- downloaded/built per
 # port/3ds/packaging/README.md, never committed.
 /tools/3ds-bin/
+
+# hwlink: the console's LAN address is a local detail, never committed.
+tools/dev/hw.ini
+
+# test fixtures are not build logs
+!tools/dev/tests/fixtures/*.log

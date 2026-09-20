@@ -1,0 +1,55 @@
+# Race start — Grand Prix / Novice / Jack Cup / Mute City / Blue Falcon.
+#
+# Everything after the title is gated on gGameMode with WAITMODE rather than on a frame count,
+# because the boot timeline is wall-clock-coupled (see title.script and refbuild-progress.md) and
+# a fixed wait that is long enough on a warm run overshoots a menu on a cold one. The three gates
+# are GAMEMODE_MAIN_MENU (7), GAMEMODE_MACHINE_SELECT (8), GAMEMODE_MACHINE_SETTINGS (9) and
+# GAMEMODE_GP_RACE (1) from decomp/include/fzx_game.h. A WAITMODE that times out logs
+# "[autotest] WAITMODE timeout" and CONTINUES, so read the log before trusting any shot below it —
+# CONTINUING.md says exactly this about scripts that claim to have raced.
+#
+# Menu path (every step is the A button on an "OK?" prompt; START only leaves the title):
+#   TITLE -START-> SELECT MODE -A-> class popup -A-> NOVICE -A-> cup -A-> Jack Cup
+#         -A-> MUTE CITY -A-> SELECT MACHINE -A-> BLUE FALCON -A-> settings -A-> OK -A-> RACE
+# 400, not 1500: the staged config paces the loop at 59.94 Hz, which puts the title window at
+# roughly poll 300-900 (unpaced it is near 1200-1500). At 1500 this script was pressing START
+# inside the attract-mode demo race.
+WAIT 400
+SHOT race_title
+PRESS START 10
+WAITMODE 7 600
+LOG reached SELECT MODE
+WAIT 60
+PRESS A 10
+WAIT 90
+PRESS A 10
+WAIT 90
+PRESS A 10
+WAIT 120
+SHOT race_cup
+PRESS A 10
+WAIT 120
+SHOT race_course
+PRESS A 10
+WAITMODE 8 600
+LOG reached SELECT MACHINE
+WAIT 60
+SHOT race_machine
+PRESS A 10
+WAIT 120
+PRESS A 10
+WAITMODE 9 600
+LOG reached MACHINE SETTINGS
+WAIT 60
+SHOT race_settings
+PRESS A 10
+WAIT 90
+PRESS A 10
+WAITMODE 1 1200
+LOG reached GP RACE
+WAIT 150
+SHOT race_grid
+WAIT 240
+SHOT race_start
+WAIT 10
+QUIT

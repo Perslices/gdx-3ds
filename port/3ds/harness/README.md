@@ -21,12 +21,9 @@ cmake --build build-3ds -j8
 Output: `build-3ds/port/3ds/harness/gdx3ds-dl-tests.3dsx` (alongside the main
 `build-3ds/port/3ds/G-Diffuser-3DS.3dsx`).
 
-Prereq (shared with `port/3ds/gfx/`): the LUS newlib patch must be applied to
-the `libultraship/` submodule working tree:
-
-```sh
-git -C libultraship apply ../port/3ds/patches/lus-newlib-portability.patch
-```
+No prereq beyond the toolchain: this links the vendored LUS carve at
+`port/3ds/vendor/lus/` (newlib portability patch and the other 37 already folded
+in — `port/3ds/vendor/lus/PROVENANCE.md`), so there is no submodule to patch.
 
 ## Running
 

@@ -1,0 +1,57 @@
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -2055,6 +2055,14 @@
+ #endif
+ #endif
+ 
++#ifdef PORT
++/* port/decomp_port.c: the 3DS native machine-mesh registry re-bakes rebuilt lists. */
++void gdx_native_machine_lists_rebuilt(void);
++#define GDX_MACHINE_LISTS_REBUILT() gdx_native_machine_lists_rebuilt()
++#else
++#define GDX_MACHINE_LISTS_REBUILT() (void)0
++#endif
++
+ void func_8008D3C4(s32 character, s32 arg1) {
+     Gfx* gfx;
+     s32 i;
+@@ -2076,6 +2084,7 @@
+             gSPEndDisplayList(gfx);
+         }
+ 
++        GDX_MACHINE_LISTS_REBUILT();
+         return;
+     }
+     if (machine->customType != CUSTOM_MACHINE_DEFAULT) {
+@@ -2091,6 +2100,7 @@
+         gfx = sMachineDrawFuncs[character][i](D_800CDDB0[arg1 * 6 + i]);
+         gSPEndDisplayList(gfx);
+     }
++    GDX_MACHINE_LISTS_REBUILT();
+ }
+ 
+ void func_8008D5F4(MachineInfo* machineInfo, s32 arg1) {
+@@ -2113,6 +2123,7 @@
+             gSPEndDisplayList(gfx);
+         }
+ 
++        GDX_MACHINE_LISTS_REBUILT();
+         return;
+     }
+     if (machineInfo->customType != CUSTOM_MACHINE_DEFAULT) {
+@@ -2128,6 +2139,7 @@
+         gfx = sMachineDrawFuncs[var_v1][i](D_800CDDB0[arg1 * 6 + i]);
+         gSPEndDisplayList(gfx);
+     }
++    GDX_MACHINE_LISTS_REBUILT();
+ }
+ 
+ void func_8008D7E8(void) {
+@@ -2191,6 +2203,7 @@
+             gSPEndDisplayList(gfx);
+         }
+     }
++    GDX_MACHINE_LISTS_REBUILT();
+ }
+ 
+ void func_8008DA68(void) {

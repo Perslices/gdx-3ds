@@ -305,6 +305,17 @@ extern "C" int gdx_mode_owns_segment(unsigned int seg);
 extern "C" int gdx_mode_segment_content_matches(unsigned int seg, unsigned int rom_base);
 extern "C" const char* GDiffuser_LookupLoadedAssetKey(const void* buffer, size_t minSize, int requireUnmodified);
 extern "C" const char* gdx_lookup_asset_segment_o2r_key(unsigned int sym_low32);
+extern "C" unsigned int gdx_lookup_asset_segment_sym_size(unsigned int sym_low32);
+/* [tile7-span] o2r-by-name delivery is only exact when the upcoming load stays inside the
+   symbol: course_track_gfx loads two stacked 64x16 RGBA16 textures (D_8007008 + D_8007808)
+   with ONE 4 KB LOADBLOCK and renders the second half through tile 7 at TMEM word 256. The
+   per-symbol resource holds 2 KB, so the interpreter decoded zeros for the second texture
+   while the N64 reads the contiguous segment. loadBytes 0 = unknown extent, keep the rewrite. */
+static inline bool GdxO2rServesWholeLoad(uint32_t raw, size_t loadBytes) {
+    if (loadBytes == 0) return true;
+    const unsigned int symSize = gdx_lookup_asset_segment_sym_size(raw);
+    return symSize == 0u || loadBytes <= static_cast<size_t>(symSize);
+}
 // Workshop texture packs (port/gdx_workshop.cpp).
 extern "C" int gdx_workshop_texture_packs_enabled(void);
 extern "C" const char* GdxWorkshopLookupOverridePath(const char* key);
@@ -3565,6 +3576,14 @@ struct GdxBcCensus {
 };
 static GdxBcCensus gGdxBcCensus;
 
+#ifdef __3DS__
+/* [native] machines (port/3ds/gfx/gdx3ds_mesh.h): weak so the bridge links without the
+ * mesh module; a registered machine body list is redirected to its mesh stub at G_DL. */
+extern "C" uintptr_t gdx3ds_mesh_bridge_lookup(uint64_t dlHostPtr,
+                                               const void* (*resolve)(uint64_t, size_t, void*), void* user)
+    __attribute__((weak));
+#endif
+
 class N64DisplayListAdapter {
   public:
     struct ConvertedList {
@@ -3645,6 +3664,48 @@ class N64DisplayListAdapter {
             }
         }
     }
+
+#ifdef __3DS__
+    /* [native] machines: the mesh baker's G_VTX pointer resolver, reproducing this
+       adapter's kOpVtx classification for a host-built (wide) source: real host pointers
+       verbatim, asset placeholders / BSS aliases / sign-extended words through the
+       segment resolver, full payload readability required. */
+    struct GdxMeshResolveCtx {
+        N64DisplayListAdapter* self;
+        const N64Gfx* source;
+    };
+    static const void* GdxMeshResolveVtx(uint64_t w1word, size_t bytes, void* user) {
+        GdxMeshResolveCtx* ctx = static_cast<GdxMeshResolveCtx*>(user);
+        return reinterpret_cast<const void*>(ctx->self->ResolveVtxForMesh(w1word, bytes, ctx->source));
+    }
+    uintptr_t ResolveVtxForMesh(uint64_t w1word, size_t bytes, const N64Gfx* source) {
+        const uint32_t low = static_cast<uint32_t>(w1word);
+        bool hostPtr;
+        if constexpr (sizeof(uintptr_t) == 4) {
+            hostPtr = ((w1word >> 32) == kGfxW1HostTag32) && (low != 0);
+        } else {
+            hostPtr = (w1word >> 32) != 0;
+        }
+        if (hostPtr && (IsAssetPlaceholderPointer(low) || IsPortBssAliasPointer(low))) {
+            hostPtr = false;
+        }
+        if (hostPtr && (w1word >> 32) == 0xFFFFFFFFull) {
+            hostPtr = false;
+        }
+        uintptr_t out = 0;
+        if (!ResolveGuarded(low, hostPtr, static_cast<uintptr_t>(w1word), out, bytes, /*preferPhysical=*/true,
+                            reinterpret_cast<uintptr_t>(source))) {
+            return 0;
+        }
+        if (out != 0) {
+            out = NormalizeLusDirectPointer(out);
+        }
+        if (out == 0 || ReadableByteLimit(out) < bytes) {
+            return 0;
+        }
+        return out;
+    }
+#endif
 
     uintptr_t EnqueueList(const N64Gfx* source, size_t explicitLimit) {
 #ifdef __3DS__
@@ -6211,6 +6272,123 @@ class N64DisplayListAdapter {
     }
 
   public:
+    /* ---- [native] interp exports (port/gdx_dlsrc_bridge.h) ------------------------------
+       Thin public views over the private resolvers so the owned interpreter
+       (port/3ds/gfx/n64/) resolves operands exactly as ProcessList does. No new behaviour:
+       every body below is a call sequence lifted from the matching ProcessList case. */
+    bool NativeRootList(const N64Gfx** outPtr, size_t* outLimit, size_t* outStride, bool* outBig,
+                        bool* outF3d) const {
+        if (mRootBegin == nullptr) return false;
+        const size_t rootLimit = RootCommandLimit(mRootBegin);
+        const size_t stride = CommandStrideForSource(mRootBegin);
+        if (rootLimit == 0 || ReadableByteLimit(reinterpret_cast<uintptr_t>(mRootBegin)) < stride ||
+            !LooksLikeDisplayList(mRootBegin, rootLimit)) {
+            return false;
+        }
+        NativeListFacts(mRootBegin, rootLimit, outPtr, outLimit, outStride, outBig, outF3d);
+        return true;
+    }
+    void NativeListFacts(const N64Gfx* target, size_t limit, const N64Gfx** outPtr, size_t* outLimit,
+                         size_t* outStride, bool* outBig, bool* outF3d) const {
+        const size_t stride = CommandStrideForSource(target);
+        const bool isBig = CommandSourceIsBigEndian(target, stride);
+        const GdxSegmentUcode dialect = GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(target));
+        const bool isF3d = (dialect == GdxSegmentUcode::F3D)    ? true
+                           : (dialect == GdxSegmentUcode::F3DEX2) ? false
+                           : (IsF3DAssetPointer(reinterpret_cast<uintptr_t>(target)) ||
+                              DisplayListUsesF3D(target, limit, stride, isBig));
+        *outPtr = target;
+        *outLimit = limit;
+        *outStride = stride;
+        *outBig = isBig;
+        *outF3d = isF3d;
+    }
+    /* == TranslateDisplayListPointer minus the conversion enqueue and the diag budgets. */
+    bool NativeResolveList(uint32_t raw, bool hostPtr, uintptr_t hostFull, const N64Gfx** outPtr,
+                           size_t* outLimit, size_t* outStride, bool* outBig, bool* outF3d) {
+        if (!hostPtr) {
+            const uint32_t epoch = GdxSegmentEpochSnapshot();
+            if (!GdxSegmentEpochStable(epoch)) {
+                NoteEpochSkip();
+                return false;
+            }
+        }
+        const N64Gfx* target = hostPtr ? reinterpret_cast<const N64Gfx*>(hostFull) : ResolveDisplayListSource(raw);
+        const auto isValidTarget = [this](const N64Gfx* candidate) {
+            if (candidate == nullptr) return false;
+            const size_t candidateLimit = KnownCommandLimitFast(candidate);
+            return (candidateLimit != 0) && LooksLikeDisplayListFast(candidate, candidateLimit);
+        };
+        if (!hostPtr && !isValidTarget(target)) {
+            const uint32_t alignedRaw = raw & ~static_cast<uint32_t>(7u);
+            if (alignedRaw != raw) {
+                const N64Gfx* alignedTarget = ResolveDisplayListSource(alignedRaw);
+                if (isValidTarget(alignedTarget)) {
+                    raw = alignedRaw;
+                    target = alignedTarget;
+                }
+            }
+        }
+        if (target == nullptr) {
+            if (mStats != nullptr) { mStats->noopDisplayLists++; mStats->missingDisplayLists++; }
+            return false;
+        }
+        const size_t limit = KnownCommandLimitFast(target);
+        if ((limit == 0) || !LooksLikeDisplayListFast(target, limit)) {
+            if (mStats != nullptr) { mStats->noopDisplayLists++; mStats->badDisplayLists++; }
+            return false;
+        }
+        NativeListFacts(target, limit, outPtr, outLimit, outStride, outBig, outF3d);
+        return true;
+    }
+    /* == ResolveGuarded + NormalizeLusDirectPointer (the shared tail of the data cases). */
+    uintptr_t NativeResolveData(uint32_t raw, bool hostPtr, uintptr_t hostFull, size_t requiredBytes,
+                                bool preferPhysical, uintptr_t sourceHint) {
+        uintptr_t out = 0;
+        if (!ResolveGuarded(raw, hostPtr, hostFull, out, requiredBytes, preferPhysical, sourceHint)) {
+            return 0;
+        }
+        return (out != 0) ? NormalizeLusDirectPointer(out) : 0;
+    }
+    uintptr_t NativeResolveTimgHost(uintptr_t hostFull, size_t requiredBytes) const {
+        const uintptr_t stubResolved = ResolveWideAssetStubPointerFast(hostFull, std::max<size_t>(requiredBytes, 1));
+        return (stubResolved != 0) ? stubResolved : hostFull;
+    }
+    /* == the kOpMoveword segment case, minus its diagnostics. */
+    uintptr_t NativeSetSegment(uint8_t segIdx, uint32_t raw, bool hostPtr, uintptr_t hostFull) {
+        if (segIdx >= kGfxSegmentCount) return static_cast<uintptr_t>(raw);
+        const uint32_t mwEpoch = hostPtr ? 0u : GdxSegmentEpochSnapshot();
+        uintptr_t translated;
+        if (hostPtr) {
+            translated = hostFull;
+        } else {
+            translated = TranslateDataPointer(raw);
+            if (translated == 0 && raw == 0 && gdx_rdram != nullptr) {
+                translated = reinterpret_cast<uintptr_t>(gdx_rdram);
+            }
+        }
+        if (!hostPtr && !GdxSegmentEpochStable(mwEpoch)) {
+            NoteEpochSkip();
+            return gSegments[segIdx];
+        }
+        if (translated != 0) {
+            const uintptr_t normalized = NormalizeLusDirectPointer(translated);
+            if (gSegments[segIdx] != normalized) {
+                ++gGdxResolveTablesVersion;
+            }
+            gSegments[segIdx] = normalized;
+        } else if (raw != 0) {
+            static int sSegFailLogs = 0;
+            if (sSegFailLogs < 24) {
+                ++sSegFailLogs;
+                gdx_port_logf("[seg-dl] (native) moveword FAILED seg=%X raw=%08X (stale base %p kept)\n",
+                              segIdx, raw, reinterpret_cast<void*>(gSegments[segIdx]));
+            }
+        }
+        return gSegments[segIdx];
+    }
+    const ConversionStats* NativeStats() const { return mStats; }
+
     Fast::F3DGfx* ConvertRoot() {
         if (mRootBegin == nullptr) return nullptr;
         const size_t rootLimit = RootCommandLimit(mRootBegin);
@@ -7039,8 +7217,13 @@ class N64DisplayListAdapter {
                         // buildings on every course placing BUILDING_TALL (Death Race, Mute City 2,
                         // the Ending). The raw-copy path reads the decoded image, which
                         // gdx_load_venue_building_texture keeps venue-correct.
+                        /* Upcoming load extent (LOADBLOCK/LOADTILE/TLUT scan); shared with the host-pointer
+                           branch below and the o2r whole-load gate. */
+                        const size_t settimgLoadBytes =
+                            EstimateRawTextureCopyBytes(item.source, i, item.limit, stride, isBig);
                         const char* o2rKey = (!w1IsHostPointer && resolutionUsable && !IsRdramHostPointer(translated) &&
-                                              !IsVenueBuildingTextureRange(translated))
+                                              !IsVenueBuildingTextureRange(translated) &&
+                                              GdxO2rServesWholeLoad(in.w1, settimgLoadBytes))
                                                  ? gdx_lookup_asset_segment_o2r_key(in.w1)
                                                  : nullptr;
                         const char* texCensusPath = "rawcopy"; /* [tex-census] delivery classification */
@@ -7090,8 +7273,7 @@ class N64DisplayListAdapter {
                             // against the actual copy size instead of silently
                             // accepting a 1-byte-wide match; reused below for the
                             // native-RGBA16 copy so it is computed only once.
-                            const size_t estimatedBytes =
-                                EstimateRawTextureCopyBytes(item.source, i, item.limit, stride, isBig);
+                            const size_t estimatedBytes = settimgLoadBytes;
                             const uintptr_t stubResolved =
                                 ResolveWideAssetStubPointerFast(w1full, std::max<size_t>(estimatedBytes, 1));
                             const uintptr_t hostTextureSource =
@@ -7611,6 +7793,20 @@ class N64DisplayListAdapter {
                     break;
 
                 case kOpDl:
+#ifdef __3DS__
+                    /* [native] machines: a registered + baked machine body list becomes its
+                       mesh stub (the interpreter's G_DL hook draws it) and the 126-command
+                       conversion is skipped. Only real host pointers are candidates; a masked
+                       slot, a refused or failed bake, or the feature off keep the legacy path. */
+                    if (w1IsHostPointer && &gdx3ds_mesh_bridge_lookup != nullptr) {
+                        GdxMeshResolveCtx meshCtx = { this, item.source };
+                        const uintptr_t meshStub = gdx3ds_mesh_bridge_lookup(w1word, GdxMeshResolveVtx, &meshCtx);
+                        if (meshStub != 0) {
+                            outW1 = meshStub;
+                            break;
+                        }
+                    }
+#endif
                     outW1 = ResolveDisplayListGuarded(in.w1, item.source, i, w1IsHostPointer, w1full);
                     break;
 
@@ -8687,12 +8883,23 @@ static void GdxDumpTopScanoutBmp(const char* label) {
  * telemetry checkpoint. Weak: desktop builds link this TU without the 3DS gfx lib. */
 extern "C" void gdx3ds_gpuprof_note_shot(const char* label) __attribute__((weak));
 
+/* ORACLE (port/3ds/gdx3ds_oracle.c): when the true-capture oracle owns SHOT, the request goes
+ * to it (main-target capture after EndFrame + [fh] receipt + autotest/<label>_L.bmp) instead of
+ * the frame-mirror dump (black in-game) and the scanout dump (frame N-1/N-2). [debug]
+ * shot_legacy=1 keeps the old dumps. Weak for the same reason as above. */
+extern "C" void gdx_oracle_capture_request(const char* tag) __attribute__((weak));
+extern "C" int gdx3ds_oracle_owns_shot(void) __attribute__((weak));
+
 extern "C" void gdx_request_frame_dump(const char* label) {
     if (label == nullptr || label[0] == '\0') {
         return;
     }
     if (gdx3ds_gpuprof_note_shot != nullptr) {
         gdx3ds_gpuprof_note_shot(label);
+    }
+    if (gdx_oracle_capture_request != nullptr && gdx3ds_oracle_owns_shot != nullptr && gdx3ds_oracle_owns_shot()) {
+        gdx_oracle_capture_request(label);
+        return;
     }
     std::snprintf(gPendingNamedDumpLabel, sizeof(gPendingNamedDumpLabel), "%s", label);
     gPendingNamedDumpArmed = true;
@@ -10249,6 +10456,17 @@ struct GdxGfxJob {
 
 static Fast::Fast3dWindow* sGdxCachedWindow = nullptr;
 
+/* [native] interp: 1 when the owned interpreter will walk this job itself (interp=1 and not
+   interp_verify), so the conversion pre-pass can be skipped. Weak: desktop / harness = 0. */
+extern "C" int gdx_ninterp_owns_walk(void) __attribute__((weak));
+static inline bool GdxNativeInterpOwnsWalk() {
+#ifdef __3DS__
+    return (&gdx_ninterp_owns_walk != nullptr) && (gdx_ninterp_owns_walk() != 0);
+#else
+    return false;
+#endif
+}
+
 /* Stage 1 -- the bridge: SETUP (wide-cache sweep, segment claims, region-cache reset) + XLATE
    (adapter construction, ConvertRoot/ProcessList, the matrix fixups) + the walk-side receipts.
    Returns false when there is nothing to run (no window). Reads segments through the calling
@@ -10427,7 +10645,14 @@ static bool GdxGfxJobPrepare(GdxGfxJob& job) {
     // Latch the current/previous GfxPool bases and reset the referenced-offset set BEFORE
     // ConvertRoot drains the G_MTX reroutes (which populate this tick's lerp list). No-op unless P1.
     adapter.GdxInterpBeginTick();
-    job.converted = adapter.ConvertRoot();
+    if (GdxNativeInterpOwnsWalk()) {
+        /* [native] interp=1 (not verify): the owned interpreter walks the game's own Gfx stream
+           through the resolver seam, so the conversion pre-pass is dead work -- this is the
+           plan's "brMain goes to 0" (§3.13). The adapter stays constructed: it IS the seam. */
+        job.converted = nullptr;
+    } else {
+        job.converted = adapter.ConvertRoot();
+    }
     // The referenced-offset set is NOT promoted here. This function runs once per GFX TASK and the
     // game submits several per tick, so the promotion happens at the real tick boundary inside
     // GdxInterpBeginTick (see gGdxInterpNewTick) where a complete tick's set is available.
@@ -11943,13 +12168,28 @@ static void GdxGfxJobRelease(GdxGfxJob& job) {
     job.adapter.reset();
 }
 
+/* [native] interp=1 (port/3ds/gfx/n64/gdx_rt_glue.cpp): the owned interpreter walks the
+   prepared job instead of the LUS Run. Weak so desktop builds and the DL-test harness, which
+   never link the n64/ library, keep the LUS path unconditionally. Returns 0 = not taken. */
+extern "C" int gdx_ninterp_job_run(GdxGfxJob* job) __attribute__((weak));
+static inline bool GdxNativeInterpTakesJob(GdxGfxJob& job) {
+#ifdef __3DS__
+    return (&gdx_ninterp_job_run != nullptr) && (gdx_ninterp_job_run(&job) != 0);
+#else
+    (void)job;
+    return false;
+#endif
+}
+
 extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
     GdxGfxJob job;
     job.dl = dl;
     job.dlSize = dl_size;
     job.ucode = taskUcode;
     if (GdxGfxJobPrepare(job)) {
-        GdxGfxJobRun(job);
+        if (!GdxNativeInterpTakesJob(job)) {
+            GdxGfxJobRun(job);
+        }
     } else {
         gdx_perf_sub_end(GDX_PERF_SUB_GFXRUN);
     }
@@ -11979,7 +12219,9 @@ extern "C" GdxGfxJob* gdx_gfx_job_prepare(void* dl, size_t dlSize, GdxTaskUcode 
 
 extern "C" void gdx_gfx_job_run(GdxGfxJob* job) {
     if (job != nullptr) {
-        GdxGfxJobRun(*job);
+        if (!GdxNativeInterpTakesJob(*job)) {
+            GdxGfxJobRun(*job);
+        }
     }
 }
 
@@ -12350,4 +12592,256 @@ extern "C" void gdx_gfx_mem_census(unsigned long out[8]) {
     out[5] = (unsigned long)gWideCache.CachedCount();
     out[6] = (unsigned long)gSetupGfxSegment.capacity();
     out[7] = (unsigned long)gHostRanges.size();
+}
+
+/* =====================================================================================
+ * [native] interp exports (port/gdx_dlsrc_bridge.h). See the adapter's Native* block for
+ * the bodies; these only unpack the job. Plan: docs/research/native/06-interp-plan.md.
+ * ===================================================================================== */
+#include "gdx_dlsrc_bridge.h"
+
+static void GdxNativeFillList(GdxDlSrcList* out, const N64Gfx* ptr, size_t limit, size_t stride, bool isBig,
+                              bool isF3d) {
+    out->ptr = ptr;
+    out->limit = limit;
+    out->stride = static_cast<uint8_t>(stride);
+    out->isBig = isBig ? 1 : 0;
+    out->isF3d = isF3d ? 1 : 0;
+    out->reserved = 0;
+}
+
+extern "C" int gdx_gfx_job_root_list(GdxGfxJob* job, GdxDlSrcList* out) {
+    if (job == nullptr || job->adapter == nullptr || out == nullptr) return 0;
+    const N64Gfx* ptr = nullptr;
+    size_t limit = 0, stride = 0;
+    bool isBig = false, isF3d = false;
+    if (!job->adapter->NativeRootList(&ptr, &limit, &stride, &isBig, &isF3d)) return 0;
+    GdxNativeFillList(out, ptr, limit, stride, isBig, isF3d);
+    return 1;
+}
+
+extern "C" int gdx_gfx_job_resolve_list(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull,
+                                        GdxDlSrcList* out) {
+    if (job == nullptr || job->adapter == nullptr || out == nullptr) return 0;
+    const N64Gfx* ptr = nullptr;
+    size_t limit = 0, stride = 0;
+    bool isBig = false, isF3d = false;
+    if (!job->adapter->NativeResolveList(raw, hostTagged != 0, hostFull, &ptr, &limit, &stride, &isBig, &isF3d)) {
+        return 0;
+    }
+    GdxNativeFillList(out, ptr, limit, stride, isBig, isF3d);
+    return 1;
+}
+
+extern "C" uintptr_t gdx_gfx_job_resolve_data(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull,
+                                              size_t requiredBytes, int preferPhysical, uintptr_t sourceHint) {
+    if (job == nullptr || job->adapter == nullptr) return 0;
+    return job->adapter->NativeResolveData(raw, hostTagged != 0, hostFull, requiredBytes, preferPhysical != 0,
+                                           sourceHint);
+}
+
+extern "C" uintptr_t gdx_gfx_job_resolve_timg_host(GdxGfxJob* job, uintptr_t hostFull, size_t requiredBytes) {
+    if (job == nullptr || job->adapter == nullptr) return hostFull;
+    return job->adapter->NativeResolveTimgHost(hostFull, requiredBytes);
+}
+
+extern "C" int gdx_gfx_timg_is_resource(uint32_t raw, int hostTagged, uintptr_t resolved, size_t loadBytes) {
+    if (hostTagged != 0 || resolved == 0) return 0;
+    if (IsRdramHostPointer(resolved) || IsVenueBuildingTextureRange(resolved)) return 0;
+    if (!GdxO2rServesWholeLoad(raw, loadBytes)) return 0;
+    return gdx_lookup_asset_segment_o2r_key(raw) != nullptr ? 1 : 0;
+}
+
+extern "C" int gdx_gfx_texels_are_native_rgba16(uintptr_t source, size_t size) {
+    return IsNativeRgba16Range(source, size) ? 1 : 0;
+}
+
+extern "C" size_t gdx_gfx_readable_bytes(uintptr_t address) {
+    return (address != 0) ? ReadableByteLimit(address) : 0;
+}
+
+extern "C" int gdx_gfx_low32_needs_resolver(uint32_t low32) {
+    return (IsAssetPlaceholderPointer(low32) || IsPortBssAliasPointer(low32)) ? 1 : 0;
+}
+
+extern "C" uintptr_t gdx_gfx_job_set_segment(GdxGfxJob* job, unsigned segment, uint32_t raw, int hostTagged,
+                                             uintptr_t hostFull) {
+    if (job == nullptr || job->adapter == nullptr) return 0;
+    return job->adapter->NativeSetSegment(static_cast<uint8_t>(segment), raw, hostTagged != 0, hostFull);
+}
+
+extern "C" int gdx_gfx_ucode_variant(uint32_t raw, int hostTagged, uintptr_t hostFull, int* variant, int* isLine) {
+    const auto matches = [raw, hostTagged, hostFull](const void* symbol) {
+        const uintptr_t symbolAddr = reinterpret_cast<uintptr_t>(symbol);
+        if (hostTagged) {
+            return hostFull == symbolAddr;
+        }
+        return ((raw ^ Low32(symbolAddr)) & 0x1FFFFFFFu) == 0;
+    };
+    *isLine = 0;
+    if (matches(gspF3DEX2_fifoTextStart)) {
+        *variant = 0;
+    } else if (matches(gspF3DLX2_Rej_fifoTextStart) || matches(gspF3DEX2_Rej_fifoTextStart)) {
+        *variant = 1;
+    } else if (matches(gspF3DFLX2_Rej_fifoTextStart)) {
+        *variant = 2;
+    } else if (matches(gspL3DEX2_fifoTextStart)) {
+        *variant = 0;
+        *isLine = 1;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Runs the LUS path for a job unconditionally (the interp_verify record pass). */
+extern "C" void gdx_gfx_job_run_lus(GdxGfxJob* job) {
+    if (job != nullptr) {
+        GdxGfxJobRun(*job);
+    }
+}
+
+extern "C" int gdx_gfx_job_ucode(GdxGfxJob* job) {
+    return (job != nullptr) ? static_cast<int>(job->variant) : 0;
+}
+
+extern "C" void gdx_gfx_job_bridge_stats(GdxGfxJob* job, unsigned long* lists, unsigned long* commands,
+                                         unsigned long opCounts[256]) {
+    *lists = 0;
+    *commands = 0;
+    for (int i = 0; i < 256; i++) opCounts[i] = 0;
+    if (job == nullptr) return;
+    const ConversionStats& st = job->stats;
+    *lists = static_cast<unsigned long>(st.convertedLists);
+    *commands = static_cast<unsigned long>(st.commandsOut);
+    for (int i = 0; i < 256; i++) opCounts[i] = static_cast<unsigned long>(st.opCounts[static_cast<size_t>(i)]);
+}
+
+extern "C" void gdx_gfx_job_epilogue(GdxGfxJob* job) {
+    (void)job;
+    /* Mirrors GdxGfxJobRun's post-Run sequence (VI-fallback guard, cadence, GPU-content latch,
+       mirror refresh + capture + named dump). The geometry diagnostics block is LUS-only. */
+    gHostFrameGfxTaskRan = true;
+    ++gdx_cadence_gfx_tasks;
+    sGpuContentLive = true;
+    sGpuHoldPixelsStale = true;
+    Fast::Fast3dWindow* fw = sGdxCachedWindow;
+    if (fw == nullptr) return;
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) return;
+    gdx_perf_sub_begin(GDX_PERF_SUB_MIRROR);
+    GdxUpdateFrameMirror(interp);
+    gdx_perf_sub_end(GDX_PERF_SUB_MIRROR);
+}
+
+extern "C" int gdx_gfx_frame_config(GdxFrameConfig* out) {
+    Fast::Fast3dWindow* fw = sGdxCachedWindow;
+    if (fw == nullptr || out == nullptr) return 0;
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) return 0;
+    extern int gdx_get_force_fixed_aspect(void);
+    out->windowW = interp->mGfxCurrentWindowDimensions.width;
+    out->windowH = interp->mGfxCurrentWindowDimensions.height;
+    out->curW = interp->mCurDimensions.width;
+    out->curH = interp->mCurDimensions.height;
+    out->internalMul = interp->mCurDimensions.internal_mul;
+    out->nativeW = interp->mNativeDimensions.width;
+    out->nativeH = interp->mNativeDimensions.height;
+    out->rendersToFb = interp->mRendersToFb ? 1 : 0;
+    out->gameFb = interp->mGameFb;
+    out->widescreen = interp->mWidescreenEnabledCache ? 1 : 0;
+    out->forceFixedAspect = gdx_get_force_fixed_aspect();
+    out->widescreenUi = interp->mWidescreenUiCache ? 1 : 0;
+    out->ultrawide = interp->mUltrawideCache ? 1 : 0;
+    out->removeBorders = interp->mRemoveBordersCache ? 1 : 0;
+    out->hudMaxAspect = interp->mHudMaxAspectCache;
+    out->textureFilter = static_cast<int>(interp->GetCurrentRenderingAPI()->GetTextureFilter());
+    return 1;
+}
+
+/* [nverify] end-of-task state snapshot of the LUS interpreter (same layout as the owned
+   path's gdxn::Interp::StateSnapshot). */
+extern "C" unsigned gdx_gfx_lus_state(uint32_t* out, unsigned cap) {
+    Fast::Fast3dWindow* fw = sGdxCachedWindow;
+    if (fw == nullptr || cap < 48) return 0;
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) return 0;
+    const Fast::RDP& r = *interp->mRdp;
+    const Fast::RSP& p = *interp->mRsp;
+    unsigned n = 0;
+    out[n++] = (uint32_t)r.combine_mode;
+    out[n++] = (uint32_t)(r.combine_mode >> 32);
+    out[n++] = r.other_mode_h;
+    out[n++] = r.other_mode_l;
+    out[n++] = (r.prim_color.r << 24) | (r.prim_color.g << 16) | (r.prim_color.b << 8) | r.prim_color.a;
+    out[n++] = (r.env_color.r << 24) | (r.env_color.g << 16) | (r.env_color.b << 8) | r.env_color.a;
+    out[n++] = (r.blend_color.r << 24) | (r.blend_color.g << 16) | (r.blend_color.b << 8) | r.blend_color.a;
+    out[n++] = (r.fill_color.r << 24) | (r.fill_color.g << 16) | (r.fill_color.b << 8) | r.fill_color.a;
+    out[n++] = (r.fog_color.r << 24) | (r.fog_color.g << 16) | (r.fog_color.b << 8) | r.fog_color.a;
+    out[n++] = ((uint32_t)r.prim_lod_fraction << 16) | r.prim_depth;
+    out[n++] = ((uint32_t)r.first_tile_index << 16) | (r.textures_changed[0] ? 1u : 0u) | (r.textures_changed[1] ? 2u : 0u);
+    out[n++] = ((uint32_t)p.texture_scaling_factor.s << 16) | p.texture_scaling_factor.t;
+    out[n++] = p.geometry_mode;
+    out[n++] = ((uint32_t)(uint16_t)r.viewport.x << 16) | (uint16_t)r.viewport.y;
+    out[n++] = (r.viewport.width << 16) | r.viewport.height;
+    out[n++] = ((uint32_t)(uint16_t)r.scissor.x << 16) | (uint16_t)r.scissor.y;
+    out[n++] = (r.scissor.width << 16) | r.scissor.height;
+    out[n++] = ((uint32_t)(int16_t)p.fog_mul << 16) | (uint16_t)p.fog_offset;
+    out[n++] = p.current_num_lights | ((uint32_t)p.modelview_matrix_stack_size << 8);
+    out[n++] = r.color_image_address == r.z_buf_address ? 1u : 0u;
+    for (int t = 0; t < 8; t++) {
+        const auto& tt = r.texture_tile[t];
+        out[n++] = ((uint32_t)tt.fmt << 28) | ((uint32_t)tt.siz << 24) | ((uint32_t)tt.tmem_index << 8) | tt.palette;
+        out[n++] = (tt.line_size_bytes << 16) | (tt.cms << 12) | (tt.cmt << 8) | (tt.masks << 4) | tt.maskt;
+        out[n++] = ((uint32_t)(uint16_t)(int)tt.uls << 16) | (uint16_t)(int)tt.ult;
+        out[n++] = ((uint32_t)(uint16_t)(int)tt.lrs << 16) | (uint16_t)(int)tt.lrt;
+    }
+    return n;
+}
+
+/* [nverify] re-apply the backend state the LUS interpreter believes is loaded (the owned pass
+   changed it in between): shader, depth/decal/alpha, bound textures + samplers. */
+extern "C" void gdx_gfx_lus_resync_backend(void) {
+    Fast::Fast3dWindow* fw = sGdxCachedWindow;
+    if (fw == nullptr) return;
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) return;
+    Fast::GfxRenderingAPI* rapi = interp->GetCurrentRenderingAPI();
+    if (rapi == nullptr) return;
+    const Fast::RenderingState& rs = interp->mRenderingState;
+    if (rs.mShaderProgram != nullptr) rapi->LoadShader(rs.mShaderProgram);
+    if (rs.depth_test_and_mask != 0xFF) {
+        rapi->SetDepthTestAndMask((rs.depth_test_and_mask & 1) != 0, (rs.depth_test_and_mask & 2) != 0);
+    }
+    rapi->SetZmodeDecal(rs.decal_mode);
+    rapi->SetUseAlpha(rs.alpha_blend);
+    for (int i = 0; i < 2; i++) {
+        if (rs.mTextures[i] != nullptr) {
+            rapi->SelectTexture(i, rs.mTextures[i]->second.texture_id);
+            if (rs.sampler_valid[i]) {
+                rapi->SetSamplerParameters(i, rs.sampler_linear_filter[i], rs.sampler_cms[i], rs.sampler_cmt[i]);
+            }
+        }
+    }
+}
+
+extern "C" void gdx_gfx_frame_publish(uintptr_t gfxFrameBuffer) {
+    Fast::Fast3dWindow* fw = sGdxCachedWindow;
+    if (fw == nullptr) return;
+    auto interp = fw->GetInterpreterWeak().lock();
+    if (!interp) return;
+    interp->mGfxFrameBuffer = gfxFrameBuffer;
+}
+
+/* [nverify] diagnostic: where does a texture host address live? bit0 RDRAM, bit1 GfxPool range,
+ * bit2 native-RGBA16 range, bit3 registered host range; 0 = plain heap (a persistent raw-texture
+ * copy or an asset). Runs on the render thread: only reads the stable range tables, never the
+ * copy vector main is mutating for the next task. */
+extern "C" unsigned gdx_gfx_classify_host_ptr(unsigned long p) {
+    unsigned cls = 0;
+    if (IsRdramHostPointer(p)) cls |= 1u;
+    if (IsGfxPoolHostRange(p)) cls |= 2u;
+    if (IsNativeRgba16Range(p, 2)) cls |= 4u;
+    if (RegisteredHostRemaining(p) != 0) cls |= 8u;
+    return cls;
 }

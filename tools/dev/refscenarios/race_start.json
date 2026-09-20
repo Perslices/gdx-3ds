@@ -1,0 +1,20 @@
+{
+  "id": "race_start",
+  "title": "GP / Novice / Jack Cup / Mute City / Blue Falcon — grid to green light",
+  "script": "race_start.script",
+  "shots": ["race_title", "race_cup", "race_course", "race_machine", "race_settings",
+            "race_grid", "race_start"],
+  "timeout_seconds": 600,
+  "env": {},
+  "cfg": {},
+  "cvars": {},
+  "emit_3ds": { "waitmode_ticks": 400 },
+  "notes": [
+    "In-race frames are the ones the 3DS viewport fold CANNOT affect: the fold only fires on",
+    "sub-window viewports (menus/UI), never in-race (docs/research/viewport-progress.md), so",
+    "race_grid and race_start are directly comparable while race_cup/race_course/race_machine",
+    "are menu frames that need the fold applied to the reference or a region mask.",
+    "Every WAITMODE here CONTINUES on timeout, so a run whose log shows a timeout has shots",
+    "taken on the wrong screen. Check run.log before citing any BMP from this scenario."
+  ]
+}

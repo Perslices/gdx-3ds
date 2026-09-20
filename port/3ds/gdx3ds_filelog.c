@@ -25,6 +25,11 @@
  */
 #include "gdx3ds_filelog.h"
 #include "gdx3ds_config.h"
+/* HWLINK: the one sink hook that mirrors every tracer line to the host over WiFi. The
+ * call is a memcpy into a static SPSC ring and returns -- it never blocks, never
+ * allocates, and takes no lock of its own (this sink's recursive lock, already held here,
+ * is what serialises the single producer). Inert unless [net] enabled = 1. */
+#include "gdx3ds_net.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -169,6 +174,7 @@ void gdx3ds_filelog_write(const char* msg, size_t len) {
             }
         }
         gdx3ds_filelog_ring_append_locked(msg, len);
+        gdx3ds_net_log_write(msg, len); /* HWLINK mirror; no-op when [net] enabled = 0 */
         if (sLogFile != NULL) {
             sBytesWritten += len + 1;
             /* Fatal-class lines must be on the card before svcBreak: flush now.

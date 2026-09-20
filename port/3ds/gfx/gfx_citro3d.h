@@ -109,6 +109,8 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
   public:
     GfxRenderingAPIC3D() = default;
     ~GfxRenderingAPIC3D() override = default;
+    // HOMEFIX diagnostic: is a C3D frame open (render-thread state; racy read, receipts only).
+    bool DiagFrameActive() const { return mFrameActive; }
 
     const char* GetName() override;
     int GetMaxTextureSize() override;
@@ -152,6 +154,14 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
                          int dstX1, int dstY1) override;
     void ClearFramebuffer(bool color, bool depth) override;
     void ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) override;
+    /* ORACLE (docs/research/native/03-oracle-plan.md §1): true capture of the FRAME JUST ENDED.
+     * eye 0 = the main 240x400 target, eye 1 = the stereo right target (only while the right
+     * pass is Active()). Must be called with NO frame open, after C3D_FrameEnd (the readback is
+ * queued behind that frame's work on the in-order gx queue and sentinel-polled).
+     * Same untile/un-rotate body as ReadFramebufferToCPU (row 0 = top, RGBA5551, alpha forced
+     * 1). Returns 0 ok, 1 transfer never landed (stale read), -1 no target / bad state,
+     * -2 right eye not active this frame. */
+    int CaptureTargetRgba16(int eye, uint16_t* out, uint32_t width, uint32_t height);
     void ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) override;
     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
     GetPixelDepth(int fbId, const std::set<std::pair<float, float>>& coordinates) override;
@@ -169,6 +179,11 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
      * range through DrawTriangles with the repack skipped. */
     float* VboPackBegin(Gdx3dsVboPackParams* params);
     void DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux);
+    /* [native] machines (gdx3ds_mesh.h): reserve packed vertices + u16 indices in the
+     * linear pool for the CURRENT shader/texture state, then submit ONE indexed draw
+     * through DrawTriangles' shared tail (C3D_DrawElements in place of DrawArrays). */
+    float* NativeMeshBegin(Gdx3dsVboPackParams* params, uint32_t minVerts, uint32_t maxIndices, uint32_t* capVerts);
+    void NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux);
 
   private:
     struct TextureC3D {
@@ -260,6 +275,11 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     void DisableFog();
     void FlushPendingVbo();
     uint32_t CurrentTargetFbHeight() const;
+    /* Shared readback body (ReadFramebufferToCPU + CaptureTargetRgba16): display-transfer
+     * untile of an RGBA8 colour buffer into RGB5A1 with the sentinel poll, then the CPU
+     * un-rotate/resample into `out`. Returns false when the transfer never landed. */
+    bool ReadColorBufRgba16(u32* colorBuf, u32 fbW, u32 fbH, u32 gameW, u32 gameH, uint32_t width,
+                            uint32_t height, uint16_t* out, const char* who);
 
     /* PICA state */
     DVLB_s* mVshDvlb = nullptr;
@@ -276,6 +296,16 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     int mScX = 0, mScY = 0, mScW = 400, mScH = 240; /* last LUS scissor (window coords) */
     bool mScValid = false;
     void ApplyScissorRect(int x, int y, int width, int height);
+
+    /* [native] indexed draw in flight (NativeMeshDraw -> DrawTriangles): index pointer
+     * (inside the pool, after the vertices), count, vertex count, pool floats to release. */
+    struct {
+        const uint16_t* idx = nullptr;
+        uint32_t nIdx = 0;
+        uint32_t nVerts = 0;
+        size_t idxFloats = 0;
+    } mNativeIdx;
+    bool mNativeActive = false;
 
     /* Fixed-size linearAlloc vertex pool, reset every StartFrame. */
     float* mVboPool = nullptr;

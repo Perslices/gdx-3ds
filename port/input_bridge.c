@@ -49,6 +49,7 @@
 #include "controller.h"
 #include "fzx_game.h" // GameMode values + GET_MODE (in-race safety checks)
 #include "gdx_input_script.h" // GDX_INPUT_SCRIPT: dev-only deterministic input playback (see file header)
+#include "gdx_input_rec.h"    // ORACLE: .gdxrec record/replay stage of the unified injector
 #include "port_log.h"
 
 #include <stdbool.h>
@@ -272,6 +273,17 @@ static int gdx_autoinput_parse_input(const char* name, u16* out_btn, s8* out_x, 
    frame. Same boundary idiom as the other cross-TU externs in this file. */
 extern void gdx_request_frame_dump(const char* label);
 
+/* ORACLE: the input tick. Incremented exactly once per gdx_controller_poll() (the single call
+   site in the host loop, one per VI tick), so it is the clock every scripted source, the .gdxrec
+   line numbering and the [fh] receipt's tick= field share. Was autoinput's private s_tick. */
+static unsigned long long s_input_tick = 0;
+
+unsigned long long gdx_input_tick(void) {
+    return s_input_tick;
+}
+
+int gdx_input_game_mode(void); /* defined below the gGameMode extern */
+
 static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y) {
     static int s_state = -1; /* -1 unread, 0 absent, 1 loaded */
     static int s_tickmode = 0;
@@ -282,13 +294,13 @@ static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y)
                     char shot[24]; u8 fired; } s_events[64];
     static int s_count = 0;
     static unsigned long long s_start_ms = 0;    /* seconds-mode wall-clock baseline */
-    static unsigned long long s_tick = 0;        /* tick-mode VI-tick counter */
+    const unsigned long long s_tick = s_input_tick; /* tick-mode timebase (see gdx_input_tick) */
 
     if (s_state == -1) {
         FILE* f = fopen("gdx-autoinput.txt", "r");
         s_state = 0;
         if (f != NULL) {
-            char line[64];
+            char line[128];
             int sniffed = 0;
             while (s_count < 64 && fgets(line, (int) sizeof(line), f) != NULL) {
                 char name[16];
@@ -296,6 +308,20 @@ static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y)
                 int hold_ticks;
                 u16 b;
                 s8 x, y;
+                /* A line longer than the buffer comes back from fgets WITHOUT its
+                   newline, and the next fgets returns its tail. That tail does not start
+                   with '#', so an over-long COMMENT used to be parsed as the first data
+                   line — and because it is not the word `ticks`, the whole script fell
+                   back to the wall-clock seconds timebase and every SHOT was silently
+                   lost (symptom: "autoinput script loaded: 1 events (seconds timebase)"
+                   from a tick-mode file). Discard the remainder so one physical line is
+                   always one logical line, whatever the buffer size. */
+                if (strchr(line, '\n') == NULL && !feof(f)) {
+                    int ch;
+                    while ((ch = fgetc(f)) != EOF && ch != '\n') {
+                        /* drain to end of line */
+                    }
+                }
                 {
                     const char* p = line;
                     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
@@ -369,6 +395,7 @@ static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y)
                 if (!s_events[i].fired && now >= s_events[i].at) {
                     s_events[i].fired = 1;
                     gdx_request_frame_dump(s_events[i].shot);
+                    gdx_input_rec_note_shot(s_events[i].shot); /* recorded on this tick's line */
                     gdx_port_logf("[input] autoinput SHOT '%s' armed at tick %.0f\n",
                                   s_events[i].shot, now);
                 }
@@ -381,14 +408,32 @@ static void gdx_autoinput_apply(u16* io_buttons, s8* io_stick_x, s8* io_stick_y)
             }
         }
     }
-    /* Exactly once per gdx_controller_poll() call — see the single call site below. */
-    s_tick++;
+}
+
+/* ORACLE: THE injector. Every scripted source lands here, at the rawest point where the pad
+   state exists (before the digital-stick derivation and the edge accumulation), so a scripted
+   press flows through the identical accumulate-then-finalize path physical input uses. Stages,
+   in order: legacy gdx-autoinput.txt (OR-in; skipped while a .gdxrec replay is armed — the
+   replay wins), GDX_INPUT_SCRIPT override, .gdxrec replay override, then the .gdxrec recorder
+   sees the FINAL pad. hwlink's gdx_replay_start() enters through the replay stage. */
+void gdx_input_inject(unsigned long long tick, GdxInputPad* pad) {
+    (void) tick; /* the stages read gdx_input_tick(); the parameter documents the contract */
+    if (!gdx_input_rec_replay_armed()) {
+        gdx_autoinput_apply(&pad->buttons, &pad->stickX, &pad->stickY);
+    }
+    gdx_input_script_override(pad);
+    gdx_input_rec_poll((unsigned long) s_input_tick, pad, gdx_input_game_mode());
 }
 
 // Decomp race state. Kept behind small C helpers so every photo-mode consumer uses the same
 // definition and the ImGui ghost importer can avoid writing persistence while a race is live.
 extern s32 gGameMode;
 extern s8 gGamePaused;
+
+/* ORACLE: the [fh] receipt's mode= field and the .gdxrec "# mode" markers. */
+int gdx_input_game_mode(void) {
+    return (int) GET_MODE(gGameMode);
+}
 
 // Declared locally -- same pattern as gdx_lus_read_pads above -- to avoid pulling a LUS/C++
 // umbrella header into this decomp-environment C TU. int32_t is `int` on this target, so the
@@ -702,25 +747,23 @@ void gdx_controller_poll(void) {
     // controller the game will accept.
     connected[0] = 1;
 
-    // Applied after the real controller read so analog events are not overwritten by it. Both dev
-    // harnesses drive PORT 1 only; giving them a port argument would change their file formats.
-    gdx_autoinput_apply(&buttons[0], &stick_x[0], &stick_y[0]);
-
-    // ── GDX_INPUT_SCRIPT (dev-only) deterministic playback override ───────────────────────────
+    // ── Unified scripted-input injector (autoinput, GDX_INPUT_SCRIPT, .gdxrec) ────────────────
     // Substituted HERE -- at the rawest point where the pad state lands, before the digital-stick
     // derivation and the edge accumulation in gdx_update_port_inputs() -- so a scripted
     // press/release flows through the EXACT same accumulate-then-finalize path physical input uses.
-    // Wins over both the live LUS read and the legacy gdx-autoinput.txt mechanism when active.
+    // Applied after the real controller read so analog events are not overwritten by it. Every dev
+    // harness drives PORT 1 only; giving them a port argument would change their file formats.
     {
         GdxInputPad scriptPad;
         scriptPad.buttons = buttons[0];
         scriptPad.stickX = stick_x[0];
         scriptPad.stickY = stick_y[0];
-        gdx_input_script_override(&scriptPad);
+        gdx_input_inject(s_input_tick, &scriptPad);
         buttons[0] = scriptPad.buttons;
         stick_x[0] = scriptPad.stickX;
         stick_y[0] = scriptPad.stickY;
     }
+    s_input_tick++; /* exactly once per poll: the poll IS the tick */
 
     // Publish presence BEFORE the per-port update: a port that just went away has its Controller
     // cleared in here, and clearing it after the update would throw away the frame we just read.

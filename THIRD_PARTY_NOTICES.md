@@ -11,6 +11,7 @@ must remain with binary packages.
 | F-Zero X decompilation | Recreated game code and extraction recipes | `LICENSES/CC0-1.0.txt` |
 | F-Zero X Expansion Kit decompilation | Source/reference submodule | `LICENSES/CC0-1.0.txt` |
 | libultraship | Runtime, platform abstraction, and resource system | `LICENSES/MIT-libultraship.txt` |
+| libultraship (vendored 3DS carve) | The 36 sources + 83 headers the 3DS build compiles, patched and vendored at `port/3ds/vendor/lus/` — same MIT terms, verbatim copy beside the code and provenance in `port/3ds/vendor/lus/PROVENANCE.md` | `LICENSES/MIT-libultraship.txt` |
 | Fast3D | Graphics interpreter and shaders | `LICENSES/MIT-Fast3D.txt` |
 | Torch | `gdx-extract` asset processor | `LICENSES/MIT-Torch.txt` |
 | cxd4 RSP core | Low-level audio RSP interpreter | `LICENSES/CC0-1.0.txt` |

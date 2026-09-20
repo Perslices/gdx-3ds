@@ -1,3 +1,9 @@
+Applies to libultraship (https://github.com/Kenix3/libultraship), used here through the
+libultraship/ submodule for the desktop build and, for the 3DS build, through the vendored
+carve at port/3ds/vendor/lus/ (36 sources + 83 headers, upstream commit 7bca0e22 with the
+port's 3DS patches folded in -- see port/3ds/vendor/lus/PROVENANCE.md). The same terms below
+cover both copies.
+
 MIT License
 
 Copyright (c) 2022 kenix3 kenixwhisperwind@gmail.com

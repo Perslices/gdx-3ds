@@ -1,0 +1,26 @@
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -8049,10 +8049,23 @@
+ }
+ 
+ // F3D, F3DEX, and F3DEX2 do the same thing but F3DEX2 has its own opcode number
++#ifdef __3DS__
++// [native] machines (port/3ds/gfx/gdx3ds_mesh.h): a registered machine body list reaches
++// G_DL as a mesh stub; the hook draws it natively from the live RSP/RDP state and the
++// stub is skipped. Weak: the interpreter links without the mesh module.
++extern "C" int gdx3ds_mesh_dl_hook(void* interpreter, void* subGfx) __attribute__((weak));
++#endif
++
+ bool gfx_dl_handler_common(F3DGfx** cmd0) {
+     Interpreter* gfx = sGfxInstanceRaw;
+     F3DGfx* cmd = *cmd0;
+     F3DGfx* subGFX = (F3DGfx*)gfx->SegAddr(cmd->words.w1);
++#ifdef __3DS__
++    if (&gdx3ds_mesh_dl_hook != nullptr && gdx3ds_mesh_dl_hook(gfx, subGFX) != 0) {
++        sGfxS7DirtyMask = 0xFFu; // the draw bound material state directly: memos re-derive
++        return false;
++    }
++#endif
+     if (C0(16, 1) == 0) {
+         // Push return address
+         if (subGFX != nullptr) {

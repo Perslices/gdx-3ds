@@ -1,0 +1,106 @@
+diff --git a/include/fast/interpreter.h b/include/fast/interpreter.h
+--- a/include/fast/interpreter.h
++++ b/include/fast/interpreter.h
+@@ -130,6 +130,8 @@
+ void gfx_cc_get_features(uint64_t shader_id0, uint64_t shader_id1, struct CCFeatures* cc_features);
+ 
+ union Gfx;
++
++struct GdxTrackPackState; /* [native] track (port/3ds/gfx/gdx3ds_track_interp.h) */
+ 
+ namespace Fast {
+ 
+@@ -702,6 +704,12 @@
+     void GfxSpVertex(size_t numVertices, size_t destIndex, const F3DVtx* vertices);
+     void GfxSpModifyVertex(uint16_t vtxIdx, uint8_t where, uint32_t val);
+     void GfxSpTri1(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t vtx3Idx, bool isRect);
++    /* [native] track (3DS): G_NOOP marker replay. GdxTrackMarker is defined by the port
++       (port/3ds/gfx/gdx3ds_track_replay.cpp); the other two live in interpreter.cpp because they
++       read this TU's file-static draw-state memo and packed-batch latches. */
++    void GdxTrackMarker(uint32_t w0, uintptr_t w1);
++    void GdxTrackPackState(GdxTrackPackState* out);
++    void GdxTrackSetCombine(uint32_t w0, uint32_t w1);
+     void GfxSpLine3DGdx(uint8_t vtx1Idx, uint8_t vtx2Idx, uint8_t halfWidth);
+     void GfxSpGeometryMode(uint32_t clear, uint32_t set);
+     void GfxSpExtraGeometryMode(uint32_t clear, uint32_t set);
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -52,6 +52,10 @@
+ // gdx3ds_lus_carve target adds that directory to this TU's include path).
+ // Desktop builds never see this include or the packed path.
+ #include "gdx3ds_vbopack.h"
++#include "gdx3ds_track_interp.h" // [native] track marker replay contract
++// [native] track: port-defined marker entry (gdx3ds_track_replay.cpp). Weak so a link
++// without the port's replay TU (nothing references it) degrades the marker to a no-op.
++extern "C" void gdx3ds_track_marker(Fast::Interpreter* interp, uint32_t w0, uintptr_t w1) __attribute__((weak));
+ #endif
+ 
+ std::stack<std::string> currentDir;
+@@ -3901,6 +3905,50 @@
+     return !(v != nullptr && v[0] == '1');
+ }();
+ 
++#ifdef __3DS__
++// [native] track: read-only snapshot of the draw-state memo + packed-batch latches for the
++// port's marker replay (gdx3ds_track_interp.h). No state is mutated.
++void Interpreter::GdxTrackPackState(::GdxTrackPackState* out) {
++    out->packBatch = sGdxPackBatch;
++    out->packDst = sGdxPackDst;
++    out->params = &sGdxPackParams;
++    out->aux = &sGdxPackAux;
++    out->memoValid = sGfxS7TriMemo.valid;
++    out->memoDirty = (sGfxS7DirtyMask & kGfxS7DirtyTri) != 0;
++    out->comb = sGfxS7TriMemo.comb;
++    out->prg = sGfxS7TriMemo.prg;
++    out->tm = sGfxS7TriMemo.tm;
++    for (int i = 0; i < 2; i++) {
++        out->texWidth[i] = sGfxS7TriMemo.tex_width[i];
++        out->texHeight[i] = sGfxS7TriMemo.tex_height[i];
++        out->texWidth2[i] = sGfxS7TriMemo.tex_width2[i];
++        out->texHeight2[i] = sGfxS7TriMemo.tex_height2[i];
++        out->effectiveTile[i] = sGfxS7TriMemo.effective_tile[i];
++        out->usedTextures[i] = sGfxS7TriMemo.usedTextures[i];
++    }
++    out->clip = sGfxS7TriMemo.clip_parameters;
++    out->cullBoth = get_attr(CULL_BOTH);
++    out->cullFront = get_attr(CULL_FRONT);
++    out->cullBack = get_attr(CULL_BACK);
++    out->triFast = sGdxTriFast;
++    out->rejectVariant =
++        (mF3dex2Variant == F3dex2Variant::Reject || mF3dex2Variant == F3dex2Variant::FZeroFlxReject);
++    out->minClipW = kGdxMinClipW;
++}
++
++bool gfx_set_combine_handler_rdp(F3DGfx** cmd0);
++// [native] track: a template-embedded G_SETCOMBINE replayed exactly as gfx_step would run it —
++// the RDP handler plus the draw-state dirty mask the dispatch entry ORs in.
++void Interpreter::GdxTrackSetCombine(uint32_t w0, uint32_t w1) {
++    F3DGfx cmd;
++    cmd.words.w0 = w0;
++    cmd.words.w1 = w1;
++    F3DGfx* p = &cmd;
++    gfx_set_combine_handler_rdp(&p);
++    sGfxS7DirtyMask |= static_cast<uint8_t>(kGfxS7DirtyTri | kGfxS7DirtyRect | kGfxS7DirtyRectViewport);
++}
++#endif
++
+ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is_rect) {
+     // [prof] state resolve + clip + repack into bufVbo. Exclusive time: any flush ->
+     // DrawTriangles, ImportTexture, or clip-fan re-entry into this function nested
+@@ -7681,6 +7729,15 @@
+         } else {
+             g_exec_stack.closeDisp();
+         }
++#ifdef __3DS__
++    } else if (p == 0x5A || p == 0x5B) {
++        // [native] track: the course tessellator's material-run marker (p=0x5A end, 0x5B
++        // verify start). The port replays the recorded VTX/MODIFYVTX/template ops here, at
++        // the exact display-list position the stock commands occupied.
++        if (&gdx3ds_track_marker != nullptr) {
++            gdx3ds_track_marker(sGfxInstanceRaw, (uint32_t)cmd->words.w0, (uintptr_t)cmd->words.w1);
++        }
++#endif
+     }
+     return false;
+ }

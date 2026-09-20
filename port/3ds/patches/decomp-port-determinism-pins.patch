@@ -1,0 +1,148 @@
+diff --git a/src/audio/disk/lib/thread.c b/src/audio/disk/lib/thread.c
+index d2886d0..16b9140 100644
+--- a/src/audio/disk/lib/thread.c
++++ b/src/audio/disk/lib/thread.c
+@@ -195,13 +195,14 @@ AudioTask* AudioThread_CreateTaskImpl(void) {
+     /* RNG determinism pin. osGetCount() is hardware entropy feeding gAudioCtx.audioRandom,
+        which is content-affecting (it perturbs sequencer velocity/gate variance), so the
+        bit-identical PCM gate can never reproduce while this term varies run to run.
+-       Substitute a deterministic counter under capture-armed mode only --
+-       gdx_pcm_capture_active() is 0 whenever GDX_PCM_CAPTURE is unset, i.e. all real play,
+-       which keeps the original expression byte for byte. */
++       Substitute a deterministic counter under capture-armed mode, or under the ORACLE
++       determinism pin (port/gdx_determinism.c, [debug] det_audio) -- both are 0 in all real
++       play, which keeps the original expression byte for byte. */
+     {
+         extern int gdx_pcm_capture_active(void);
++        extern int gdx_det_audio_pin(void);
+         u32 gdxRandTick;
+-        if (gdx_pcm_capture_active()) {
++        if (gdx_pcm_capture_active() || gdx_det_audio_pin()) {
+             static u32 sGdxDetCount = 0;
+             sGdxDetCount += 0x9E3779B9u; /* golden-ratio step: distinct per tick */
+             gdxRandTick = sGdxDetCount;
+diff --git a/src/audio/rom/lib/thread.c b/src/audio/rom/lib/thread.c
+index 86991b3..1f0fde2 100644
+--- a/src/audio/rom/lib/thread.c
++++ b/src/audio/rom/lib/thread.c
+@@ -136,7 +136,25 @@ AudioTask* AudioThread_CreateTask(void) {
+     }
+ #endif
+     gCurAbiCmdBuffer = AudioSynth_Update(gCurAbiCmdBuffer, &abiCmdCount, aiBuffer, gAiBufLengths[aiBufIndex]);
++#ifdef PORT
++    /* ORACLE determinism pin (port/gdx_determinism.c): same osGetCount() entropy term as the
++       disk audio library's thread.c, same deterministic-counter substitute, off (original
++       expression byte for byte) unless [debug] det_audio pins it. */
++    {
++        extern int gdx_det_audio_pin(void);
++        u32 gdxRandTick;
++        if (gdx_det_audio_pin()) {
++            static u32 sGdxDetCount = 0;
++            sGdxDetCount += 0x9E3779B9u; /* golden-ratio step: distinct per task */
++            gdxRandTick = sGdxDetCount;
++        } else {
++            gdxRandTick = (u32) osGetCount();
++        }
++        gAudioRandom = gdxRandTick * (gAudioRandom + gTotalTaskCount);
++    }
++#else
+     gAudioRandom = osGetCount() * (gAudioRandom + gTotalTaskCount);
++#endif
+     gAudioRandom = gAiBuffers[aiBufIndex][gTotalTaskCount & 0xFF] + gAudioRandom;
+ 
+     aiBufIndex = gRspTaskIndex;
+diff --git a/src/sys/sys_gfx.c b/src/sys/sys_gfx.c
+index 223a4a3..fd8a829 100644
+--- a/src/sys/sys_gfx.c
++++ b/src/sys/sys_gfx.c
+@@ -689,25 +689,16 @@ void Game_ThreadEntry(void* entry) {
+     Matrix_SetTransRot(&D_80225800.unk_000, 0, 1.0f, 0, 0, 0, 0.0f, 0.0f, 0.0f);
+ 
+ #ifdef PORT
+-    /* Determinism pin for the bit-identical PCM gate: osGetTime() seeding makes every run
+-       diverge. GDX_RAND_SEED1 substitutes a fixed seed into the original (a, a+a) shape;
+-       unset keeps the osGetTime() behavior exactly. */
++    /* Determinism pin (port/gdx_determinism.c): osGetTime() seeding makes every run diverge.
++       A pinned seed substitutes into the original (a, a+a) shape; unpinned keeps the
++       osGetTime() behavior exactly. The accessor replaces the former getenv("GDX_RAND_SEED1")
++       read, which is dead on 3DS (no environment) — desktop keeps that env as its fallback
++       inside the accessor. */
+     {
+-        extern char* getenv(const char* name);
+-        extern unsigned long strtoul(const char* s, char** e, int base);
+-        static int sSeed1Read = 0;
+-        static int sSeed1Have = 0;
+-        static u32 sSeed1 = 0;
+-        if (!sSeed1Read) {
+-            const char* env = getenv("GDX_RAND_SEED1");
+-            sSeed1Read = 1;
+-            if (env != NULL && env[0] != '\0') {
+-                sSeed1 = (u32) strtoul(env, NULL, 0);
+-                sSeed1Have = 1;
+-            }
+-        }
+-        if (sSeed1Have) {
+-            Math_Rand1Init(sSeed1, sSeed1 + sSeed1);
++        extern int gdx_det_rand_seed(int which, u32* out);
++        u32 gdxSeed1;
++        if (gdx_det_rand_seed(1, &gdxSeed1)) {
++            Math_Rand1Init(gdxSeed1, gdxSeed1 + gdxSeed1);
+         } else {
+             Math_Rand1Init(osGetTime(), osGetTime() + osGetTime());
+         }
+@@ -750,11 +741,26 @@ void Game_ThreadEntry(void* entry) {
+        Ruled out: re-presenting the CPU-blitted logo from this loop. The direct-to-interpreter
+        draw path renders nothing visible and costs enough GPU sync per call to starve the audio
+        fiber. Logo presentation needs a real VI-scanout fallback in the frame loop. */
++    /* Determinism pin (port/gdx_determinism.c): each gdx_yield() returns to the host loop,
++       which pumps exactly one VI tick per yield, so the wall-clock hold consumes a wall-clock-
++       dependent NUMBER OF GAME TICKS — every tick-scheduled event downstream (input scripts,
++       rival AI cadence) then lands on a different game frame per run. Invisible on a static
++       menu, visible in a race ("timer digits + pack positions"). With a pin, the hold is a
++       fixed tick count (230 = the console's 230-frame hold at 60 Hz). */
+     {
+         extern void gdx_yield(void);
+-        OSTime gdxHoldStart = osGetTime();
+-        while (OS_CYCLES_TO_NSEC(osGetTime() - gdxHoldStart) * 6e-8 <= 230.0) {
+-            gdx_yield();
++        extern int gdx_det_boot_hold_ticks(void);
++        const int gdxHoldTicks = gdx_det_boot_hold_ticks();
++        if (gdxHoldTicks > 0) {
++            int gdxTick;
++            for (gdxTick = 0; gdxTick < gdxHoldTicks; gdxTick++) {
++                gdx_yield();
++            }
++        } else {
++            OSTime gdxHoldStart = osGetTime();
++            while (OS_CYCLES_TO_NSEC(osGetTime() - gdxHoldStart) * 6e-8 <= 230.0) {
++                gdx_yield();
++            }
+         }
+     }
+ #endif
+@@ -763,21 +769,10 @@ void Game_ThreadEntry(void* entry) {
+ #ifdef PORT
+     /* Second seed, same determinism pin as Math_Rand1Init above; (a+a, a) shape. */
+     {
+-        extern char* getenv(const char* name);
+-        extern unsigned long strtoul(const char* s, char** e, int base);
+-        static int sSeed2Read = 0;
+-        static int sSeed2Have = 0;
+-        static u32 sSeed2 = 0;
+-        if (!sSeed2Read) {
+-            const char* env = getenv("GDX_RAND_SEED2");
+-            sSeed2Read = 1;
+-            if (env != NULL && env[0] != '\0') {
+-                sSeed2 = (u32) strtoul(env, NULL, 0);
+-                sSeed2Have = 1;
+-            }
+-        }
+-        if (sSeed2Have) {
+-            Math_Rand2Init(sSeed2 + sSeed2, sSeed2);
++        extern int gdx_det_rand_seed(int which, u32* out);
++        u32 gdxSeed2;
++        if (gdx_det_rand_seed(2, &gdxSeed2)) {
++            Math_Rand2Init(gdxSeed2 + gdxSeed2, gdxSeed2);
+         } else {
+             Math_Rand2Init(osGetTime() + osGetTime(), osGetTime());
+         }

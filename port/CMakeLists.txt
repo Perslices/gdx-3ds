@@ -125,6 +125,8 @@ add_executable(G-Diffuser
                                 # references it, so it looks like dead code and is not.
     input_bridge.c
     gdx_input_script.c
+    gdx_input_rec.c            # ORACLE: .gdxrec record/replay stage of the unified injector
+    gdx_determinism.c          # ORACLE: Math_Rand seed / boot-hold pins the decomp reads
     n64_gfx_bridge.cpp
     gdx_interp.cpp
     n64_gfx_convert.cpp
@@ -156,6 +158,9 @@ add_executable(G-Diffuser
     mio0_wrap.c
     gdx_segment_source.c       # in the exe, not gdiffuser_game: needs symbols from AssetLoader.cpp,
                                 # rom_buffer.cpp and gen/AssetBindings.c
+    gdx_linkstubs_desktop.c    # symbols the DEFAULT config gets from a TU a non-default config
+                                # does not compile. Sibling of gdx3ds_us_linkstubs.c; behaviour
+                                # is unchanged in the shipped configuration. See the file.
     "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
     $<TARGET_OBJECTS:gdiffuser_game>)
 
@@ -581,6 +586,8 @@ if(GDX_BUILD_JP)
         gdx_discord.cpp
         input_bridge.c
         gdx_input_script.c
+        gdx_input_rec.c
+        gdx_determinism.c
         n64_gfx_bridge.cpp
         gdx_interp.cpp
         n64_gfx_convert.cpp

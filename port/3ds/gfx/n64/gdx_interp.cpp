@@ -1,0 +1,344 @@
+/* port/3ds/gfx/n64/gdx_interp.cpp -- frame driver, per-task reset, receipts, and the
+ * handlers that are pure state writes. T&L, TMEM, texcache, combiner and emission live in
+ * their own TUs (gdx_rsp / gdx_tmem / gdx_texcache / gdx_cc / gdx_tri) as the milestones land;
+ * until then the handlers below that only count are marked [M1]/[M2]. */
+#include "gdx_interp.h"
+
+#include <math.h>
+#include <string.h>
+
+#include "gdx_dlsrc_bridge.h"
+#include "gdx_log.h"
+
+namespace gdxn {
+
+Interp::Interp(Backend* backend) : mBackend(backend) {
+    memset(&mRsp, 0, sizeof(mRsp));
+    memset(&mRdp, 0, sizeof(mRdp));
+    memset(&mRs, 0, sizeof(mRs));
+    memset(&mStats, 0, sizeof(mStats));
+    memset(&mCfg, 0, sizeof(mCfg));
+    memset(mUnknownLogged, 0, sizeof(mUnknownLogged));
+    memset(&mPackParams, 0, sizeof(mPackParams));
+    memset(&mPackAux, 0, sizeof(mPackAux));
+    memset(mTex, 0, sizeof(mTex));
+    for (unsigned i = 0; i < kTexCacheHash; i++) {
+        mTexHash[i] = -1;
+    }
+    mRs.textures[0] = mRs.textures[1] = -1;
+    mRdp.viewport_or_scissor_changed = true;
+    mRdp.tmem_generation = 1;
+    mRsp.modelview_matrix_stack_size = 1;
+    mRsp.viewport_z_scale = 511.0f;
+    mRsp.viewport_z_trans = 511.0f;
+    mRsp.current_num_lights = 2;
+    for (int k = 0; k < 256; k++) {
+        mByteToUnit[k] = k / 255.0f; /* == (int)b / 255.0f, the LUS table */
+    }
+    mTexUpload = new uint8_t[kTexUploadBytes];
+    mTrectBatchOn = mBackend->TrectBatchEnabled();
+}
+
+Interp::~Interp() {
+    delete[] mTexUpload;
+}
+
+void Interp::ResetStats() {
+    memset(&mStats, 0, sizeof(mStats));
+}
+
+void Interp::ResetRenderStateCache() {
+    mRs.shader_program = nullptr;
+    mRs.depth_test_and_mask = 0xFF;
+    mRs.decal_mode = 0xFF;
+    mRs.alpha_blend = 0xFF;
+    memset(&mRs.viewport, 0, sizeof(mRs.viewport));
+    memset(&mRs.scissor, 0, sizeof(mRs.scissor));
+    mRdp.viewport_or_scissor_changed = true;
+    for (int i = 0; i < 2; i++) {
+        mRs.textures[i] = -1;
+        mRs.sampler_valid[i] = false;
+    }
+    ArmTexturesChanged();
+}
+
+void Interp::ResyncBackend() {
+    if (mRs.shader_program != nullptr) {
+        mBackend->LoadShader(mRs.shader_program);
+    }
+    if (mRs.depth_test_and_mask != 0xFF) {
+        mBackend->SetDepthTestAndMask((mRs.depth_test_and_mask & 1) != 0, (mRs.depth_test_and_mask & 2) != 0);
+    }
+    if (mRs.decal_mode != 0xFF) {
+        mBackend->SetZmodeDecal(mRs.decal_mode != 0);
+    }
+    if (mRs.alpha_blend != 0xFF) {
+        mBackend->SetUseAlpha(mRs.alpha_blend != 0);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (mRs.textures[i] >= 0) {
+            mBackend->SelectTexture(i, mTex[mRs.textures[i]].texture_id);
+            if (mRs.sampler_valid[i]) {
+                mBackend->SetSamplerParameters(i, mRs.sampler_linear[i], mRs.sampler_cms[i], mRs.sampler_cmt[i]);
+            }
+        }
+    }
+}
+
+unsigned Interp::StateSnapshot(uint32_t* out, unsigned cap) const {
+    if (cap < 48) return 0;
+    const Rdp& r = mRdp;
+    const Rsp& p = mRsp;
+    unsigned n = 0;
+    out[n++] = static_cast<uint32_t>(r.combine_mode);
+    out[n++] = static_cast<uint32_t>(r.combine_mode >> 32);
+    out[n++] = r.other_mode_h;
+    out[n++] = r.other_mode_l;
+    const auto pack = [](const Rgba& c) { return (static_cast<uint32_t>(c.r) << 24) | (c.g << 16) | (c.b << 8) | c.a; };
+    out[n++] = pack(r.prim_color);
+    out[n++] = pack(r.env_color);
+    out[n++] = pack(r.blend_color);
+    out[n++] = pack(r.fill_color);
+    out[n++] = pack(r.fog_color);
+    out[n++] = (static_cast<uint32_t>(r.prim_lod_fraction) << 16) | r.prim_depth;
+    out[n++] = (static_cast<uint32_t>(r.first_tile_index) << 16) | (r.textures_changed[0] ? 1u : 0u) | (r.textures_changed[1] ? 2u : 0u);
+    out[n++] = (static_cast<uint32_t>(p.texture_scaling_factor.s) << 16) | p.texture_scaling_factor.t;
+    out[n++] = p.geometry_mode;
+    out[n++] = (static_cast<uint32_t>(static_cast<uint16_t>(r.viewport.x)) << 16) | static_cast<uint16_t>(r.viewport.y);
+    out[n++] = (r.viewport.width << 16) | r.viewport.height;
+    out[n++] = (static_cast<uint32_t>(static_cast<uint16_t>(r.scissor.x)) << 16) | static_cast<uint16_t>(r.scissor.y);
+    out[n++] = (r.scissor.width << 16) | r.scissor.height;
+    out[n++] = (static_cast<uint32_t>(static_cast<int16_t>(p.fog_mul)) << 16) | static_cast<uint16_t>(p.fog_offset);
+    out[n++] = p.current_num_lights | (static_cast<uint32_t>(p.modelview_matrix_stack_size) << 8);
+    out[n++] = r.color_image_address == r.z_buf_address ? 1u : 0u;
+    for (int t = 0; t < 8; t++) {
+        const Tile& tt = r.texture_tile[t];
+        out[n++] = (static_cast<uint32_t>(tt.fmt) << 28) | (static_cast<uint32_t>(tt.siz) << 24) | (static_cast<uint32_t>(tt.tmem_index) << 8) | tt.palette;
+        out[n++] = (tt.line_size_bytes << 16) | (tt.cms << 12) | (tt.cmt << 8) | (tt.masks << 4) | tt.maskt;
+        out[n++] = (static_cast<uint32_t>(static_cast<uint16_t>(static_cast<int>(tt.uls))) << 16) | static_cast<uint16_t>(static_cast<int>(tt.ult));
+        out[n++] = (static_cast<uint32_t>(static_cast<uint16_t>(static_cast<int>(tt.lrs))) << 16) | static_cast<uint16_t>(static_cast<int>(tt.lrt));
+    }
+    return n;
+}
+
+bool Interp::UnknownLoggedOnce(uint8_t op) {
+    const uint32_t bit = 1u << (op & 31u);
+    uint32_t& word = mUnknownLogged[op >> 5];
+    if ((word & bit) != 0) {
+        return false;
+    }
+    word |= bit;
+    return true;
+}
+
+/* == Interpreter::SpReset (interpreter.cpp:9745), minus the LUS-only memos. The lookat
+ * coefficient recompute lands with gdx_rsp [M2]; the direction defaults are set here. */
+void Interp::SpReset() {
+    mRsp.extra_geometry_mode = 0;
+    mRsp.modelview_matrix_stack_size = 1;
+    mBranchZValid = false;
+    mRsp.viewport_z_scale = 511.0f;
+    mRsp.viewport_z_trans = 511.0f;
+    mRsp.current_num_lights = 2;
+    mRsp.lights_changed = true;
+    memset(mRsp.dmem, 0, sizeof(mRsp.dmem));
+    mRsp.dma_io_dmem = 0;
+    mRsp.dma_io_loaded = false;
+    mRsp.f3dflx_alpha_light_valid = false;
+    mRsp.lookat[0].dir[0] = 0;
+    mRsp.lookat[0].dir[1] = 127;
+    mRsp.lookat[0].dir[2] = 0;
+    mRsp.lookat[1].dir[0] = 127;
+    mRsp.lookat[1].dir[1] = 0;
+    mRsp.lookat[1].dir[2] = 0;
+    CalculateNormalDir(&mRsp.lookat[0], mRsp.current_lookat_coeffs[0]);
+    CalculateNormalDir(&mRsp.lookat[1], mRsp.current_lookat_coeffs[1]);
+    mLineSection = false;
+    mBufNumTris = 0;
+    mPackBatch = false;
+    mPackDst = nullptr;
+}
+
+void Interp::RunFrame(GdxGfxJob* job, const GdxFrameConfig& cfg, int variant) {
+    mSrc.Begin(job);
+    mCfg = cfg;
+    mVariant = variant;
+    mStats.tasks++;
+    SpReset();
+
+    /* == Interpreter::Run prologue (interpreter.cpp:10016-10060): the fresh canvas. Run()
+     * re-latches the fixed-aspect flag PER TASK and re-derives the render-target decision from
+     * it (a mode flip between StartFrame and the task); on this port the viewport always
+     * matches and MSAA is 1, so rendersToFb == pillarbox == !widescreen || forceFixedAspect. */
+    const bool rendersToFb = (cfg.widescreen == 0) || (cfg.forceFixedAspect != 0);
+    mCfg.rendersToFb = rendersToFb ? 1 : 0;
+    mBackend->UpdateFramebufferParameters(0, cfg.windowW, cfg.windowH, 1, false, true, true, !rendersToFb);
+    mBackend->StartFrame();
+    mBackend->StartDrawToFramebuffer(rendersToFb ? cfg.gameFb : 0,
+                                     static_cast<float>(cfg.curH) / static_cast<float>(cfg.nativeH));
+    mBackend->ClearFramebuffer(true, true);
+    mRdp.viewport_or_scissor_changed = true;
+    memset(&mRs.viewport, 0, sizeof(mRs.viewport));
+    memset(&mRs.scissor, 0, sizeof(mRs.scissor));
+    /* The port's after-clear hook (boot-logo seed) is env-gated and off on 3DS; not carried. */
+
+    ListRef root;
+    if (mSrc.Root(root)) {
+        Walk(root);
+    } else {
+        mStats.rootRejects++;
+    }
+    Flush(FLUSH_TASK_END);
+
+    /* == Run epilogue: publish the offscreen target when the game renders to it. */
+    uintptr_t gfxFrameBuffer = 0;
+    if (rendersToFb) {
+        mBackend->StartDrawToFramebuffer(0, 1);
+        mBackend->ClearFramebuffer(true, true);
+        gfxFrameBuffer = reinterpret_cast<uintptr_t>(mBackend->GetFramebufferTextureId(cfg.gameFb));
+    }
+    gdx_gfx_frame_publish(gfxFrameBuffer);
+}
+
+/* ---------------------------------------------------------------------------------------
+ * State handlers that are pure writes (byte-for-byte the LUS bodies).
+ * --------------------------------------------------------------------------------------- */
+
+void Interp::SpGeometryMode(uint32_t clear, uint32_t set) {
+    mRsp.geometry_mode &= ~clear;
+    mRsp.geometry_mode |= set;
+}
+
+void Interp::SpSetOtherMode(uint32_t shift, uint32_t numBits, uint64_t mode) {
+    const uint64_t mask = (((static_cast<uint64_t>(1) << numBits) - 1) << shift);
+    uint64_t om = (static_cast<uint64_t>(mRdp.other_mode_h) << 32) | mRdp.other_mode_l;
+    om = (om & ~mask) | mode;
+    mRdp.other_mode_l = static_cast<uint32_t>(om);
+    mRdp.other_mode_h = static_cast<uint32_t>(om >> 32);
+}
+
+void Interp::DpSetOtherMode(uint32_t h, uint32_t l) {
+    mRdp.other_mode_h = h;
+    mRdp.other_mode_l = l;
+}
+
+void Interp::SpTexture(uint16_t sc, uint16_t tc, uint8_t level, uint8_t tile, uint8_t on) {
+    (void)level;
+    (void)on;
+    mRsp.texture_scaling_factor.s = sc;
+    mRsp.texture_scaling_factor.t = tc;
+    if (mRdp.first_tile_index != tile) {
+        mRdp.textures_changed[0] = true;
+        mRdp.textures_changed[1] = true;
+    }
+    mRdp.first_tile_index = tile;
+}
+
+void Interp::SpMoveword(uint8_t index, uint16_t offset, const Cmd& c) {
+    switch (index) {
+        case MW_NUMLIGHT:
+            mRsp.current_num_lights = static_cast<uint8_t>(c.w1 / 24 + 1);
+            mRsp.lights_changed = true;
+            break;
+        case MW_FOG: {
+            const int16_t mul = static_cast<int16_t>(c.w1 >> 16);
+            const int16_t off = static_cast<int16_t>(c.w1);
+            if (mRsp.fog_mul != mul || mRsp.fog_offset != off) {
+                Flush(FLUSH_FOG);
+            }
+            mRsp.fog_mul = mul;
+            mRsp.fog_offset = off;
+            break;
+        }
+        case MW_SEGMENT:
+            mSrc.SetSegment(offset / 4u, c);
+            break;
+        default:
+            break;
+    }
+}
+
+void Interp::DpSetCombineMode(uint32_t rgb, uint32_t alpha, uint32_t rgb2, uint32_t alpha2) {
+    mRdp.combine_mode = static_cast<uint64_t>(rgb) | (static_cast<uint64_t>(alpha) << 16) |
+                        (static_cast<uint64_t>(rgb2) << 28) | (static_cast<uint64_t>(alpha2) << 44);
+}
+
+static inline bool RgbaDiffers(const Rgba& a, const Rgba& b) {
+    return a.r != b.r || a.g != b.g || a.b != b.b || a.a != b.a;
+}
+
+/* prim/env/fog split the open batch on a VALUE change only (lus-3ds-primenv-flush): the
+ * backend binds them as stage constants from vertex 0 of the flushed batch. */
+void Interp::DpSetEnvColor(Rgba c) {
+    if (RgbaDiffers(mRdp.env_color, c)) {
+        Flush(FLUSH_CONST);
+    }
+    mRdp.env_color = c;
+}
+void Interp::DpSetPrimColor(uint8_t m, uint8_t l, Rgba c) {
+    (void)m;
+    if (RgbaDiffers(mRdp.prim_color, c) || mRdp.prim_lod_fraction != l) {
+        Flush(FLUSH_CONST);
+    }
+    mRdp.prim_lod_fraction = l;
+    mRdp.prim_color = c;
+}
+void Interp::DpSetFogColor(Rgba c) {
+    if (RgbaDiffers(mRdp.fog_color, c)) {
+        Flush(FLUSH_CONST);
+    }
+    mRdp.fog_color = c;
+}
+extern "C" int gdx_ninterp_blendflush(void);
+void Interp::DpSetBlendColor(Rgba c) {
+    /* [blend-alpha-flush] Flush() samples blend_color.a lazily for the alpha-compare threshold, so
+     * buffered geometry must drain before the register changes (only alpha reaches Flush; r/g/b
+     * ride the per-vertex fog/blend path). Mirrors the LUS handler; without it a batch drawn under
+     * the OLD blend alpha is submitted with the NEW threshold -- the [nverify] field-7 class. */
+    if (c.a != mRdp.blend_color.a && gdx_ninterp_blendflush()) {
+        Flush(FLUSH_CONST);
+    }
+    mRdp.blend_color = c;
+}
+void Interp::DpSetFillColor(uint32_t packed) {
+    const uint16_t col16 = static_cast<uint16_t>(packed);
+    mRdp.fill_color.r = static_cast<uint8_t>(((col16 >> 11) & 0x1F) * 255 / 31);
+    mRdp.fill_color.g = static_cast<uint8_t>(((col16 >> 6) & 0x1F) * 255 / 31);
+    mRdp.fill_color.b = static_cast<uint8_t>(((col16 >> 1) & 0x1F) * 255 / 31);
+    mRdp.fill_color.a = static_cast<uint8_t>((col16 & 1) * 255);
+}
+void Interp::DpSetPrimDepth(uint16_t z) {
+    /* [prim-depth-flush] Flush samples prim_depth at drain time: drain before the register
+     * moves (gfx_set_prim_depth_handler_rdp). */
+    if (z != mRdp.prim_depth) {
+        Flush(FLUSH_CONST);
+    }
+    mRdp.prim_depth = z;
+}
+
+void Interp::DpSetTextureImage(uint32_t fmt, uint32_t siz, uint32_t width, const Cmd& c) {
+    /* Resolution is lazy: the load extent is only known at LOADBLOCK/LOADTILE/LOADTLUT time
+     * (plan §3.2, replaces the bridge's forward scan + persistent copy). */
+    mRdp.texture_to_load.fmt = static_cast<uint8_t>(fmt);
+    mRdp.texture_to_load.siz = static_cast<uint8_t>(siz);
+    mRdp.texture_to_load.width = width;
+    mRdp.texture_to_load.cmd = c;
+    mRdp.texture_to_load.addr = nullptr;
+    mRdp.texture_to_load.immutable = 0;
+    mRdp.texture_to_load.native_rgba16 = 0;
+}
+
+void Interp::DpSetColorImage(uint32_t fmt, uint32_t siz, uint32_t width, const Cmd& c) {
+    (void)fmt;
+    (void)siz;
+    (void)width;
+    const uintptr_t p = mSrc.ResolveData(c, 1);
+    mRdp.color_image_address = p != 0 ? p : (0x40000000u ^ c.w1);
+}
+
+void Interp::DpSetZImage(const Cmd& c) {
+    const uintptr_t p = mSrc.ResolveData(c, 1);
+    mRdp.z_buf_address = p != 0 ? p : (0x40000000u ^ c.w1);
+}
+
+} // namespace gdxn

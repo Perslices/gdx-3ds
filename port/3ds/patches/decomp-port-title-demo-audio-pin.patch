@@ -1,0 +1,105 @@
+diff --git a/src/audio/disk/external.c b/src/audio/disk/external.c
+--- a/src/audio/disk/external.c
++++ b/src/audio/disk/external.c
+@@ -2185,12 +2185,29 @@
+ 
+ extern s32 gNumPlayers;
+ extern s8 gTitleDemoState;
++#ifdef PORT
++extern int gdx_det_audio_pin(void);
++#endif
+ extern s32 gGameMode;
+ 
+ void func_807442E4(void) {
+     s32 temp_lo;
+     SequenceLayer* layer;
+     Note* note;
++#ifdef PORT
++    /* ORACLE determinism pin (port/gdx_determinism.c, [debug] det_audio / det=1). The two
++       gTitleDemoState writes below are the ONLY place game state is advanced by the audio
++       library's synthesis position: temp_lo is note->synthesisState.samplePosInt/100, which
++       the dedicated audio thread advances on a 5 ms wall-clock self-pump (port/
++       gdx_audio_thread.cpp AudioThreadMain), NOT once per VI tick. Measured on the RetroArch
++       lane, three otherwise bit-identical replays read temp_lo = 8 / 4 / 8 at input tick 127
++       and 1340 / 1343 / 1350 at tick 420 -- a spread already wider than the 9-unit arming
++       window (2100, 2110), so WHICH tick (if any) lands inside it is run-dependent and the
++       attract demo starts at a different frame, or not at all, per run. With the pin the
++       demo is never armed from audio state, so the title screen advances on tick count
++       alone. Unpinned (all real play) the expression is byte for byte the original. */
++    const int gdxDetTitleDemoPin = gdx_det_audio_pin();
++#endif
+ 
+     if ((sActiveBgm == BGM_TITLE) && (gAudioCtx.seqPlayers[1].channels[0] != NULL) && (IS_SEQUENCE_CHANNEL_VALID(gAudioCtx.seqPlayers[1].channels[0]))) {
+         layer = gAudioCtx.seqPlayers[1].channels[0]->layers[0];
+@@ -2210,11 +2227,18 @@
+                 }
+ 
+                 if ((temp_lo > 2100) && (temp_lo < 2110) && (gGameMode == GAMEMODE_FLX_TITLE) &&
++#ifdef PORT
++                    !gdxDetTitleDemoPin &&
++#endif
+                     (gTitleDemoState == TITLE_DEMO_INACTIVE)) {
+                     if (!note) {}
+                     gTitleDemoState = TITLE_DEMO_ACTIVE;
+                 }
+-                if ((temp_lo > 8200) && (temp_lo < 8210) && (gTitleDemoState == TITLE_DEMO_ACTIVE)) {
++                if ((temp_lo > 8200) && (temp_lo < 8210) &&
++#ifdef PORT
++                    !gdxDetTitleDemoPin &&
++#endif
++                    (gTitleDemoState == TITLE_DEMO_ACTIVE)) {
+                     gTitleDemoState = TITLE_DEMO_START_EXIT;
+                 }
+                 if (temp_lo > 250 && temp_lo < 260) {
+diff --git a/src/audio/rom/external.c b/src/audio/rom/external.c
+--- a/src/audio/rom/external.c
++++ b/src/audio/rom/external.c
+@@ -526,12 +526,29 @@
+ 
+ extern s32 gNumPlayers;
+ extern s8 gTitleDemoState;
++#ifdef PORT
++extern int gdx_det_audio_pin(void);
++#endif
+ extern s32 gGameMode;
+ 
+ void func_800B84B8(void) {
+     s32 temp_lo;
+     SequenceLayer* layer;
+     Note* note;
++#ifdef PORT
++    /* ORACLE determinism pin (port/gdx_determinism.c, [debug] det_audio / det=1). The two
++       gTitleDemoState writes below are the ONLY place game state is advanced by the audio
++       library's synthesis position: temp_lo is note->synthesisState.samplePosInt/100, which
++       the dedicated audio thread advances on a 5 ms wall-clock self-pump (port/
++       gdx_audio_thread.cpp AudioThreadMain), NOT once per VI tick. Measured on the RetroArch
++       lane, three otherwise bit-identical replays read temp_lo = 8 / 4 / 8 at input tick 127
++       and 1340 / 1343 / 1350 at tick 420 -- a spread already wider than the 9-unit arming
++       window (2100, 2110), so WHICH tick (if any) lands inside it is run-dependent and the
++       attract demo starts at a different frame, or not at all, per run. With the pin the
++       demo is never armed from audio state, so the title screen advances on tick count
++       alone. Unpinned (all real play) the expression is byte for byte the original. */
++    const int gdxDetTitleDemoPin = gdx_det_audio_pin();
++#endif
+ 
+     if ((sActiveBgm == BGM_TITLE) && (gSeqPlayers[0].channels[0] != NULL) && (IS_SEQUENCE_CHANNEL_VALID(gSeqPlayers[0].channels[0]))) {
+         layer = gSeqPlayers[0].channels[0]->layers[0];
+@@ -551,10 +568,17 @@
+                 }
+ 
+                 if ((temp_lo > 2100) && (temp_lo < 2110) && (gGameMode == GAMEMODE_FLX_TITLE) &&
++#ifdef PORT
++                    !gdxDetTitleDemoPin &&
++#endif
+                     (gTitleDemoState == TITLE_DEMO_INACTIVE)) {
+                     gTitleDemoState = TITLE_DEMO_ACTIVE;
+                 }
+-                if ((temp_lo > 8200) && (temp_lo < 8210) && (gTitleDemoState == TITLE_DEMO_ACTIVE)) {
++                if ((temp_lo > 8200) && (temp_lo < 8210) &&
++#ifdef PORT
++                    !gdxDetTitleDemoPin &&
++#endif
++                    (gTitleDemoState == TITLE_DEMO_ACTIVE)) {
+                     gTitleDemoState = TITLE_DEMO_START_EXIT;
+                 }
+             }

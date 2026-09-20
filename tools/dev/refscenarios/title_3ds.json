@@ -1,0 +1,28 @@
+{
+  "id": "title_3ds",
+  "title": "Title screen at the 3DS's OWN geometry — the frame to diff against a console SHOT",
+  "script": "title.script",
+  "shots": ["title_0300", "title_0450", "title_0600", "title_0750", "title_0900"],
+  "timeout_seconds": 300,
+  "env": {},
+  "cfg": { "Window.Width": 400 },
+  "cvars": {
+    "gEnhancements.Graphics.Widescreen": 1,
+    "gEnhancements.Graphics.WidescreenUI": 1
+  },
+  "notes": [
+    "MEASURED: this configuration matches a 3DS Azahar SHOT of the same screen at 88.69% of",
+    "pixels EXACT (dE76 mean 2.02, below the ~2.3 JND). The plan's 3.1 floor -- Widescreen 0 at",
+    "320x240 -- matches the SAME console frame at only 28.46% (dE 36.05). The floor is right for",
+    "a 4:3 reference render and WRONG for a console comparison, so both live here as separate",
+    "scenarios rather than one being silently 'the' setting.",
+    "Why: the 3DS never REGISTERS gEnhancements.Graphics.Widescreen -- port/3ds/game/CMakeLists",
+    ".txt excludes gdx_menu*.cpp and the CVar stub returns the caller's default -- so the console",
+    "renders hor+ widescreen at 1, which its log confirms with [wide] hit= receipt lines. Its top",
+    "screen is 400x240, and the 320x240 mirror is a uniform 0.8 downscale of it (measured: the",
+    "content box is 48..352 on the 400-wide scanout twin and 39..282 on the mirror). Matching",
+    "that means a 400-wide window with hor+ on, not a 320-wide one with it off.",
+    "title_0300 is the PUSH START blink-OFF frame and was bit-identical across three runs; the",
+    "blink-ON frames (0450/0600/0750) agree 99.07-100%. Prefer title_0300 for any exact gate."
+  ]
+}

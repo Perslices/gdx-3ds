@@ -1,0 +1,36 @@
+# Title screen — the reference renderer's simplest oracle.
+#
+# GDX_INPUT_SCRIPT format: port/gdx_input_script.c. One tick per controller poll on both
+# renderers, so tools/dev/refrun.py emit-3ds maps these frame counts 1:1 onto sdmc ticks.
+#
+# Zero input all the way: the title is where the boot logo, the LUS archive mount and the first
+# F3DFLX task have all completed and nothing the player did can have diverged.
+#
+# WHY A BURST AND NOT ONE SHOT. Two traps stack here:
+#   * `WAITMODE 0` is a no-op — gGameMode is GAMEMODE_TITLE (0) from the first frame, so it
+#     returns instantly at a black boot frame. There is no mode change to hang a gate on: the
+#     attract-mode demo race that takes the screen back is still GAMEMODE_TITLE.
+#   * The poll index at which the title art appears is NOT stable. The boot timeline is
+#     wall-clock-coupled (asset preload, archive mount), so the same script lands on the title
+#     in one run and on the attract race in the next — measured both ways here, with and
+#     without the 59.94 Hz frame pacer.
+# So shoot the whole window instead of guessing a point in it. The manifest records all five
+# SHA-256s, and the report says which one it used and how it was identified.
+#
+# The indices below are for the config refrun.py stages, which has FramePacing ON: the paced
+# loop burns far fewer polls waiting on the same wall-clock asset preload, so the title is up
+# from roughly poll 300 and the attract-mode race takes over around 900. Unpaced, the same
+# window sits near 1200-1500 — measured both ways. The 3DS reaches its title at tick ~600,
+# inside this same range, which is why the emitted gdx-autoinput.txt works unchanged.
+WAIT 300
+SHOT title_0300
+WAIT 150
+SHOT title_0450
+WAIT 150
+SHOT title_0600
+WAIT 150
+SHOT title_0750
+WAIT 150
+SHOT title_0900
+WAIT 10
+QUIT

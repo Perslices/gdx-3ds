@@ -3,24 +3,32 @@
 #
 # From a clean checkout (submodules initialized) this script:
 #   1. verifies the devkitPro toolchain is present;
-#   2. verifies/applies the port/3ds/patches/ submodule patches (idempotent —
+#   2. verifies/applies the port/3ds/patches/ decomp patches (idempotent —
 #      each submodule's FULL ordered stack is checked as one combined patchset,
 #      so already-applied trees are detected via a whole-stack reverse check
 #      even when patches share overlapping context; a stack that neither applies
 #      nor reverses cleanly fails LOUDLY, or warns under SKIP_PATCH_GATE=1);
 #   3. builds the host-side unit tests that run on this machine and runs them
-#      (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx3ds_fs_host_smoke —
+#      (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests, gdx3ds_fs_host_smoke,
+#      gdx_machines_harness —
 #      compiled directly with the host compiler; no desktop configure needed);
 #   4. configures + builds the 3DS target (G-Diffuser-3DS.3dsx) and the DL
-#      replay harness (gdx3ds-dl-tests.3dsx) with the devkitARM toolchain;
+#      replay harness (gdx3ds-dl-tests.3dsx) with the devkitARM toolchain,
+#      preferring Ninja + ccache when both are on PATH and timing configure,
+#      full and incremental builds;
 #   5. with --emu, boots the game .3dsx in Azahar for ${EMU_BOOT_SECONDS}s and
 #      asserts the frame heartbeat advances with zero [fatal] lines
 #      (honours the shared /tmp/azahar.lock emulator-lock protocol);
 #   6. prints a PASS/FAIL summary table and exits nonzero on any failure.
 #
-# Usage:  tools/ci-3ds.sh [--emu] [--jobs N]
+# Usage:  tools/ci-3ds.sh [--emu] [--jobs N] [--no-ninja] [--no-ccache]
+#                         [--no-incremental]
 #
 # Notes:
+#  - The LUS carve is VENDORED at port/3ds/vendor/lus/ with all 38 lus-*.patch
+#    already folded in (port/3ds/vendor/lus/PROVENANCE.md), so the 3DS lane
+#    needs neither the libultraship submodule nor its patch stack. Only the 10
+#    decomp-*.patch are applied here.
 #  - Written for macOS's stock bash 3.2 (no associative arrays, BSD stat).
 #  - DEVKITPRO defaults to /opt/devkitpro; export DEVKITPRO to override.
 #  - The emulator smoke needs the prebaked archives staged on Azahar's virtual
@@ -34,9 +42,15 @@ BUILD_3DS="${ROOT}/build-3ds"
 HOST_TEST_DIR="${BUILD_3DS}/host-tests"
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 RUN_EMU=0
+USE_NINJA=1
+USE_CCACHE=1
+RUN_INCREMENTAL=1
+# The file an incremental-build timing touches: the biggest carve TU.
+INCR_TOUCH="port/3ds/vendor/lus/src/fast/interpreter.cpp"
 
 EMU_BOOT_SECONDS=45
-AZAHAR_BIN="/Applications/Azahar.app/Contents/MacOS/azahar"
+AZAHAR_APP="/Applications/Azahar.app"
+AZAHAR_BIN="${AZAHAR_APP}/Contents/MacOS/azahar"   # existence probe only — see the launch below
 AZAHAR_LOG="${HOME}/Library/Application Support/Azahar/log/azahar_log.txt"
 AZAHAR_CFG="${HOME}/Library/Application Support/Azahar/config/qt-config.ini"
 AZAHAR_SDMC="${HOME}/Library/Application Support/Azahar/sdmc"
@@ -50,8 +64,11 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --emu)  RUN_EMU=1 ;;
         --jobs) shift; JOBS="$1" ;;
+        --no-ninja)       USE_NINJA=0 ;;
+        --no-ccache)      USE_CCACHE=0 ;;
+        --no-incremental) RUN_INCREMENTAL=0 ;;
         -h|--help)
-            sed -n '2,27p' "$0"; exit 0 ;;
+            sed -n '2,32p' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -106,8 +123,14 @@ for probe in \
 done
 command -v cmake >/dev/null 2>&1 || { echo "MISSING: cmake on PATH" >&2; PREFLIGHT_OK=0; }
 command -v cc    >/dev/null 2>&1 || { echo "MISSING: cc (host compiler)" >&2; PREFLIGHT_OK=0; }
-if [ ! -e "${ROOT}/libultraship/CMakeLists.txt" ] || [ ! -e "${ROOT}/decomp/Makefile" ]; then
-    echo "Submodules not initialized. Run: git submodule update --init --recursive" >&2
+# The 3DS lane needs decomp only — the LUS carve is vendored (see the note above),
+# so libultraship/ may be absent or empty here and everything must still work.
+if [ ! -e "${ROOT}/decomp/Makefile" ]; then
+    echo "decomp submodule not initialized. Run: git submodule update --init decomp fzerox-expansion-kit" >&2
+    PREFLIGHT_OK=0
+fi
+if [ ! -e "${ROOT}/port/3ds/vendor/lus/cmake/cvars.cmake" ]; then
+    echo "MISSING: port/3ds/vendor/lus/ — the vendored LUS carve is part of this repo" >&2
     PREFLIGHT_OK=0
 fi
 if [ "$PREFLIGHT_OK" -ne 1 ]; then
@@ -115,50 +138,41 @@ if [ "$PREFLIGHT_OK" -ne 1 ]; then
     summary; exit 1
 fi
 echo "devkitPro: ${DEVKITPRO}  cmake: $(cmake --version | head -1)"
-record "preflight" PASS "devkitPro + host compiler + submodules present"
+record "preflight" PASS "devkitPro + host compiler + decomp + vendored LUS carve present"
+
+# ----------------------------------------------------------- vendor manifest --
+# port/3ds/vendor/lus/MANIFEST.sha256 is the vendored carve's content receipt: with the
+# libultraship submodule gone from the 3DS build, it is the ONLY thing that says which
+# bytes the carve is supposed to contain. It went stale twice (interpreter.h drifted, and
+# PROVENANCE.md was never listed) because nothing checked it, so check it here. Editing a
+# vendored file is fine and expected — regenerate with `tools/vendor-lus.sh --manifest` in
+# the same commit. Needs no submodule and no network: it is a plain shasum -c.
+banner "vendored LUS manifest"
+VENDOR_LUS="${ROOT}/port/3ds/vendor/lus"
+MANIFEST_LOG="${HOST_TEST_DIR:-${ROOT}/build-3ds/host-tests}/vendor-manifest.log"
+mkdir -p "$(dirname "${MANIFEST_LOG}")"
+VENDOR_UNLISTED="$( (cd "${VENDOR_LUS}" && find . -type f ! -path './patches/*' ! -name MANIFEST.sha256 \
+    | sed 's|^\./||' | LC_ALL=C sort) | comm -23 - <(awk '{print $2}' "${VENDOR_LUS}/MANIFEST.sha256" | LC_ALL=C sort) )"
+if (cd "${VENDOR_LUS}" && shasum -a 256 -c MANIFEST.sha256) > "${MANIFEST_LOG}" 2>&1 && [ -z "${VENDOR_UNLISTED}" ]; then
+    echo "PASS: MANIFEST.sha256 matches the vendored tree ($(grep -c ': OK$' "${MANIFEST_LOG}") files)"
+    record "vendor manifest" PASS "$(grep -c ': OK$' "${MANIFEST_LOG}") files match"
+else
+    echo "FAIL: port/3ds/vendor/lus/MANIFEST.sha256 is stale — run tools/vendor-lus.sh --manifest" >&2
+    grep -v ': OK$' "${MANIFEST_LOG}" | head -10 >&2
+    [ -n "${VENDOR_UNLISTED}" ] && echo "unlisted files: ${VENDOR_UNLISTED}" >&2
+    record "vendor manifest" FAIL "stale — run tools/vendor-lus.sh --manifest"
+fi
 
 # ------------------------------------------------------------------ patches --
 # Apply order follows port/3ds/patches/README.md. Every *.patch on disk must be
 # listed here — an unknown patch means this script is stale, and that FAILS.
+#
+# decomp only. The 38 lus-*.patch are folded into the vendored carve at
+# port/3ds/vendor/lus/ and live on there as frozen provenance under
+# port/3ds/vendor/lus/patches/ — they are NOT applied and NOT listed here (they
+# also sit outside PATCH_DIR, so the unknown-patch guard below is not tripped
+# by them).
 PATCH_LIST=(
-    "libultraship:lus-newlib-portability.patch"
-    "libultraship:lus-resource-cache-cap.patch"
-    "libultraship:lus-device-path-archives.patch"
-    "libultraship:lus-3ds-settimg-low-address.patch"
-    "libultraship:lus-3ds-hud-tall-atlas-extent.patch"
-    "libultraship:lus-texcache-content-hash-span.patch"
-    "libultraship:lus-3ds-hud-speedtex-hash-span.patch"
-    "libultraship:lus-3ds-fog-exact-params.patch"
-    "libultraship:lus-3ds-texcache-resource-stable-key.patch"
-    "libultraship:lus-3ds-settimg-resolution-memo.patch"
-    "libultraship:lus-s7-raw-instance-dispatch.patch"
-    "libultraship:lus-s7-geo-diag-gate.patch"
-    "libultraship:lus-s7-tri-state-memo.patch"
-    "libultraship:lus-3ds-primenv-flush.patch"
-    "libultraship:lus-prof-sections.patch"
-    "libultraship:lus-flat-dispatch.patch"
-    "libultraship:lus-vtx-mtx-hoist.patch"
-    "libultraship:lus-profop.patch"
-    "libultraship:lus-tmem-diag-race-latch.patch"
-    "libultraship:lus-tmem-span-store.patch"
-    "libultraship:lus-tmem-same-content-skip.patch"
-    "libultraship:lus-texrect-run-memo.patch"
-    "libultraship:lus-texrect-viewport-hoist.patch"
-    "libultraship:lus-3ds-livery-ident.patch"
-    "libultraship:lus-traffic-pipesync-noop.patch"
-    "libultraship:lus-traffic-tri-memo-whitelist.patch"
-    "libultraship:lus-traffic-vtx-clipmask.patch"
-    "libultraship:lus-3ds-shade-alpha-ccmux.patch"
-    "libultraship:lus-currentdir-reset-churn.patch"
-    "libultraship:lus-cc-key-uninit-shader-id.patch"
-    "libultraship:lus-crowd2-tilestate-value-gate.patch"
-    "libultraship:lus-3ds-triloop-packed-vbo.patch"
-    "libultraship:lus-tri2-phase-census.patch"
-    "libultraship:lus-trifast-tri-memo-pack.patch"
-    "libultraship:lus-tmem2-tmemfast.patch"
-    "libultraship:lus-trect-census.patch"
-    "libultraship:lus-trectbatch-atlas.patch"
-    "libultraship:lus-renderthread-texcache-owner.patch"
     "decomp:decomp-ilp32.patch"
     "decomp:decomp-port-segment-bzero.patch"
     "decomp:decomp-3ds-dma-low-address.patch"
@@ -169,9 +183,14 @@ PATCH_LIST=(
     "decomp:decomp-3ds-rom-audio-port.patch"
     "decomp:decomp-port-course-select-state-reset.patch"
     "decomp:decomp-port-rival-detail.patch"
+    "decomp:decomp-native-track-shim.patch"
+    "decomp:decomp-port-determinism-pins.patch"
+    "decomp:decomp-native-machines-rebuilt.patch"
+    "decomp:decomp-port-title-demo-audio-pin.patch"
+    "decomp:decomp-native-fx-shim.patch"
 )
 
-banner "submodule patches"
+banner "submodule patches (decomp)"
 PATCH_DIR="${ROOT}/port/3ds/patches"
 PATCHES_OK=1
 APPLIED_NOW=0
@@ -203,13 +222,13 @@ for entry in "${PATCH_LIST[@]}"; do
 done
 
 # The gate is verified PER SUBMODULE against the FULL ordered stack, not
-# per-patch. Two of the libultraship patches (lus-texcache-content-hash-span
-# and lus-3ds-fog-exact-params) extend the SAME `#ifdef __3DS__` hook block in
-# src/fast/interpreter.cpp (see port/3ds/patches/README.md): the fog patch's
-# hunks are addressed AT the line numbers the texcache patch produces. So the
-# two are order-dependent, and a per-patch check on either one against the fully
-# patched tree matches neither forward NOR reverse — the old gate false-aborted
-# on a correctly patched checkout.
+# per-patch. Order-dependent stacks are the reason: patches later in a series are
+# generated against the tree the earlier ones produce, so their hunks are
+# addressed AT line numbers that only exist post-application. A per-patch check
+# against a fully patched tree then matches neither forward NOR reverse, and the
+# old gate false-aborted on a correctly patched checkout. (The worst offenders
+# were in the libultraship series, now vendored; the decomp stack keeps the same
+# whole-stack treatment because the property is not specific to it.)
 #
 # Why not a combined `git apply --check`? `--check` with several patch files
 # validates every file against the SAME starting tree, so an order-dependent
@@ -343,6 +362,44 @@ else
     record "test: gdx_gfx_convert_tests" FAIL "compile failed"
 fi
 
+# gdx_track_template_tests — [native] track index-template decoder over the committed raw
+# blobs vs the golden table (port/3ds/gfx/gdx3ds_track_templates.c, plain C, no deps).
+if cc -O1 -Wall \
+      "${ROOT}/port/tests/track_template_tests.c" \
+      "${ROOT}/port/3ds/gfx/gdx3ds_track_templates.c" \
+      -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/track_template_tests"; then
+    run_host_test "gdx_track_template_tests" "${HOST_TEST_DIR}/track_template_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_track_template_tests" FAIL "compile failed"
+fi
+
+# gdx_interp_host_tests — the owned F3DEX2 interpreter (port/3ds/gfx/n64/) against a mock
+# backend + mock resolver seam (docs/research/native/06-interp-plan.md §6.3). n64/ first on
+# the include path: port/gdx_interp.h is a different header.
+if c++ -std=c++20 -O1 \
+      "${ROOT}/port/tests/gdx_interp_host_tests.cpp" \
+      "${ROOT}"/port/3ds/gfx/n64/gdx_{dlsrc,dl,interp,cc,tmem,texcache,rsp,tri,rect}.cpp \
+      -I"${ROOT}/port/3ds/gfx/n64" -I"${ROOT}/port/3ds/gfx" -I"${ROOT}/port" -I"${ROOT}/port/tests" \
+      -o "${HOST_TEST_DIR}/gdx_interp_host_tests"; then
+    run_host_test "gdx_interp_host_tests" "${HOST_TEST_DIR}/gdx_interp_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_interp_host_tests" FAIL "compile failed"
+fi
+
+# gdx_gfx_atlas_uv_tests — the pow2-padding / [trectbatch] atlas-view UV clamp contract
+# (RESIDUALS-2): drives gdx3ds_pad_clamp_limit + gdx3ds_uv_prep/gdx3ds_uv_pack, the real
+# production derivations, and carries the negative control for "fold uOff into the clamp
+# limit" (which would walk an atlas view's sample out of its own cell).
+if c++ -std=c++20 -O1 -ffp-contract=off \
+      "${ROOT}/port/tests/gfx_atlas_uv_tests.cpp" \
+      -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/gfx_atlas_uv_tests"; then
+    run_host_test "gdx_gfx_atlas_uv_tests" "${HOST_TEST_DIR}/gfx_atlas_uv_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_gfx_atlas_uv_tests" FAIL "compile failed"
+fi
+
 # gdx3ds_fs_host_smoke — stream D's SD/O2R/zipshim smoke test; needs a scratch
 # CWD because "sdmc:" is an ordinary directory to the host
 # (mirrors port/3ds/assets/CMakeLists.txt:45).
@@ -363,25 +420,137 @@ else
     record "test: gdx3ds_fs_host_smoke" FAIL "compile failed"
 fi
 
+# gdx_machines_harness — native machine-mesh differential tests (tools/native/
+# machines_harness.sh: A walker vs independent decoder over the 263 body emitters,
+# B colour-attribution golden table, C gdx3ds_vtx_math.h vs the interpreter
+# transcription). Needs fzerox.o2r ($GDX_O2R or the Azahar SD copy); without it the
+# script exits 3 and the step is recorded as PASS "skipped".
+MH_LOG="${HOST_TEST_DIR}/gdx_machines_harness.log"
+if "${ROOT}/tools/native/machines_harness.sh" --out "${HOST_TEST_DIR}/machines" > "${MH_LOG}" 2>&1; then
+    echo "PASS: gdx_machines_harness  ($(tail -1 "${MH_LOG}"))"
+    record "test: gdx_machines_harness" PASS "$(tail -1 "${MH_LOG}")"
+else
+    MH_RC=$?
+    if [ "${MH_RC}" -eq 3 ]; then
+        echo "PASS: gdx_machines_harness  (skipped: no fzerox.o2r)"
+        record "test: gdx_machines_harness" PASS "skipped: no fzerox.o2r (set GDX_O2R)"
+    else
+        echo "FAIL: gdx_machines_harness — last lines:" >&2
+        tail -8 "${MH_LOG}" >&2
+        record "test: gdx_machines_harness" FAIL "see ${MH_LOG#${ROOT}/}"
+    fi
+fi
+
 # ---------------------------------------------------------------- 3DS build --
 banner "3DS build (game + harness)"
 BUILD_OK=1
 mkdir -p "${BUILD_3DS}"
+
+# Generator + compiler launcher are chosen from what is actually on PATH, so the
+# same script works on a devkitpro container that has neither (before its
+# `apt-get install -y ninja-build ccache` lands) and on a dev box that has both.
+# --no-ninja / --no-ccache force the fallbacks.
+CMAKE_EXTRA=()
+GEN_NAME="Unix Makefiles"
+if [ "$USE_NINJA" -eq 1 ] && command -v ninja >/dev/null 2>&1; then
+    CMAKE_EXTRA+=(-G Ninja)
+    GEN_NAME="Ninja"
+fi
+CCACHE_NAME="off"
+if [ "$USE_CCACHE" -eq 1 ] && command -v ccache >/dev/null 2>&1; then
+    CMAKE_EXTRA+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+    CCACHE_NAME="ccache $(ccache --version | head -1 | awk '{print $3}')"
+fi
+# Switching generator in place is not supported by CMake — start clean if the
+# cached generator is not the one we want.
+if [ -f "${BUILD_3DS}/CMakeCache.txt" ] \
+   && ! grep -q "^CMAKE_GENERATOR:INTERNAL=${GEN_NAME}$" "${BUILD_3DS}/CMakeCache.txt"; then
+    echo "generator changed -> wiping ${BUILD_3DS#${ROOT}/}"
+    rm -rf "${BUILD_3DS}"
+    mkdir -p "${BUILD_3DS}"
+fi
+echo "generator: ${GEN_NAME}   compiler launcher: ${CCACHE_NAME}"
+
+# Sub-second resolution matters now: with Ninja + a warm ccache both configure and
+# the incremental build land well under 1 s, which whole-second $SECONDS reports as
+# "0s". Prefer bash 5's EPOCHREALTIME, then python3, then fall back to whole seconds.
+now_ms() {
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        printf '%s' "${EPOCHREALTIME%%[.,]*}${EPOCHREALTIME#*[.,]}" | cut -c1-13
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import time; print(int(time.time()*1000))'
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+fmt_ms() { # start-ms -> "1.23s"
+    local d=$(( $(now_ms) - $1 ))
+    printf '%d.%02ds' $((d / 1000)) $(((d % 1000) / 10))
+}
+
+# ccache hit/miss delta across the full build (best-effort: field names differ
+# across ccache majors, so we parse the machine-readable dump when available).
+# Field names differ across ccache majors (cache_hit_direct vs direct_cache_hit,
+# ...), so sum every spelling we know and fall back to 0.
+ccache_stat() { # regex over stat names -> summed value, 0 if ccache absent
+    command -v ccache >/dev/null 2>&1 || { echo 0; return; }
+    ccache --print-stats 2>/dev/null \
+        | awk -v re="$1" '$1 ~ re { n += $2 } END { print n + 0 }'
+}
+CC_HIT0="$(ccache_stat '^(direct_cache_hit|preprocessed_cache_hit|cache_hit_direct|cache_hit_preprocessed)$')"
+CC_MISS0="$(ccache_stat '^cache_miss$')"
+
+T0="$(now_ms)"
 if ! cmake -S "${ROOT}" -B "${BUILD_3DS}" \
+        "${CMAKE_EXTRA[@]:+${CMAKE_EXTRA[@]}}" \
         -DCMAKE_TOOLCHAIN_FILE="${DEVKITPRO}/cmake/3DS.cmake" \
         -DGDX_PLATFORM_3DS=ON \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -DCMAKE_BUILD_TYPE=Release > "${BUILD_3DS}/ci-configure.log" 2>&1; then
+    T_CONFIGURE="$(fmt_ms "$T0")"
     tail -20 "${BUILD_3DS}/ci-configure.log" >&2
     record "3ds configure" FAIL "see build-3ds/ci-configure.log"
     BUILD_OK=0
 else
-    record "3ds configure" PASS "toolchain=${DEVKITPRO}/cmake/3DS.cmake"
+    T_CONFIGURE="$(fmt_ms "$T0")"
+    record "3ds configure" PASS "${GEN_NAME}, launcher=${CCACHE_NAME}, ${T_CONFIGURE}"
+    T0="$(now_ms)"
     if cmake --build "${BUILD_3DS}" -j"${JOBS}" > "${BUILD_3DS}/ci-build.log" 2>&1; then
-        echo "build OK (-j${JOBS})"
+        T_FULL="$(fmt_ms "$T0")"
+        echo "build OK (-j${JOBS}, ${T_FULL})"
     else
+        T_FULL="$(fmt_ms "$T0")"
         echo "FAIL: 3DS build — last lines:" >&2
         tail -30 "${BUILD_3DS}/ci-build.log" >&2
         BUILD_OK=0
+    fi
+    CC_HIT1="$(ccache_stat '^(direct_cache_hit|preprocessed_cache_hit|cache_hit_direct|cache_hit_preprocessed)$')"
+    CC_MISS1="$(ccache_stat '^cache_miss$')"
+
+    # Incremental timing: touch the biggest carve TU and rebuild. This also
+    # re-proves the stale-object trap is gone — with the sources vendored there
+    # is no patch step to desynchronise mtimes any more.
+    T_INCR="skipped"
+    if [ "$BUILD_OK" -eq 1 ] && [ "$RUN_INCREMENTAL" -eq 1 ] && [ -f "${ROOT}/${INCR_TOUCH}" ]; then
+        touch "${ROOT}/${INCR_TOUCH}"
+        T0="$(now_ms)"
+        if cmake --build "${BUILD_3DS}" -j"${JOBS}" > "${BUILD_3DS}/ci-incr.log" 2>&1; then
+            T_INCR="$(fmt_ms "$T0")"
+            if ! grep -qiE 'interpreter\.(cpp|o)' "${BUILD_3DS}/ci-incr.log"; then
+                echo "WARN: incremental build did not mention ${INCR_TOUCH##*/} — stale-object trap?" >&2
+            fi
+        else
+            tail -20 "${BUILD_3DS}/ci-incr.log" >&2
+            record "3ds incremental build" FAIL "see build-3ds/ci-incr.log"
+            BUILD_OK=0
+        fi
+    fi
+    echo "[time] configure=${T_CONFIGURE} full=${T_FULL} incr=${T_INCR} gen=${GEN_NAME} launcher=${CCACHE_NAME} jobs=${JOBS}"
+    if [ "$CCACHE_NAME" != "off" ]; then
+        echo "[ccache] hits=+$((CC_HIT1 - CC_HIT0)) misses=+$((CC_MISS1 - CC_MISS0)) over the full build"
+        record "3ds build timing" PASS "configure=${T_CONFIGURE} full=${T_FULL} incr=${T_INCR} ccache +$((CC_HIT1 - CC_HIT0))h/+$((CC_MISS1 - CC_MISS0))m"
+    else
+        record "3ds build timing" PASS "configure=${T_CONFIGURE} full=${T_FULL} incr=${T_INCR} (no ccache)"
     fi
     GAME_3DSX="${BUILD_3DS}/port/3ds/G-Diffuser-3DS.3dsx"
     HARNESS_3DSX="${BUILD_3DS}/port/3ds/harness/gdx3ds-dl-tests.3dsx"
@@ -451,10 +620,14 @@ if [ "$RUN_EMU" -eq 1 ]; then
             if pgrep -x azahar >/dev/null 2>&1; then
                 record "emu boot smoke" FAIL "stale azahar process would not die (macOS IOKit wedge? see docs/3DS-HARDWARE.md troubleshooting)"
             else
-                "$AZAHAR_BIN" "$GAME_3DSX" >/dev/null 2>&1 &
-                AZAHAR_PID=$!
-                disown "$AZAHAR_PID" 2>/dev/null || true   # silence bash's "Killed: 9" job notice
-                echo "azahar pid ${AZAHAR_PID}; booting for ${EMU_BOOT_SECONDS}s..."
+                # Launch through `open -a`, NOT the bundle's inner binary. Running
+                # Contents/MacOS/azahar directly starts a process that sits idle at
+                # ~0% CPU and never boots the title: no azahar_log.txt output, no
+                # sdmc log.txt, no frames — so the heartbeat probe below always
+                # reported "not advancing". `open -a` launches it through LaunchServices
+                # the way the shared emulator protocol does, and it boots normally.
+                open -a "$AZAHAR_APP" --args "$GAME_3DSX"
+                echo "azahar launched (open -a ${AZAHAR_APP}); booting for ${EMU_BOOT_SECONDS}s..."
                 sleep "$EMU_BOOT_SECONDS"
                 # SIGTERM first (graceful exit flushes the log), then -9.
                 pkill -x azahar 2>/dev/null || true

@@ -7331,6 +7331,17 @@ const char* gdx_lookup_asset_segment_o2r_key(unsigned int sym_low32) {
     return NULL;
 }
 
+/* Byte size of the asset-segment symbol at sym_low32 (0 when unknown). The bridge gates the
+ * o2r-by-name SETTIMG rewrite on it: a LOADBLOCK that runs past the symbol reads the NEXT
+ * symbol's bytes on the N64 (contiguous segment), which a per-symbol o2r resource cannot serve. */
+unsigned int gdx_lookup_asset_segment_sym_size(unsigned int sym_low32) {
+    int f = gdx_asset_index_floor(sym_low32);
+    if (f >= 0 && sAssetSegmentIndex[f].low32 == sym_low32) {
+        return sAssetSegmentMap[sAssetSegmentIndex[f].idx].sym_size;
+    }
+    return 0u;
+}
+
 const char* gdx_find_o2r_key_by_abs_rom_offset(unsigned int abs_rom_offset) {
     int i;
     for (i = 0; sAssetSegmentMap[i].sym != NULL; i++) {

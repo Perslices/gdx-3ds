@@ -19,11 +19,14 @@
  *     x/y, and viewport/scissor rectangles are swapped to match.
  */
 #include "gfx_citro3d.h"
+#include "gdx3ds_mesh.h" // [native] machines: indexed backend entry + frame cadence
 #include <cstddef>
 extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__((weak));
 
 #include "gdx3ds_gpu_prof.h" // G-GPUPROF [gpu]/[fill] telemetry (gated: debug.gputrace)
 #include "gdx3ds_stereo.h" // stream S: stereo foundation (dual targets + per-eye loop)
+#include "gdx3ds_nativebatch.h" // Gdx_NativeBatch: shared native draw primitive ([native] track/machines)
+#include "gdx3ds_texclamp.h" // the pow2-pad / atlas-view UV clamp contract (host-tested)
 
 #include <cmath>
 #include <cstdarg>
@@ -100,6 +103,56 @@ extern "C" int gGdxRaceActive __attribute__((weak));
 extern "C" float gdx_get_widescreen_geometry_xscale(void) __attribute__((weak));
 extern "C" int gdx3ds_config_get_int(const char* section, const char* key, int fallback)
     __attribute__((weak));
+extern "C" int gdx3ds_config_loaded(void) __attribute__((weak));
+
+/* [atlasdiag] frame mirror + window predicate, declared here so the texture-cache miss
+ * hook (a free function above the renderer) can share the atlas trace's frame window. */
+static unsigned long sAtlasDiagFrame = 0;
+/* [atlasdiag] investigation receipt for the frame-1702 residual ([debug] atlasdiag_from /
+ * atlasdiag_to, both 0 = off): every atlas placement, release, eviction and page allocation
+ * inside the frame window, so two runs' placement SEQUENCES can be diffed line for line. */
+static unsigned long sAtlasDiagFrom = 0;
+static unsigned long sAtlasDiagTo = 0;
+static bool AtlasDiagInit() {
+    if (&gdx3ds_config_get_int != nullptr) {
+        sAtlasDiagFrom = (unsigned long)gdx3ds_config_get_int("debug", "atlasdiag_from", 0);
+        sAtlasDiagTo = (unsigned long)gdx3ds_config_get_int("debug", "atlasdiag_to", 0);
+    }
+    return sAtlasDiagTo >= sAtlasDiagFrom && sAtlasDiagTo != 0;
+}
+static bool AtlasDiagArmed();
+static bool AtlasDiagInWindow() {
+    return AtlasDiagArmed() && sAtlasDiagFrame >= sAtlasDiagFrom && sAtlasDiagFrame <= sAtlasDiagTo;
+}
+static bool AtlasDiagArmed() {
+    static const bool sOn = [] {
+        const bool on = AtlasDiagInit();
+        GFX_C3D_LOG("[atlasdiag] armed=%d from=%lu to=%lu\n", (int)on, sAtlasDiagFrom, sAtlasDiagTo);
+        return on;
+    }();
+    return sOn;
+}
+
+/* [atlasuv] Texcoord receipt: the exact float texcoords this backend hands PICA for texture
+ * unit 0, expressed in the BOUND texture's texel units (u * padWidth), so a trectbatch=0 run
+ * and a trectbatch=1 run can be compared rect-for-rect. Gated on [debug] uvdiag=1 plus the
+ * atlasdiag frame window; batches are paired across runs by their screen-space bbox, which
+ * the lever cannot move. `cs` is the CONTENT-relative texel (page texel - cell origin), the
+ * quantity the two paths are supposed to agree on exactly. */
+static bool UvDiagOn() {
+    static const bool sOn = [] {
+        const bool on = (&gdx3ds_config_get_int != nullptr) && gdx3ds_config_get_int("debug", "uvdiag", 0) != 0;
+        GFX_C3D_LOG("[uvdiag] on=%d\n", (int)on);
+        return on;
+    }();
+    return sOn;
+}
+static uint32_t UvDiagBits(float f) {
+    uint32_t b;
+    std::memcpy(&b, &f, 4);
+    return b;
+}
+
 
 namespace {
 unsigned long sTexCacheImports = 0;
@@ -501,6 +554,10 @@ extern "C" void gdx3ds_texcache_note_miss(const void* addr, unsigned fmt, unsign
         --sTexMissWindowBudget;
         emit = true;
     }
+    if (AtlasDiagInWindow()) {
+        GFX_C3D_LOG("[texmissdiag] f=%lu a=%p fmt=%u/%u tm=%u ln=%u sz=%u t=%ux%u h=%08x\n", sAtlasDiagFrame, addr,
+                    fmt, siz, tmemWord, lineBytes, sizeBytes, tileW, tileH, contentHash);
+    }
     if (emit) {
         char msg[144];
         int n = std::snprintf(msg, sizeof(msg),
@@ -540,6 +597,37 @@ static bool GdxSkyClampFixEnabled() {
     return sSkyClampFix;
 }
 
+/* [padgutter] killswitch: [debug] padgutter=0 or env GDX_PAD_GUTTER_OFF restores the
+ * all-zero pow2 padding (see the gutter replication in UploadTexture). Default on. */
+static bool GdxPadGutterEnabled() {
+    static const bool sOn = [] {
+        const char* env = std::getenv("GDX_PAD_GUTTER_OFF");
+        const int cfg = (&gdx3ds_config_get_int != nullptr) ? gdx3ds_config_get_int("debug", "padgutter", 1) : 1;
+        const int on = env != nullptr ? 0 : (cfg != 0 ? 1 : 0);
+        GFX_C3D_LOG("[padgutter] init on=%d env=%p cfg=%d\n", on, (const void*)env, cfg);
+        return on != 0;
+    }();
+    return sOn;
+}
+
+/* [atlasuv] killswitch / A-B discriminator: [debug] viewclamp=1 (or env GDX_ATLAS_VIEW_CLAMP)
+ * restores the pre-fix behaviour where an atlas VIEW also took the content-edge coordinate
+ * clamp at (extent - 0.5) / page. That pulled a pow2 glyph cell's far vertex from u = extent
+ * to extent - 0.5, squeezing the rect's whole UV interpolation and shifting the sampled
+ * content right by up to half a texel against trectbatch=0 (the 782-px course-name
+ * residual). Default 0 = fixed: a view clamps at the cell's far edge, extent / page.
+ * See gdx3ds_view_clamp_limit. */
+static bool GdxAtlasViewClampLegacy() {
+    static const bool sOn = [] {
+        const char* env = std::getenv("GDX_ATLAS_VIEW_CLAMP");
+        const int cfg = (&gdx3ds_config_get_int != nullptr) ? gdx3ds_config_get_int("debug", "viewclamp", 0) : 0;
+        const int on = env != nullptr ? 1 : (cfg != 0 ? 1 : 0);
+        GFX_C3D_LOG("[atlasuv] viewclamp legacy=%d env=%p cfg=%d\n", on, (const void*)env, cfg);
+        return on != 0;
+    }();
+    return sOn;
+}
+
 /* [triloop] killswitch: [debug] triloop=0 or env GDX_TRILOOP_OFF refuses every
  * pack begin, restoring the legacy two-stage (append + repack) tri path. */
 static bool GdxTriloopEnabled() {
@@ -560,19 +648,334 @@ static bool GdxTriloopEnabled() {
  * the patched interpreter at every task boundary. */
 extern "C" int gdx3ds_trectbatch_enabled(void) {
     static const int sEnabled = [] {
-        if (std::getenv("GDX_TRECTBATCH_OFF") != nullptr) {
-            return 0;
-        }
-        if (&gdx3ds_config_get_int != nullptr) {
-            return gdx3ds_config_get_int("debug", "trectbatch", 1) != 0 ? 1 : 0;
-        }
-        return 1;
+        const char* env = std::getenv("GDX_TRECTBATCH_OFF");
+        const int cfg = (&gdx3ds_config_get_int != nullptr) ? gdx3ds_config_get_int("debug", "trectbatch", 1) : 1;
+        const int loaded = (&gdx3ds_config_loaded != nullptr) ? gdx3ds_config_loaded() : -1;
+        const int on = env != nullptr ? 0 : (cfg != 0 ? 1 : 0);
+        GFX_C3D_LOG("[trectbatch] init on=%d env=%p cfg=%d cfgloaded=%d\n", on, (const void*)env, cfg, loaded);
+        return on;
     }();
     return sEnabled;
 }
 
+/* [texclr] investigation receipt sink for the vendored interpreter's TextureCacheClear
+ * ([debug] texclrdiag=1): the pre-sort / post-sort head of free_texture_ids. */
+extern "C" int gdx_texclr_diag_on(void) {
+    static const int sOn = (&gdx3ds_config_get_int != nullptr)
+                               ? gdx3ds_config_get_int("debug", "texclrdiag", 0)
+                               : 0;
+    return sOn;
+}
+extern "C" void gdx_texclr_dump(const char* line) {
+    GFX_C3D_LOG("%s\n", line);
+}
+
 /* [triloop] packed-draw telemetry for the [c3d] line (dPk). */
 static unsigned long sPackedDrawCalls = 0;
+/* [native] indexed mesh draws this session (dNat on the [c3d] line). */
+static unsigned long sNativeDrawCalls = 0;
+/* [native] machines_verify capture hook (gdx3ds_mesh_backend_set_capture). */
+static Gdx3dsMeshCaptureFn sMeshCaptureFn = nullptr;
+static void* sMeshCaptureUser = nullptr;
+static bool sMeshCaptureSkip = false;
+static unsigned long sPrevNativeDraws = 0;
+
+/* ---- [nverify] per-batch record/compare (gdx3ds_verify.h) --------------------------------- */
+#include "gdx3ds_verify.h"
+namespace {
+int sVfyMode = 0;                       /* 0 off, 1 record, 2 compare */
+std::vector<uint32_t> sVfyRing;         /* 4 words per record: kind, state, vbo, fieldsig */
+std::vector<uint32_t> sVfyTexHash;      /* per texture id: FNV of the last upload payload */
+std::vector<uint32_t> sVfyFields;       /* mode-1 per-record state field hashes (16 per record) */
+size_t sVfyIdx = 0;
+uint32_t sVfyFirst = 0xFFFFFFFFu, sVfyClass = 0, sVfyDetail = 0;
+constexpr int kVfyFields = 16;
+/* Per-record vertex-0 + tri count + shader ids (mode 1), and the compare side's copy at the
+ * first mismatch, for the [nverify] detail line. */
+struct VfyBatchInfo {
+    float v0[12];
+    uint32_t tris;
+    uint64_t id0, id1;
+    uint32_t texUsed[2], texId[2], texHash[2], texW[2], texH[2];
+    float vpf[5];
+    int vis[4];
+    Gdx3dsVerifyTri tri;
+};
+Gdx3dsVerifyTri sVfyLastTri = {};
+std::vector<VfyBatchInfo> sVfyInfo;
+VfyBatchInfo sVfyMismatchOwned = {};
+VfyBatchInfo sVfyMismatchLus = {};
+bool sVfyMismatchInfoValid = false;
+/* Compare-side sequence (kind, id0 low32, tris) of the first records, for the sequence dump. */
+constexpr int kVfySeq = 12;
+uint32_t sVfySeqOwned[kVfySeq][3];
+size_t sVfySeqOwnedN = 0;
+inline uint32_t VfyFnv(uint32_t h, const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint32_t w;
+        memcpy(&w, b + i, 4);
+        h = (h ^ w) * 16777619u;
+    }
+    for (; i < n; i++) {
+        h = (h ^ b[i]) * 16777619u;
+    }
+    return h;
+}
+/* command-stream differential */
+std::vector<uint32_t> sVfyCmd;      /* mode 1: w0,w1 pairs */
+size_t sVfyCmdIdx = 0;
+uint32_t sVfyCmdFirst = 0xFFFFFFFFu;
+uint32_t sVfyCmdLus[6] = {}, sVfyCmdOwned[6] = {};
+uint32_t sVfyCmdPrevOwned[4] = {};
+uint32_t sVfyKindState[4] = {};      /* first mismatch: lus kind/state, owned kind/state */
+inline bool VfyCmdCounts(uint32_t w0) {
+    const uint32_t op = w0 >> 24;
+    return (op >= 0x05 && op <= 0x07) || (op >= 0xD7 && op <= 0xD9) || (op >= 0xE2 && op <= 0xEF && op != 0xE4 && op != 0xE5) ||
+           (op >= 0xF0 && op <= 0xFC);
+}
+
+void VfyRecord(uint32_t kind, uint32_t state, uint32_t vbo, const uint32_t* fields, const VfyBatchInfo* info = nullptr) {
+    if (sVfyMode == 1) {
+        sVfyInfo.push_back(info != nullptr ? *info : VfyBatchInfo{});
+        sVfyRing.push_back(kind);
+        sVfyRing.push_back(state);
+        sVfyRing.push_back(vbo);
+        sVfyRing.push_back(0);
+        for (int i = 0; i < kVfyFields; i++) {
+            sVfyFields.push_back(fields != nullptr ? fields[i] : 0);
+        }
+    } else if (sVfyMode == 2) {
+        if (sVfySeqOwnedN < kVfySeq) {
+            sVfySeqOwned[sVfySeqOwnedN][0] = kind;
+            sVfySeqOwned[sVfySeqOwnedN][1] = info != nullptr ? static_cast<uint32_t>(info->id0) : state;
+            sVfySeqOwned[sVfySeqOwnedN][2] = info != nullptr ? info->tris : 0;
+            sVfySeqOwnedN++;
+        }
+        const size_t n = sVfyRing.size() / 4;
+        uint32_t cls = 0;
+        if (sVfyIdx >= n) {
+            cls = 8;
+        } else {
+            const uint32_t* r = &sVfyRing[sVfyIdx * 4];
+            if (r[0] != kind) cls |= 1;
+            if (r[1] != state) cls |= 2;
+            if (r[2] != vbo) cls |= 4;
+            if ((cls & 2) != 0 && fields != nullptr && sVfyFirst == 0xFFFFFFFFu) {
+                const uint32_t* f = &sVfyFields[sVfyIdx * kVfyFields];
+                for (int i = 0; i < kVfyFields; i++) {
+                    if (f[i] != fields[i]) {
+                        sVfyDetail = static_cast<uint32_t>(i) + 1u;
+                        break;
+                    }
+                }
+            }
+        }
+        if (cls != 0 && sVfyFirst == 0xFFFFFFFFu) {
+            sVfyFirst = static_cast<uint32_t>(sVfyIdx);
+            sVfyClass = cls;
+            sVfyKindState[0] = sVfyIdx < n ? sVfyRing[sVfyIdx * 4] : 0;
+            sVfyKindState[1] = sVfyIdx < n ? sVfyRing[sVfyIdx * 4 + 1] : 0;
+            sVfyKindState[2] = kind;
+            sVfyKindState[3] = state;
+            sVfyMismatchOwned = info != nullptr ? *info : VfyBatchInfo{};
+            sVfyMismatchLus = sVfyIdx < sVfyInfo.size() ? sVfyInfo[sVfyIdx] : VfyBatchInfo{};
+            sVfyMismatchInfoValid = true;
+        }
+        sVfyIdx++;
+    }
+}
+} // namespace
+
+extern "C" void gdx3ds_verify_begin(int mode) {
+    sVfyMode = mode;
+    if (mode == 1) {
+        sVfyRing.clear();
+        sVfyFields.clear();
+        sVfyInfo.clear();
+        sVfyCmd.clear();
+        sVfyIdx = 0;
+    }
+    if (mode == 2) {
+        sVfyIdx = 0;
+        sVfyCmdIdx = 0;
+        sVfyCmdFirst = 0xFFFFFFFFu;
+        memset(sVfyCmdPrevOwned, 0, sizeof(sVfyCmdPrevOwned));
+        memset(sVfyCmdOwned, 0, sizeof(sVfyCmdOwned));
+        sVfySeqOwnedN = 0;
+        sVfyFirst = 0xFFFFFFFFu;
+        sVfyClass = 0;
+        sVfyDetail = 0;
+        sVfyMismatchInfoValid = false;
+    }
+    /* mode 0 leaves the counters for gdx3ds_verify_result */
+}
+
+extern "C" void gdx3ds_verify_note_tri(const Gdx3dsVerifyTri* t) {
+    sVfyLastTri = *t;
+}
+
+extern "C" unsigned gdx_gfx_classify_host_ptr(unsigned long p) __attribute__((weak));
+extern "C" void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem64) {
+    t->addr0 = reinterpret_cast<unsigned long>(addr);
+    t->cls0 = (addr && gdx_gfx_classify_host_ptr) ? gdx_gfx_classify_host_ptr(t->addr0) : 0u;
+    t->srcHash0 = addr ? VfyFnv(2166136261u, addr, sizeBytes < 64u ? sizeBytes : 64u) : 0u;
+    t->tmemHash0 = tmem64 ? VfyFnv(2166136261u, tmem64, 64) : 0u;
+}
+
+extern "C" void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem64) {
+    t->addr1 = reinterpret_cast<unsigned long>(addr);
+    t->cls1 = (addr && gdx_gfx_classify_host_ptr) ? gdx_gfx_classify_host_ptr(t->addr1) : 0u;
+    t->srcHash1 = addr ? VfyFnv(2166136261u, addr, sizeBytes < 64u ? sizeBytes : 64u) : 0u;
+    t->tmemHash1 = tmem64 ? VfyFnv(2166136261u, tmem64, 64) : 0u;
+}
+
+extern "C" void gdx3ds_verify_note_cmd(unsigned w0, unsigned w1) {
+    if (!VfyCmdCounts(w0)) return;
+    if (sVfyMode == 1) {
+        sVfyCmd.push_back(w0);
+        sVfyCmd.push_back(w1);
+    } else if (sVfyMode == 2) {
+        const size_t n = sVfyCmd.size() / 2;
+        if (sVfyCmdFirst == 0xFFFFFFFFu) {
+            const bool same = sVfyCmdIdx < n && sVfyCmd[sVfyCmdIdx * 2] == w0 && sVfyCmd[sVfyCmdIdx * 2 + 1] == w1;
+            if (!same) {
+                sVfyCmdFirst = static_cast<uint32_t>(sVfyCmdIdx);
+                for (int k = 0; k < 3; k++) {
+                    const size_t i = sVfyCmdIdx + k;
+                    sVfyCmdLus[k * 2] = i < n ? sVfyCmd[i * 2] : 0;
+                    sVfyCmdLus[k * 2 + 1] = i < n ? sVfyCmd[i * 2 + 1] : 0;
+                }
+                sVfyCmdOwned[0] = w0;
+                sVfyCmdOwned[1] = w1;
+            } else {
+                sVfyCmdPrevOwned[2] = sVfyCmdPrevOwned[0];
+                sVfyCmdPrevOwned[3] = sVfyCmdPrevOwned[1];
+                sVfyCmdPrevOwned[0] = w0;
+                sVfyCmdPrevOwned[1] = w1;
+            }
+        } else if (sVfyCmdIdx == static_cast<size_t>(sVfyCmdFirst) + 1) {
+            sVfyCmdOwned[2] = w0;
+            sVfyCmdOwned[3] = w1;
+        } else if (sVfyCmdIdx == static_cast<size_t>(sVfyCmdFirst) + 2) {
+            sVfyCmdOwned[4] = w0;
+            sVfyCmdOwned[5] = w1;
+        }
+        sVfyCmdIdx++;
+    }
+}
+
+extern "C" void gdx3ds_verify_cmd_detail(char* buf, unsigned bufSize) {
+    if (bufSize == 0) return;
+    const size_t n = sVfyCmd.size() / 2;
+    snprintf(buf, bufSize,
+             "[nverify]   cmds lus=%u owned=%u first_diff=%u | prev owned %08X/%08X %08X/%08X | lus %08X/%08X %08X/%08X "
+             "%08X/%08X | owned %08X/%08X %08X/%08X %08X/%08X | first_batch kind/state lus=%u/%08X owned=%u/%08X",
+             (unsigned)n, (unsigned)sVfyCmdIdx, sVfyCmdFirst, sVfyCmdPrevOwned[2], sVfyCmdPrevOwned[3],
+             sVfyCmdPrevOwned[0], sVfyCmdPrevOwned[1], sVfyCmdLus[0], sVfyCmdLus[1], sVfyCmdLus[2], sVfyCmdLus[3],
+             sVfyCmdLus[4], sVfyCmdLus[5], sVfyCmdOwned[0], sVfyCmdOwned[1], sVfyCmdOwned[2], sVfyCmdOwned[3],
+             sVfyCmdOwned[4], sVfyCmdOwned[5], sVfyKindState[0], sVfyKindState[1], sVfyKindState[2], sVfyKindState[3]);
+}
+extern "C" int gdx3ds_verify_active(void) {
+    return sVfyMode != 0;
+}
+
+extern "C" void gdx3ds_verify_tri_detail(char* buf, unsigned bufSize) {
+    if (!sVfyMismatchInfoValid || bufSize == 0) {
+        if (bufSize) buf[0] = 0;
+        return;
+    }
+    const Gdx3dsVerifyTri& a = sVfyMismatchLus.tri;
+    const Gdx3dsVerifyTri& b = sVfyMismatchOwned.tri;
+    snprintf(buf, bufSize,
+             "[nverify]   tri lus: t=%u/%u ft=%u rect=%u win=%.0f,%.0f..%.0f,%.0f tex=%ux%u t2=%ux%u tex1=%ux%u tm=%u "
+             "uv=%.0f,%.0f sh=%d/%d ld=%u/%u/%u/%u sc=%X/%X | owned: t=%u/%u ft=%u rect=%u win=%.0f,%.0f..%.0f,%.0f "
+             "tex=%ux%u t2=%ux%u tex1=%ux%u tm=%u uv=%.0f,%.0f sh=%d/%d ld=%u/%u/%u/%u sc=%X/%X | "
+             "om lus=%08X/%08X geo=%08X var=%u vp=%d,%d %ux%u walk=%u/%u bz=%u noop=%u | owned=%08X/%08X geo=%08X "
+             "var=%u vp=%d,%d %ux%u walk=%u/%u bz=%u noop=%u",
+             a.tile0, a.tile1, a.firstTile, a.isRect, a.uls0, a.ult0, a.lrs0, a.lrt0, a.texW0, a.texH0, a.texW20, a.texH20,
+             a.texW1, a.texH1, a.tm, a.vu, a.vv, a.shifts0, a.shiftt0, a.line0, a.size0, a.full0, a.orig0, a.scaleS,
+             a.scaleT, b.tile0, b.tile1, b.firstTile, b.isRect, b.uls0, b.ult0, b.lrs0, b.lrt0, b.texW0, b.texH0,
+             b.texW20, b.texH20, b.texW1, b.texH1, b.tm, b.vu, b.vv, b.shifts0, b.shiftt0, b.line0, b.size0, b.full0,
+             b.orig0, b.scaleS, b.scaleT, a.omh, a.oml, a.geo, a.variant, a.vpx, a.vpy, a.vpw, a.vph, a.lists, a.cmds,
+             a.branchZ, a.noop, b.omh, b.oml, b.geo, b.variant, b.vpx, b.vpy, b.vpw, b.vph, b.lists, b.cmds, b.branchZ,
+             b.noop);
+}
+
+extern "C" void gdx3ds_verify_src_detail(char* buf, unsigned bufSize) {
+    if (!sVfyMismatchInfoValid || bufSize == 0) {
+        if (bufSize) buf[0] = 0;
+        return;
+    }
+    const VfyBatchInfo& ia = sVfyMismatchLus;
+    const VfyBatchInfo& ib = sVfyMismatchOwned;
+    const Gdx3dsVerifyTri& a = ia.tri;
+    const Gdx3dsVerifyTri& b = ib.tri;
+    snprintf(buf, bufSize,
+             "[nverify]   src lus=%08lX cls=%X h=%08X tm=%08X bA=%u | owned=%08lX cls=%X h=%08X tm=%08X bA=%u | "
+             "src1 lus=%08lX cls=%X h=%08X tm=%08X @%u ld=%u/%u/%u/%u | owned=%08lX cls=%X h=%08X tm=%08X @%u ld=%u/%u/%u/%u | "
+             "vp lus=%.0f %.4f %.4f %.4f %.4f vis=%d,%d %dx%d | owned=%.0f %.4f %.4f %.4f %.4f vis=%d,%d %dx%d | "
+             "span0 lus u=%u/%u @%u base=%u %08lX/%u/%u | owned u=%u/%u @%u base=%u %08lX/%u/%u",
+             a.addr0, a.cls0, a.srcHash0, a.tmemHash0, a.blendA, b.addr0, b.cls0, b.srcHash0, b.tmemHash0, b.blendA,
+             a.addr1, a.cls1, a.srcHash1, a.tmemHash1, a.tmem1, a.line1, a.size1, a.full1, a.orig1,
+             b.addr1, b.cls1, b.srcHash1, b.tmemHash1, b.tmem1, b.line1, b.size1, b.full1, b.orig1,
+             ia.vpf[0], ia.vpf[1], ia.vpf[2], ia.vpf[3], ia.vpf[4], ia.vis[0], ia.vis[1], ia.vis[2], ia.vis[3],
+             ib.vpf[0], ib.vpf[1], ib.vpf[2], ib.vpf[3], ib.vpf[4], ib.vis[0], ib.vis[1], ib.vis[2], ib.vis[3],
+             a.used0, a.used1, a.tmem0, a.base0, a.baseAddr0, a.baseSize0, a.baseOrig0,
+             b.used0, b.used1, b.tmem0, b.base0, b.baseAddr0, b.baseSize0, b.baseOrig0);
+}
+
+extern "C" void gdx3ds_verify_seq_detail(char* buf, unsigned bufSize) {
+    if (bufSize == 0) return;
+    buf[0] = 0;
+    unsigned off = 0;
+    const int nl = static_cast<int>(sVfyRing.size() / 4) < kVfySeq ? static_cast<int>(sVfyRing.size() / 4) : kVfySeq;
+    off += static_cast<unsigned>(snprintf(buf + off, bufSize - off, "[nverify]   seq lus:"));
+    for (int i = 0; i < nl && off < bufSize; i++) {
+        const uint32_t k = sVfyRing[i * 4];
+        const uint32_t id = k == 1 ? static_cast<uint32_t>(sVfyInfo[i].id0) : sVfyRing[i * 4 + 1];
+        off += static_cast<unsigned>(snprintf(buf + off, bufSize - off, " %u:%08X/%u", k, id, k == 1 ? sVfyInfo[i].tris : 0u));
+    }
+    off += static_cast<unsigned>(snprintf(buf + off, bufSize - off, " | owned:"));
+    for (size_t i = 0; i < sVfySeqOwnedN && off < bufSize; i++) {
+        off += static_cast<unsigned>(snprintf(buf + off, bufSize - off, " %u:%08X/%u", sVfySeqOwned[i][0], sVfySeqOwned[i][1], sVfySeqOwned[i][2]));
+    }
+}
+
+extern "C" void gdx3ds_verify_first_detail(char* buf, unsigned bufSize) {
+    if (!sVfyMismatchInfoValid || bufSize == 0) {
+        if (bufSize) buf[0] = 0;
+        return;
+    }
+    const VfyBatchInfo& a = sVfyMismatchLus;
+    const VfyBatchInfo& b = sVfyMismatchOwned;
+    snprintf(buf, bufSize,
+             "[nverify]   lus tris=%u id=%08X%08X/%08X%08X v0=%.4f %.4f %.4f %.4f uv=%.4f %.4f c=%.3f %.3f %.3f %.3f | "
+             "owned tris=%u id=%08X%08X/%08X%08X v0=%.4f %.4f %.4f %.4f uv=%.4f %.4f c=%.3f %.3f %.3f %.3f | "
+             "tex lus u0=%u/%u/%08X/%ux%u u1=%u/%u/%08X/%ux%u owned u0=%u/%u/%08X/%ux%u u1=%u/%u/%08X/%ux%u",
+             a.tris, (unsigned)(a.id0 >> 32), (unsigned)a.id0, (unsigned)(a.id1 >> 32), (unsigned)a.id1, a.v0[0], a.v0[1],
+             a.v0[2], a.v0[3], a.v0[4], a.v0[5], a.v0[6], a.v0[7], a.v0[8], a.v0[9], b.tris, (unsigned)(b.id0 >> 32),
+             (unsigned)b.id0, (unsigned)(b.id1 >> 32), (unsigned)b.id1, b.v0[0], b.v0[1], b.v0[2], b.v0[3], b.v0[4],
+             b.v0[5], b.v0[6], b.v0[7], b.v0[8], b.v0[9], a.texUsed[0], a.texId[0], a.texHash[0], a.texW[0], a.texH[0],
+             a.texUsed[1], a.texId[1], a.texHash[1], a.texW[1], a.texH[1], b.texUsed[0], b.texId[0], b.texHash[0],
+             b.texW[0], b.texH[0], b.texUsed[1], b.texId[1], b.texHash[1], b.texW[1], b.texH[1]);
+}
+
+extern "C" void gdx3ds_verify_result(unsigned* recorded, unsigned* compared, unsigned* first, unsigned* cls,
+                                     unsigned* detail) {
+    const unsigned n = static_cast<unsigned>(sVfyRing.size() / 4);
+    *recorded = n;
+    *compared = static_cast<unsigned>(sVfyIdx);
+    if (sVfyFirst == 0xFFFFFFFFu && sVfyIdx < n) {
+        sVfyFirst = static_cast<uint32_t>(sVfyIdx);
+        sVfyClass = 16;
+    }
+    *first = sVfyFirst;
+    *cls = sVfyClass;
+    *detail = sVfyDetail;
+}
+
 /* [trectbatch] atlas page-eviction telemetry for the [c3d] line (atlasEv=), see AtlasTryPlace. */
 static unsigned long sAtlasEvictions = 0;     /* pages reclaimed */
 static unsigned long sAtlasEvictedViews = 0;  /* views copied out to standalone */
@@ -604,6 +1007,62 @@ uint32_t MortonInterleave(uint32_t x, uint32_t y) {
     static const uint32_t xlut[8] = { 0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15 };
     static const uint32_t ylut[8] = { 0x00, 0x02, 0x08, 0x0a, 0x20, 0x22, 0x28, 0x2a };
     return xlut[x & 7] | ylut[y & 7];
+}
+
+/* [padgutter] Replicate the content edge into the 1-texel pow2 padding of a swizzled RGBA8
+ * PICA texture, the way the [trectbatch] atlas has always gutted its cells (kAtlasGutter).
+ * N64 G_TX_CLAMP returns the EDGE TEXEL past the tile window; PICA's GPU_CLAMP_TO_EDGE
+ * clamps at the PADDED edge, and padding written as transparent black makes GPU_LINEAR fade
+ * every clamped content edge to black instead. One texel is all that is reachable: an
+ * atlas-eligible rect's UV window sits inside the tile window, so the packed texel
+ * coordinate is at most extent + 0.5 (port/tests/gfx_atlas_uv_tests.cpp).
+ * CLAMPED AXES ONLY — a WRAP/MIRROR axis folds at the PADDED period on this hardware
+ * (docs/research/shadow2-mirror-period-audit.md), so its pad texels belong to the wrap
+ * image, not to an edge clamp. A non-clamped axis's gutter is ZEROED rather than left
+ * alone: a recycled texture id keeps its C3D_Tex when the padded extent is unchanged and
+ * would otherwise serve the previous tenant's gutter. Caller flushes. */
+unsigned long sPadGutterPadded = 0;   /* uploads with padding on at least one axis */
+unsigned long sPadGutterReplicated = 0; /* of those, axes that got a REPLICATED gutter */
+unsigned long sPadGutterZeroed = 0;     /* of those, axes that got a ZEROED gutter */
+void WritePadGutter(uint32_t* dst, uint32_t w, uint32_t h, uint32_t padW, uint32_t padH, bool clampU,
+                    bool clampV) {
+    const uint32_t tilesPerRow = padW >> 3;
+    const auto at = [dst, tilesPerRow](uint32_t x, uint32_t dy) -> uint32_t& {
+        return dst[(((dy >> 3) * tilesPerRow + (x >> 3)) << 6) | MortonInterleave(x, dy)];
+    };
+    if (w < padW || h < padH) {
+        /* [padgutter] receipt: how often padding exists at all, and how many of those axes
+         * the N64 tile actually clamps. Without this the fix is unfalsifiable — a run where
+         * every padded axis is a WRAP axis is indistinguishable from the code never running. */
+        sPadGutterPadded++;
+        if (w < padW) {
+            (clampU ? sPadGutterReplicated : sPadGutterZeroed)++;
+        }
+        if (h < padH) {
+            (clampV ? sPadGutterReplicated : sPadGutterZeroed)++;
+        }
+        if (sPadGutterPadded <= 8 || (sPadGutterPadded & 1023) == 0) {
+            GFX_C3D_LOG("[padgutter] n=%lu %ux%u -> %ux%u clampU=%d clampV=%d rep=%lu zero=%lu\n",
+                        sPadGutterPadded, (unsigned)w, (unsigned)h, (unsigned)padW, (unsigned)padH,
+                        (int)clampU, (int)clampV, sPadGutterReplicated, sPadGutterZeroed);
+        }
+    }
+    if (w < padW) {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint32_t dy = padH - 1 - y;
+            at(w, dy) = clampU ? at(w - 1, dy) : 0u;
+        }
+    }
+    if (h < padH) {
+        const uint32_t dySrc = padH - h;     /* N64 row h-1 */
+        const uint32_t dyDst = padH - 1 - h; /* N64 row h   */
+        for (uint32_t x = 0; x < w; x++) {
+            at(x, dyDst) = clampV ? at(x, dySrc) : 0u;
+        }
+        if (w < padW) {
+            at(w, dyDst) = (clampU && clampV) ? at(w - 1, dySrc) : 0u;
+        }
+    }
 }
 
 uint32_t PackTexEnvColor(float r, float g, float b, float a) {
@@ -940,12 +1399,15 @@ GfxClipParameters GfxRenderingAPIC3D::GetClipParameters() {
 /* Init / frame lifecycle                                                           */
 /* ------------------------------------------------------------------------------- */
 
+static GfxRenderingAPIC3D* sGdxOracleApi = nullptr; // ORACLE capture entry point (set in Init)
+
 void GfxRenderingAPIC3D::Init() {
     if (mInitialized) {
         return;
     }
     // Precondition: stream B's OS layer has run gfxInitDefault() already.
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 2);
+    sGdxOracleApi = this; // ORACLE: the C capture entry point below reaches the backend via this
 
     // Framebuffer 0: the top screen. 240x400 because 3DS framebuffers are portrait.
     FramebufferC3D main = {};
@@ -1052,8 +1514,6 @@ void GfxRenderingAPIC3D::OnResize() {
  * target, so modes 2/3 zoom the (already-scaled) capture ~8%% for the wipe frames.
  * Scissors expand about the center by the mode's scene factors (never shrink), so
  * the game's safe-area scissor cannot clip the magnified content. */
-extern "C" int gdx3ds_config_loaded(void) __attribute__((weak));
-
 namespace {
 int sDispMode = -1; /* -1 = config not latched yet (treated as 0/authentic) */
 constexpr float kDispSideBorder = 15.0f; /* left/right border, window px */
@@ -1127,6 +1587,9 @@ void GfxRenderingAPIC3D::StartFrame() {
     if (!mInitialized) {
         return;
     }
+    if (sVfyMode == 2) {
+        return; /* [nverify] compare pass rides the recorded pass's open frame */
+    }
     if (!mFrameActive) {
         // First begin of this frame (the interpreter legitimately re-enters
         // StartFrame mid-frame: Interpreter::Run and the VI-fallback prologue).
@@ -1151,6 +1614,7 @@ void GfxRenderingAPIC3D::StartFrame() {
     mVboOffsetFloats = 0;
     mVboFlushedFloats = 0;
     mVboExhaustionLogged = false;
+    gdx3ds_mesh_frame_begin(); /* [native] machines receipt cadence */
     if (mFogLutCacheOverflowPending) {
         // Deferred to the frame boundary: LUT storage must outlive the previous
         // frame's command list (C3D_FrameEnd has serialized it by now).
@@ -1195,6 +1659,7 @@ void GfxRenderingAPIC3D::EndFrame() {
     // Present-path telemetry (bounded: ~1 svc line/sec at 60fps). C3D_FrameEnd
     // above queued the display transfer + swap for THIS frame's draws.
     mFrameIndex++;
+    sAtlasDiagFrame = (unsigned long)mFrameIndex; /* [atlasdiag] window mirror for the texcache hook */
     if ((mFrameIndex & 63) == 1 && GdxVerboseTelemetry()) {
         // texUp/texImp/texMiss/texDel are CUMULATIVE since boot (they always were);
         // dUp/dImp/dMiss/dDel are the deltas since the previous [c3d] emit (64 frames),
@@ -1220,6 +1685,8 @@ void GfxRenderingAPIC3D::EndFrame() {
         // is fully packed when dPk tracks the window's draw volume.
         const unsigned long dPk = sPackedDrawCalls - sPrevPackedDraws;
         sPrevPackedDraws = sPackedDrawCalls;
+        const unsigned long dNat = sNativeDrawCalls - sPrevNativeDraws; /* [native] indexed mesh draws */
+        sPrevNativeDraws = sNativeDrawCalls;
         sPrevUploads = (unsigned long)mTexUploads;
         sPrevImports = sTexCacheImports;
         sPrevMisses = sTexCacheMisses;
@@ -1231,18 +1698,24 @@ void GfxRenderingAPIC3D::EndFrame() {
         int n = std::snprintf(msg, sizeof(msg),
                               "[c3d] frame=%lu draws=%lu (scr=%lu tex=%lu) tris=%lu fbBinds=%lu "
                               "bindMiss=%lu texUp=%lu texUpFail=%lu texImp=%lu texMiss=%lu texDel=%lu "
-                              "dUp=%lu dImp=%lu dMiss=%lu dDel=%lu dRl=%lu dRm=%lu dPk=%lu",
+                              "dUp=%lu dImp=%lu dMiss=%lu dDel=%lu dRl=%lu dRm=%lu dPk=%lu dNat=%lu",
                               (unsigned long)mFrameIndex, (unsigned long)mFrameDrawCalls,
                               (unsigned long)mFrameDrawsScreenFb, (unsigned long)mFrameDrawsTexFb,
                               (unsigned long)mFrameTris, (unsigned long)mFrameFbBinds,
                               (unsigned long)mFrameBindMisses, (unsigned long)mTexUploads,
                               (unsigned long)mTexUploadFails, sTexCacheImports, sTexCacheMisses,
-                              sTexCacheDeletes, dUp, dImp, dMiss, dDel, dRl, dRm, dPk);
+                              sTexCacheDeletes, dUp, dImp, dMiss, dDel, dRl, dRm, dPk, dNat);
         if (mAtlasPlaced > 0 && n > 0 && n < (int)sizeof(msg)) {
             // [trectbatch] atlas-only suffix (never emitted with trectbatch=0): page evictions /
             // views copied out to standalone / copy-out failures / no-safe-candidate fallbacks.
             n += std::snprintf(msg + n, sizeof(msg) - n, " atlasEv=%lu/%lu/%lu/%lu", sAtlasEvictions,
                                sAtlasEvictedViews, sAtlasEvictCopyFail, sAtlasEvictNone);
+        }
+        if (sPadGutterPadded > 0 && n > 0 && n < (int)sizeof(msg)) {
+            // [padgutter] cumulative: padded uploads / axes given a replicated gutter (N64
+            // clamp) / axes zeroed (wrap or mirror, where the pad belongs to the wrap image).
+            n += std::snprintf(msg + n, sizeof(msg) - n, " padGut=%lu/%lu/%lu", sPadGutterPadded,
+                               sPadGutterReplicated, sPadGutterZeroed);
         }
         if (mStereoEnabled && n > 0 && n < (int)sizeof(msg)) {
             // Stereo-only suffix: the off-state [c3d] line stays byte-identical.
@@ -1679,7 +2152,13 @@ unsigned long sAtlasPageLastUsed[kAtlasMaxPages] = {};
  * page's flipped row layout (same convention as UploadTexture: N64 row y -> padded row
  * pageH-1-y) and flush only the touched tile rows. */
 bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uint32_t w, uint32_t h) {
+    const bool diag = AtlasDiagArmed() && (unsigned long)mFrameIndex >= sAtlasDiagFrom &&
+                      (unsigned long)mFrameIndex <= sAtlasDiagTo;
+    const uint32_t diagId = mBoundTextureIds[mLastSelectedTile];
     if (w == 0 || h == 0 || w > kAtlasMaxCellW || h > kAtlasMaxCellH) {
+        if (diag) {
+            GFX_C3D_LOG("[atlasdiag] f=%lu id=%u reject w=%u h=%u\n", (unsigned long)mFrameIndex, diagId, w, h);
+        }
         return false;
     }
     const uint32_t cw = w + 2 * kAtlasGutter;
@@ -1733,6 +2212,10 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
             if (victim < 0) {
                 sAtlasEvictNone++;
                 mAtlasFull++;
+                if (diag) {
+                    GFX_C3D_LOG("[atlasdiag] f=%lu id=%u full (no evict victim)\n", (unsigned long)mFrameIndex,
+                                  diagId);
+                }
                 return false;
             }
             /* copy every view of the victim page out into its own pow2 texture */
@@ -1759,6 +2242,12 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
                         const uint32_t dof = (((dy >> 3) * dTpr + (x >> 3)) << 6) | MortonInterleave(x, dy);
                         d[dof] = s[so];
                     }
+                }
+                /* [padgutter] the cell this view is leaving HAD a replicated gutter; its new
+                 * pow2 padding must carry one too, or an evicted HUD texture's edges change
+                 * appearance mid-run purely because the atlas filled up. */
+                if (GdxPadGutterEnabled()) {
+                    WritePadGutter(d, vw, vh, padW, padH, (v.cms & G_TX_CLAMP) != 0, (v.cmt & G_TX_CLAMP) != 0);
                 }
                 GSPGPU_FlushDataCache(tex.data, tex.size);
                 v.tex = tex;
@@ -1794,6 +2283,9 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
             vp.cursorX = 0;
             sAtlasEvictions++;
             mAtlasResets++;
+            if (diag) {
+                GFX_C3D_LOG("[atlasdiag] f=%lu id=%u evict page=%d\n", (unsigned long)mFrameIndex, diagId, victim);
+            }
             pageIdx = victim;
         }
         if (pageIdx < 0) {
@@ -1804,6 +2296,10 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
         if (!pg.inited) {
             if (!C3D_TexInit(&pg.tex, (u16)kAtlasPageW, (u16)kAtlasPageH, GPU_RGBA8)) {
                 mAtlasFull++;
+                if (diag) {
+                    GFX_C3D_LOG("[atlasdiag] f=%lu id=%u texinit-failed page=%d\n", (unsigned long)mFrameIndex,
+                                  diagId, pageIdx);
+                }
                 GFX_C3D_LOG("[atlas] C3D_TexInit(%ux%u) failed (linear heap exhausted?)\n", kAtlasPageW, kAtlasPageH);
                 if ((size_t)pageIdx == mAtlasPages.size() - 1) {
                     mAtlasPages.pop_back();
@@ -1866,6 +2362,11 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
     t.uOff = (float)t.ax / (float)kAtlasPageW;
     t.vOff = (float)t.ay / (float)kAtlasPageH;
     pg.refs++;
+    if (diag) {
+        GFX_C3D_LOG("[atlasdiag] f=%lu id=%u place page=%d ax=%u ay=%u w=%u h=%u refs=%u pages=%u\n",
+                      (unsigned long)mFrameIndex, diagId, pageIdx, (unsigned)t.ax, (unsigned)t.ay, w, h,
+                      (unsigned)pg.refs, (unsigned)mAtlasPages.size());
+    }
     mAtlasPlaced++;
     mTexUploads++;
     gdx3ds_gpuprof_note_tex_upload((unsigned)(cw * ch * 4u));
@@ -1875,6 +2376,12 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
 void GfxRenderingAPIC3D::AtlasRelease(TextureC3D& t) {
     if (t.page < 0) {
         return;
+    }
+    if (AtlasDiagArmed() && (unsigned long)mFrameIndex >= sAtlasDiagFrom &&
+        (unsigned long)mFrameIndex <= sAtlasDiagTo) {
+        GFX_C3D_LOG("[atlasdiag] f=%lu release page=%d ax=%u ay=%u refs=%u\n", (unsigned long)mFrameIndex,
+                      (int)t.page, (unsigned)t.ax, (unsigned)t.ay,
+                      (size_t)t.page < mAtlasPages.size() ? (unsigned)mAtlasPages[(size_t)t.page].refs : 0u);
     }
     if ((size_t)t.page < mAtlasPages.size()) {
         AtlasPageC3D& pg = mAtlasPages[(size_t)t.page];
@@ -1921,11 +2428,28 @@ void GfxRenderingAPIC3D::AtlasFillTexParams(int t, Gdx3dsVboPackParams* params, 
         params->uScale[t] = tex.uScale;
         params->vScale[t] = tex.vScale;
         if (skyClampFix) {
-            if (!prg.cc.clamp[t][0] && (tex.cms & G_TX_CLAMP) != 0 && tex.width < tex.padWidth) {
-                params->wrapClampU[t] = ((float)tex.width - 0.5f) / (float)tex.padWidth;
+            /* PRE-OFFSET space on purpose — see gdx3ds_texclamp.h. The limit is measured
+             * from the CELL's own origin because uOff is added by the packers AFTER this
+             * min; adding it here would double it (pinned by
+             * port/tests/gfx_atlas_uv_tests.cpp). [atlasuv] an atlas VIEW clamps at its
+             * cell's far EDGE instead of the last texel's centre: the (extent - 0.5) limit
+             * sheared every pow2 glyph against its unclamped standalone twin, while the
+             * edge limit leaves the quad's interpolation alone AND still keeps the sample
+             * inside the cell's replicated gutter. See gdx3ds_view_clamp_limit. */
+            const bool isView = (tex.page >= 0) && !GdxAtlasViewClampLegacy();
+            if (!prg.cc.clamp[t][0] && (tex.cms & G_TX_CLAMP) != 0) {
+                if (isView) {
+                    params->wrapClampU[t] = gdx3ds_view_clamp_limit(tex.width, tex.padWidth);
+                } else if (gdx3ds_pad_clamp_needed(tex.width, tex.padWidth)) {
+                    params->wrapClampU[t] = gdx3ds_pad_clamp_limit(tex.width, tex.padWidth);
+                }
             }
-            if (!prg.cc.clamp[t][1] && (tex.cmt & G_TX_CLAMP) != 0 && tex.height < tex.padHeight) {
-                params->wrapClampV[t] = ((float)tex.height - 0.5f) / (float)tex.padHeight;
+            if (!prg.cc.clamp[t][1] && (tex.cmt & G_TX_CLAMP) != 0) {
+                if (isView) {
+                    params->wrapClampV[t] = gdx3ds_view_clamp_limit(tex.height, tex.padHeight);
+                } else if (gdx3ds_pad_clamp_needed(tex.height, tex.padHeight)) {
+                    params->wrapClampV[t] = gdx3ds_pad_clamp_limit(tex.height, tex.padHeight);
+                }
             }
         }
         if (tex.page >= 0) {
@@ -1955,6 +2479,15 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
         return;
     }
     TextureC3D& t = mTextures[id];
+    if (sVfyMode != 0) { /* [nverify] content identity of what this id holds */
+        if (sVfyTexHash.size() <= id) {
+            sVfyTexHash.resize(id + 1, 0);
+        }
+        uint32_t h = 2166136261u;
+        h = VfyFnv(h, &width, 4);
+        h = VfyFnv(h, &height, 4);
+        sVfyTexHash[id] = VfyFnv(h, rgba32Buf, static_cast<size_t>(width) * height * 4u);
+    }
     /* [trectbatch] a recycled id that was an atlas view drops its cell reference first; an
      * armed (eligible rect) upload then tries the atlas and falls back to standalone. */
     if (t.page >= 0) {
@@ -2026,6 +2559,15 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
             const uint32_t offset = ((tileY * tilesPerRow + (x >> 3)) << 6) | MortonInterleave(x, dy);
             dst[offset] = texel;
         }
+    }
+    /* [padgutter] Replicate the content edge into the pow2 padding: the standalone path used
+     * to memset(0) it, so GPU_LINEAR faded every clamped content edge into transparent black
+     * while the [trectbatch] atlas cell of the same texture showed a replicated gutter. That
+     * is the 782-px course-name glyph-edge delta the residuals track measured. t.cms/t.cmt
+     * carry the importing tile's modes because TextureCacheLookup seeds a fresh slot from its
+     * own cache key. See WritePadGutter. */
+    if (GdxPadGutterEnabled()) {
+        WritePadGutter(dst, width, height, padW, padH, (t.cms & G_TX_CLAMP) != 0, (t.cmt & G_TX_CLAMP) != 0);
     }
     GSPGPU_FlushDataCache(t.tex.data, t.tex.size);
 
@@ -2354,7 +2896,9 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         return;
     }
     const ShaderProgramC3D& prg = *mCurrentShader;
-    const size_t numVerts = bufVboNumTris * 3;
+    /* [native] an indexed mesh draw carries its own vertex count (bufVboNumTris = nIdx/3). */
+    const size_t numVerts = mNativeActive ? (size_t)mNativeIdx.nVerts : bufVboNumTris * 3;
+    const size_t nativeIdxFloats = mNativeActive ? mNativeIdx.idxFloats : 0;
     const size_t inStride = bufVboLen / numVerts;
     if (mPackedAux == nullptr && inStride != prg.inputStride) {
         GFX_C3D_LOG("DrawTriangles stride mismatch: got %zu floats/vtx, shader %016llx/%016llx expects %u — "
@@ -2363,7 +2907,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                     bufVboNumTris);
         return;
     }
-    if (mVboOffsetFloats + numVerts * kOutStrideFloats > mVboPoolFloats) {
+    if (mVboOffsetFloats + numVerts * kOutStrideFloats + nativeIdxFloats > mVboPoolFloats) {
         if (!mVboExhaustionLogged) {
             mVboExhaustionLogged = true;
             GFX_C3D_LOG("VBO pool exhausted (%zu KiB) — dropping the rest of the frame's geometry\n",
@@ -2422,6 +2966,8 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
             /* [trectbatch] atlas VIEW: clamp limits stay in un-offset space (the repack adds
              * uOff after the min); the PAGE is bound with this view's filter. */
             const bool view = t.page >= 0;
+            /* [atlasuv] a view clamps at its cell's far EDGE — see gdx3ds_view_clamp_limit. */
+            const bool viewClamp = view && !GdxAtlasViewClampLegacy();
             uOffB[tile] = t.uOff;
             vOffB[tile] = t.vOff;
             viewB[tile] = view;
@@ -2437,16 +2983,22 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                         // Interpreter per-vertex clamp-S limit (draw-constant: vertex 0).
                         uClampMax[tile] = bufVbo[prg.uvOffset[tile] + 2] * t.uScale;
                     }
-                } else if ((t.cms & G_TX_CLAMP) != 0 && t.width < t.padWidth) {
-                    uClampMax[tile] = ((float)t.width - 0.5f) / (float)t.padWidth;
+                } else if ((t.cms & G_TX_CLAMP) != 0) {
+                    uClampMax[tile] = viewClamp ? gdx3ds_view_clamp_limit(t.width, t.padWidth)
+                                      : gdx3ds_pad_clamp_needed(t.width, t.padWidth)
+                                          ? gdx3ds_pad_clamp_limit(t.width, t.padWidth)
+                                          : uClampMax[tile];
                 }
                 if (prg.cc.clamp[tile][1]) {
                     if (!packed) {
                         const int slot = prg.uvOffset[tile] + 2 + (prg.cc.clamp[tile][0] ? 1 : 0);
                         vClampMax[tile] = bufVbo[slot] * t.vScale;
                     }
-                } else if ((t.cmt & G_TX_CLAMP) != 0 && t.height < t.padHeight) {
-                    vClampMax[tile] = ((float)t.height - 0.5f) / (float)t.padHeight;
+                } else if ((t.cmt & G_TX_CLAMP) != 0) {
+                    vClampMax[tile] = viewClamp ? gdx3ds_view_clamp_limit(t.height, t.padHeight)
+                                      : gdx3ds_pad_clamp_needed(t.height, t.padHeight)
+                                          ? gdx3ds_pad_clamp_limit(t.height, t.padHeight)
+                                          : vClampMax[tile];
                 }
             }
             // SHIP-LIVERY-2 fix: express the interpreter's SHADER-side clamp at the
@@ -2552,6 +3104,55 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         } else {
             out[10] = 0.0f;
             out[11] = 0.0f;
+        }
+    }
+    if (UvDiagOn() && AtlasDiagInWindow() && prg.cc.usedTextures[0] && numVerts > 0 && numVerts <= 12) {
+        const uint32_t texId0 = mBoundTextureIds[0];
+        const TextureC3D* td = (texId0 < mTextures.size()) ? &mTextures[texId0] : nullptr;
+        const float padW = td != nullptr ? (float)td->padWidth : 0.0f;
+        const float padH = td != nullptr ? (float)td->padHeight : 0.0f;
+        const float ax = (td != nullptr && td->page >= 0) ? (float)td->ax : 0.0f;
+        const float ay = (td != nullptr && td->page >= 0) ? (float)td->ay : 0.0f;
+        float x0 = dst[0], x1 = dst[0], y0 = dst[1], y1 = dst[1];
+        float s0 = 1e30f, s1 = -1e30f, t0 = 1e30f, t1 = -1e30f;
+        uint32_t bs = 0, bt = 0;
+        for (size_t v = 0; v < numVerts; v++) {
+            const float* o = dst + v * kOutStrideFloats;
+            x0 = fminf(x0, o[0]); x1 = fmaxf(x1, o[0]);
+            y0 = fminf(y0, o[1]); y1 = fmaxf(y1, o[1]);
+            const float sc = o[4] * padW - ax;
+            const float tc = o[5] * padH - ay;
+            if (sc < s0) { s0 = sc; bs = UvDiagBits(o[4]); }
+            if (sc > s1) { s1 = sc; }
+            if (tc < t0) { t0 = tc; bt = UvDiagBits(o[5]); }
+            if (tc > t1) { t1 = tc; }
+        }
+        GFX_C3D_LOG("[uvdiag] f=%lu pg=%d id=%u wh=%ux%u pad=%.0fx%.0f a=%.0f,%.0f "
+                    "xy=%.4f,%.4f,%.4f,%.4f cs=%.6f,%.6f ct=%.6f,%.6f b=%08lx,%08lx nv=%u\n",
+                    (unsigned long)mFrameIndex, td != nullptr ? (int)td->page : -2, texId0,
+                    td != nullptr ? (unsigned)td->width : 0u, td != nullptr ? (unsigned)td->height : 0u,
+                    padW, padH, ax, ay, x0, y0, x1, y1, s0, s1, t0, t1,
+                    (unsigned long)bs, (unsigned long)bt, (unsigned)numVerts);
+    }
+    /* [native] machines_verify: hand the final packed stream + material identity to the
+     * mesh verifier; in capture-only mode stop here (no GPU state, no submit, no advance). */
+    if (sMeshCaptureFn != nullptr) {
+        Gdx3dsMeshCapture cap;
+        cap.verts = dst;
+        cap.nVerts = (uint32_t)numVerts;
+        cap.idx = mNativeActive ? mNativeIdx.idx : nullptr;
+        cap.nIdx = mNativeActive ? mNativeIdx.nIdx : 0;
+        cap.numTris = (uint32_t)bufVboNumTris;
+        cap.shaderId0 = prg.id0;
+        cap.shaderId1 = prg.id1;
+        cap.texId[0] = prg.cc.usedTextures[0] ? mBoundTextureIds[0] : 0xFFFFFFFFu;
+        cap.texId[1] = prg.cc.usedTextures[1] ? mBoundTextureIds[1] : 0xFFFFFFFFu;
+        cap.aux = mPackedAux;
+        cap.vtxColorInput = (int8_t)prg.vtxColorInput;
+        cap.vtxAlphaInput = (int8_t)prg.vtxAlphaInput;
+        sMeshCaptureFn(&cap, sMeshCaptureUser);
+        if (sMeshCaptureSkip) {
+            return;
         }
     }
     // No per-draw cache flush: FlushPendingVbo() flushes the whole appended range in
@@ -2737,6 +3338,78 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
     const bool texBacked = mCurrentFramebuffer >= 0 && mCurrentFramebuffer < (int)mFramebuffers.size() &&
                            mFramebuffers[mCurrentFramebuffer].texBacked;
 
+    /* [native] every per-eye/mono submission below goes through this: an indexed mesh
+     * draw issues C3D_DrawElements over the same bound VBO range, arrays otherwise. */
+    const auto IssueDraw = [&]() {
+        if (mNativeActive) {
+            C3D_DrawElements(GPU_TRIANGLES, (int)mNativeIdx.nIdx, C3D_UNSIGNED_SHORT, mNativeIdx.idx);
+        } else {
+            C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+        }
+    };
+
+    if (sVfyMode != 0) { /* [nverify] one record per submitted batch; compare pass never draws */
+        uint32_t f[kVfyFields] = {};
+        uint32_t h = 2166136261u;
+        f[0] = VfyFnv(h, &prg.id0, 8);
+        f[1] = VfyFnv(h, &prg.id1, 8);
+        for (int tile = 0; tile < 2; tile++) {
+            uint32_t th = 2166136261u;
+            if (prg.cc.usedTextures[tile]) {
+                const uint32_t texId = mBoundTextureIds[tile];
+                const uint32_t ch = texId < sVfyTexHash.size() ? sVfyTexHash[texId] : 0u;
+                th = VfyFnv(th, &ch, 4);
+                if (texId < mTextures.size()) {
+                    const TextureC3D& tt = mTextures[texId];
+                    const uint32_t sm[4] = { tt.cms, tt.cmt, tt.linearFilter ? 1u : 0u, tt.page >= 0 ? 1u : 0u };
+                    th = VfyFnv(th, sm, sizeof(sm));
+                }
+            }
+            f[2 + tile] = th;
+        }
+        const uint32_t mode[4] = { mDepthTest ? 1u : 0u, mDepthMask ? 1u : 0u, mZmodeDecal ? 1u : 0u, mUseAlpha ? 1u : 0u };
+        f[4] = VfyFnv(h, mode, sizeof(mode));
+        f[5] = VfyFnv(h, &mCurrentPrimDepth, 4);
+        f[6] = VfyFnv(h, &mCurrentAlphaCompareThreshold, 4);
+        /* The fold floats / visible rect are GPU-relevant only while the affine fold is active;
+           inactive they hold the last folded viewport of whichever pass ran last. */
+        const float vp[5] = { mVpAffineActive ? 1.0f : 0.0f, mVpAffineActive ? mVpSx : 0.0f,
+                              mVpAffineActive ? mVpSy : 0.0f, mVpAffineActive ? mVpTx : 0.0f,
+                              mVpAffineActive ? mVpTy : 0.0f };
+        f[7] = VfyFnv(h, vp, sizeof(vp));
+        const int vis[4] = { mVpAffineActive ? mVpVisX : 0, mVpAffineActive ? mVpVisY : 0,
+                             mVpAffineActive ? mVpVisW : 0, mVpAffineActive ? mVpVisH : 0 };
+        f[8] = VfyFnv(h, vis, sizeof(vis));
+        const int sc[5] = { mScX, mScY, mScW, mScH, mScValid ? 1 : 0 };
+        f[9] = VfyFnv(h, sc, sizeof(sc));
+        f[10] = packed ? VfyFnv(h, mPackedAux, sizeof(Gdx3dsVboPackAux)) : 0u;
+        const uint32_t nv = static_cast<uint32_t>(numVerts);
+        f[11] = VfyFnv(h, &nv, 4);
+        f[12] = packed ? 1u : 0u;
+        uint32_t state = 2166136261u;
+        for (int i = 0; i < kVfyFields; i++) state = (state ^ f[i]) * 16777619u;
+        const uint32_t vboHash = VfyFnv(2166136261u, dst, numVerts * kOutStrideFloats * sizeof(float));
+        VfyBatchInfo info;
+        memcpy(info.v0, dst, sizeof(info.v0));
+        info.tris = static_cast<uint32_t>(bufVboNumTris);
+        info.id0 = prg.id0;
+        info.id1 = prg.id1;
+        info.tri = sVfyLastTri;
+        for (int tile = 0; tile < 2; tile++) {
+            const uint32_t texId = mBoundTextureIds[tile];
+            info.texUsed[tile] = prg.cc.usedTextures[tile] ? 1u : 0u;
+            info.texId[tile] = texId;
+            info.texHash[tile] = texId < sVfyTexHash.size() ? sVfyTexHash[texId] : 0u;
+            info.texW[tile] = texId < mTextures.size() ? mTextures[texId].width : 0u;
+            info.texH[tile] = texId < mTextures.size() ? mTextures[texId].height : 0u;
+        }
+        memcpy(info.vpf, vp, sizeof(info.vpf));
+        memcpy(info.vis, vis, sizeof(info.vis));
+        VfyRecord(1, state, vboHash, f, &info);
+        if (sVfyMode == 2) {
+            return;
+        }
+    }
     C3D_BufInfo* bufInfo = C3D_GetBufInfo();
     BufInfo_Init(bufInfo);
     BufInfo_Add(bufInfo, dst, kOutStrideFloats * sizeof(float), 4, 0x3210);
@@ -2781,7 +3454,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         if (texBacked) {
             Gdx3dsStereo::ComputeEyeMatrix(&mFixupMatrix, 0, &eyeMtx);
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mProjectionUniformLoc, &eyeMtx);
-            C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+            IssueDraw();
         } else {
             // Stereo class: bridge override, else ortho heuristic (clip w == 1
             // on vertex 0 -> HUD/menu content at zero parallax).
@@ -2805,19 +3478,19 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                 // vertex uniforms survive the raw target switch, so upload once.
                 Gdx3dsStereo::ComputeEyeMatrix(dispBase, 0, &eyeMtx);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mProjectionUniformLoc, &eyeMtx);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+                IssueDraw();
                 Gdx3dsStereo::BindTargetRaw(Gdx3dsStereo::RightTarget());
-                C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+                IssueDraw();
             } else {
                 // Left eye: the current (main) target is already bound.
                 Gdx3dsStereo::ComputeEyeMatrix(dispBase, -1, &eyeMtx, cls);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mProjectionUniformLoc, &eyeMtx);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+                IssueDraw();
                 // Right eye: raw switch keeps viewport/scissor (gdx3ds_stereo.h).
                 Gdx3dsStereo::BindTargetRaw(Gdx3dsStereo::RightTarget());
                 Gdx3dsStereo::ComputeEyeMatrix(dispBase, 1, &eyeMtx, cls);
                 C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mProjectionUniformLoc, &eyeMtx);
-                C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+                IssueDraw();
             }
             C3D_RenderTarget* back = mFramebuffers[mCurrentFramebuffer].target;
             Gdx3dsStereo::BindTargetRaw(back != nullptr ? back : mFramebuffers[0].target);
@@ -2829,10 +3502,10 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mProjectionUniformLoc, dispBase);
             sDispProjLast = (dispBase == &vpMtx) ? nullptr : dispBase;
         }
-        C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
+        IssueDraw();
     }
 
-    mVboOffsetFloats += numVerts * kOutStrideFloats;
+    mVboOffsetFloats += numVerts * kOutStrideFloats + nativeIdxFloats;
     mFrameDrawCalls++;
     if (packed) {
         sPackedDrawCalls++; // [triloop] receipt: dPk on the [c3d] line
@@ -2881,12 +3554,82 @@ float* GfxRenderingAPIC3D::VboPackBegin(Gdx3dsVboPackParams* params) {
     return mVboPool + mVboOffsetFloats;
 }
 
+static bool sNbStockArm = false;      /* [native] verify: hash every packed draw */
+static uint32_t sNbStockHash = GDX_NATIVEBATCH_HASH_SEED;
+static uint32_t sNbStockTris = 0;
+
 void GfxRenderingAPIC3D::DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux) {
+    if (sNbStockArm && numTris != 0 && mVboOffsetFloats + numTris * 3 * kOutStrideFloats <= mVboPoolFloats) {
+        sNbStockHash = Gdx_NativeBatchHashBytes(mVboPool + mVboOffsetFloats,
+                                                numTris * 3 * kOutStrideFloats * sizeof(float), sNbStockHash);
+        sNbStockTris += (uint32_t)numTris;
+    }
     // Route through DrawTriangles so every early-out, diagnostic and the
     // submission tail stay shared; mPackedAux flags the repack-free mode.
     mPackedAux = aux;
     DrawTriangles(mVboPool + mVboOffsetFloats, numTris * 3 * kOutStrideFloats, numTris);
     mPackedAux = nullptr;
+}
+
+/* ------------------------------------------------------------------------------- */
+/* [native] machines: indexed mesh draws (gdx3ds_mesh.h)                             */
+/* ------------------------------------------------------------------------------- */
+
+/* [wobble] floats consumed by an n-entry u16 index tail, rounded up to whole 16-byte units. */
+static inline size_t NativeIdxFloats(size_t nIndices) {
+    return ((nIndices * 2u + 15u) / 16u) * 4u;
+}
+
+float* GfxRenderingAPIC3D::NativeMeshBegin(Gdx3dsVboPackParams* params, uint32_t minVerts, uint32_t maxIndices,
+                                           uint32_t* capVerts) {
+    if (!mInitialized || !mFrameActive || mCurrentShader == nullptr) {
+        return nullptr;
+    }
+    /* Vertices first, then the u16 indices rounded up to whole floats; the caller writes
+     * only what survives (bounded by capVerts) and NativeMeshDraw advances by the actual
+     * counts. Refuse only when even the minimum does not fit. */
+    /* [wobble] the u16 index tail is padded to 16 bytes (4 floats) so the pool cursor — and
+     * therefore every later draw's attribute-buffer base — keeps the 16-byte alignment the
+     * stock 48-byte-stride appends always had; ceil(n*2/4) alone left it 4-byte aligned. Bytes
+     * drawn are unchanged (parity-neutral); only the padding between draws differs. */
+    const size_t idxFloats = NativeIdxFloats(maxIndices);
+    const size_t minFloats = (size_t)minVerts * kOutStrideFloats + idxFloats;
+    if (mVboOffsetFloats + minFloats > mVboPoolFloats) {
+        return nullptr;
+    }
+    *capVerts = (uint32_t)((mVboPoolFloats - mVboOffsetFloats - idxFloats) / kOutStrideFloats);
+    const ShaderProgramC3D& prg = *mCurrentShader;
+    const bool skyClampFix = GdxSkyClampFixEnabled();
+    params->hasOff = 0;
+    for (int t = 0; t < 2; t++) {
+        params->used[t] = prg.cc.usedTextures[t] ? 1 : 0;
+        AtlasFillTexParams(t, params, skyClampFix);
+    }
+    params->shaderClampGate = skyClampFix ? 1 : 0;
+    params->vtxColorInput = (int8_t)prg.vtxColorInput;
+    params->vtxAlphaInput = (int8_t)prg.vtxAlphaInput;
+    params->wantVtxAlpha = (prg.inputSize == 4 && prg.vtxAlphaInput > 0) ? 1 : 0;
+    params->fogFactorToAlpha = (prg.fogBlendStage && prg.fogOffset >= 0) ? 1 : 0;
+    return mVboPool + mVboOffsetFloats;
+}
+
+void GfxRenderingAPIC3D::NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux) {
+    if (nIdx == 0 || nVerts == 0 || aux == nullptr) {
+        return; /* nothing survived: the reservation is simply not consumed */
+    }
+    float* base = mVboPool + mVboOffsetFloats;
+    uint16_t* idxDst = (uint16_t*)(base + (size_t)nVerts * kOutStrideFloats);
+    std::memcpy(idxDst, idx, (size_t)nIdx * sizeof(uint16_t));
+    mNativeIdx.idx = idxDst;
+    mNativeIdx.nIdx = nIdx;
+    mNativeIdx.nVerts = nVerts;
+    mNativeIdx.idxFloats = NativeIdxFloats(nIdx);
+    mNativeActive = true;
+    mPackedAux = aux;
+    DrawTriangles(base, (size_t)nVerts * kOutStrideFloats, nIdx / 3u);
+    mPackedAux = nullptr;
+    mNativeActive = false;
+    sNativeDrawCalls++;
 }
 
 /* ------------------------------------------------------------------------------- */
@@ -3183,6 +3926,12 @@ void GfxRenderingAPIC3D::StartDrawToFramebuffer(int fbId, float noiseScale) {
         return;
     }
     mCurrentFramebuffer = fbId;
+    if (sVfyMode != 0) {
+        VfyRecord(3, static_cast<uint32_t>(fbId), 0, nullptr);
+        if (sVfyMode == 2) {
+            return;
+        }
+    }
     if (mFrameActive) {
         C3D_FrameDrawOn(mFramebuffers[fbId].target);
         mFrameFbBinds++;
@@ -3275,6 +4024,12 @@ void GfxRenderingAPIC3D::ClearFramebuffer(bool color, bool depth) {
     if (mCurrentFramebuffer >= (int)mFramebuffers.size()) {
         return;
     }
+    if (sVfyMode != 0) {
+        VfyRecord(2, (color ? 1u : 0u) | (depth ? 2u : 0u) | (static_cast<uint32_t>(mCurrentFramebuffer) << 8), 0, nullptr);
+        if (sVfyMode == 2) {
+            return;
+        }
+    }
     C3D_RenderTarget* target = mFramebuffers[mCurrentFramebuffer].target;
     if (target == nullptr) {
         return;
@@ -3292,6 +4047,82 @@ void GfxRenderingAPIC3D::ClearFramebuffer(bool color, bool depth) {
             Gdx3dsStereo::ClearRight(flags, 0x000000FF, kClearDepthFar); // no-op unless Active()
         }
     }
+}
+
+bool GfxRenderingAPIC3D::ReadColorBufRgba16(u32* colorBuf, u32 fbW, u32 fbH, u32 gameW, u32 gameH,
+                                            uint32_t width, uint32_t height, uint16_t* out, const char* who) {
+    const size_t linearBytes = (size_t)fbW * fbH * sizeof(u16);
+    u16* linear = (u16*)linearAlloc(linearBytes);
+    if (linear == nullptr) {
+        GFX_C3D_LOG("%s: linearAlloc(%ux%u) failed\n", who, fbW, fbH);
+        return false;
+    }
+    if (mFrameActive) {
+        FlushPendingVbo();
+        C3D_FrameSplit(0); // submit queued draws so the readback sees this frame's content
+    }
+    /* TRANSITION-GLITCH root cause: C3D_SyncDisplayTransfer is NOT synchronous while a C3D
+     * frame is active — citro3d's implementation is `if (inFrame) { C3D_FrameSplit(0);
+     * GX_DisplayTransfer(...); }` with NO wait (renderqueue.c), the transfer merely joins the
+     * gx command queue behind everything else pending (including the frame mirror's async
+     * GX_TextureCopy). The CPU then read `linear` before the PPF ever ran: freed/stale linear
+     * heap decoded as the capture — the race->menu wipe redrew exactly that noise (and the
+     * historical "B2: in-game SHOT/mirror BMPs black while scanout fine" was this same race).
+     * Azahar usually drains the queue fast enough to hide it; on real hardware the PPF always
+     * takes real time, so captures there were reliably garbled.
+     *
+     * Fix: pre-fill a two-word sentinel at the END of the output buffer, then poll it with the
+     * data cache invalidated until the transfer's writes land (the gx queue executes in
+     * submission order, so our transfer completing also proves every earlier async copy did).
+     * A PPF wait alone is NOT sufficient: gsp events are latched, and a stale PPF signal from
+     * an earlier texture copy satisfies gspWaitForPPF immediately. Bounded (~400 ms) so a
+     * hypothetical dropped transfer degrades to a logged stale read instead of a hang. */
+    volatile u32* sentinel = (volatile u32*)((u8*)linear + linearBytes - 8);
+    sentinel[0] = 0xDEADC0DEu;
+    sentinel[1] = 0x5EA7BEEFu ^ 0x0F0F0F0Fu; /* distinct second word */
+    GSPGPU_FlushDataCache((void*)((u8*)linear + linearBytes - 8), 8);
+    const u32 transferFlags =
+        GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
+        GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB5A1) |
+        GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
+    C3D_SyncDisplayTransfer(colorBuf, GX_BUFFER_DIM(fbW, fbH), (u32*)linear, GX_BUFFER_DIM(fbW, fbH),
+                            transferFlags);
+    bool landed = false;
+    {
+        for (int spin = 0; spin < 4000; ++spin) { // 4000 * 100us = 400 ms bound
+            GSPGPU_InvalidateDataCache((void*)((u8*)linear + linearBytes - 8), 8);
+            if (sentinel[0] != 0xDEADC0DEu || sentinel[1] != (0x5EA7BEEFu ^ 0x0F0F0F0Fu)) {
+                landed = true;
+                break;
+            }
+            svcSleepThread(100 * 1000); // 100 us
+        }
+        if (!landed) {
+            GFX_C3D_LOG("%s: display transfer never landed\n", who);
+        }
+    }
+    GSPGPU_InvalidateDataCache(linear, linearBytes);
+    gdx3ds_gpuprof_note_readback((unsigned)fbW * fbH);
+
+    for (uint32_t yOut = 0; yOut < height; yOut++) {
+        // Output row 0 = top of scene; GL-convention game y counts from the bottom.
+        const u32 gy = (u32)(((uint64_t)(height - 1 - yOut) * gameH) / height);
+        for (uint32_t xOut = 0; xOut < width; xOut++) {
+            const u32 gx = (u32)(((uint64_t)xOut * gameW) / width);
+            // Harness-verified un-rotation: game y runs along fb-x from 0 and
+            // game x along fb-y from 0 (the first cut used fbH-1-gx and read
+            // every scene horizontally mirrored + offset by the dead band).
+            const u32 fbX = gy;
+            const u32 fbY = gx;
+            if (fbX >= fbW || fbY >= fbH) {
+                continue;
+            }
+            const u16 px = linear[(size_t)fbY * fbW + fbX];
+            out[(size_t)yOut * width + xOut] = (u16)(px | 0x0001u); // force coverage bit
+        }
+    }
+    linearFree(linear);
+    return landed;
 }
 
 void GfxRenderingAPIC3D::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t height, uint16_t* rgba16Buf) {
@@ -3331,59 +4162,6 @@ void GfxRenderingAPIC3D::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t
         return;
     }
 
-    const size_t linearBytes = (size_t)fbW * fbH * sizeof(u16);
-    u16* linear = (u16*)linearAlloc(linearBytes);
-    if (linear == nullptr) {
-        GFX_C3D_LOG("ReadFramebufferToCPU: linearAlloc(%ux%u) failed\n", fbW, fbH);
-        return;
-    }
-    if (mFrameActive) {
-        FlushPendingVbo();
-        C3D_FrameSplit(0); // submit queued draws so the readback sees this frame's content
-    }
-    /* TRANSITION-GLITCH root cause: C3D_SyncDisplayTransfer is NOT synchronous while a C3D
-     * frame is active — citro3d's implementation is `if (inFrame) { C3D_FrameSplit(0);
-     * GX_DisplayTransfer(...); }` with NO wait (renderqueue.c), the transfer merely joins the
-     * gx command queue behind everything else pending (including the frame mirror's async
-     * GX_TextureCopy). The CPU then read `linear` before the PPF ever ran: freed/stale linear
-     * heap decoded as the capture — the race->menu wipe redrew exactly that noise (and the
-     * historical "B2: in-game SHOT/mirror BMPs black while scanout fine" was this same race).
-     * Azahar usually drains the queue fast enough to hide it; on real hardware the PPF always
-     * takes real time, so captures there were reliably garbled.
-     *
-     * Fix: pre-fill a two-word sentinel at the END of the output buffer, then poll it with the
-     * data cache invalidated until the transfer's writes land (the gx queue executes in
-     * submission order, so our transfer completing also proves every earlier async copy did).
-     * A PPF wait alone is NOT sufficient: gsp events are latched, and a stale PPF signal from
-     * an earlier texture copy satisfies gspWaitForPPF immediately. Bounded (~400 ms) so a
-     * hypothetical dropped transfer degrades to a logged stale read instead of a hang. */
-    volatile u32* sentinel = (volatile u32*)((u8*)linear + linearBytes - 8);
-    sentinel[0] = 0xDEADC0DEu;
-    sentinel[1] = 0x5EA7BEEFu ^ 0x0F0F0F0Fu; /* distinct second word */
-    GSPGPU_FlushDataCache((void*)((u8*)linear + linearBytes - 8), 8);
-    const u32 transferFlags =
-        GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
-        GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB5A1) |
-        GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
-    C3D_SyncDisplayTransfer(colorBuf, GX_BUFFER_DIM(fbW, fbH), (u32*)linear, GX_BUFFER_DIM(fbW, fbH),
-                            transferFlags);
-    {
-        bool landed = false;
-        for (int spin = 0; spin < 4000; ++spin) { // 4000 * 100us = 400 ms bound
-            GSPGPU_InvalidateDataCache((void*)((u8*)linear + linearBytes - 8), 8);
-            if (sentinel[0] != 0xDEADC0DEu || sentinel[1] != (0x5EA7BEEFu ^ 0x0F0F0F0Fu)) {
-                landed = true;
-                break;
-            }
-            svcSleepThread(100 * 1000); // 100 us
-        }
-        if (!landed) {
-            GFX_C3D_LOG("ReadFramebufferToCPU: display transfer never landed (fb %d)\n", fbId);
-        }
-    }
-    GSPGPU_InvalidateDataCache(linear, linearBytes);
-    gdx3ds_gpuprof_note_readback((unsigned)fbW * fbH);
-
     /* Logical game extent of this framebuffer (fb.width/height track the interpreter's sizes;
      * fall back to the padded extents when unset). */
     const u32 gameW = (fb.width != 0) ? fb.width : fbH;
@@ -3400,24 +4178,49 @@ void GfxRenderingAPIC3D::ReadFramebufferToCPU(int fbId, uint32_t width, uint32_t
                         (unsigned)gameW, (unsigned)gameH, (unsigned)width, (unsigned)height);
         }
     }
-    for (uint32_t yOut = 0; yOut < height; yOut++) {
-        // Output row 0 = top of scene; GL-convention game y counts from the bottom.
-        const u32 gy = (u32)(((uint64_t)(height - 1 - yOut) * gameH) / height);
-        for (uint32_t xOut = 0; xOut < width; xOut++) {
-            const u32 gx = (u32)(((uint64_t)xOut * gameW) / width);
-            // Harness-verified un-rotation: game y runs along fb-x from 0 and
-            // game x along fb-y from 0 (the first cut used fbH-1-gx and read
-            // every scene horizontally mirrored + offset by the dead band).
-            const u32 fbX = gy;
-            const u32 fbY = gx;
-            if (fbX >= fbW || fbY >= fbH) {
-                continue;
-            }
-            const u16 px = linear[(size_t)fbY * fbW + fbX];
-            rgba16Buf[(size_t)yOut * width + xOut] = (u16)(px | 0x0001u); // force coverage bit
-        }
+    ReadColorBufRgba16(colorBuf, fbW, fbH, gameW, gameH, width, height, rgba16Buf, "ReadFramebufferToCPU");
+}
+
+/* ORACLE true capture (contract in gfx_citro3d.h). Reads the target the GPU drew THIS frame
+ * into, not the scanout copy one transfer downstream (that off-by-one was the old oracle's
+ * bug: docs/research/reference-diff-2026-08-20.md Part 1). No FrameSplit branch: the caller
+ * guarantees no frame is open. The transfer joins citro3d's gx command queue BEHIND the frame's
+ * P3D list + display transfer (in-order execution), and the sentinel poll proves it — and hence
+ * the frame's GPU work — completed. */
+int GfxRenderingAPIC3D::CaptureTargetRgba16(int eye, uint16_t* out, uint32_t width, uint32_t height) {
+    if (out == nullptr || width == 0 || height == 0) {
+        return -1;
     }
-    linearFree(linear);
+    std::memset(out, 0, (size_t)width * height * sizeof(uint16_t));
+    if (!mInitialized || mFrameActive || mFramebuffers.empty()) {
+        return -1;
+    }
+    C3D_RenderTarget* target = nullptr;
+    if (eye == 1) {
+        if (!mStereoEnabled || !Gdx3dsStereo::Active()) {
+            return -2;
+        }
+        target = Gdx3dsStereo::RightTarget();
+    } else {
+        target = mFramebuffers[0].target;
+    }
+    if (target == nullptr || target->frameBuf.colorBuf == nullptr) {
+        return -1;
+    }
+    const u32 fbW = (u32)kScreenHeight; // portrait target: 240 wide ...
+    const u32 fbH = (u32)kScreenWidth;  // ... x 400 tall
+    const bool landed = ReadColorBufRgba16((u32*)target->frameBuf.colorBuf, fbW, fbH, (u32)kScreenWidth,
+                                           (u32)kScreenHeight, width, height, out, "CaptureTargetRgba16");
+    return landed ? 0 : 1;
+}
+
+/* C entry point for port/3ds/gdx3ds_oracle.c. Same return codes as CaptureTargetRgba16;
+ * -1 before Init(). */
+extern "C" int gdx3ds_gfx_capture_target(int eye, uint16_t* out, uint32_t width, uint32_t height) {
+    if (sGdxOracleApi == nullptr) {
+        return -1;
+    }
+    return sGdxOracleApi->CaptureTargetRgba16(eye, out, width, height);
 }
 
 void GfxRenderingAPIC3D::ResolveMSAAColorBuffer(int fbIdTarget, int fbIdSrc) {
@@ -3468,6 +4271,12 @@ Fast::GfxRenderingAPI* Gdx3ds_GetCitro3dRenderer() {
     return &GdxCitro3dRendererSingleton();
 }
 
+/* HOMEFIX: [apt] receipts sample whether a C3D frame is open on the backend (render-thread
+ * state, racy read from main / the watchdog; diagnostic only). */
+extern "C" int gdx3ds_gfx_frame_active(void) {
+    return GdxCitro3dRendererSingleton().DiagFrameActive() ? 1 : 0;
+}
+
 /* [triloop] strong-link hooks for the interpreter's packed tri path (declared
  * in gdx3ds_vbopack.h; the interpreter only ever calls them from its own DL
  * walk, where the renderer singleton exists by construction). */
@@ -3489,4 +4298,241 @@ extern "C" void gdx3ds_atlas_stats(unsigned long out[5]) {
 }
 extern "C" void gdx3ds_vbopack_draw(size_t numTris, const Gdx3dsVboPackAux* aux) {
     GdxCitro3dRendererSingleton().DrawPackedBatch(numTris, aux);
+}
+
+/* ------------------------------------------------------------------------------- */
+/* Gdx_NativeBatch (gdx3ds_nativebatch.h): shared native draw primitive             */
+/* ------------------------------------------------------------------------------- */
+
+namespace Fast {
+
+namespace {
+struct NativeBatchState {
+    bool open = false;
+    size_t startFloats = 0;
+    int cls = -1;
+    Gdx3dsVboPackAux aux = {};
+};
+NativeBatchState sNb;
+uint32_t sNbDraws = 0;
+} // namespace
+
+extern "C" uint32_t Gdx_NativeBatchHashBytes(const void* p, size_t n, uint32_t h) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+extern "C" int Gdx_NativeBatchBeginWithAux(const Gdx3dsVboPackAux* aux, int stereoClass) {
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    if (!r.mInitialized || !r.mFrameActive || r.mCurrentShader == nullptr || aux == nullptr) {
+        return 0;
+    }
+    if (sNb.open) {
+        Gdx_NativeBatchFlush();
+    }
+    sNb.open = true;
+    sNb.startFloats = r.mVboOffsetFloats;
+    sNb.cls = stereoClass;
+    sNb.aux = *aux;
+    return 1;
+}
+
+extern "C" int Gdx_NativeBatchBegin(int stereoClass) {
+    Gdx3dsVboPackAux aux = {};
+    return Gdx_NativeBatchBeginWithAux(&aux, stereoClass);
+}
+
+extern "C" int Gdx_NativeBatchMaterial(const Gdx3dsNativeMaterial* m, int stereoClass) {
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    if (m == nullptr || !r.mInitialized || !r.mFrameActive) {
+        return 0;
+    }
+    if (sNb.open) {
+        Gdx_NativeBatchFlush();
+    }
+    ShaderProgram* prg = r.LookupShader(m->shaderId0, m->shaderId1);
+    if (prg == nullptr) {
+        prg = r.CreateAndLoadNewShader(m->shaderId0, m->shaderId1);
+    } else {
+        r.LoadShader(prg);
+    }
+    if (prg == nullptr) {
+        return 0;
+    }
+    for (int t = 0; t < 2; t++) {
+        if (r.mCurrentShader->cc.usedTextures[t]) {
+            r.SelectTexture(t, m->texId[t]);
+        }
+    }
+    r.SetDepthTestAndMask(m->depthTest != 0, m->depthMask != 0);
+    r.SetZmodeDecal(m->decal != 0);
+    r.SetUseAlpha(m->useAlpha != 0);
+    return Gdx_NativeBatchBeginWithAux(&m->aux, stereoClass);
+}
+
+extern "C" int Gdx_NativeBatchOpen(void) {
+    return sNb.open ? 1 : 0;
+}
+
+extern "C" float* Gdx_NativeBatchCursor(void) {
+    if (!sNb.open) {
+        return nullptr;
+    }
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    return r.mVboPool + r.mVboOffsetFloats;
+}
+
+extern "C" float* Gdx_NativeBatchVerts(uint32_t nVerts) {
+    if (!sNb.open) {
+        return nullptr;
+    }
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    const size_t floats = (size_t)nVerts * kOutStrideFloats;
+    if (r.mVboOffsetFloats + floats > r.mVboPoolFloats) {
+        return nullptr;
+    }
+    float* p = r.mVboPool + r.mVboOffsetFloats;
+    r.mVboOffsetFloats += floats;
+    return p;
+}
+
+extern "C" void Gdx_NativeBatchCommit(uint32_t nVerts) {
+    if (!sNb.open) {
+        return;
+    }
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    const size_t floats = (size_t)nVerts * kOutStrideFloats;
+    if (r.mVboOffsetFloats + floats <= r.mVboPoolFloats) {
+        r.mVboOffsetFloats += floats;
+    }
+}
+
+extern "C" uint16_t* Gdx_NativeBatchIndices(uint32_t nIndices) {
+    (void)nIndices;
+    return nullptr;
+}
+
+extern "C" uint32_t Gdx_NativeBatchFlush(void) {
+    if (!sNb.open) {
+        return 0;
+    }
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    const size_t end = r.mVboOffsetFloats;
+    const size_t floats = end > sNb.startFloats ? end - sNb.startFloats : 0;
+    const uint32_t tris = (uint32_t)(floats / (3 * kOutStrideFloats));
+    if (tris != 0) {
+        r.mVboOffsetFloats = sNb.startFloats;
+        gdx3ds_stereo_set_draw_class(sNb.cls);
+        r.DrawPackedBatch(tris, &sNb.aux); /* advances the cursor to `end` on success */
+        gdx3ds_stereo_set_draw_class(-1);
+        r.mVboOffsetFloats = end;          /* the range is consumed even on a backend early-out */
+        sNbDraws++;
+    }
+    sNb.startFloats = end;
+    return tris;
+}
+
+extern "C" uint32_t Gdx_NativeBatchDiscard(uint32_t* hash) {
+    if (!sNb.open) {
+        return 0;
+    }
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    const size_t end = r.mVboOffsetFloats;
+    const size_t floats = end > sNb.startFloats ? end - sNb.startFloats : 0;
+    const uint32_t tris = (uint32_t)(floats / (3 * kOutStrideFloats));
+    if (hash != nullptr && floats != 0) {
+        *hash = Gdx_NativeBatchHashBytes(r.mVboPool + sNb.startFloats, floats * sizeof(float), *hash);
+    }
+    r.mVboOffsetFloats = sNb.startFloats;
+    return tris;
+}
+
+extern "C" void Gdx_NativeBatchEnd(void) {
+    if (sNb.open) {
+        Gdx_NativeBatchFlush();
+        sNb.open = false;
+    }
+}
+
+extern "C" void Gdx_NativeBatchStockHashArm(int on) {
+    sNbStockArm = on != 0;
+}
+
+extern "C" uint32_t Gdx_NativeBatchStockHash(uint32_t* trisOut, int reset) {
+    const uint32_t h = sNbStockHash;
+    if (trisOut != nullptr) {
+        *trisOut = sNbStockTris;
+    }
+    if (reset) {
+        sNbStockHash = GDX_NATIVEBATCH_HASH_SEED;
+        sNbStockTris = 0;
+    }
+    return h;
+}
+
+/* [native] track: link anchor — the marker replay object must be pulled from this archive
+ * before the LUS carve archive resolves its weak reference to it (static-archive order). */
+extern "C" void gdx3ds_track_marker(Fast::Interpreter* interp, uint32_t w0, uintptr_t w1);
+extern "C" void* gdx3ds_track_replay_anchor(void) {
+    return reinterpret_cast<void*>(&gdx3ds_track_marker);
+}
+
+extern "C" int Gdx_NativeBatchConstInputs(uint32_t* rgbMask, uint32_t* alphaMask) {
+    GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    const ShaderProgramC3D* prg = r.mCurrentShader;
+    uint32_t rgb = 0, alpha = 0;
+    if (prg == nullptr) {
+        return 0;
+    }
+    for (int s = 0; s < prg->numStages; s++) {
+        const TexEnvStageC3D& st = prg->stages[s];
+        if (st.constRgbInput > 0) {
+            rgb |= 1u << (st.constRgbInput - 1);
+        }
+        if (st.constAlphaInput > 0) {
+            alpha |= 1u << (st.constAlphaInput - 1);
+        }
+    }
+    if (rgbMask != nullptr) {
+        *rgbMask = rgb;
+    }
+    if (alphaMask != nullptr) {
+        *alphaMask = alpha;
+    }
+    return 1;
+}
+
+/* [native] fx: link anchor, same reason as the track one. */
+extern "C" void gdx3ds_fx_marker(Fast::Interpreter* interp, uint32_t w0, uintptr_t w1);
+extern "C" void* gdx3ds_fx_replay_anchor(void) {
+    return reinterpret_cast<void*>(&gdx3ds_fx_marker);
+}
+
+extern "C" uint32_t Gdx_NativeBatchDrainDraws(void) {
+    const uint32_t d = sNbDraws;
+    sNbDraws = 0;
+    return d;
+}
+
+} // namespace Fast
+/* [native] machines backend entry (gdx3ds_mesh.h). */
+extern "C" float* gdx3ds_mesh_backend_begin(Gdx3dsVboPackParams* params, uint32_t minVerts, uint32_t maxIndices,
+                                            uint32_t* capVerts) {
+    return GdxCitro3dRendererSingleton().NativeMeshBegin(params, minVerts, maxIndices, capVerts);
+}
+extern "C" void gdx3ds_mesh_backend_draw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx,
+                                         const Gdx3dsVboPackAux* aux) {
+    GdxCitro3dRendererSingleton().NativeMeshDraw(nVerts, idx, nIdx, aux);
+}
+extern "C" unsigned long gdx3ds_mesh_backend_linear_free_kib(void) {
+    return (unsigned long)(linearSpaceFree() / 1024u);
+}
+extern "C" void gdx3ds_mesh_backend_set_capture(Gdx3dsMeshCaptureFn fn, void* user, int skipSubmit) {
+    Fast::sMeshCaptureFn = fn;
+    Fast::sMeshCaptureUser = user;
+    Fast::sMeshCaptureSkip = skipSubmit != 0;
 }

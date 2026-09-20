@@ -488,6 +488,19 @@ u32 gdx_io_read(u32 addr) {
     return 0;
 }
 
+/* [native] machines: the game rebuilt one or more D_800CDDB0 machine model lists
+ * (racer.c func_8008D3C4/func_8008D5F4/func_8008D97C via
+ * port/3ds/patches/decomp-native-machines-rebuilt.patch). The 3DS mesh registry bumps
+ * its bake generation; every other platform: no-op. */
+void gdx_native_machine_lists_rebuilt(void) {
+#if defined(GDX_PLATFORM_3DS)
+    extern void gdx3ds_mesh_lists_rebuilt(void) __attribute__((weak));
+    if (&gdx3ds_mesh_lists_rebuilt != NULL) {
+        gdx3ds_mesh_lists_rebuilt();
+    }
+#endif
+}
+
 void gdx_io_write(u32 addr, u32 data) {
     (void)addr;
     (void)data;

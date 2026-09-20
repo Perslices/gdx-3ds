@@ -1,0 +1,29 @@
+{
+  "id": "title",
+  "title": "Boot to the title screen (zero input)",
+  "script": "title.script",
+  "shots": [
+    "title_0300",
+    "title_0450",
+    "title_0600",
+    "title_0750",
+    "title_0900"
+  ],
+  "timeout_seconds": 300,
+  "env": {},
+  "cfg": {},
+  "cvars": {},
+  "emit_3ds": {
+    "waitmode_ticks": 600
+  },
+  "notes": [
+    "Five shots across the title window, not one: gGameMode never leaves GAMEMODE_TITLE between",
+    "the boot logo and the attract-mode demo race, so there is no WAITMODE gate to use, and the",
+    "poll index at which the art appears moves run to run (the boot timeline is wall-clock-coupled;",
+    "the 59.94 Hz frame pacer does not fix it). Pick the frame that is on the title and say so.",
+    "The 4:3/16:9 caveat: gEnhancements.Graphics.Widescreen defaults to 1 and is NEVER registered",
+    "on the 3DS (port/3ds/game/CMakeLists.txt excludes gdx_menu*.cpp, and the CVar stub returns the",
+    "caller's default), so the console renders hor+ -- confirmed by the [wide] receipt lines in a",
+    "console run's log. refrun.py's floor sets it to 0; the manifest records which was used."
+  ]
+}

@@ -6,14 +6,14 @@
 # lists, one scene per START press, verifying STATUS.md's TODO(citra-verify)
 # items. Per-scene ground truth: EXPECTED.md. Run instructions: README.md.
 #
-# Prereq (same as ../gfx): the LUS newlib patch must be applied to the
-# libultraship/ submodule working tree.
+# Like ../gfx, this compiles against the vendored LUS carve in port/3ds/vendor/lus/
+# — no libultraship/ submodule, no patch step.
 
 if(NOT NINTENDO_3DS)
     return()
 endif()
 
-set(GDX3DS_LUS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../libultraship")
+set(GDX3DS_LUS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/lus")
 set(GDX3DS_DECOMP_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../../decomp/include")
 
 # CVar name macros — same directory-scoped cvars.cmake trick as ../gfx.
@@ -26,14 +26,13 @@ add_executable(gdx3ds-dl-tests
 )
 
 # Include order matters (spike-proven, mirrors ../gfx): lus_stubs shadow desktop
-# header leaks and must precede libultraship. decomp/include serves PR/gbi.h to
+# header leaks and must precede the vendored LUS headers. decomp/include serves PR/gbi.h to
 # scenes.cpp only (which includes no LUS headers — colliding G_* macros).
 target_include_directories(gdx3ds-dl-tests PRIVATE
     ../include
     ../lus_stubs
     ../gfx/third_party
     "${GDX3DS_LUS_ROOT}/include"
-    "${GDX3DS_LUS_ROOT}/src"
     "${GDX3DS_DECOMP_INCLUDE}"
 )
 target_compile_definitions(gdx3ds-dl-tests PRIVATE F3DEX_GBI_2) # never ENABLE_OPENGL, never PORT

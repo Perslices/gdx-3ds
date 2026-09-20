@@ -1,0 +1,5 @@
+# boot: reach the title screen, one SHOT.
+# Lines must stay under 62 bytes (see README).
+ticks
+600 SHOT title
+900 A 30

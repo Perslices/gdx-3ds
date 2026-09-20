@@ -1,0 +1,18 @@
+# storm2: A-mash into a 30-machine GP, then hold A.
+# Course card ~tick 3300, driving ~4600 (RESUME.md:155).
+# Every SHOT sits between two button lines on purpose.
+ticks
+20 A 2980
+3000 A 2980
+3400 SHOT card
+6000 A 2980
+6200 SHOT drive1
+9000 A 2980
+9200 SHOT drive2
+12000 A 2980
+12200 SHOT drive3
+15000 A 2980
+15200 SHOT drive4
+18000 A 2980
+18200 SHOT drive5
+21000 A 2980

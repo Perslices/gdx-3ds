@@ -1,0 +1,39 @@
+diff --git a/src/game/course.c b/src/game/course.c
+--- a/src/game/course.c
++++ b/src/game/course.c
+@@ -7,6 +7,15 @@
+ #include "fzx_segmentA.h"
+ #include ASSET_HEADER(course_track_gfx.h)
+ 
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++/* [native] track (port/3ds/gfx/gdx3ds_track_shim.h): redirects the tessellator's OUTPUT
++   (gSPVertex / template gSPDisplayList / gSPModifyVertex, plus a marker before each material
++   state command) to a recorder the interpreter replays natively. Runtime-gated on
++   [native] track; inactive, every redefined macro emits the original GBI via helpers compiled
++   with this same gbi.h. The C bodies below are unchanged. */
++#include "gdx3ds_track_shim.h"
++#endif
++
+ #define VERTEX_MODIFIED_ST(s, t) ((((s) << 15) & 0xFFFF0000) | ((t) &0xFFFF))
+ 
+ #ifndef EXPANSION_KIT
+@@ -4977,6 +4986,9 @@
+         segmentChunkGroupEnd = segmentChunkGroup;
+     }
+ 
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++    GDXTRK_BEGIN(cameraIndex);
++#endif
+     gSPDisplayList(sCourseDisp++, D_8014008);
+     gSPDisplayList(sCourseDisp++, D_8014078);
+     gSPFogPosition(sCourseDisp++, sCourseFogStartDistance, 1000);
+@@ -5059,6 +5071,9 @@
+     } else {
+         gSPTexture(sCourseDisp++, 0, 0, 0, 5, G_OFF);
+     }
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++    GDXTRK_END();
++#endif
+     return sCourseDisp;
+ }
+ 

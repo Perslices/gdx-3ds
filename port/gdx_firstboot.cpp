@@ -58,6 +58,20 @@ constexpr const char* kDiskArchiveName = "fzerox-disk.o2r";
 // name as satisfying the game-archive input.
 constexpr const char* kGameArchiveDevName = "generic.o2r";
 
+// ── Expansion Kit inputs are only inputs when EK is compiled in ──────────────────────────────────
+// port/CMakeLists.txt defines EXPANSION_KIT=1 on this target only under GDX_EXPANSION_KIT, which is
+// ON by default and ON in every release — so for the shipped binary this is `true` and nothing below
+// changes. GDX_EXPANSION_KIT=OFF is the cartridge-only source set the 3DS port builds
+// (port/3ds/game/CMakeLists.txt) and the reference renderer builds so it compiles the same game
+// (tools/refbuild). That build cannot read a 64DD disk at all — disk_buffer.cpp is not compiled —
+// so demanding a disk image and an IPL ROM before it will boot makes it permanently unbootable
+// behind a setup wizard that can never be satisfied.
+#ifdef EXPANSION_KIT
+constexpr bool kExpansionKitInputsRequired = true;
+#else
+constexpr bool kExpansionKitInputsRequired = false;
+#endif
+
 // ── Known-good SHA-1 identity tables (region/dump recognition) ──────────────────────────────────────
 // Named tables so the future JP build can reuse the same sets (it would accept kRomSha1JpRev0 as
 // VerifiedKnown and reject the US hash with the mirror message). All lowercase hex. The US-rev0 ROM's
@@ -715,7 +729,9 @@ FirstBootResult FirstBootRun(const char* argv0) {
                 }
             }
 
-            if (!diskCand.empty() && !iplCand.empty()) {
+            const bool ekInputsOk = !kExpansionKitInputsRequired ||
+                                    (!diskCand.empty() && !iplCand.empty());
+            if (ekInputsOk) {
                 result.status = FirstBootStatus::DevLayout;
                 result.romPath = fs::absolute(romCand, ec).string();
                 result.diskPath = fs::absolute(diskCand, ec).string();
@@ -796,10 +812,12 @@ FirstBootResult FirstBootRun(const char* argv0) {
         bool romSatisfied = gameArchiveValid || (fileExists(romInData) && validateRom(romInData, why));
         // IPL: verified n64ddipl.o2r (gdx_ddipl_load is archive-first, re-hashed against the recorded
         // ipl_archive_sha256, corrupt one quarantined) OR the original IPL ROM.
-        bool iplSatisfied = iplArchiveSatisfies(dataDir) || fileExists(iplCheck);
+        bool iplSatisfied = !kExpansionKitInputsRequired ||
+                            iplArchiveSatisfies(dataDir) || fileExists(iplCheck);
         // Disk: original .ndd OR managed media/ copy OR fzerox-disk.o2r validated against the sidecar
         // disk_archive_sha256 where available (falls back to presence when the sidecar has no hash).
-        bool diskSatisfied = fileExists(diskInData) || managedDiskValid || diskArchiveSatisfies(dataDir);
+        bool diskSatisfied = !kExpansionKitInputsRequired ||
+                             fileExists(diskInData) || managedDiskValid || diskArchiveSatisfies(dataDir);
 
         // Japanese-ROM raw-boot install (experimental): setup completed with the JP dump, for which no
         // fzerox.o2r can exist. It requires the recorded JP ROM itself, re-hashed every boot so a

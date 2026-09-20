@@ -1,0 +1,12 @@
+# menu: A-mash through the title into the menus.
+# SHOTs are interleaved among the button lines.
+ticks
+20 A 2980
+600 SHOT title
+3000 A 2980
+3200 SHOT menu1
+6000 A 2980
+6200 SHOT menu2
+9000 A 2980
+9200 SHOT menu3
+12000 A 2980
