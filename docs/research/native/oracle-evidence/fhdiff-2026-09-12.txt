@@ -1,0 +1,51 @@
+## A vs B
+first divergence at frame=1702
+    frame=1700 A=63b459bc B=63b459bc tag=auto/auto mode=10/10 tick=1699/1699 SAME
+    frame=1701 A=680d3a1b B=680d3a1b tag=auto/auto mode=10/10 tick=1700/1700 SAME
+  > frame=1702 A=38435f61 B=e06e08d5 tag=auto/auto mode=10/10 tick=1701/1701 DIFF
+    frame=1703 A=d85a170c B=d85a170c tag=auto/auto mode=10/10 tick=1702/1702 SAME
+    frame=1704 A=686c5bf7 B=686c5bf7 tag=auto/auto mode=10/10 tick=1703/1703 SAME
+fhdiff: compared=6002 divergent=1 known_transient=0 only_in_a=0 only_in_b=0 first_divergent=1702 last_common=6002
+
+## rec vs A
+first divergence at frame=1702
+    frame=1700 A=63b459bc B=63b459bc tag=auto/auto mode=10/10 tick=1699/1699 SAME
+    frame=1701 A=680d3a1b B=680d3a1b tag=auto/auto mode=10/10 tick=1700/1700 SAME
+  > frame=1702 A=e06e08d5 B=38435f61 tag=auto/auto mode=10/10 tick=1701/1701 DIFF
+    frame=1703 A=d85a170c B=d85a170c tag=auto/auto mode=10/10 tick=1702/1702 SAME
+    frame=1704 A=686c5bf7 B=686c5bf7 tag=auto/auto mode=10/10 tick=1703/1703 SAME
+fhdiff: compared=6001 divergent=1 known_transient=0 only_in_a=0 only_in_b=1 first_divergent=1702 last_common=6001
+
+## rec vs B
+fhdiff: compared=6001 divergent=0 known_transient=0 only_in_a=0 only_in_b=1 first_divergent=none last_common=6001
+
+## C vs E
+fhdiff: compared=1801 divergent=0 known_transient=0 only_in_a=0 only_in_b=0 first_divergent=none last_common=1801
+
+## C vs F
+first divergence at frame=1702
+    frame=1700 A=63b459bc B=63b459bc tag=f1700/f1700 mode=10/10 tick=1699/1699 SAME
+    frame=1701 A=680d3a1b B=680d3a1b tag=f1701/f1701 mode=10/10 tick=1700/1700 SAME
+  > frame=1702 A=38435f61 B=e06e08d5 tag=f1702/f1702 mode=10/10 tick=1701/1701 DIFF
+    frame=1703 A=d85a170c B=d85a170c tag=f1703/f1703 mode=10/10 tick=1702/1702 SAME
+    frame=1704 A=686c5bf7 B=686c5bf7 tag=f1704/f1704 mode=10/10 tick=1703/1703 SAME
+fhdiff: compared=1801 divergent=1 known_transient=0 only_in_a=0 only_in_b=0 first_divergent=1702 last_common=1801
+
+## C vs D
+first divergence at frame=213
+    frame=211 A=7d4bcfa1 B=7d4bcfa1 tag=auto/auto mode=0/0 tick=210/210 SAME
+    frame=212 A=7d4bcfa1 B=7d4bcfa1 tag=auto/auto mode=0/0 tick=211/211 SAME
+  > frame=213 A=7d4bcfa1 B=1213a5d5 tag=auto/auto mode=0/0 tick=212/212 DIFF
+    frame=214 A=7d4bcfa1 B=b8023cf5 tag=auto/auto mode=0/0 tick=213/213 DIFF
+    frame=215 A=7d4bcfa1 B=8ca9c1b4 tag=auto/auto mode=0/0 tick=214/214 DIFF
+fhdiff: compared=1801 divergent=1589 known_transient=0 only_in_a=0 only_in_b=0 first_divergent=213 last_common=1801
+
+framediff: DIFF /tmp/oracle-art/C/autotest/f1702_L.bmp vs /tmp/oracle-art/F/autotest/f1702_L.bmp size=400x240 diff_bytes=158 diff_pixels=56 masked_diff_pixels=0 unmasked_fail=56 max_unmasked_delta=82 bbox=251,185-263,197
+
+## G vs H (both with [debug] trectbatch=0 trifast=0 tmemfast=0)
+fhdiff: compared=1801 divergent=0 known_transient=0 only_in_a=0 only_in_b=0 first_divergent=none last_common=1801
+framediff: IDENTICAL /tmp/oracle-art/G/autotest/f1702_L.bmp vs /tmp/oracle-art/H/autotest/f1702_L.bmp size=400x240 diff_bytes=0 diff_pixels=0 masked_diff_pixels=0 unmasked_fail=0 max_unmasked_delta=0 bbox=none
+## C (fast paths on) vs G (off)
+fhdiff: compared=1801 divergent=1037 known_transient=0 only_in_a=0 only_in_b=0 first_divergent=475 last_common=1801
+framediff: DIFF /tmp/oracle-art/C/autotest/f1702_L.bmp vs /tmp/oracle-art/G/autotest/f1702_L.bmp size=400x240 diff_bytes=261 diff_pixels=99 masked_diff_pixels=0 unmasked_fail=99 max_unmasked_delta=82 bbox=154,185-263,208
+framediff: DIFF /tmp/oracle-art/C/autotest/f1703_L.bmp vs /tmp/oracle-art/G/autotest/f1703_L.bmp size=400x240 diff_bytes=2191 diff_pixels=782 masked_diff_pixels=0 unmasked_fail=782 max_unmasked_delta=148 bbox=142,185-263,208
