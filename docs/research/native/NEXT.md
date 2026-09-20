@@ -25,7 +25,7 @@ stack) with 0 errors. Open on hardware: the HOME hang after run E, the "distant 
 | B3 | Tunnel + 4P + second course replays | cpuclip A/B, split-screen fold, course coverage beyond Mute City | replays committed; parity all paths |
 | B4 | Owned interp `dsp` remainder | emu crowd: dsp 20 ms of 30 total after br->0 | per-opcode census on owned path; batch-split classes; target -5 ms emu |
 | B5 | Explosions class split (fold=p459 split=e459) | last per-sprite draw class; vertex colour carries one colour | pack env into a second vertex colour or per-class constant; parity |
-| B6 | interp M5 prep: delete list | inventory what the bridge still owns (segments, DMA fences, transition capture, VI fallback) | a delete plan with every survivor relocated; no code yet |
+| B6 | interp M5 prep: delete list | inventory what the bridge still owns (segments, DMA fences, transition capture, VI fallback) | **DONE** — `m5-delete-plan.md` (53 survivors relocated, 6 steps, 3DS-only split) |
 | B7 | Owned-interpreter `interp_verify` with Tier-2 levers | untested combination | 0 mismatches over the replay |
 | B8 | Release engineering | public repo `native` branch, CI workflow from release repo applied, STATUS.md as README section | fresh-clone `tools/ci-3ds.sh` PASS in the devkitpro container |
 
