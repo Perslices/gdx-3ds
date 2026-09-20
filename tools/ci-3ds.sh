@@ -146,14 +146,26 @@ record "preflight" PASS "devkitPro + host compiler + decomp + vendored LUS carve
 # bytes the carve is supposed to contain. It went stale twice (interpreter.h drifted, and
 # PROVENANCE.md was never listed) because nothing checked it, so check it here. Editing a
 # vendored file is fine and expected — regenerate with `tools/vendor-lus.sh --manifest` in
-# the same commit. Needs no submodule and no network: it is a plain shasum -c.
+# the same commit. Needs no submodule and no network: it is a plain checksum -c.
+#
+# macOS ships `shasum` (perl); a stripped Linux CI container may ship only GNU
+# `sha256sum` and no perl at all. Both read the same `<hash>  <path>` lines and both
+# print `<path>: OK`, so either verifies the manifest — pick whichever is on PATH
+# rather than making perl a build dependency.
 banner "vendored LUS manifest"
+if command -v shasum >/dev/null 2>&1; then
+    sha256_check() { shasum -a 256 -c "$1"; }
+elif command -v sha256sum >/dev/null 2>&1; then
+    sha256_check() { sha256sum -c "$1"; }
+else
+    sha256_check() { echo "neither shasum nor sha256sum is on PATH" >&2; return 1; }
+fi
 VENDOR_LUS="${ROOT}/port/3ds/vendor/lus"
 MANIFEST_LOG="${HOST_TEST_DIR:-${ROOT}/build-3ds/host-tests}/vendor-manifest.log"
 mkdir -p "$(dirname "${MANIFEST_LOG}")"
 VENDOR_UNLISTED="$( (cd "${VENDOR_LUS}" && find . -type f ! -path './patches/*' ! -name MANIFEST.sha256 \
     | sed 's|^\./||' | LC_ALL=C sort) | comm -23 - <(awk '{print $2}' "${VENDOR_LUS}/MANIFEST.sha256" | LC_ALL=C sort) )"
-if (cd "${VENDOR_LUS}" && shasum -a 256 -c MANIFEST.sha256) > "${MANIFEST_LOG}" 2>&1 && [ -z "${VENDOR_UNLISTED}" ]; then
+if (cd "${VENDOR_LUS}" && sha256_check MANIFEST.sha256) > "${MANIFEST_LOG}" 2>&1 && [ -z "${VENDOR_UNLISTED}" ]; then
     echo "PASS: MANIFEST.sha256 matches the vendored tree ($(grep -c ': OK$' "${MANIFEST_LOG}") files)"
     record "vendor manifest" PASS "$(grep -c ': OK$' "${MANIFEST_LOG}") files match"
 else
