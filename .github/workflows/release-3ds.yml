@@ -1,13 +1,29 @@
-name: Release (3DS)
+name: Release (3DS, native renderer)
 
 # Builds everything a player needs without a compiler:
 #   * gdx-extract, the PC-side asset extractor tools/prebake drives, for Windows, macOS and Linux;
 #   * the console artifacts (.3dsx, .cia, .elf) from a clean checkout via tools/ci-3ds.sh.
-# On a tag push (v*) or a manual run with a tag, the files are attached to that GitHub Release.
+# On a tag push (native-v*) or a manual run with a tag, the files are attached to that GitHub Release.
+#
+# This is the `native` branch's workflow. What differs from the `main` one:
+#   * tags are `native-v*`, so a native beta never collides with a stable `v*` release;
+#   * submodules are initialised BY NAME. The 3DS lane needs `decomp` and
+#     `fzerox-expansion-kit` only — the slice of libultraship the console compiles is
+#     vendored in-tree at port/3ds/vendor/lus/ (see its PROVENANCE.md), so the
+#     `libultraship` submodule is desktop-only and is never fetched here. `torch` is the
+#     extractor's source and is fetched only by the extractor job. The one-liner for a
+#     human clone that wants both lanes is:
+#         git submodule update --init decomp fzerox-expansion-kit torch
+#   * Ninja + ccache are installed in the container, so tools/ci-3ds.sh picks them up and
+#     the incremental rebuild it times is meaningful; the ccache directory is cached
+#     between runs;
+#   * tools/ci-3ds.sh is the single gate: it checks the vendored-LUS MANIFEST.sha256,
+#     applies the 15-patch decomp stack idempotently (failing loudly on an unknown patch
+#     file), builds and runs the 7 host test binaries, then builds the .3dsx.
 
 on:
   push:
-    tags: ['v*']
+    tags: ['native-v*']
   workflow_dispatch:
     inputs:
       tag:
@@ -65,19 +81,45 @@ jobs:
           if-no-files-found: error
 
   console:
-    name: 3DS build
+    name: 3DS build (native renderer)
     runs-on: ubuntu-22.04
     container: devkitpro/devkitarm:latest
+    env:
+      DEVKITPRO: /opt/devkitpro
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 500M
     steps:
       - name: Host packages
         run: |
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git cmake build-essential python3 python3-yaml python3-pil curl ca-certificates >/dev/null
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git cmake build-essential ninja-build ccache \
+            python3 python3-yaml python3-pil curl ca-certificates >/dev/null
           git config --global --add safe.directory '*'
           cmake --version | head -1
+          ninja --version
+          ccache --version | head -1
+
+      # No `submodules:` here on purpose — the 3DS lane initialises by name below.
       - uses: actions/checkout@v4
+
+      - name: Submodules (3DS lane only — libultraship is vendored in-tree)
+        run: |
+          set -e
+          git submodule update --init --depth 1 decomp fzerox-expansion-kit
+          test -f decomp/Makefile
+          test -f port/3ds/vendor/lus/cmake/cvars.cmake
+          echo "libultraship submodule intentionally NOT initialised:"
+          git submodule status | sed 's/^/  /'
+
+      - name: ccache
+        uses: actions/cache@v4
         with:
-          submodules: recursive
+          path: /ccache
+          key: ccache-3ds-native-${{ github.sha }}
+          restore-keys: |
+            ccache-3ds-native-
+
       - name: makerom + bannertool (built from source; the prebuilt Linux binaries need a newer glibc than this image)
         run: |
           set -e
@@ -91,21 +133,42 @@ jobs:
           cp "$(find /tmp/bt/build -type f -name bannertool | head -1)" tools/3ds-bin/
           chmod +x tools/3ds-bin/makerom tools/3ds-bin/bannertool && ls -la tools/3ds-bin
           tools/3ds-bin/makerom -help >/dev/null 2>&1 || true; tools/3ds-bin/bannertool >/dev/null 2>&1 || true
-      - name: Patches, host tests, 3DS build
-        run: |
-          export DEVKITPRO=/opt/devkitpro
-          tools/ci-3ds.sh --jobs 4
-      - name: .cia
-        run: |
-          export DEVKITPRO=/opt/devkitpro
-          export PATH="$PWD/tools/3ds-bin:$PATH"
-          cmake -S . -B build-3ds -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/3DS.cmake -DGDX_PLATFORM_3DS=ON -DCMAKE_BUILD_TYPE=Release >/dev/null
-          cmake --build build-3ds --target G-Diffuser-3DS-cia --parallel 4
+
+      # One gate, in this order: vendored-LUS MANIFEST.sha256 -> the 15 decomp patches
+      # (idempotent; an unlisted patch file is a hard FAIL) -> 7 host test binaries
+      # (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests,
+      #  gdx_interp_host_tests, gdx_gfx_atlas_uv_tests, gdx3ds_fs_host_smoke,
+      #  gdx_machines_harness) -> configure + full + incremental 3DS build.
+      # It configures build-3ds with Ninja because ninja is on PATH; the .cia step below
+      # reuses that build tree rather than reconfiguring it (CMake cannot switch generator
+      # in place, and the cia target is already present: find_program picks makerom and
+      # bannertool out of tools/3ds-bin/, which the step above filled).
+      - name: Vendored-LUS manifest, decomp patches, host tests, 3DS build
+        run: tools/ci-3ds.sh --jobs 4
+
+      - name: .cia (same build tree, no reconfigure)
+        run: cmake --build build-3ds --target G-Diffuser-3DS-cia --parallel 4
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats | head -20
+
       - name: Collect
         run: |
           mkdir -p out
           cp build-3ds/port/3ds/G-Diffuser-3DS.3dsx build-3ds/port/3ds/G-Diffuser-3DS.cia build-3ds/port/3ds/G-Diffuser-3DS.elf out/
           cd out && sha256sum G-Diffuser-3DS.3dsx G-Diffuser-3DS.cia G-Diffuser-3DS.elf > SHA256SUMS && cat SHA256SUMS
+
+      - name: CI logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-3ds-logs
+          path: |
+            build-3ds/ci-*.log
+            build-3ds/host-tests/*.log
+          if-no-files-found: ignore
+
       - uses: actions/upload-artifact@v4
         with:
           name: G-Diffuser-3DS
@@ -115,7 +178,7 @@ jobs:
   publish:
     name: Attach to release
     needs: [extractor, console]
-    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+    if: startsWith(github.ref, 'refs/tags/native-v') || github.event.inputs.tag != ''
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4

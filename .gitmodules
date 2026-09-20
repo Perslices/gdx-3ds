@@ -1,3 +1,16 @@
+# Which submodules you actually need depends on the lane.
+#
+#   3DS (this branch's build):  decomp fzerox-expansion-kit
+#   PC-side asset extractor:    torch
+#   Desktop G-Diffuser build:   all four, libultraship included
+#
+# The 3DS lane does NOT need libultraship: the 36 sources + 83 headers the console
+# compiles are vendored in-tree at port/3ds/vendor/lus/ with every 3DS patch already
+# folded in (port/3ds/vendor/lus/PROVENANCE.md). Initialise by name rather than with
+# --recursive so a 3DS checkout stays small:
+#
+#   git submodule update --init decomp fzerox-expansion-kit torch
+#
 [submodule "libultraship"]
 	path = libultraship
 	url = https://github.com/Zorkats/libultraship.git
