@@ -120,7 +120,44 @@ heap_watch = 8     ; MB above the 60 s heap baseline that triggers a [heap-watch
 heap_watch_step = 4 ; MB between further triggers
 heap_watch_arm = 0 ; 1 = first trigger also arms the live allocation histogram
                    ;     (for long stress sessions; costs a little per frame once armed)
+
+[native]           ; the native renderer levers (read once at boot; 0 = the exact prior path)
+all = 0            ; master for the TIER-2 levers only (machines, track, fx_sink, fx_sprites,
+                   ;     fx_hud): 1 = each of those that is 0/absent reads as 1 (a lever set to
+                   ;     2 keeps verify). Never touches interp.
+interp = 0         ; Tier 1 own interpreter (1 on); always explicit, `all` does not imply it.
+                   ;     Carries the Tier-2 hooks (track/fx markers, machine meshes), so
+                   ;     interp=1 all=1 is a valid combination
+machines = 0       ; retained machine meshes (1 on)
+track = 0          ; course tessellator marker replay (1 on, 2 verify: stock drawn + hashed)
+fx_sink = 0        ; effects sprite marker replay, one native draw per material run
+                   ;     (1 on, 2 verify); receipts [fx] with fxcensus=1
+fx_sprites = 0     ; with fx_sink: fold prim/env colour changes into the vertex colour where
+                   ;     the shader carries them per vertex (fewer draws; split= receipt)
+fx_hud = 0         ; the same prim/env fold applied inside the interpreter's own 2D batches
+                   ;     (HUD digits, stars, markers stop splitting on every prim colour).
+                   ;     Inert under interp=1: the owned walker has no fold yet (pixel-neutral)
+fxcensus = 0       ; 1 = [fx] per-class sprite/tri/draw census every 64th Racer_Draw
+trkcensus = 0      ; 1 = [trk] course census (see track)
+interp_verify = 0  ; 1 = run BOTH interpreters over every job and compare the packed batches
+                   ;     field by field ([nverify]). Slow; a correctness tool, not a play mode
+cpuclip = 1        ; the owned interpreter clips triangles on the CPU the way LUS does.
+                   ;     0 = let the PICA clip (fewer draws, different pixels — the tunnel A/B)
+blendflush = 1     ; the owned interpreter flushes its batch before a blend-alpha change, so
+                   ;     alpha compare uses the register in force at the primitive (LUS parity)
+machines_walk_only = 0 ; 1 = replay the baked mesh back through the interpreter's own
+                   ;     vertex/triangle path. A stepping stone, kept as a bisect
+machines_verify = 0    ; 1 = per draw, walk pass drawn+captured vs native pass captured with
+                   ;     GPU submit suppressed, triangle streams compared bit-exact
+machines_mask = ffffffff ; hex per-slot mask (bit i = machine slot i, 30 slots) — bisect
+machines_lod_mask = 1f   ; hex per-LOD mask (bit l = LOD l+1)
 ```
+
+The boot log states every lever once, as RESOLVED (the `all` master already applied):
+`[native] all= interp= machines= track= fx_sink= fx_sprites= fx_hud= fx=<bitmask> ...
+(resolved: all=tier2 only, interp explicit; ...)`, and the interpreter path once:
+`[native] interp= path=lus|owned ... hooks=`. The DBG tab shows the same state on its
+NATIVE rows.
 
 ## 6. Controls
 
@@ -201,22 +238,30 @@ Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MS
 1. **Toolchain.** Install devkitPro with the `3ds-dev` group (devkitARM, libctru, citro3d,
    3dstools), plus `cmake` 3.24+ and Python 3 with `pyyaml` and `pillow`. `dkp-pacman -S 3ds-dev`
    gets the console side. For the `.cia` you also need `makerom` and `bannertool`, on PATH or dropped into `tools/3ds-bin/` (`port/3ds/packaging/README.md` says where to get them); without them only the `.3dsx` target is generated.
-2. **Clone with submodules.** The decompilation, libultraship, Torch and the Expansion Kit
-   reference are submodules pinned to exact commits:
+2. **Clone with submodules.** The 3DS build needs exactly two: the decompilation and the
+   Expansion Kit reference. It does **not** need `libultraship` — the slice of it the 3DS
+   compiles is vendored in-tree at `port/3ds/vendor/lus/` with every 3DS patch already folded
+   in (`port/3ds/vendor/lus/PROVENANCE.md`). `libultraship` and `torch` are only for the
+   desktop build and the extractor, so a 3DS-only checkout can skip them:
    ```sh
-   git clone --recurse-submodules https://github.com/cruxxxxxx/gdx-3ds.git
+   git clone https://github.com/cruxxxxxx/gdx-3ds.git
    cd gdx-3ds
+   git submodule update --init decomp fzerox-expansion-kit
    ```
-3. **Apply the patch stack.** The submodules are never modified in place; the 3DS deltas live
-   in `port/3ds/patches/` and are applied to the working trees in the order listed in
-   `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that idempotently and then builds:
+   (`git clone --recurse-submodules` still works and just fetches more than the 3DS lane uses.)
+3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
+   deltas are the 15 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
+   tree in the order listed in `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that
+   idempotently and then builds:
    ```sh
    export DEVKITPRO=/opt/devkitpro
    tools/ci-3ds.sh            # patches + host tests + 3DS build; --emu adds an Azahar boot smoke
    ```
-   Manual equivalent: the `git -C <submodule> apply ...` lines from the patches README, then
+   It picks up Ninja and ccache automatically when they are on PATH (`--no-ninja` /
+   `--no-ccache` force the fallbacks) and prints a `[time] configure=… full=… incr=…` line.
+   Manual equivalent: the `git -C decomp apply ...` lines from the patches README, then
    ```sh
-   cmake -S . -B build-3ds -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/3DS.cmake \
+   cmake -S . -B build-3ds -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/3DS.cmake \
          -DGDX_PLATFORM_3DS=ON -DCMAKE_BUILD_TYPE=Release
    cmake --build build-3ds --target G-Diffuser-3DS_3dsx -j8     # Homebrew Launcher build
    cmake --build build-3ds --target G-Diffuser-3DS-cia -j8      # HOME menu build (needs makerom)
