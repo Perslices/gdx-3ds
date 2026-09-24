@@ -265,7 +265,7 @@ Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MS
    ```
    (`git clone --recurse-submodules` still works and just fetches more than the 3DS lane uses.)
 3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
-   deltas are the 15 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
+   deltas are the 18 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
    tree in the order listed in `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that
    idempotently and then builds:
    ```sh

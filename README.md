@@ -77,7 +77,7 @@ The full story of the port — every step from research to a native-60 stereosco
 | Path | What |
 |---|---|
 | `port/3ds/` | The 3DS port: citro3d renderer, stereo, ndsp audio, input, touch menu, lifecycle, render thread, profilers, packaging |
-| `port/3ds/patches/` | Pure-delta patch stack applied over the untouched `decomp/` submodule — 15 `decomp-*.patch`, apply order in its README |
+| `port/3ds/patches/` | Pure-delta patch stack applied over the untouched `decomp/` submodule — 18 `decomp-*.patch`, apply order in its README |
 | `port/3ds/vendor/lus/` | The slice of libultraship the console compiles, vendored in-tree with every 3DS patch folded in (`PROVENANCE.md`, `MANIFEST.sha256`). The `libultraship` submodule is desktop-only. |
 | `port/3ds/gfx/n64/` | The **native renderer**: the owned F3DEX2→citro3d interpreter and the Tier-2 native paths (course, machines, effects, HUD) |
 | `port/` | The G-Diffuser PC port this builds on (see `README-G-Diffuser.md`) |
