@@ -3,7 +3,7 @@
 One page. Do steps 1-6 once per power-on; after that the Mac drives the console on its own.
 
 Console side: `port/3ds/net/gdx3ds_net.c` (killswitch `[net] enabled`, **default off**).
-Mac side: `tools/dev/hw.py` (stdlib only). Design + rationale: `docs/research/native/02-hwlink-plan.md`.
+Mac side: `tools/dev/hw.py` (stdlib only). Design + rationale: see `docs/research/native/README.md`.
 
 ## 1. Console setup (once per power-on)
 
