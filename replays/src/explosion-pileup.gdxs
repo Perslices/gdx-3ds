@@ -1,0 +1,91 @@
+# explosion-pileup: GP on the JACK cup (Mute City) driven into the wall and into the pack, to
+# make the gExplosions1/gExplosions2 rings actually fill. The canonical race-mutecity-start
+# replay parks the player and retires, so its explosion population is 640 isolated sprites over
+# 1473 brackets (max 5 in one bracket, no two of them ever on the same animation frame).
+#
+# What spawns explosions (decomp): racer.c:4700 — one per SPINNING racer every fourth frame,
+# gated `!((gGameFrameCount + racer->id) & 3)`, so racers whose id shares a residue class mod 4
+# spawn on the SAME tick with the SAME timer, hence the same animation frame and the same
+# prim/env; and racer.c:4241 — one per retiring racer. Braking inside the 30-machine pack and
+# slamming both walls is the cheapest deterministic way to get several racers spinning at once.
+#
+# Authored with `tools/dev/mkgdxrec.py` from the replays track (not yet on native/main):
+#   python3 ../replays/tools/dev/mkgdxrec.py replays/src/explosion-pileup.gdxs \
+#           replays/explosion-pileup.gdxrec
+# SHOTs are the hash sampler: each one emits a full `[fh] frame=… hash=…` receipt with
+# fh_every=0, which the RetroArch lane needs (dense capture crashes the core — fx gotchas).
+# SHOT PLACEMENT IS NOT AUTHORED HERE ANY MORE (NEXT.md B15/B43, coverage2-progress.md).
+# This file is the INPUT script: ticks, buttons, sticks. The schedule that decides which frames
+# the parity gate hashes is DERIVED from a `[debug] cov=1` coverage census of the replay and
+# written into the .gdxrec by tools/dev/covsched.py. Regenerating a .gdxrec from this file
+# therefore produces a recording with NO SHOTs; re-apply the schedule with
+#   tools/dev/covsched.py derive <cov-run>/log-*.txt --rewrite in.gdxrec out.gdxrec
+# The hand-placed schedules this file used to carry covered 49-80% of what their replay draws.
+build native/explosions@e2691f9
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 rival_detail_auto=0 stereo=1 fh_every=0
+note menu walk mirrors race-gp2-sector.gdxs minus the cup-change press (JACK stays selected)
+
+at 400
+press START 15 0
+at 800
+press A 15 0
+at 1100
+press A 15 0
+at 1400
+press A 15 0
+at 1700
+press A 15 0
+at 2000
+press A 15 0
+at 2300
+press A 15 0
+at 2600
+press A 15 0
+at 2900
+press A 15 0
+at 3200
+press A 15 0
+at 3300
+
+hold A 60 0 0
+hold A 60 0 0
+hold A 60 0 0
+hold B 60 0 0
+hold B 60 0 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 80 0
+hold A 60 80 0
+hold A 60 80 0
+hold B 60 0 0
+hold B 60 0 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 80 0
+hold A 60 80 0
+hold A 60 80 0
+hold B 60 0 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 80 0
+hold A 60 80 0
+hold A 60 80 0
+hold A+B 60 0 0
+hold A+B 60 0 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 80 0
+hold A 60 80 0
+hold A 60 80 0
+hold B 60 0 0
+hold B 60 0 0
+hold A 60 -80 0
+hold A 60 -80 0
+hold A 60 -80 0
+len 5700

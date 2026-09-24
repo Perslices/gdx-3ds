@@ -7,13 +7,37 @@
  * render task's wall time per frame (one svcGetSystemTick pair around gdx_gfx_run — the
  * render thread's job in pipe mode, the inline path otherwise; no gputrace needed) and
  * moves the EFFECTIVE tier between the user's manual setting (the FLOOR) and MINIMAL (the
- * ceiling) with hysteresis:
- *   - raise one tier when the last GDX_DYNLOD_RAISE_FRAMES frames average above
- *     [perf] rival_auto_hi_x10 / 10 ms (default 15.0), at most once per
- *     GDX_DYNLOD_DWELL_FRAMES frames so a change can land before it is judged;
- *   - lower one tier when a whole [perf] rival_auto_lower_frames (default 30) frame block
- *     AVERAGES below [perf] rival_auto_lo_x10 / 10 ms (default 12.0) — a block average,
- *     not a consecutive run, so +-2 ms frame jitter cannot pin the tier at the ceiling.
+ * ceiling) with ASYMMETRIC hysteresis.
+ *
+ * The asymmetry is not taste. A tier change is an ACTION on the signal being measured:
+ * one tier of rival reduction takes 2.5-3.0 ms off the render task (Azahar A/B,
+ * docs/research/dynlod-progress.md run C vs B2; the hardware hand-set MINIMAL +8-9 fps in
+ * crowds agrees). The original shipped band was hi 15.0 / lo 12.0 — 3.0 ms wide, i.e. no
+ * wider than one tier of authority — so once the native renderer brought the task inside
+ * that band the controller could cross its own LOWER line simply by RAISING: raise, drop
+ * below lo, lower ~30 frames later, raise again. Each of those transitions re-tiers EVERY
+ * distant rival at once (2.5x, or 6x beyond 120, view-depth bias), which is visible as
+ * distant machines flickering between LODs. The host test measured 26-27 transitions per
+ * 1000 frames in that regime; see docs/research/native/dynlod-progress-native.md.
+ *
+ *   - RAISE (protect the frame rate — cheap, urgent): a majority
+ *     (GDX_DYNLOD_RAISE_OVER_MIN of GDX_DYNLOD_RAISE_FRAMES) of the last frames are
+ *     INDIVIDUALLY over [perf] rival_auto_hi_x10 / 10 ms (default 15.0) AND their average
+ *     is too. The majority test is what stops one course-load stall from re-tiering the
+ *     whole field. Needs [perf] rival_auto_dwell (default 15) frames since the last
+ *     change, so ~0.25 s.
+ *   - LOWER (give detail back — expensive, only ever undone by a raise): a whole
+ *     [perf] rival_auto_lower_frames (default 90) frame block AVERAGES below
+ *     [perf] rival_auto_lo_x10 / 10 ms (default 9.0), the block having started only after
+ *     the dwell — so the earliest a LOWER can follow any change is dwell + lowerFrames
+ *     = 105 frames, ~1.75 s.
+ *   - lo is CLAMPED to hi - GDX_DYNLOD_MIN_DEADBAND_X10 (6.0 ms) at init, not merely
+ *     defaulted below it: an ini must not be able to ask for a deadband narrower than the
+ *     controller's own authority. An existing gdiffuser.ini carrying the old
+ *     rival_auto_lo_x10=120 is honoured as 9.0, and the init receipt says "(clamped)".
+ *   - any change clears the raise window and the lower block: frames measured under a
+ *     different amount of rival detail describe the old tier, not the new one.
+ *
  * Killswitch [perf] rival_detail_auto=0 (default 1, read live via the menu latch): the
  * effective level is exactly the manual setting and the tick pair is skipped, so the old
  * path is byte-identical.

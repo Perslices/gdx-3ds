@@ -11,6 +11,9 @@
  *   fx_sprites = 0   ; fold prim/env into the vertex colour across sprites where the shader
  *                    ; carries that input per vertex (needs fx_sink)
  *   fx_hud     = 0   ; native 2D batcher (HUD, stars, markers)
+ *   ownfold    = 0   ; the SAME prim/env fold inside the OWNED interpreter's own batches
+ *                    ; (fx_hud is inert under interp=1). Tier-2: `all` turns it on.
+ *   ncensus    = 0   ; [ncensus] batch-split attribution on the owned path (raw, not Tier-2)
  *
  * Levers are read at first use, after the ini is loaded; every consumer latches its own copy
  * (a boot-time decision, like trectbatch/renderthread). Everything external is weak so this
@@ -28,6 +31,11 @@ int gdx3ds_native_ready(void);
 /* The lever's value with the `all` master applied to the Tier-2 keys (fallback when not
  * ready); every other key (interp, ...) is returned as written. */
 int gdx3ds_native_lever(const char* key, int fallback);
+
+/* 1 when interp_verify != 0 and interp != 0, i.e. when the batch-for-batch oracle is running
+ * and BOTH 2D folds -- fx_hud (LUS) and ownfold (owned) -- are forced off so it is comparing
+ * like with like (verifymatrix-progress.md, audit-2026-09-24 finding 5). */
+int gdx3ds_native_verify_forces_fold_off(void);
 /* 1 for the keys the `all` master covers. */
 int gdx3ds_native_is_tier2(const char* key);
 /* Raw [native] key (no master), for receipts and the DBG rows. */

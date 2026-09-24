@@ -158,6 +158,19 @@ static int ReadHeader(FILE* f, unsigned long* outFrames) {
                                       value, have ? "" : "none ", seed);
                     }
                 }
+                /* RTPARITY: `pins` is DESCRIPTIVE — a snapshot of the RECORDER's ini, written
+                 * into the header and never applied on replay. Read as a configuration it is a
+                 * trap: every committed replay says `renderthread=0` because the shared Azahar
+                 * SD happened to carry that key when the file was recorded, and three progress
+                 * docs plus an audit then reported the fork's parity gate as render-thread-off
+                 * while the RetroArch lane had in fact been running it ON. So say it out loud:
+                 * print the LIVE pins beside the file's whenever they differ, in the same shape
+                 * as the seed warning above. */
+                if (strcmp(key, "pins") == 0 && strcmp(value, sHdrPins) != 0) {
+                    gdx_port_logf("[rec] WARNING pins: file='%s' run='%s' (the header is "
+                                  "descriptive only — the RUN's values are what executed)\n",
+                                  value, sHdrPins);
+                }
                 continue;
             }
         }

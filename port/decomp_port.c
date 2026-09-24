@@ -99,7 +99,7 @@ extern GfxPool D_8024DCE0[2];
 void gdx_rdram_init(void) {
     gdx_rdram = (unsigned char*)gdx_host_calloc(1, GDX_RDRAM_SIZE);
     if (gdx_rdram == NULL) {
-        gdx_cki("[rdram] FATAL: failed to allocate RDRAM buffer, requested bytes", (int)GDX_RDRAM_SIZE);
+        gdx_dbg_logf("[rdram] FATAL: failed to allocate RDRAM buffer, requested bytes %d\n", (int)GDX_RDRAM_SIZE);
         gdx_host_exit(1);
     }
 
@@ -306,7 +306,7 @@ void gdx_gfxpool_racer_mtx_layout(size_t* outBody, size_t* outSecond, size_t* ou
 void* gdx_rdram_alloc_raw(size_t size, size_t align) {
     size_t base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
     if (base + size > gdx_rdram_persist_top) {
-        gdx_ck("[rdram] FATAL: arena exhausted");
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted\n");
         gdx_host_abort();
     }
     gdx_rdram_bump = base + size;
@@ -322,12 +322,12 @@ void* gdx_rdram_alloc_raw(size_t size, size_t align) {
 void* gdx_rdram_persist_alloc_raw(size_t size, size_t align) {
     size_t base;
     if (size > gdx_rdram_persist_top) {
-        gdx_ck("[rdram] FATAL: arena exhausted (persist)");
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted (persist)\n");
         gdx_host_abort();
     }
     base = (gdx_rdram_persist_top - size) & ~(align - 1u);
     if (base < gdx_rdram_bump) {
-        gdx_ck("[rdram] FATAL: arena exhausted (persist)");
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted (persist)\n");
         gdx_host_abort();
     }
     gdx_rdram_persist_top = base;
@@ -374,7 +374,7 @@ void* gdx_rdram_peek_raw(size_t size, size_t align) {
 
     base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
     if (base + size > gdx_rdram_persist_top) {
-        gdx_ck("[rdram] FATAL: arena exhausted (peek)");
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted (peek)\n");
         gdx_host_abort();
     }
     return gdx_rdram + base;
@@ -1381,7 +1381,7 @@ void Segment_LoadOverlays(void) {
         }
         D_80128C94 = D_80128C90;
         if (D_80128C90 == NULL) {
-            gdx_ck("[segment] FATAL: Course Edit graphics allocation failed");
+            gdx_dbg_logf("[segment] FATAL: Course Edit graphics allocation failed\n");
             gdx_host_abort();
         }
         for (i = 0; i < workBufferSize; i++) {

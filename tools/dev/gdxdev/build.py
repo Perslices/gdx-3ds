@@ -235,3 +235,75 @@ def build_info_for_manifest(root, build_dir, artifact):
         "build_s": None,
     }
     return info
+
+
+# ---------------------------------------------------------------- the tree --
+# PROTOCOL.md, "a parity cell is a claim about a tree" (NEXT.md B46). A number measured on
+# a long-lived branch is a statement about THAT tree, not about native/main: if the branch
+# point is behind, a bug fixed on main after the branch point is still present here, and
+# "pre-existing on main" is unfalsifiable from where the branch stands. This cost one
+# agent a full bisect of B42, a bug that had already been fixed on main.
+#
+# So the harness writes the branch point into every run manifest. An agent cannot quote a
+# parity number out of a manifest without the branch point sitting next to it.
+BASE_BRANCH = os.environ.get("GDX_BASE_BRANCH", "native/main")
+
+
+def tree_info(root, base=None):
+    """The manifest's `tree` block: which tree produced this run.
+
+    Keys: branch, head, base, base_head, branch_point (the merge-base against `base`),
+    behind (commits on `base` this tree does not have), ahead, dirty, current (branch
+    point == base head, i.e. nothing on main is missing from this tree).
+
+    `behind > 0` is the whole point of the block: it is exactly the condition under which
+    a "pre-existing on main" claim made from this tree cannot be checked.
+    """
+    base = base or BASE_BRANCH
+    branch = git(["rev-parse", "--abbrev-ref", "HEAD"], root, "unknown")
+    head = git(["rev-parse", "HEAD"], root, "")
+    base_head = git(["rev-parse", base], root, "")
+    point = git(["merge-base", "HEAD", base], root, "") if base_head else ""
+    def _count(spec):
+        n = git(["rev-list", "--count", spec], root, "")
+        return int(n) if n.isdigit() else None
+    behind = _count("HEAD..%s" % base) if base_head else None
+    ahead = _count("%s..HEAD" % base) if base_head else None
+    return {
+        "branch": branch,
+        "head": head or None,
+        "base": base,
+        "base_head": base_head or None,
+        "branch_point": point or None,
+        "behind": behind,
+        "ahead": ahead,
+        "dirty": is_dirty(root),
+        "current": bool(point) and point == base_head,
+    }
+
+
+def tree_receipt(tree):
+    """The one line a run prints and a report quotes."""
+    if not tree:
+        return "tree: unknown"
+    line = ("tree: %s@%s, branch point %s off %s@%s (+%s/-%s)"
+            % (tree.get("branch"), (tree.get("head") or "?")[:8],
+               (tree.get("branch_point") or "?")[:8], tree.get("base"),
+               (tree.get("base_head") or "?")[:8],
+               tree.get("ahead"), tree.get("behind")))
+    if tree.get("dirty"):
+        line += " DIRTY"
+    return line
+
+
+def tree_warning(tree):
+    """-> the warning a stale branch point earns, or None."""
+    if not tree or not tree.get("behind"):
+        return None
+    return ("this tree is %d commit(s) behind %s (branch point %s). Any number from this "
+            "run is a claim about THIS tree: a bug fixed on %s after the branch point is "
+            "still present here, so 'pre-existing on %s' cannot be checked from here. "
+            "Forward-merge and re-gate, or cite the branch point beside the number "
+            "(PROTOCOL.md: a parity cell is a claim about a tree)."
+            % (tree["behind"], tree.get("base"), (tree.get("branch_point") or "?")[:8],
+               tree.get("base"), tree.get("base")))

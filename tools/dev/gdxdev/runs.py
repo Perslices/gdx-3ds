@@ -28,6 +28,11 @@ _TEMPLATE = {
     "ended": None,
     "wall_s": None,
     "build": None,           # {id,dirty,artifact,sha256,generator,configure_s,build_s}
+    # WHICH TREE produced this run (NEXT.md B46, PROTOCOL.md "a parity cell is a claim
+    # about a tree"). {branch,head,base,base_head,branch_point,behind,ahead,dirty,current}.
+    # Required so that no parity number can be quoted out of a manifest without the
+    # branch point it was measured at sitting beside it.
+    "tree": None,
     "ini": None,             # merged [debug]/[native] keys this run set
     "replay": None,          # {id,sha256,kind,events}
     "gputrace": None,        # promoted out of `ini`: PROTOCOL.md requires every perf
@@ -54,6 +59,32 @@ def new_manifest(**kw):
     return m
 
 
+# TIMEOUT is a FAIL for exit-code purposes (only PASS exits 0) but a different FACT: the
+# run was cut short by `--seconds`, not by a crash. NEXT.md B45: the two were reported
+# identically, and "RESULT FAIL" on a truncated corpus replay reads like a crash.
+VERDICTS = ("PASS", "FAIL", "TIMEOUT", "UNKNOWN")
+
+# Every field of the `tree` block, so a half-filled one is refused as loudly as a missing
+# one. `behind`/`ahead` may be null only when the base branch is not resolvable at all.
+TREE_KEYS = ("branch", "head", "base", "base_head", "branch_point", "behind", "ahead",
+             "dirty", "current")
+
+
+def _tree_problems(tree):
+    """PROTOCOL.md: a parity cell is a claim about a tree, so every manifest names one."""
+    if tree is None:
+        return ["tree is missing: every run must record its branch point "
+                "(PROTOCOL.md, a parity cell is a claim about a tree)"]
+    if not isinstance(tree, dict):
+        return ["tree must be an object"]
+    missing = [k for k in TREE_KEYS if k not in tree]
+    out = ["tree.%s is missing" % k for k in missing]
+    if not tree.get("branch_point"):
+        out.append("tree.branch_point must be non-empty: without it a parity number "
+                   "cannot be attributed to a tree")
+    return out
+
+
 def validate(manifest):
     """Return a list of problems; empty means the manifest is schema-valid."""
     problems = []
@@ -67,9 +98,10 @@ def validate(manifest):
     for k in ("run_id", "track", "lane"):
         if k in manifest and not manifest[k]:
             problems.append("%s must be non-empty" % k)
+    problems += _tree_problems(manifest.get("tree"))
     res = manifest.get("result")
     if isinstance(res, dict):
-        if res.get("verdict") not in ("PASS", "FAIL", "UNKNOWN", None):
+        if res.get("verdict") not in VERDICTS + (None,):
             problems.append("result.verdict is %r" % res.get("verdict"))
     if manifest.get("gputrace") not in (True, False, None):
         problems.append("gputrace must be a bool (PROTOCOL.md: perf claims state it)")

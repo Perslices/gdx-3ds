@@ -52,17 +52,38 @@ typedef struct Gdx3dsVerifyTri {
     unsigned tmem0, base0;
     unsigned long baseAddr0;
     unsigned baseSize0, baseOrig0, used0, used1;
+    /* First 8 bytes of the unit-0 source and of its TMEM window, verbatim. A hash says the
+     * two sides differ; these say HOW -- a byte-swapped pair is a byte-order difference
+     * (the bridge's persistent copy is swapped for a native-RGBA16 source), anything else
+     * is different content. */
+    /* srcB[0..1] = the first 8 source bytes, srcB[2..3] = the last 8; same for tmemB. */
+    unsigned srcB0[4], tmemB0[4];
+    unsigned rtLine0;   /* the RENDER tile's line_size_bytes: the decode's TMEM row stride */
+    /* if this side's unit-0 source is a bridge persistent copy: its ORIGINAL source address and
+     * the copy bytes remaining from that point (0/0 when the pointer is not a copy). */
+    unsigned long copyOrigin0;
+    unsigned copyRemain0;
 } Gdx3dsVerifyTri;
 void gdx3ds_verify_note_tri(const Gdx3dsVerifyTri* t);
 /* Fills addr0/cls0/srcHash0/tmemHash0 from a loaded-record address and a TMEM window. */
-void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem64);
+void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem, unsigned tmemBytes);
 void gdx3ds_verify_src_detail(char* buf, unsigned bufSize);
-void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem64);
+void gdx3ds_verify_bytes_detail(char* buf, unsigned bufSize);
+void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem, unsigned tmemBytes);
 /* Command-stream differential: every VALUE-carrying command each interpreter dispatches
  * (TRI1/TRI2/QUAD, TEXTURE/POPMTX/GEOMETRYMODE, E2-EF minus RDPHALF, F0-FC), in order. */
 void gdx3ds_verify_note_cmd(unsigned w0, unsigned w1);
 void gdx3ds_verify_cmd_detail(char* buf, unsigned bufSize);
 int gdx3ds_verify_active(void);
+
+/* [nverify] the mode as a plain global (0 off, 1 record, 2 compare), so the two interpreters'
+ * hottest loops -- per GBI command and per triangle -- can test it INLINE instead of calling
+ * gdx3ds_verify_active() across a TU boundary with no LTO in the tree (audit 2026-09-23
+ * findings 5 and 31: that call, and the diagnostic work behind it, was being paid on every
+ * command and every triangle of every [prof] run on both paths, in different amounts).
+ * Written only by gdx3ds_verify_begin, on the render thread, between passes. Mirrors the
+ * gdx3ds_prof_active contract (gdx3ds_gpu_prof.h). */
+extern int gdx3ds_verify_mode;
 
 /* One line describing the first mismatching batch: both sides' vertex 0 (12 floats), tri
  * counts, shader ids. Empty string when nothing mismatched. */

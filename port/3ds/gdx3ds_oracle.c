@@ -10,6 +10,7 @@
 #include <citro3d.h>
 
 #include "gdx3ds_config.h"
+#include "gdx3ds_cov.h"
 #include "gdx3ds_filelog.h"
 
 #ifndef GDX3DS_BUILD_ID
@@ -32,6 +33,14 @@ static int sEyeMask = 1; /* bit0 = L, bit1 = R */
 static int sScale = 0;
 static int sEveryBmp = 0;
 static int sLegacyShot = 0;
+/* A10 LOAD-STALL: `[debug] shot_fastwrite` (default 1). A SHOT BMP is written row by row --
+ * 240-400 fwrite()s of ~1 KB -- and newlib's default stdio buffer is ~1 KB, so every row was
+ * its own FS transaction to the SD card. On hardware that cost ~2 SECONDS per image on the
+ * MAIN thread, and the canonical replay fires five SHOTs inside the 60 s measurement window:
+ * every fps beat that carried one collapsed into the teens, in every lever configuration.
+ * With a 64 KB stdio buffer the same bytes go out in ~5 writes. 0 restores the old behaviour
+ * so the cost can be A/B'd on device without a rebuild. */
+static int sFastWrite = 1;
 static char sPlatform[24] = "unknown";
 
 /* Cross-thread arm: requester writes sPendingTag then stores sPendingArmed=1 (release); the hook
@@ -43,7 +52,15 @@ static volatile int sQuit = 0;
 static unsigned long sQuitAtTick = 0; /* [debug] quit_at_tick: self-terminating scripted runs */
 
 /* Frame bookkeeping. sFrame counts after-endframe calls (== host frameNum: exactly one per host
- * iteration in every rt mode). The ring carries main's (frame, tick, mode) for that frame. */
+ * iteration in every rt mode). The ring carries main's (frame, tick, mode) for that frame.
+ *
+ * RTPARITY (audit-2026-09-23 finding 12): with the render thread on, MAIN writes this ring and
+ * CORE 2 reads it. `.frame` is the publication key, so it needs a release store against the
+ * `.tick`/`.mode` writes and an acquire load against the reads — on ARM11 MPCore a plain store
+ * to `.frame` can be observed before its payload, which stamps a capture with the PREVIOUS
+ * iteration's tick and mode. The oracle is the instrument: a mis-stamped receipt would make a
+ * correct frame look divergent (or hide a divergent one) in exactly the mode this track gates.
+ * `sPendingArmed` was already __atomic_*; the ring was missed. */
 static unsigned long sFrame = 0;
 static unsigned long sCaptures = 0;
 static struct {
@@ -94,10 +111,17 @@ static long WriteBmp(const char* path, const uint16_t* px, unsigned outW) {
     const uint32_t fileBytes = 54u + imageBytes;
     unsigned char header[54];
     unsigned char row[ORACLE_W * 3u + 3u];
+    /* A10: one 64 KB stdio buffer instead of newlib's ~1 KB default, so the 240 row writes
+     * below coalesce into ~5 FS transactions. Static (not stack: the render thread's stack is
+     * small) and file-lifetime, as setvbuf requires the buffer to outlive the stream. */
+    static unsigned char sWriteBuf[64u * 1024u];
     FILE* f = fopen(path, "wb");
     unsigned y;
     if (f == NULL) {
         return -1;
+    }
+    if (sFastWrite) {
+        setvbuf(f, (char*)sWriteBuf, _IOFBF, sizeof(sWriteBuf));
     }
     memset(header, 0, sizeof(header));
     header[0] = 'B';
@@ -157,12 +181,19 @@ static void CaptureEye(int eye, const char* tag, int writeBmp, unsigned long fra
     if (writeBmp) {
         char path[96];
         long bytes;
+        /* A10: the write is MAIN-THREAD blocking work inside the measured window, so its cost
+         * has to be on the record next to the bytes -- an fps beat that carries a SHOT is not
+         * a frame rate until this number is small. */
+        const u64 t0 = svcGetSystemTick();
+        int writeMs;
         snprintf(path, sizeof(path), "autotest/%s_%c.bmp", tag, eyeCh);
         bytes = WriteBmp(path, sPixels, sScale != 0 ? (unsigned)sScale : ORACLE_W);
+        writeMs = (int)((svcGetSystemTick() - t0) / CPU_TICKS_PER_MSEC);
         if (bytes < 0) {
-            snprintf(line, sizeof(line), "[autotest] SHOT capture write failed: %s", path);
+            snprintf(line, sizeof(line), "[autotest] SHOT capture write failed: %s ms=%d", path, writeMs);
         } else {
-            snprintf(line, sizeof(line), "[autotest] SHOT captured -> %s bytes=%ld frame=%lu", path, bytes, frame);
+            snprintf(line, sizeof(line), "[autotest] SHOT captured -> %s bytes=%ld frame=%lu ms=%d fast=%d",
+                     path, bytes, frame, writeMs, sFastWrite);
         }
         OracleLog(line);
     }
@@ -176,25 +207,36 @@ void gdx3ds_oracle_after_endframe(void) {
     int shot;
     char tag[ORACLE_TAG_CAP];
     sFrame++; /* one increment per host frame: the ring lookup below needs it in every mode */
-    if (sPendingArmed == 0 && sEvery == 0) {
+    if (sPendingArmed == 0 && sEvery == 0 && !gdx3ds_cov_on) {
         return; /* idle path: two loads, no sync, no config, no allocation */
     }
     shot = __atomic_exchange_n(&sPendingArmed, 0, __ATOMIC_ACQ_REL);
-    if (!shot && (sEvery == 0 || sFrame < (unsigned long)sStart || (sFrame % (unsigned long)sEvery) != 0)) {
-        return;
-    }
     frame = sFrame;
     {
         const unsigned slot = (unsigned)(frame % ORACLE_MARK_RING);
-        if (sMarks[slot].frame == frame) {
+        /* acquire: pairs with the release store of .frame in gdx3ds_oracle_frame_mark */
+        if (__atomic_load_n(&sMarks[slot].frame, __ATOMIC_ACQUIRE) == frame) {
             tick = sMarks[slot].tick;
             mode = sMarks[slot].mode;
             markOk = 1;
         }
     }
+    /* COVERAGE: the frame boundary, taken from the SAME (frame, tick, mode) tuple a [fh]
+     * receipt is stamped with -- which is the whole point, since a [cov] frame number has to
+     * be usable to place a SHOT that fhdiff will then match by frame. Before the capture
+     * early-out: coverage runs every frame, capture only on the sampled ones. */
+    gdx3ds_cov_frame(frame, tick, mode);
+    if (!shot && (sEvery == 0 || sFrame < (unsigned long)sStart || (sFrame % (unsigned long)sEvery) != 0)) {
+        return;
+    }
     if (shot) {
         memcpy(tag, sPendingTag, sizeof(tag));
         tag[sizeof(tag) - 1] = '\0';
+    } else if (sEveryBmp) {
+        /* [debug] fh_every_bmp: one BMP per captured frame, so the auto tag has to carry the
+         * frame number -- a single "auto" name overwrites itself and leaves exactly one file,
+         * which is useless for anything temporal (wobble2-progress.md section 2). */
+        snprintf(tag, sizeof(tag), "auto%06lu", frame);
     } else {
         strcpy(tag, "auto");
     }
@@ -222,7 +264,8 @@ void gdx3ds_oracle_frame_mark(unsigned long frame, unsigned long tick, int gameM
     }
     sMarks[slot].tick = tick;
     sMarks[slot].mode = gameMode;
-    sMarks[slot].frame = frame; /* written last: the hook keys on it */
+    /* release: the payload above must be visible to core 2 before the key it reads */
+    __atomic_store_n(&sMarks[slot].frame, frame, __ATOMIC_RELEASE);
 }
 
 static void SanitizeTag(char* dst, size_t cap, const char* src) {
@@ -272,6 +315,10 @@ void gdx3ds_oracle_request_quit(const char* why) {
     sQuit = 1;
 }
 
+/* Read by the legacy SHOT dumps in port/n64_gfx_bridge.cpp (weak-linked: desktop builds do
+ * not compile this TU). Latched by gdx3ds_oracle_init before any capture can run. */
+int gdx3ds_shot_fastwrite(void) { return sFastWrite; }
+
 void gdx3ds_oracle_init(void) {
     const char* eye;
     const char* platform;
@@ -299,6 +346,7 @@ void gdx3ds_oracle_init(void) {
     }
     sEveryBmp = gdx3ds_config_get_bool("debug", "fh_every_bmp", 0) ? 1 : 0;
     sLegacyShot = gdx3ds_config_get_bool("debug", "shot_legacy", 0) ? 1 : 0;
+    sFastWrite = gdx3ds_config_get_bool("debug", "shot_fastwrite", 1) ? 1 : 0;
     sQuitAtTick = (unsigned long)gdx3ds_config_get_int("debug", "quit_at_tick", 0);
     platform = gdx3ds_config_get_string("debug", "platform", "unknown");
     snprintf(sPlatform, sizeof(sPlatform), "%s", platform);

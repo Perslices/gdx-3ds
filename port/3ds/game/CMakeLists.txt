@@ -20,7 +20,20 @@ endif()
 # the 64DD Expansion Kit sources stay desktop-only until post-MVP. Must be set before the
 # include() so the shared filter logic picks the rom-side subsystems (CMP0077: option()
 # honors the pre-set normal variable).
-set(GDX_EXPANSION_KIT OFF)
+#
+# B11 (docs/research/native/ekbuild-progress.md): GDX_3DS_EXPANSION_KIT is the opt-in that
+# flips it. It is OFF by default and the SHIPPED build is the OFF one -- EK=ON is not an
+# additive flag, it swaps sys/rom -> sys/disk, audio/rom -> audio/disk and save_buffer.c ->
+# dd_save.c and changes #ifdef EXPANSION_KIT behaviour in 65 decomp TUs, so an EK build is a
+# different game binary, not the shipped one plus two overlays.
+option(GDX_3DS_EXPANSION_KIT
+       "Compile the 64DD Expansion Kit (course editor / machine creator) into the 3DS build -- EXPERIMENTAL, needs a ~64.9 MB .ndd disk image at runtime" OFF)
+if(GDX_3DS_EXPANSION_KIT)
+    message(STATUS "G-Diffuser-3DS: GDX_3DS_EXPANSION_KIT=ON -- Expansion Kit build (NOT the shipped configuration)")
+    set(GDX_EXPANSION_KIT ON)
+else()
+    set(GDX_EXPANSION_KIT OFF)
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/GdxGameSources.cmake")
 
@@ -45,8 +58,19 @@ target_compile_options(gdx3ds_cxd4_rsp PRIVATE -w -fno-strict-aliasing -fwrapv)
 # the rationale on every flag). The fiber backend is NOT added here: gdx_fiber_3ds.c
 # already lives in gdx3ds_os (stream B).
 # ---------------------------------------------------------------------------------
+if(GDX_3DS_EXPANSION_KIT)
+    # EK=ON supplies the real leoBootID (port/n64_leo.c) and the ucode text markers
+    # (port/gen/EkLinkStubs.c), so the EK=OFF stand-ins must NOT be compiled too.
+    set(GDX3DS_EK_STUBS "")
+    set(GDX3DS_EK_SOURCES ${GDX_GAME_EK_PORT_SOURCES})
+else()
+    set(GDX3DS_EK_STUBS gdx3ds_us_linkstubs.c)
+    set(GDX3DS_EK_SOURCES "")
+endif()
+
 add_library(gdx3ds_game OBJECT ${GAME_SOURCES} ${GDX_GAME_CORE_SOURCES}
-    gdx3ds_us_linkstubs.c   # EK=OFF stand-ins for n64_leo.c/EkLinkStubs.c symbols
+    ${GDX3DS_EK_STUBS}      # EK=OFF stand-ins for n64_leo.c/EkLinkStubs.c symbols
+    ${GDX3DS_EK_SOURCES}    # EK=ON: n64_leo.c, gen/EkAssetBindings.c, gen/EkLinkStubs.c, gdx_ek_disk_overrides.c
     gdx3ds_livery_diag.c    # SHIP-LIVERY-2 [livery] game-state receipts (weak-called by gfx)
     gdx3ds_track_gbi.c      # [native] track: real GBI emitters behind gdx3ds_track_shim.h
     gdx3ds_fx_gbi.c         # [native] fx: real GBI emitters behind gdx3ds_fx_shim_begin.h
@@ -70,6 +94,13 @@ target_compile_definitions(gdx3ds_game PRIVATE
     GDX_NATIVE_TRACK=1     # course.c includes gdx3ds_track_shim.h (runtime-gated: [native] track)
     GDX_NATIVE_FX=1        # racer.c includes gdx3ds_fx_shim.h (runtime-gated: [native] fx_sink)
 )
+
+if(GDX_3DS_EXPANSION_KIT)
+    # Same triplet the desktop gdiffuser_game uses (port/CMakeLists.txt:30). MFS_VERSION/
+    # BUILD_VERSION are the 64DD filesystem's own build selectors, not a game region: the
+    # US text/font behaviour stays on VERSION_US above.
+    target_compile_definitions(gdx3ds_game PRIVATE EXPANSION_KIT=1 MFS_VERSION=1 BUILD_VERSION=VERSION_J)
+endif()
 
 # Same UB-hardening/legacy-quieting as the desktop gdiffuser_game (see port/CMakeLists.txt).
 target_compile_options(gdx3ds_game PRIVATE -w -Werror=return-type -fcommon
@@ -117,9 +148,21 @@ add_library(gdx3ds_glue OBJECT
     "${GDX_PORT_DIR}/gdx_dev_gates.c"
     "${GDX_PORT_DIR}/gdx_workshop.cpp"
     "${GDX_PORT_DIR}/mio0_wrap.c"
+    "${GDX_PORT_DIR}/gdx_stall.c"
     "${GDX_PORT_DIR}/gdx_segment_source.c"
     "${GDX_PORT_DIR}/../torch/lib/libmio0/mio0.c"
 )
+
+if(GDX_3DS_EXPANSION_KIT)
+    # The desktop executable's EK glue (port/CMakeLists.txt:171): the disk-image loader plus
+    # the fan-translation string/override layers n64_leo.c and the EK overlays call into.
+    target_sources(gdx3ds_glue PRIVATE
+        "${GDX_PORT_DIR}/disk_buffer.cpp"
+        "${GDX_PORT_DIR}/gen/EkTranslatedOverrides.c"
+        "${GDX_PORT_DIR}/gdx_ek_strings.c"
+        "${GDX_PORT_DIR}/gen/EkTranslatedStrings.c"
+        gdx3ds_ek_stubs.cpp)   # 3DS stand-ins for the dropped gdx_extract_launch.cpp helpers
+endif()
 
 target_include_directories(gdx3ds_glue PRIVATE
     "${GDX_PORT_DIR}"                       # "resource/ResourceFactories.h" etc.
@@ -136,6 +179,7 @@ target_compile_definitions(gdx3ds_glue PRIVATE
     ${GDX_DEV_TOOLS_DEFS}
     GDX_PLATFORM_3DS=1
     F3DEX_GBI_2=1
+    $<$<BOOL:${GDX_3DS_EXPANSION_KIT}>:EXPANSION_KIT=1>
 )
 
 target_compile_options(gdx3ds_glue PRIVATE

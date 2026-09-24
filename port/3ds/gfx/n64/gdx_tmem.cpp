@@ -5,9 +5,25 @@
  * with the [tmem2] whole-span teardown as the only teardown. */
 #include "gdx_interp.h"
 
+#include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
+
 #include <string.h>
 
+/* [native] dspcensus>=2 clock (gdx_rt_glue.cpp / the host harness). */
+extern "C" long long gdx_ninterp_now(void);
+
 namespace gdxn {
+
+/* One-line phase timer for the dspcensus>=2 sub-buckets. `on` is mDspCensus >= 2, so the
+ * whole thing folds to nothing with the lever off. */
+#define DSP_PH_BEGIN(on) const uint64_t dspT0_ = (on) ? (uint64_t)gdx_ninterp_now() : 0
+#define DSP_PH_END(on, ph)                                                                                   \
+    do {                                                                                                     \
+        if (on) {                                                                                            \
+            mStats.phTicks[ph] += (uint64_t)gdx_ninterp_now() - dspT0_;                                       \
+            mStats.phCalls[ph]++;                                                                             \
+        }                                                                                                    \
+    } while (0)
 
 static constexpr uint16_t kListInvalid = 0xFFFFu;
 
@@ -63,15 +79,67 @@ void Interp::DpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lr
  * TranslateTexturePointer(estimate) / wide-stub hop, minus the persistent copy. */
 bool Interp::ResolveTextureSource(size_t requiredBytes) {
     auto& tl = mRdp.texture_to_load;
+    const bool ph = mDspCensus >= 2;
+
+    DSP_PH_BEGIN(ph);
     const uintptr_t p = mSrc.ResolveTimg(tl.cmd, requiredBytes);
+    DSP_PH_END(ph, DSP_PH_TIMGRES);
     if (p == 0) {
         tl.addr = nullptr;
         mStats.timgUnresolved++;
-        return false;
+        return false; /* failures are not memoised (see the contract) */
     }
     tl.addr = reinterpret_cast<const uint8_t*>(p);
-    tl.native_rgba16 = DlSrc::TexelsAreNativeRgba16(p, 2) ? 1 : 0;
-    tl.immutable = DlSrc::TimgIsResource(tl.cmd, p, requiredBytes) ? 1 : 0;
+
+    /* [native] timgmemo -- see the memo's contract on Interp::mTimgClassMemo. The RESOLVED
+     * pointer is the key, not an output: the classification is a pure function of it (plus the
+     * command and the load extent) and two counted tables, so this memo needs no segment term
+     * and is genuinely cross-frame. */
+    if (mTimgMemo) {
+        const uint32_t epoch = mSrc.TimgClassEpoch();
+        const uint32_t req32 = (requiredBytes <= 0xFFFFFFFFu) ? static_cast<uint32_t>(requiredBytes) : 0xFFFFFFFFu;
+        const uint32_t h = (static_cast<uint32_t>(p) * 2654435761u) ^ (req32 * 40503u) ^ (tl.cmd.w1 * 2246822519u);
+        TimgClassEntry& e = mTimgClassMemo[(h >> 17) & (kTimgMemoSlots - 1u)];
+        if (e.filled != 0 && e.epoch == epoch && e.addr == p && e.w1 == tl.cmd.w1 && e.w1hi == tl.cmd.w1hi &&
+            e.required == req32) {
+            mStats.timgMemoHit++;
+            tl.native_rgba16 = e.native_rgba16;
+            tl.immutable = e.immutable;
+            return true;
+        }
+        mStats.timgMemoMiss++;
+        if (e.filled == 0) {
+            mStats.timgMemoMissEmpty++;
+        } else if (e.addr == p && e.w1 == tl.cmd.w1 && e.w1hi == tl.cmd.w1hi && e.required == req32) {
+            mStats.timgMemoMissEpoch++;
+        } else {
+            mStats.timgMemoMissKey++;
+        }
+        if (epoch != mTimgEpochLast) {
+            mStats.timgEpochChanges++;
+            mTimgEpochLast = epoch;
+        }
+        DSP_PH_BEGIN(ph);
+        tl.native_rgba16 = DlSrc::TexelsAreNativeRgba16(p, 2) ? 1 : 0;
+        tl.immutable = DlSrc::TimgIsResource(tl.cmd, p, requiredBytes) ? 1 : 0;
+        DSP_PH_END(ph, DSP_PH_TIMGCLASS);
+        e.w1 = tl.cmd.w1;
+        e.w1hi = tl.cmd.w1hi;
+        e.required = req32;
+        e.addr = p;
+        e.native_rgba16 = tl.native_rgba16;
+        e.immutable = tl.immutable;
+        e.epoch = epoch; /* the two calls above mutate nothing, so the probe's epoch still holds */
+        e.filled = 1;
+        return true;
+    }
+
+    {
+        DSP_PH_BEGIN(ph);
+        tl.native_rgba16 = DlSrc::TexelsAreNativeRgba16(p, 2) ? 1 : 0;
+        tl.immutable = DlSrc::TimgIsResource(tl.cmd, p, requiredBytes) ? 1 : 0;
+        DSP_PH_END(ph, DSP_PH_TIMGCLASS);
+    }
     return true;
 }
 
@@ -83,6 +151,14 @@ void Interp::DpLoadTlut(uint8_t tile, uint32_t highIndex) {
     }
     const uint16_t tmem = mRdp.texture_tile[tile].tmem;
     const uint8_t* src = mRdp.texture_to_load.addr;
+    /* COVERAGE: a TLUT load. B9 (the Silence lamps cycling 8+ palettes in place) is the bug
+     * class that lives here, so the schedule has to know which frames load palettes and how
+     * big the loads are. value = (tmem << 8) | log2(entries). */
+    {
+        uint32_t lg = 0, n = entryCount;
+        while (n > 1u && lg < 15u) { n >>= 1; lg++; }
+        gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_TLUT, ((uint32_t)tmem << 8) | lg));
+    }
     if (tmem >= 256) {
         const uint32_t paletteByteOffset = (tmem - 256) * 2;
         if (highIndex == 255 && paletteByteOffset == 0) {
@@ -254,9 +330,20 @@ void Interp::NoteTmemLoadKind(uint16_t base, uint8_t kind, uint32_t writeEndByte
     }
 }
 
-/* == GdxTmemSameContentLoad: gated on the immutable (LUS resource-backed) class. */
-bool Interp::SameContentLoad(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const {
-    if (base >= 512u || !fresh.immutable) return false;
+/* == Everything GdxTmemSameContentLoad tests EXCEPT the source bytes.
+ *
+ * This is the whole of the skip's TMEM-side reasoning and it is UNCHANGED by [native] tmemskip:
+ * the live span at `base` must still be this span (tmem_span_base[base] == base+1), still have
+ * been written by this kind of load, still be exactly `want` words long, and the descriptor it
+ * carries -- source pointer, both sizes, both line strides, the byte-swap mode and the o2r
+ * class -- must be identical. A later load that overlapped these TMEM words retired this span
+ * (StoreLoadedTexture zeroes tmem_span_words[base] and memsets loaded_texture[base]), so it
+ * fails here; a load at the same base with different geometry fails on `want`.
+ *
+ * The ONLY input it does not cover is the CONTENT of [fresh.addr, fresh.addr + bytes), and the
+ * only job of the gate on top of it is to cover that one input. */
+bool Interp::SameContentDescriptor(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const {
+    if (base >= 512u) return false;
     const Rdp& rdp = mRdp;
     const uint32_t logicalSize = fresh.orig_size_bytes != 0 ? fresh.orig_size_bytes : fresh.size_bytes;
     uint32_t want = (logicalSize + 7u) / 8u;
@@ -271,6 +358,131 @@ bool Interp::SameContentLoad(uint16_t base, uint8_t kind, const LoadedTexture& f
            prev.size_bytes == fresh.size_bytes && prev.full_image_line_size_bytes == fresh.full_image_line_size_bytes &&
            prev.line_size_bytes == fresh.line_size_bytes && prev.native_rgba16 == fresh.native_rgba16 &&
            prev.immutable == fresh.immutable;
+}
+
+/* == GdxTmemSameContentLoad: gated on the immutable (LUS resource-backed) class. The shipping
+ * gate, byte for byte, and the one [native] tmemskip=0 still takes. */
+bool Interp::SameContentLoad(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const {
+    return fresh.immutable != 0 && SameContentDescriptor(base, kind, fresh);
+}
+
+void Interp::RecordTmemSrcStamp(uint16_t base, const uint64_t stamp[2], unsigned cls) {
+    if (base >= 512u) return;
+    mRdp.tmem_span_src_stamp[base][0] = stamp[0];
+    mRdp.tmem_span_src_stamp[base][1] = stamp[1];
+    mRdp.tmem_span_src_cls[base] = static_cast<uint8_t>(cls);
+}
+
+/* Census only: which test of SameContentDescriptor failed first. See Counters::tmemMissSpan. */
+void Interp::NoteDescriptorMiss(uint16_t base, uint8_t kind, const LoadedTexture& fresh) {
+    if (base >= 512u) {
+        mStats.tmemMissSpan++;
+        return;
+    }
+    const Rdp& rdp = mRdp;
+    if (rdp.tmem_span_base[base] != static_cast<uint16_t>(base + 1u)) {
+        mStats.tmemMissSpan++;
+        return;
+    }
+    if (rdp.tmem_span_load_kind[base] != kind) {
+        mStats.tmemMissKind++;
+        return;
+    }
+    const uint32_t logicalSize = fresh.orig_size_bytes != 0 ? fresh.orig_size_bytes : fresh.size_bytes;
+    uint32_t want = (logicalSize + 7u) / 8u;
+    if (want < 1) want = 1;
+    if (want > 512u - base) want = 512u - base;
+    if (rdp.tmem_span_words[base] != want || rdp.loaded_texture[base].tmem_word_count != want) {
+        mStats.tmemMissWords++;
+        return;
+    }
+    if (rdp.loaded_texture[base].addr != fresh.addr) {
+        mStats.tmemMissAddr++;
+        return;
+    }
+    mStats.tmemMissOther++;
+}
+
+/* == [native] tmemskip -- the widened same-content skip.
+ *
+ * Shape: the descriptor test above answers "is everything except the bytes the same"; this adds
+ * the one remaining question, "are the BYTES the same", using the bridge's own source-stability
+ * seam instead of a compare or a second content hash. The stamp for the NEXT load is sampled
+ * here, BEFORE the mirror copy reads the source, so a write that lands during the copy leaves
+ * the live generation ahead of the stamp and the next load re-mirrors. (The bridge stamps AFTER
+ * its copy; this is deliberately the other way round -- see tmemblock-progress.md S2.)
+ *
+ * The lever also decides which classes may skip: 1 = the two the bridge treats as stable with
+ * no compare at all, 2 = additionally the DMA-tracked class. The stamp is recorded for EVERY
+ * class regardless, so a level change does not need a warm-up frame. */
+bool Interp::TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTexture& fresh, uint32_t readBytes,
+                                 uint64_t outStamp[2], unsigned* outCls) {
+    outStamp[0] = 0;
+    outStamp[1] = 0;
+    *outCls = GDX_TMEMSRC_UNKNOWN;
+
+    /* LEVER OFF: the shipping gate, by the same call, in the same order -- not one bridge call
+       and not one extra comparison. The classification below is a range scan and the descriptor
+       test is ten compares that `!fresh.immutable` used to short-circuit; paying either on the
+       default path would be a regression dressed up as a diagnostic. */
+    if (mTmemSkip == 0 && mTmemCls == 0) {
+        return SameContentLoad(base, kind, fresh);
+    }
+
+    const bool descSame = SameContentDescriptor(base, kind, fresh);
+    if (!descSame) {
+        NoteDescriptorMiss(base, kind, fresh);
+    }
+    if (descSame) {
+        mStats.tmemDescSame++;
+        /* The shipping gate first: an o2r resource is immutable by class and needs no stamp.
+           Its span's stored stamp stays whatever the last mirror left, which is correct -- a
+           skip writes nothing, so nothing about the mirror has changed. */
+        if (fresh.immutable != 0) {
+            if (mTmemSkip != 0) mStats.tmemSkipImm++;
+            return true;
+        }
+    }
+
+    /* From here the mirror is going to be rewritten unless the staleness test says otherwise,
+       so this is where classifying and stamping is paid for. An unresolved load still rewrites
+       the span store with a null descriptor; leave its class UNKNOWN so it can never satisfy a
+       later load. */
+    if (fresh.addr == nullptr || readBytes == 0) {
+        return false;
+    }
+    const uintptr_t src = reinterpret_cast<uintptr_t>(fresh.addr);
+    const unsigned cls = gdx_gfx_tmem_source_class(src, readBytes);
+    gdx_gfx_tmem_source_stamp(outStamp);
+    *outCls = cls;
+    switch (cls) {
+        case GDX_TMEMSRC_NATIVE: mStats.tmemClsN++; break;
+        case GDX_TMEMSRC_STABLE: mStats.tmemClsS++; break;
+        case GDX_TMEMSRC_DMA: mStats.tmemClsD++; break;
+        default: mStats.tmemClsU++; break;
+    }
+    if (mTmemSkip == 0 || !descSame) {
+        return false;
+    }
+    /* Only the classes this level admits. UNKNOWN is admitted at no level: the owned walk reads
+       the live source and holds no copy to fall back to a compare against. */
+    const bool admitted = (cls == GDX_TMEMSRC_NATIVE || cls == GDX_TMEMSRC_STABLE) ||
+                          (mTmemSkip >= 2 && cls == GDX_TMEMSRC_DMA);
+    if (!admitted) {
+        return false;
+    }
+    /* The class the STAMP was taken under has to be the class being tested now; the seam
+       re-derives the live class and refuses a mismatch, and this is the stored half of it. */
+    if (mRdp.tmem_span_src_cls[base] != static_cast<uint8_t>(cls)) {
+        mStats.tmemStale++;
+        return false;
+    }
+    if (gdx_gfx_tmem_source_unchanged(src, readBytes, cls, mRdp.tmem_span_src_stamp[base]) == 0) {
+        mStats.tmemStale++;
+        return false;
+    }
+    mStats.tmemSkipGen++;
+    return true;
 }
 
 /* The TMEM mirror sees what LUS saw: CopyRawTextureBytes byte-swapped host-order RGBA16
@@ -358,28 +570,54 @@ void Interp::DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs,
         loaded.native_rgba16 = tl.native_rgba16;
     }
 
-    if (SameContentLoad(tmemIndex, 1, loaded)) {
-        mStats.tmemSkips++;
-        return;
+    const bool ph = mDspCensus >= 2;
+    /* [native] tmemskip: the staleness test is bounded by the TMEM window, which is an UPPER
+       BOUND on the bytes MirrorToTmem will read (the ReadableBytes clamp below can only shrink
+       it further). Testing a superset for staleness over-invalidates and never under-; the
+       seam's whole-extent classification is what makes the bound safe. */
+    const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIndex) * 8u;
+    uint32_t testBytes = 0;
+    if (tmemByteOffset < sizeof(mRdp.tmem)) {
+        testBytes = size_bytes < sizeof(mRdp.tmem) - tmemByteOffset
+                        ? size_bytes
+                        : static_cast<uint32_t>(sizeof(mRdp.tmem) - tmemByteOffset);
+    }
+    uint64_t srcStamp[2];
+    unsigned srcCls = GDX_TMEMSRC_UNKNOWN;
+    {
+        DSP_PH_BEGIN(ph);
+        const bool same = TmemLoadIsRedundant(tmemIndex, 1, loaded, testBytes, srcStamp, &srcCls);
+        DSP_PH_END(ph, DSP_PH_TMEMSAME);
+        if (same) {
+            mStats.tmemSkips++;
+            return;
+        }
     }
 
     uint32_t tmemWriteEndByte = 0;
     if (loaded.addr != nullptr) {
-        const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIndex) * 8u;
         if (tmemByteOffset < sizeof(mRdp.tmem)) {
-            uint32_t copyBytes = size_bytes;
-            if (copyBytes > sizeof(mRdp.tmem) - tmemByteOffset) copyBytes = sizeof(mRdp.tmem) - tmemByteOffset;
+            uint32_t copyBytes = testBytes;
             const size_t readable = DlSrc::ReadableBytes(reinterpret_cast<uintptr_t>(loaded.addr));
             if (readable < copyBytes) copyBytes = static_cast<uint32_t>(readable);
             if (copyBytes != 0) {
+                DSP_PH_BEGIN(ph);
                 MirrorToTmem(mRdp.tmem + tmemByteOffset, loaded.addr, copyBytes, loaded.native_rgba16 != 0);
+                DSP_PH_END(ph, DSP_PH_TMEMCOPY);
                 mRdp.tmem_generation++;
                 tmemWriteEndByte = tmemByteOffset + copyBytes;
             }
         }
     }
-    StoreLoadedTexture(tmemIndex, loaded);
-    NoteTmemLoadKind(tmemIndex, 1, tmemWriteEndByte);
+    {
+        DSP_PH_BEGIN(ph);
+        StoreLoadedTexture(tmemIndex, loaded);
+        NoteTmemLoadKind(tmemIndex, 1, tmemWriteEndByte);
+        /* After StoreLoadedTexture, which is what makes tmemIndex a live base. The stamp was
+           sampled BEFORE the copy read the source. */
+        RecordTmemSrcStamp(tmemIndex, srcStamp, srcCls);
+        DSP_PH_END(ph, DSP_PH_TMEMSTORE);
+    }
     ArmTexturesChanged();
 }
 
@@ -422,7 +660,18 @@ void Interp::DpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, 
         loaded.native_rgba16 = tl.native_rgba16;
     }
 
-    if (SameContentLoad(tmemIndex, 2, loaded)) {
+    /* [native] tmemskip: LOADTILE reads a STRIDED window, so the extent the staleness test has
+       to cover runs from loaded.addr to the end of the last row -- `need` above, minus the
+       start offset that loaded.addr already carries. The copy loop below can stop short of it
+       (the ReadableBytes break), which is the same over-bound as LOADBLOCK's. */
+    const size_t tileReadSpan = need > static_cast<size_t>(start_offset_bytes)
+                                    ? need - static_cast<size_t>(start_offset_bytes)
+                                    : 0;
+    const uint32_t tileTestBytes =
+        tileReadSpan <= 0xFFFFFFFFu ? static_cast<uint32_t>(tileReadSpan) : 0xFFFFFFFFu;
+    uint64_t srcStamp[2];
+    unsigned srcCls = GDX_TMEMSRC_UNKNOWN;
+    if (TmemLoadIsRedundant(tmemIndex, 2, loaded, tileTestBytes, srcStamp, &srcCls)) {
         mStats.tmemSkips++;
         Tile& t = mRdp.texture_tile[tile];
         if (!(t.uls == uls && t.ult == ult && t.lrs == lrs && t.lrt == lrt)) {
@@ -457,6 +706,7 @@ void Interp::DpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, 
     }
     StoreLoadedTexture(tmemIndex, loaded);
     NoteTmemLoadKind(tmemIndex, 2, tmemWriteEndByte);
+    RecordTmemSrcStamp(tmemIndex, srcStamp, srcCls);
     Tile& t = mRdp.texture_tile[tile];
     t.uls = uls;
     t.ult = ult;

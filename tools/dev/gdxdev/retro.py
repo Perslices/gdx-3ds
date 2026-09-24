@@ -339,6 +339,57 @@ def install_guards():
 _CFG_RE = re.compile(r"-c\s+(\S[^\n]*?)/([^/]+)/retroarch\.cfg")
 
 
+# ---- host gate -------------------------------------------------------------------
+# Several agents share one Mac. Ten concurrent instances took the 1-minute load average
+# to 111 on 2026-09-23: at that point boot SIGBUS becomes common and every ms measured is
+# host contention rather than guest cost. Both limits are advisory defaults, overridable
+# for a deliberate stress test.
+MAX_CONCURRENT = int(os.environ.get("GDX_RETRO_SLOTS", "3"))
+MAX_LOADAVG = float(os.environ.get("GDX_RETRO_MAXLOAD", "40"))
+GATE_TIMEOUT = float(os.environ.get("GDX_RETRO_GATE_TIMEOUT", "300"))
+
+
+def host_load():
+    try:
+        return os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return 0.0
+
+
+def wait_for_host(out=None, poll=20.0, timeout=None):
+    """Block until the host can take another instance. Returns the load we launched at.
+
+    A caller that wants the old unthrottled behaviour sets GDX_RETRO_SLOTS=0.
+    """
+    if MAX_CONCURRENT <= 0:
+        return host_load()
+    deadline = time.time() + (GATE_TIMEOUT if timeout is None else timeout)
+    said = False
+    while True:
+        live = len([p for p in our_retro_processes() if not _gone(p["pid"])])
+        load = host_load()
+        # Instance count is the hard limit — that is the resource emulator runs actually
+        # contend for. Load is advisory: with a dozen agents compiling, the 1-minute average
+        # sits high for reasons no emulator run can wait out, so back off briefly and then
+        # proceed, recording the load rather than stalling the night. Timing taken above the
+        # threshold is discardable; a parity run blocked for half an hour is just lost work.
+        if live < MAX_CONCURRENT and load <= MAX_LOADAVG:
+            return load
+        if time.time() >= deadline:
+            if out:
+                why = ("%d instance(s) still live" % live if live >= MAX_CONCURRENT
+                       else "load %.1f above %.1f" % (load, MAX_LOADAVG))
+                out.say("host gate: %s after %.0fs — launching anyway. Parity from this run is "
+                        "valid; any ms or fps figure is host contention, not guest cost."
+                        % (why, GATE_TIMEOUT))
+            return load
+        if out and not said:
+            out.say("host gate: waiting (live=%d/%d, load=%.1f/%.1f) — another agent is running"
+                    % (live, MAX_CONCURRENT, load, MAX_LOADAVG))
+            said = True
+        time.sleep(poll)
+
+
 def our_retro_processes():
     """Every RetroArch on this machine that gdx-dev started, by instance name.
 
@@ -429,6 +480,43 @@ log_verbosity = "true"
 frontend_log_level = "0"
 audio_enable = "%(audio)s"
 video_driver = "%(video_driver)s"
+%(extra)s"""
+
+# `core_options_path` DOES NOT WORK, measured 2026-09-23 (three A/B boots, stereo lane).
+# RetroArch 1.22 only consults it when `global_core_options` is true; otherwise it builds a
+# PER-CORE path `<rgui_config_directory>/<core name>/<core name>.opt` and uses that. With
+# the stock `rgui_config_directory` that is the SHARED
+# ~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt, so every instance's
+# retroarch-core-options.cfg has been ignored and the core has been running on its compiled
+# defaults ("Saved core options file to .../RetroArch/config/Azahar/Azahar.opt" in the
+# frontend log; `GET_VARIABLE citra_layout_option = "default"` with `side_by_side` in the
+# instance file). Pointing rgui_config_directory at the instance makes the file land — and
+# because the same shared .opt is what every concurrent agent reads, redirecting it is also
+# what keeps a --3d run from turning on 3D underneath somebody else's mono parity run.
+#
+# This redirection is applied ONLY under --3d. Honouring core options for the first time is
+# a real behaviour change for the lane (it is what finally makes `--gfx` reach the core),
+# and that deserves its own re-baseline rather than riding in on a stereo branch.
+CFG_3D_EXTRA = 'rgui_config_directory = "%s"\n'
+
+# Values written under --3d. Spelled so every one of them is LEGAL for the core, because
+# under --3d the file is finally read: `citra_is_new_3ds = "enabled"` (the mono template's
+# spelling) is not a legal value — the legal pair is "New 3DS"/"Old 3DS" — and an illegal
+# value falls back to the option default. New 3DS, 1x and the default layout happen to BE
+# the defaults, so a --3d run differs from a mono run in render_3d/factor_3d and nothing
+# else; only citra_graphics_api actually starts being honoured, and it is asked for the
+# value it was defaulting to anyway.
+CORE_OPTIONS_3D_TEMPLATE = """\
+# Written by `gdx-dev retro run --3d`. Unlike retroarch-core-options.cfg this path IS read
+# (see CFG_3D_EXTRA), so every value here has to be one the core declares.
+citra_is_new_3ds = "New 3DS"
+citra_graphics_api = "%(gfx)s"
+citra_use_hw_shader = "enabled"
+citra_resolution_factor = "1"
+citra_layout_option = "default"
+citra_use_virtual_sd = "enabled"
+citra_use_libretro_save_path = "LibRetro Default"
+citra_region_value = "Auto"
 """
 
 CORE_OPTIONS_TEMPLATE = """\
@@ -444,19 +532,91 @@ citra_region_value = "Auto"
 """
 
 
-def write_config(inst, gfx="Vulkan", audio="false", video_driver="vulkan"):
+def write_config(inst, gfx="Vulkan", audio="false", video_driver="vulkan",
+                 core=None, three_d=None):
+    """Write this instance's retroarch.cfg + core-options file.
+
+    `three_d` is (mode, depth) from `--3d`, or None. When it is None not one byte of the
+    core-options file changes, so a non-3D run is exactly the run it was before this flag
+    existed.
+    """
     for d in (inst.dir, inst.system, inst.saves, inst.screenshots):
         os.makedirs(d, exist_ok=True)
+    cfg_dir = os.path.join(inst.dir, "config")
     with open(inst.cfg, "w") as f:
         f.write(CFG_TEMPLATE % {
             "name": inst.name, "saves": inst.saves, "system": inst.system,
             "shots": inst.screenshots, "coreopts": inst.core_options,
-            "cores": os.path.dirname(core_path() or ""), "dir": inst.dir,
+            "cores": os.path.dirname(core or core_path() or ""), "dir": inst.dir,
             "port": inst.port, "audio": audio, "video_driver": video_driver,
+            "extra": (CFG_3D_EXTRA % cfg_dir) if three_d else "",
         })
     with open(inst.core_options, "w") as f:
         f.write(CORE_OPTIONS_TEMPLATE % {"gfx": gfx})
+    if three_d:
+        from . import stereo3d
+        # The path RetroArch actually reads. "Azahar" is the core's `corename`, which is
+        # both the directory and the file stem of a per-core options file.
+        opt = os.path.join(cfg_dir, "Azahar", "Azahar.opt")
+        os.makedirs(os.path.dirname(opt), exist_ok=True)
+        with open(opt, "w") as f:
+            f.write(CORE_OPTIONS_3D_TEMPLATE % {"gfx": gfx})
+            f.write("# --3d: the HOST knob. Without it the emulated 3D slider reads 0 and\n"
+                    "# the guest skips its right-eye pass whatever [stereo] enabled says.\n")
+            for key, value in stereo3d.core_options(*three_d):
+                f.write('%s = "%s"\n' % (key, value))
     return inst.cfg
+
+
+# `--3d` needs a core that declares citra_render_3d. The pinned 2126.0 release does not
+# (stereo was never wired into its core_settings.cpp); the libretro nightly does. It is
+# installed BESIDE the shared core, under the instance root, so a `--3d` run cannot change
+# which emulator another agent's in-flight run is using.
+CORE_3D_DIR = os.path.join(INSTANCE_ROOT, "cores-3d")
+
+
+def core_3d_path():
+    p = os.path.join(CORE_3D_DIR, CORE_NAME)
+    return p if os.path.exists(p) else None
+
+
+def ensure_core_3d(out):
+    """-> path to a core that exposes citra_render_3d, installing the nightly if needed."""
+    from . import stereo3d
+    have = core_path()
+    if have and stereo3d.core_exposes_3d(have):
+        out.say("core exposes %s: %s" % (stereo3d.CORE_OPTION_KEY, have))
+        return have
+    p = core_3d_path()
+    if p and stereo3d.core_exposes_3d(p):
+        return p
+    os.makedirs(CORE_3D_DIR, exist_ok=True)
+    out.say("the pinned core has no %s option; fetching the nightly for --3d: %s"
+            % (stereo3d.CORE_OPTION_KEY, CORE_NIGHTLY_URL))
+    dest = os.path.join(CORE_3D_DIR, CORE_NAME)
+    tmp = dest + ".download"
+    try:
+        urllib.request.urlretrieve(CORE_NIGHTLY_URL, tmp + ".zip")
+        with zipfile.ZipFile(tmp + ".zip") as z:
+            member = next((n for n in z.namelist() if n.endswith(CORE_NAME)), None)
+            if not member:
+                raise GdxError("nightly zip contains no %s" % CORE_NAME, util.EXIT_PREFLIGHT)
+            with z.open(member) as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dest)
+        os.unlink(tmp + ".zip")
+    except GdxError:
+        raise
+    except Exception as e:
+        raise GdxError("could not install a 3D-capable core (%s): %s" % (CORE_NIGHTLY_URL, e),
+                       util.EXIT_PREFLIGHT)
+    if not stereo3d.core_exposes_3d(dest):
+        raise GdxError("the nightly core at %s does not declare %s either — the RetroArch "
+                       "lane cannot render 3D with it; use `gdx-dev emu run --3d` (Qt lane)"
+                       % (dest, stereo3d.CORE_OPTION_KEY), util.EXIT_PREFLIGHT)
+    out.say("installed 3D-capable core: %s" % dest)
+    return dest
 
 
 # The instance ini is seeded from the shared Azahar Qt SD so REAL user preferences carry
@@ -535,12 +695,24 @@ def seed_sd(inst, out, ini_settings=None):
         copied.append("dspfirm.cdc")
     src_ini = util.GDX_INI
     dst_ini = os.path.join(dst, "gdiffuser.ini")
-    if os.path.exists(src_ini) and not os.path.exists(dst_ini):
+    # Re-seed on EVERY run, not just the first. An instance ini persists, so a lever set by
+    # an earlier run used to survive into the next one silently: an agent measuring a
+    # "default" run got it carrying the previous run's fxceiling=2. A run's configuration
+    # must be a function of its command line and nothing else.
+    fresh = not os.path.exists(dst_ini)
+    if os.path.exists(src_ini):
         shutil.copy2(src_ini, dst_ini)
         stripped = strip_run_control(dst_ini)
-        copied.append("gdiffuser.ini")
+        if fresh:
+            copied.append("gdiffuser.ini")
         if stripped and out:
             out.say("dropped %d inherited run-control key(s) from the seeded ini: %s"
+                    % (len(stripped), ", ".join(stripped)))
+    elif not fresh:
+        # No source ini to re-seed from: strip in place so levers still cannot carry over.
+        stripped = strip_run_control(dst_ini)
+        if stripped and out:
+            out.say("cleared %d run-control key(s) left by a previous run: %s"
                     % (len(stripped), ", ".join(stripped)))
     if ini_settings:
         inifile.merge(dst_ini, ini_settings)
@@ -600,6 +772,57 @@ _LAST_ATTEMPT = {}
 # One boot is retried this many times before moving to the next renderer.
 EARLY_CRASH_ATTEMPTS = 3          # i.e. the initial try plus 2 retries
 
+# `--seconds` is a CEILING, not a schedule: the run ends when the guest ends.
+DEFAULT_SECONDS = 60              # no replay: this is a boot smoke test
+# NEXT.md B45: a staged replay is not a 60-second thing, so 60 could only ever cut one
+# short — and it did, on every corpus replay, while printing RESULT FAIL. The canonical
+# replay is 6002 ticks = ~100 s of GUEST time, which has measured 240-420 s of WALL time
+# on this host depending on load (residuals2-progress.md). 300 s is the lane's own
+# timeout (PROTOCOL.md). With replay_quit implied (B19) the run leaves the frame loop at
+# the replay's last tick, so this ceiling costs nothing when the replay behaves and only
+# bounds the run when it does not.
+REPLAY_SECONDS = int(os.environ.get("GDX_RETRO_REPLAY_SECONDS", "300"))
+
+
+def resolve_seconds(args, replay_block):
+    """-> (seconds, why). An explicit --seconds always wins."""
+    asked = getattr(args, "seconds", None)
+    if asked:
+        return int(asked), "--seconds %d" % int(asked)
+    if replay_block:
+        return REPLAY_SECONDS, ("default for a staged replay (a 60 s ceiling truncates "
+                                "every corpus replay; NEXT.md B45)")
+    return DEFAULT_SECONDS, "default for a run with no replay"
+
+
+def build_settings(args, three_d=None):
+    """The guest ini this invocation asks for. -> (settings, explicit keys).
+
+    `explicit` is what the command line NAMED, and nothing implied may overwrite it
+    (NEXT.md B19: `--no-replay-quit` and `--ini debug.replay_quit=0` must still win).
+    """
+    settings = {}
+    if three_d:
+        # Guest-side defaults --3d implies ([stereo] enabled, [debug] fh_eye=both); an
+        # explicit --ini below overrides either of them.
+        from . import stereo3d
+        settings.update(stereo3d.guest_settings())
+    explicit = set()
+    for spec in (getattr(args, "ini", None) or []):
+        section, key, value = inifile.parse_spec(spec)
+        settings[(section, key)] = value
+        explicit.add((section, key))
+    if getattr(args, "no_replay_quit", False):
+        settings[replay.REPLAY_QUIT_KEY] = "0"
+        explicit.add(replay.REPLAY_QUIT_KEY)
+    # Same measurement set as the Qt lane, so a brief's --ini means the same thing in
+    # both. Needed explicitly now that strip_run_control clears ALL of [debug] from a
+    # seeded ini — nothing is inherited, so every key we rely on must be set here.
+    from . import emu as _emu
+    for k, v in _emu.MEASUREMENT_INI.items():
+        settings.setdefault(k, v)
+    return settings, explicit
+
 
 def cmd_extra(args):
     """Frontend flags that do not depend on the renderer."""
@@ -613,7 +836,8 @@ def cmd_extra(args):
     return extra
 
 
-def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, attempt):
+def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, attempt,
+             three_d=None):
     """One boot. -> (ok, early_crash, guest_log_text, detail).
 
     `early_crash` means RetroArch died on its own before the deadline AND the guest never
@@ -622,7 +846,7 @@ def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, 
     next renderer instead.
     """
     video_driver = {"Vulkan": "vulkan", "OpenGL": "glcore", "Software": "gl"}.get(gfx, "gl")
-    write_config(inst, gfx=gfx, video_driver=video_driver)
+    write_config(inst, gfx=gfx, video_driver=video_driver, core=core, three_d=three_d)
     seed_sd(inst, out, settings)
     suppress_restore_prompt(out)
     for stale in (inst.log, rd.sub("log-%s.txt" % inst.name)):
@@ -666,7 +890,13 @@ def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, 
     # A guest that exited on purpose is not the core dying, so it must not count as
     # "the emulator was gone at the end" when the verdict judges completion.
     exited_early = rc is not None and not guest_done
+    # NEXT.md B45: "the clock ran out" and "the thing died" are different facts and were
+    # reported identically. rc is None and no guest exit receipt == the deadline expired
+    # with everything still alive, i.e. a TIMEOUT.
+    deadline_hit = rc is None and not guest_done
     _LAST_ATTEMPT["exited_early"] = exited_early
+    _LAST_ATTEMPT["deadline_hit"] = deadline_hit
+    _LAST_ATTEMPT["guest_exit"] = guest_done
     if rc is None:
         # Time-bounded run: grab the end screenshot over UDP before quitting, which is
         # what replaces --max-frames-ss (and the Qt lane's wid.swift hack).
@@ -731,30 +961,55 @@ def _crash_signature(console_path):
     return " (%s%s)" % (m.group(1), worker)
 
 
+def _three_d_or_none(args):
+    """--3d -> (mode, depth), or None when the flag was not given."""
+    if not getattr(args, "three_d", None):
+        return None
+    from . import stereo3d
+    return (stereo3d.mode_or_die(args.three_d),
+            stereo3d.depth_or_die(getattr(args, "depth_3d", None)
+                                  or stereo3d.DEFAULT_DEPTH))
+
+
 def do_run(args, out, ctx):
+    dry = bool(getattr(args, "dry_run", False))
     if not os.path.exists(RETRO_BIN):
-        raise GdxError("RetroArch not installed at %s (brew install --cask retroarch)"
-                       % RETRO_BIN, util.EXIT_PREFLIGHT)
-    core = ensure_core(out)
+        # A dry run reports the missing frontend instead of refusing: saying what WOULD
+        # happen is exactly what the flag is for, and it needs no frontend to say it.
+        if not dry:
+            raise GdxError("RetroArch not installed at %s (brew install --cask retroarch)"
+                           % RETRO_BIN, util.EXIT_PREFLIGHT)
+        out.warn("RetroArch is not installed at %s — a real run would fail preflight"
+                 % RETRO_BIN)
     threedsx = os.path.abspath(args.threedsx)
     if not os.path.isfile(threedsx):
         raise GdxError("no such .3dsx: %s" % threedsx, util.EXIT_USAGE)
 
+    # --3d: a 3D-capable core (the nightly, installed beside the shared one) plus the
+    # citra_render_3d / citra_factor_3d core options. Without the flag nothing below
+    # changes and the pinned release core is used exactly as before.
+    three_d = _three_d_or_none(args)
+    if dry:
+        # ensure_core() DOWNLOADS and unzips. "Change nothing" means nothing.
+        core = core_3d_path() if three_d else core_path()
+    elif three_d:
+        core = ensure_core_3d(out)
+    else:
+        core = ensure_core(out)
+
     want_gfx = normalise_gfx(getattr(args, "gfx", None))
     gfx_list = [want_gfx] if want_gfx else GFX_ORDER
-    suppress_restore_prompt(out)
-    settings = {}
-    for spec in (getattr(args, "ini", None) or []):
-        section, key, value = inifile.parse_spec(spec)
-        settings[(section, key)] = value
-    # Same measurement set as the Qt lane, so a brief's --ini means the same thing in
-    # both. Needed explicitly now that strip_run_control clears ALL of [debug] from a
-    # seeded ini — nothing is inherited, so every key we rely on must be set here.
-    from . import emu as _emu
-    for k, v in _emu.MEASUREMENT_INI.items():
-        settings.setdefault(k, v)
+    settings, explicit = build_settings(args, three_d)
+    if dry:
+        # NEXT.md B45: this used to fall straight through and boot a real instance. The
+        # flag that exists to be safe was the one that was not, so the dry-run return is
+        # the FIRST thing after the arguments are understood and BEFORE anything that
+        # writes, downloads, locks, or launches.
+        return _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit,
+                        three_d)
 
-    seconds = getattr(args, "seconds", None) or 60
+    suppress_restore_prompt(out)
+    load_at_launch = wait_for_host(out)
     rd = runs.create(ctx["run_root"], ctx["track"], getattr(args, "name", None) or "retro")
     out.say("run dir: %s" % rd.path)
     t0 = time.time()
@@ -775,8 +1030,17 @@ def do_run(args, out, ctx):
         replay_block, extra = replay.stage(args.replay, sdmc_root=inst.sdmc(),
                                            gdx_dir=inst.gdx_dir(), out=out)
         settings.update(extra)
+        # NEXT.md B19: a staged replay ENDS the run at its last tick unless the
+        # invocation said otherwise. `explicit` is what the command line named, so
+        # --no-replay-quit / --ini debug.replay_quit=0 survive this.
+        replay.apply_implied(settings, explicit, kind=replay_block.get("kind"), out=out)
     else:
         replay.stale_autoinput_warning(out, sdmc_root=inst.sdmc())
+
+    # The ceiling can only be chosen once the replay is known: a staged replay needs
+    # minutes, a bare boot needs a minute (NEXT.md B45).
+    seconds, seconds_why = resolve_seconds(args, replay_block)
+    out.say("--seconds ceiling: %d s (%s)" % (seconds, seconds_why))
 
     last_error = None
     attempts_log = []
@@ -787,7 +1051,8 @@ def do_run(args, out, ctx):
     for gfx in gfx_list:
         for attempt in range(1, EARLY_CRASH_ATTEMPTS + 1):
             ok, early, sd_log, why = _attempt(inst, gfx, core, threedsx, cmd_extra(args),
-                                              seconds, settings, rd, ctx, out, attempt)
+                                              seconds, settings, rd, ctx, out, attempt,
+                                              three_d=three_d)
             alive_at_end = not _LAST_ATTEMPT.get("exited_early", False)
             attempts_log.append({"gfx": gfx, "attempt": attempt, "ok": ok,
                                  "early_crash": early, "detail": why})
@@ -803,6 +1068,16 @@ def do_run(args, out, ctx):
         if ok:
             break
         out.warn("giving up on citra_graphics_api=%s: %s" % (gfx, why))
+    used_gfx = next((a["gfx"] for a in reversed(attempts_log) if a.get("ok")), None)
+    if used_gfx and want_gfx and used_gfx != want_gfx:
+        out.warn("renderer fell back to %s (asked for %s)" % (used_gfx, want_gfx))
+    elif used_gfx and not want_gfx and used_gfx != GFX_ORDER[0]:
+        # Frame hashes are renderer-specific, so a silent fallback turns an A/B into a
+        # comparison of two renderers. Say so; `gdx-dev prof --ab` and fhdiff also refuse
+        # to compare runs whose `platform.gfx` differ.
+        out.warn("renderer fell back to %s (default is %s) — do NOT compare frame hashes "
+                 "or timings from this run against a %s run"
+                 % (used_gfx, GFX_ORDER[0], GFX_ORDER[0]))
 
     manifest = runs.new_manifest(
         run_id=rd.run_id, track=ctx["track"], lane="retro", started=util.iso_now(),
@@ -810,14 +1085,23 @@ def do_run(args, out, ctx):
         build=buildmod.build_info_for_manifest(ctx["root"],
                                                getattr(args, "build_dir", "build-3ds"),
                                                threedsx),
+        # NEXT.md B46 / PROTOCOL.md: a parity cell is a claim about a tree. The branch
+        # point goes in the manifest so no number can be quoted without it.
+        tree=buildmod.tree_info(ctx["root"]),
         ini={"%s.%s" % k: v for k, v in settings.items()}, replay=replay_block,
         gputrace=inifile.truthy(settings.get(("debug", "gputrace"), "0")), seconds=seconds,
-        platform={"host": "darwin-arm64", "azahar": None,
+        platform={"host": "darwin-arm64", "azahar": None, "gfx": used_gfx,
+                  "gfx_requested": want_gfx or GFX_ORDER[0],
                   "retroarch": retroarch_version(), "model": "emu-new3ds"},
         result={"verdict": "UNKNOWN", "fatals": 0, "max_frame": None,
                 "distinct_frames": 0, "errors": {}},
         artifacts={"log": "log-%s.txt" % inst.name, "emu_log": "retroarch-%s.log" % inst.name,
                    "shots": sorted(os.listdir(rd.sub("shots")))})
+    if three_d:
+        from . import stereo3d
+        # Which emulator drew this, and in which 3D mode: two --3d runs are only
+        # comparable to each other, never to a release-core mono run.
+        manifest["stereo3d"] = stereo3d.retro_receipt(three_d[0], three_d[1], core)
 
     from . import emu as emumod
     sd_text = util.read_text(rd.sub("log-%s.txt" % inst.name))
@@ -825,18 +1109,30 @@ def do_run(args, out, ctx):
     result = emumod.judge(ra_text, sd_text, out,
                           replay_kind=(replay_block or {}).get("kind"),
                           replay_block=replay_block,
-                          emu_alive_at_end=alive_at_end)
+                          emu_alive_at_end=alive_at_end,
+                          deadline_hit=_LAST_ATTEMPT.get("deadline_hit"),
+                          seconds=seconds)
     manifest["result"] = {k: result[k] for k in
                           ("verdict", "fatals", "max_frame", "distinct_frames", "errors",
                            "replay_complete", "shots_expected", "shots_seen",
-                           "missing_shots")}
+                           "missing_shots", "timed_out")}
+    # Host contention is the difference between a profile and a fiction: record it so a
+    # reader can throw the run out rather than trust it (2026-09-23, load hit 111).
+    manifest["host"] = {"loadavg_at_launch": round(load_at_launch, 2),
+                        "loadavg_at_end": round(host_load(), 2),
+                        "slots": MAX_CONCURRENT, "max_loadavg": MAX_LOADAVG}
     manifest["attempts"] = attempts_log
     rd.write_manifest(manifest)
     rd.write_verdict(result["verdict"], result["detail"] + ("; " + last_error if last_error else ""))
     with open(rd.sub("RESULT"), "w") as f:
         f.write(emumod.result_line(manifest, result) + "\n")
     out.say(emumod.result_line(manifest, result))
+    out.say(buildmod.tree_receipt(manifest["tree"]))
+    stale = buildmod.tree_warning(manifest["tree"])
+    if stale:
+        out.warn(stale)
     out.table(["field", "value"], [["run", rd.run_id], ["verdict", result["verdict"]],
+                                   ["tree", buildmod.tree_receipt(manifest["tree"])],
                                    ["detail", result["detail"]], ["instance", inst.name],
                                    ["replay complete", result["replay_complete"]],
                                    ["SHOTs", "%s/%s" % (result["shots_seen"],
@@ -848,6 +1144,68 @@ def do_run(args, out, ctx):
     out.emit(manifest)
     release_instance(inst)
     return util.EXIT_OK if result["verdict"] == "PASS" else util.EXIT_FAIL
+
+
+def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three_d):
+    """`--dry-run`: say exactly what a real run would do, and do none of it.
+
+    NEXT.md B45. This flag existed, was documented, was parsed — and `retro run` never
+    read it, so `--dry-run` booted a real RetroArch instance on a private SD. The worst
+    kind of harness bug: the flag that exists to be safe is the one that is not. Every
+    side effect a real run has is listed here as a WOULD, and the function reaches none
+    of them: no core download, no instance lock, no SD seed, no ini write, no launch,
+    not even a run directory.
+    """
+    inst = Instance(getattr(args, "instance", None) or "<run-id>")
+    replay_block, extra = (None, {})
+    if getattr(args, "replay", None):
+        # dry_run=True: resolves, VALIDATES and reports the replay, copies nothing.
+        replay_block, extra = replay.stage(args.replay, sdmc_root=inst.sdmc(),
+                                           gdx_dir=inst.gdx_dir(), dry_run=True, out=out)
+        settings.update(extra)
+        replay.apply_implied(settings, explicit, kind=replay_block.get("kind"), out=out)
+    seconds, seconds_why = resolve_seconds(args, replay_block)
+
+    cmd = [RETRO_BIN, "-c", inst.cfg, "-L", core, threedsx, "-v", "--log-file", inst.log]
+    cmd += list(cmd_extra(args))
+    tree = buildmod.tree_info(ctx["root"])
+
+    out.say("DRY RUN — nothing below was launched, written, downloaded or locked.")
+    out.say("")
+    out.table(["would", "value"], [
+        ["launch", " ".join(cmd)],
+        ["renderers, in order", ", ".join(gfx_list)],
+        ["instance", inst.name + ("" if getattr(args, "instance", None)
+                                  else " (defaulted to the run id, unique per run)")],
+        ["private SD", inst.sdmc()],
+        ["udp port", inst.port],
+        ["core", "%s%s" % (core, "" if os.path.exists(core) else "  (NOT INSTALLED — a "
+                                                                "real run downloads it)")],
+        ["seconds ceiling", "%d s (%s)" % (seconds, seconds_why)],
+        ["replay", "%s (%s, last tick %s, %d SHOT(s))"
+         % (replay_block["id"], replay_block["kind"], replay_block["last_tick"],
+            len(replay_block["shots"])) if replay_block else "none"],
+        ["host gate", "wait for < %d live instance(s) and load <= %.0f (now %.2f)"
+         % (MAX_CONCURRENT, MAX_LOADAVG, host_load())],
+        ["tree", buildmod.tree_receipt(tree)],
+    ])
+    out.say("")
+    out.say("would seed this guest ini (every [debug]/[native] key stripped first):")
+    out.table(["section.key", "value", "source"],
+              [["%s.%s" % k, settings[k],
+                "--ini" if k in explicit else
+                ("--replay" if k in extra else
+                 ("implied by --replay" if k == replay.REPLAY_QUIT_KEY and replay_block
+                  else "lane default"))]
+               for k in sorted(settings)])
+    stale = buildmod.tree_warning(tree)
+    if stale:
+        out.warn(stale)
+    out.emit({"dry_run": True, "cmd": cmd, "instance": inst.name, "sdmc": inst.sdmc(),
+              "seconds": seconds, "seconds_why": seconds_why, "gfx": gfx_list,
+              "replay": replay_block, "tree": tree,
+              "ini": {"%s.%s" % k: v for k, v in settings.items()}})
+    return util.EXIT_OK
 
 
 def do_reap(args, out, ctx):

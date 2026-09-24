@@ -140,7 +140,14 @@ void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
 void* gdx_host_calloc(size_t count, size_t size) { return calloc(count, size); }
 void gdx_host_free(void* ptr) { free(ptr); }
 void  gdx_host_exit(int status) { exit(status); }
-void  gdx_host_abort(void) { abort(); }
+/* Every abort so far reached the 3DS log as a bare "[fatal] abort() called": the reason
+   breadcrumbs at the call sites rode the TRACE gate, which the 3DS build never sets. Name the
+   caller unconditionally (symbolize with addr2line against G-Diffuser-3DS.elf). */
+void  gdx_host_abort(void) {
+    extern void gdx_dbg_logf(const char* fmt, ...);
+    gdx_dbg_logf("[fatal] gdx_host_abort from ra=%p\n", __builtin_return_address(0));
+    abort();
+}
 
 // ---- Memory arena (port reimplementation) ----------------------------------
 // Arena_Allocate carves from the host RDRAM bump allocator (gdx_rdram_alloc_raw; the buffer is

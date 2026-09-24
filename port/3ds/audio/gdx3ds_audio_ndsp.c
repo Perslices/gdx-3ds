@@ -312,10 +312,14 @@ static void EnsureSuspendGate(void) {
  * the caller's loop condition then exits WITHOUT touching ndsp -- the DSP is asleep). */
 static void ParkDrainWhileSuspended(void) {
     sDrainParked = 1;
+    __dmb(); /* HOMEFIX2: the ack must be visible before we block -- plain volatile stores are
+              * not ordered against the suspender's polling load on ARM11 MPCore (the Dekker
+              * store-buffer shape the 2026-09-23 audit flagged). */
     while (sSuspended && !s.stopRequested) {
         LightEvent_Wait(&sDrainParkEvent);
     }
     sDrainParked = 0;
+    __dmb();
 }
 
 /* Pull up to maxFrames from the ring into dst (NULL = discard, null-sink mode). Returns the
@@ -825,10 +829,21 @@ void gdx3ds_audio_shutdown(void) {
         return;
     }
     s.stopRequested = 1;         /* set BEFORE the signal: the park loop re-checks it */
+    __dmb();
     LightEvent_Signal(&sDrainParkEvent); /* a drain parked by the suspend gate must see stop */
     if (s.drainThread != NULL) {
-        threadJoin(s.drainThread, U64_MAX); /* drain loop wakes every <= 16 ms */
-        threadFree(s.drainThread);
+        /* HOMEFIX2: bounded. This teardown runs on the close-from-HOME path with the DSP
+         * asleep; a drain stuck in an ndsp call there would wedge main() one step short of
+         * the final flush (the hang home-crash-audit.md's "Close-from-HOME hang fix"
+         * documents). Leak the thread deliberately with a receipt instead. */
+        if (R_FAILED(threadJoin(s.drainThread, 3000000000LL))) {
+            AudioOutLogf("[audio-out] drain join TIMEOUT (3 s) — leaking the thread so teardown "
+                         "can finish; suspended=%d stopRequested=%d",
+                         sSuspended ? 1 : 0, s.stopRequested);
+        } else {
+            threadFree(s.drainThread);
+        }
+        s.drainThread = NULL;
     }
     if (s.ndspOk) {
         /* Also correct when closing from the HOME menu with the DSP asleep (sSuspended still
@@ -1044,9 +1059,15 @@ int gdx3ds_audio_producer_thread_start(void (*entry)(void*), void* arg) {
 void gdx3ds_audio_producer_thread_join(void) {
     if (sProducerThread != NULL) {
         sProducerRelease = 1; /* a producer parked by the suspend gate must be able to exit */
+        __dmb();
         LightEvent_Signal(&sProducerParkEvent); /* producer's event ONLY: never wakes the drain */
-        threadJoin(sProducerThread, U64_MAX);
-        threadFree(sProducerThread);
+        /* HOMEFIX2: bounded, same reason as the drain join in gdx3ds_audio_shutdown. */
+        if (R_FAILED(threadJoin(sProducerThread, 3000000000LL))) {
+            AudioOutLogf("[audio-out] HLE producer join TIMEOUT (3 s) — leaking the thread so "
+                         "teardown can finish; suspended=%d", sSuspended ? 1 : 0);
+        } else {
+            threadFree(sProducerThread);
+        }
         sProducerThread = NULL;
     }
 }
@@ -1066,10 +1087,12 @@ int gdx3ds_audio_producer_park_if_suspended(void) {
         return 0;
     }
     sProducerParked = 1;
+    __dmb(); /* HOMEFIX2: see ParkDrainWhileSuspended -- publish the ack before blocking. */
     while (sSuspended && !sProducerRelease) {
         LightEvent_Wait(&sProducerParkEvent);
     }
     sProducerParked = 0;
+    __dmb();
     return sProducerRelease ? 1 : 0;
 }
 
@@ -1086,10 +1109,14 @@ int gdx3ds_audio_suspend(int* drainParked, int* producerParked) {
     LightEvent_Clear(&sDrainParkEvent); /* clear BEFORE the flag: a thread seeing 1 must block */
     LightEvent_Clear(&sProducerParkEvent);
     sSuspended = 1;
+    __dmb(); /* HOMEFIX2: the flag must be visible to both threads before we start polling
+              * their acks; without it the poll can read a stale 0 for the whole 50 ms and
+              * the receipt blames a thread that did park. */
     int needDrain = (s.drainThread != NULL);
     int needProducer = (sProducerThread != NULL && !sProducerRelease);
     uint32_t polls = 0;
     for (;;) {
+        __dmb(); /* HOMEFIX2: pair with the park-side barriers above */
         int drainOk = !needDrain || sDrainParked;
         int producerOk = !needProducer || sProducerParked;
         if ((drainOk && producerOk) || polls >= GDX3DS_AUDIO_SUSPEND_ACK_POLLS) {

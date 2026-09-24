@@ -8,6 +8,7 @@ run — fails your run. We record the log's byte offset immediately before launc
 (05-devcli-plan.md §6, "Mitigation: byte-offset slicing at launch").
 """
 
+import contextlib
 import os
 import shutil
 import signal
@@ -31,11 +32,21 @@ DEFAULT_SECONDS = 60
 
 # The measurement set every campaign turns on (05-devcli-plan.md §2 item 5). gputrace is
 # NOT here: it inflates profiles (PROTOCOL.md line 22), so it is opt-in per run.
+#
+# `renderthread` IS here, and it is here for the same reason `strip_run_control` exists on
+# the RetroArch lane (rtparity-progress.md). The Qt lane merges into the SHARED virtual SD
+# ini, which on this machine has carried `[debug] renderthread = 0` since 2026-09-17 — a
+# control value some earlier track left behind. Because `emu run` merges and never
+# overwrites, every Qt-lane run since then silently inherited it, including the oracle's
+# 6002-frame twin gate. Pinning it here makes the SHIPPING configuration (the thread on,
+# `bridgemain=1`) the default a gate measures, and makes `--ini debug.renderthread=0` an
+# explicit bisect lever rather than an accident of whoever used the SD last.
 MEASUREMENT_INI = {
     ("debug", "console"): "1",
     ("debug", "filelog"): "1",
     ("debug", "filelog_max_kb"): "4096",
     ("debug", "verbose"): "1",
+    ("debug", "renderthread"): "1",
 }
 
 
@@ -133,7 +144,7 @@ def frames_from_emu_log(text):
 
 
 def judge(emu_text, sd_text, out, replay_kind=None, replay_block=None,
-          emu_alive_at_end=None):
+          emu_alive_at_end=None, deadline_hit=None, seconds=None):
     frames = frames_from_emu_log(emu_text)
     p_emu = prof.parse_text(emu_text)
     p_sd = prof.parse_text(sd_text) if sd_text else prof.Parsed()
@@ -167,6 +178,18 @@ def judge(emu_text, sd_text, out, replay_kind=None, replay_block=None,
         verdict, detail = "FAIL", "%d [fatal] line(s) in this run's slice" % fatals
     elif not replay_ok:
         verdict, detail = "FAIL", replay_detail
+    elif comp["replay_complete"] is False and deadline_hit:
+        # NEXT.md B45: the run was CUT SHORT, not broken. The emulator was still alive and
+        # the guest still beating when `--seconds` expired, so the incomplete replay is a
+        # statement about the budget, not about the build. Reporting it as FAIL read like
+        # a crash and sent readers looking for one.
+        verdict = "TIMEOUT"
+        detail = ("--seconds%s elapsed with the run still going (frame %s%s): the replay "
+                  "was cut short, NOT crashed. Give it more --seconds, or let "
+                  "[debug] replay_quit=1 end it at the replay's last tick. (%s)"
+                  % ("" if seconds is None else " %d" % seconds, max_frame,
+                     "" if not (replay_block or {}).get("last_tick")
+                     else " of ~%d" % replay_block["last_tick"], comp["detail"]))
     elif comp["replay_complete"] is False:
         verdict, detail = "FAIL", "replay did not complete: " + comp["detail"]
     else:
@@ -177,6 +200,7 @@ def judge(emu_text, sd_text, out, replay_kind=None, replay_block=None,
         verdict = "PASS"
     return {
         "verdict": verdict, "detail": detail, "fatals": fatals,
+        "timed_out": verdict == "TIMEOUT",
         "max_frame": max_frame, "distinct_frames": distinct,
         "errors": {k: v for k, v in errors.items() if k not in ("fatal", "fatal-trace")},
         "replay_complete": comp["replay_complete"],
@@ -195,9 +219,24 @@ def do_run(args, out, ctx):
     settings = dict(MEASUREMENT_INI)
     if args.gputrace:
         settings[("debug", "gputrace")] = "1"
+    # --3d: the HOST 3D knob (qt-config.ini [Layout] render_3d/factor_3d, patched inside
+    # the lock below) plus the guest-side defaults it implies. Without the flag nothing in
+    # this function changes. See gdxdev/stereo3d.py for why the guest ini alone is inert.
+    three_d = None
+    if getattr(args, "three_d", None):
+        from . import stereo3d
+        three_d = (stereo3d.mode_or_die(args.three_d),
+                   stereo3d.depth_or_die(getattr(args, "depth_3d", None)
+                                         or stereo3d.DEFAULT_DEPTH))
+        settings.update(stereo3d.guest_settings())
+    explicit = set()
     for spec in (args.ini or []):
         section, key, value = inifile.parse_spec(spec)
         settings[(section, key)] = value
+        explicit.add((section, key))
+    if getattr(args, "no_replay_quit", False):
+        settings[replay.REPLAY_QUIT_KEY] = "0"
+        explicit.add(replay.REPLAY_QUIT_KEY)
 
     if args.dry_run:
         out.say("DRY RUN — the legacy equivalent of this invocation:")
@@ -209,6 +248,11 @@ def do_run(args, out, ctx):
             path, kind = replay.resolve(args.replay)
             out.say("  cp %s %s" % (path, util.AUTOINPUT_SD if kind == "autoinput"
                                     else os.path.join(util.GDX_SDMC_DIR, "rec/")))
+        if three_d:
+            from . import stereo3d
+            out.say("  # --3d: set in [Layout] of %s, RESTORED after the run" % util.AZAHAR_CFG)
+            for k, v in stereo3d.qt_keys(three_d[0], three_d[1]):
+                out.say("  #   %s=%s" % (k, v))
         out.say("  wc -c '%s'   # byte offset for this run's slice" % util.AZAHAR_LOG)
         out.say("  '%s' '%s' &  sleep %d" % (util.AZAHAR_BIN, threedsx, seconds))
         out.say("  pkill -x azahar; sleep 3; pkill -9 -x azahar")
@@ -227,6 +271,7 @@ def do_run(args, out, ctx):
         platform={"host": "darwin-arm64", "azahar": azahar_version(),
                   "retroarch": None, "model": "emu-new3ds"},
         build=buildmod.build_info_for_manifest(root, args.build_dir, threedsx),
+        tree=buildmod.tree_info(root),        # NEXT.md B46 / PROTOCOL.md
         ini={"%s.%s" % k: v for k, v in settings.items()},
         replay=None, result={"verdict": "UNKNOWN", "fatals": 0, "max_frame": None,
                              "distinct_frames": 0, "errors": {}},
@@ -249,6 +294,8 @@ def do_run(args, out, ctx):
             block, extra = replay.stage(args.replay, out=out)
             manifest["replay"] = block
             settings.update(extra)
+            # NEXT.md B19: the run ends at the replay's last tick unless told otherwise.
+            replay.apply_implied(settings, explicit, kind=block.get("kind"), out=out)
         else:
             manifest["replay"] = None
             replay.stale_autoinput_warning(out)
@@ -262,6 +309,27 @@ def do_run(args, out, ctx):
         manifest["ini"] = {"%s.%s" % k: v for k, v in settings.items()}
         manifest["gputrace"] = inifile.truthy(settings.get(("debug", "gputrace"), "0"))
 
+        # The Qt lane merges into the SHARED virtual SD, so every `[debug]` / `[native]` key
+        # this run did not set is INHERITED from whoever used that SD last. The RetroArch lane
+        # strips both sections from a seeded instance ini for exactly this reason; the Qt lane
+        # cannot, because that file is the user's. So name them. Measured cost of not doing so
+        # (rtparity-progress.md): the shared SD's `renderthread = 0` silently defined the
+        # render-thread state of every Qt-lane parity run the fork ever scored, and a stale
+        # `[native] machines/fx_sink/fx_sprites/fx_hud = 1` block turned a "levers off"
+        # reference lane into something else without a word in the transcript.
+        inherited = []
+        live_ini = inifile.read(util.GDX_INI)
+        for sec in ("debug", "native"):
+            for key, val in sorted(live_ini.get(sec, {}).items()):
+                if (sec, key) not in settings and str(val).strip() not in ("", "0"):
+                    inherited.append("[%s] %s = %s" % (sec, key, val))
+        if inherited:
+            out.warn("%d lever/run-control key(s) INHERITED from the shared SD ini — this run "
+                     "did not set them and they are not neutral:" % len(inherited))
+            for line in inherited:
+                out.warn("  " + line)
+        manifest["ini_inherited"] = inherited
+
         # The guest opens log.txt with "w" (port/3ds/gdx3ds_filelog.c:113) so it is
         # per-boot already; move the previous one aside anyway so a boot that never
         # reaches the filelog init cannot pass off stale content as this run's.
@@ -274,42 +342,52 @@ def do_run(args, out, ctx):
         slicer = LogSlicer(util.AZAHAR_LOG)
         out.say("azahar log offset for this run: %d bytes" % slicer.offset)
 
-        shots_before = _shot_set()
-        alive_at_end = True
-        pid, console_path = _launch(threedsx, rd, args.launch, out)
-        out.say("azahar pid %d; running %ds..." % (pid, seconds))
+        # The qt-config.ini patch has to open AFTER the stale-azahar kill (Azahar rewrites
+        # the whole file when it exits) and close BEFORE the lock is released (so no other
+        # agent can launch into a 3D config we are about to take away). This stack gives
+        # it exactly that window, restore included on any exit path.
+        with contextlib.ExitStack() as stack:
+            if three_d:
+                from . import stereo3d
+                stack.enter_context(stereo3d.QtStereo(three_d[0], three_d[1], out))
+                manifest["stereo3d"] = stereo3d.qt_receipt(three_d[0], three_d[1])
 
-        deadline = time.time() + seconds
-        t0 = time.time()
-        next_snap = 0.0
-        try:
-            while time.time() < deadline:
-                # Poll often, snapshot rarely. The old loop slept a full SNAPSHOT_S
-                # between checks, so a run that finished in 8 s still sat here.
-                time.sleep(min(POLL_S, max(0.1, deadline - time.time())))
-                now = time.time()
-                if now >= next_snap:
-                    _snapshot(rd, slicer)
-                    next_snap = now + SNAPSHOT_S
-                if not util.pid_alive(pid):
-                    alive_at_end = False
-                    out.warn("azahar exited early after %.0fs" % (now - t0))
-                    break
-                # The EMULATOR outliving the GUEST is the common case: a .3dsx that
-                # exits (replay_quit, quit_at_tick, or its own exit()) leaves Azahar up
-                # with a dead window, so waiting on the process idled out the whole of
-                # --seconds after the run was already over.
-                why = guest_exit_reason(util.read_text(rd.sub("log.txt")))
-                if why:
-                    out.say("guest exited after %.0fs (%s) — stopping early" % (now - t0, why))
-                    break
-        except KeyboardInterrupt:
-            out.warn("interrupted — stopping azahar and keeping the artifacts")
-        finally:
-            _stop_pid(pid)
-            _snapshot(rd, slicer)
+            shots_before = _shot_set()
+            alive_at_end = True
+            pid, console_path = _launch(threedsx, rd, args.launch, out)
+            out.say("azahar pid %d; running %ds..." % (pid, seconds))
 
-        shots = _collect_shots(rd, shots_before)
+            deadline = time.time() + seconds
+            t0 = time.time()
+            next_snap = 0.0
+            try:
+                while time.time() < deadline:
+                    # Poll often, snapshot rarely. The old loop slept a full SNAPSHOT_S
+                    # between checks, so a run that finished in 8 s still sat here.
+                    time.sleep(min(POLL_S, max(0.1, deadline - time.time())))
+                    now = time.time()
+                    if now >= next_snap:
+                        _snapshot(rd, slicer)
+                        next_snap = now + SNAPSHOT_S
+                    if not util.pid_alive(pid):
+                        alive_at_end = False
+                        out.warn("azahar exited early after %.0fs" % (now - t0))
+                        break
+                    # The EMULATOR outliving the GUEST is the common case: a .3dsx that
+                    # exits (replay_quit, quit_at_tick, or its own exit()) leaves Azahar up
+                    # with a dead window, so waiting on the process idled out the whole of
+                    # --seconds after the run was already over.
+                    why = guest_exit_reason(util.read_text(rd.sub("log.txt")))
+                    if why:
+                        out.say("guest exited after %.0fs (%s) — stopping early" % (now - t0, why))
+                        break
+            except KeyboardInterrupt:
+                out.warn("interrupted — stopping azahar and keeping the artifacts")
+            finally:
+                _stop_pid(pid)
+                _snapshot(rd, slicer)
+
+            shots = _collect_shots(rd, shots_before)
 
     emu_text = util.read_text(rd.sub("emu.log"))
     sd_text = util.read_text(rd.sub("log.txt"))

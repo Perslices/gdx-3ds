@@ -151,6 +151,9 @@ add_library(gdx3ds_gfx STATIC
     gdx3ds_track_replay.cpp  # [native] track: Interpreter::GdxTrackMarker (marker replay)
     gdx3ds_native_tri.cpp    # [native] shared exact/fast triangle replay (track + fx)
     gdx3ds_native_cfg.c      # [native] ini section reader (all master, boot receipt)
+    gdx3ds_cov.c             # COVERAGE (B15/B43): [cov] per-frame feature census ([debug] cov).
+                             # Here, not in the exe, because gdx3ds-dl-tests links this library
+                             # too and every hook in it resolves gdx3ds_cov_mark.
     gdx3ds_fx_sink.c         # [native] fx: game-side effects recorder (gdx3ds_fx_shim.h)
     gdx3ds_fx_replay.cpp     # [native] fx: Interpreter::GdxFxMarker (marker replay)
     gdx3ds_seam_lus.cpp      # [native] GdxInterpSeam over the vendored LUS interpreter (marker + DL hook entries)

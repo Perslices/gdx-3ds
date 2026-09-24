@@ -1,0 +1,40 @@
+diff --git a/src/audio/disk/lib/audio.h b/src/audio/disk/lib/audio.h
+index cfba128..c15c1c1 100644
+--- a/src/audio/disk/lib/audio.h
++++ b/src/audio/disk/lib/audio.h
+@@ -1286,7 +1286,11 @@ extern s16 D_80771228[];
+ /* Enlarged on host: N64-tuned pool splits overflow the retail heap once structs carry
+    64-bit pointers (see audio_heap.c). This declaration must match the definition --
+    init_data.c derives the heap init size from sizeof(gAudioHeap). */
++#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
++extern u8 gAudioHeap[0x2ECA00 * 2];
++#else
+ extern u8 gAudioHeap[0x2ECA00 * 4];
++#endif
+ #else
+ extern u8 gAudioHeap[0x2ECA00];
+ #endif
+diff --git a/src/audio/disk/lib/audio_heap.c b/src/audio/disk/lib/audio_heap.c
+index 4555a18..234801f 100644
+--- a/src/audio/disk/lib/audio_heap.c
++++ b/src/audio/disk/lib/audio_heap.c
+@@ -4,8 +4,18 @@
+ /* The pools are carved by N64-tuned spec sizes, but several cached structs carry
+    64-bit pointers on the host and outgrow their N64 footprints. At the retail
+    0x2ECA00 the session-pool carve fails, AudioHeap_InitPool builds a near-NULL
+-   pool, and the second AudioHeap_AllocZeroed from it faults. */
++   pool, and the second AudioHeap_AllocZeroed from it faults.
++   The x4 is a 64-BIT-HOST headroom figure: the overflow it pays for is pointers
++   doubling from 4 to 8 bytes, which does not happen on an ILP32 target. 0x2ECA00*4 is
++   12.2 MB of BSS -- on the 3DS that is 12 MB taken out of a ~49 MB application heap
++   before a single allocation, and it is the single largest reason an EK 3DS build runs
++   out of memory at boot (B11, docs/research/native/ekbuild-progress.md). Halved there;
++   x2 still leaves 2.9 MB of headroom over the retail carve. */
++#if defined(__SIZEOF_POINTER__) && __SIZEOF_POINTER__ == 4
++u8 gAudioHeap[0x2ECA00 * 2];
++#else
+ u8 gAudioHeap[0x2ECA00 * 4];
++#endif
+ #else
+ u8 gAudioHeap[0x2ECA00];
+ #endif

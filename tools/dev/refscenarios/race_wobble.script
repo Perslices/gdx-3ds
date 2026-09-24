@@ -1,0 +1,299 @@
+# Race start — Grand Prix / Novice / Jack Cup / Mute City / Blue Falcon.
+#
+# Everything after the title is gated on gGameMode with WAITMODE rather than on a frame count,
+# because the boot timeline is wall-clock-coupled (see title.script and refbuild-progress.md) and
+# a fixed wait that is long enough on a warm run overshoots a menu on a cold one. The three gates
+# are GAMEMODE_MAIN_MENU (7), GAMEMODE_MACHINE_SELECT (8), GAMEMODE_MACHINE_SETTINGS (9) and
+# GAMEMODE_GP_RACE (1) from decomp/include/fzx_game.h. A WAITMODE that times out logs
+# "[autotest] WAITMODE timeout" and CONTINUES, so read the log before trusting any shot below it —
+# CONTINUING.md says exactly this about scripts that claim to have raced.
+#
+# Menu path (every step is the A button on an "OK?" prompt; START only leaves the title):
+#   TITLE -START-> SELECT MODE -A-> class popup -A-> NOVICE -A-> cup -A-> Jack Cup
+#         -A-> MUTE CITY -A-> SELECT MACHINE -A-> BLUE FALCON -A-> settings -A-> OK -A-> RACE
+# 400, not 1500: the staged config paces the loop at 59.94 Hz, which puts the title window at
+# roughly poll 300-900 (unpaced it is near 1200-1500). At 1500 this script was pressing START
+# inside the attract-mode demo race.
+WAIT 400
+SHOT race_title
+PRESS START 10
+WAITMODE 7 600
+LOG reached SELECT MODE
+WAIT 60
+PRESS A 10
+WAIT 90
+PRESS A 10
+WAIT 90
+PRESS A 10
+WAIT 120
+SHOT race_cup
+PRESS A 10
+WAIT 120
+SHOT race_course
+PRESS A 10
+WAITMODE 8 600
+LOG reached SELECT MACHINE
+WAIT 60
+SHOT race_machine
+PRESS A 10
+WAIT 120
+PRESS A 10
+WAITMODE 9 600
+LOG reached MACHINE SETTINGS
+WAIT 60
+SHOT race_settings
+PRESS A 10
+WAIT 90
+PRESS A 10
+WAITMODE 1 1200
+LOG reached GP RACE
+# Window S (stationary): >8 s after the race begins with NO input at all -- the machine never
+# leaves the line and the chase camera is perfectly still. Anything that moves in the distant
+# road in this window is per-frame instability, not motion sampling.
+WAIT 500
+LOG stationary window begins
+WAIT 1
+SHOT s000
+WAIT 1
+SHOT s001
+WAIT 1
+SHOT s002
+WAIT 1
+SHOT s003
+WAIT 1
+SHOT s004
+WAIT 1
+SHOT s005
+WAIT 1
+SHOT s006
+WAIT 1
+SHOT s007
+WAIT 1
+SHOT s008
+WAIT 1
+SHOT s009
+WAIT 1
+SHOT s010
+WAIT 1
+SHOT s011
+WAIT 1
+SHOT s012
+WAIT 1
+SHOT s013
+WAIT 1
+SHOT s014
+WAIT 1
+SHOT s015
+WAIT 1
+SHOT s016
+WAIT 1
+SHOT s017
+WAIT 1
+SHOT s018
+WAIT 1
+SHOT s019
+WAIT 1
+SHOT s020
+WAIT 1
+SHOT s021
+WAIT 1
+SHOT s022
+WAIT 1
+SHOT s023
+WAIT 1
+SHOT s024
+WAIT 1
+SHOT s025
+WAIT 1
+SHOT s026
+WAIT 1
+SHOT s027
+WAIT 1
+SHOT s028
+WAIT 1
+SHOT s029
+WAIT 1
+SHOT s030
+WAIT 1
+SHOT s031
+WAIT 1
+SHOT s032
+WAIT 1
+SHOT s033
+WAIT 1
+SHOT s034
+WAIT 1
+SHOT s035
+WAIT 1
+SHOT s036
+WAIT 1
+SHOT s037
+WAIT 1
+SHOT s038
+WAIT 1
+SHOT s039
+WAIT 1
+SHOT s040
+WAIT 1
+SHOT s041
+WAIT 1
+SHOT s042
+WAIT 1
+SHOT s043
+WAIT 1
+SHOT s044
+WAIT 1
+SHOT s045
+WAIT 1
+SHOT s046
+WAIT 1
+SHOT s047
+WAIT 1
+SHOT s048
+WAIT 1
+SHOT s049
+WAIT 1
+SHOT s050
+WAIT 1
+SHOT s051
+WAIT 1
+SHOT s052
+WAIT 1
+SHOT s053
+WAIT 1
+SHOT s054
+WAIT 1
+SHOT s055
+WAIT 1
+SHOT s056
+WAIT 1
+SHOT s057
+WAIT 1
+SHOT s058
+WAIT 1
+SHOT s059
+# Window W (moving): 10 s of full throttle from the line, then one SHOT per frame.
+INPUT A 0 0 600
+LOG moving window begins
+INPUT A 0 0 1
+SHOT w000
+INPUT A 0 0 1
+SHOT w001
+INPUT A 0 0 1
+SHOT w002
+INPUT A 0 0 1
+SHOT w003
+INPUT A 0 0 1
+SHOT w004
+INPUT A 0 0 1
+SHOT w005
+INPUT A 0 0 1
+SHOT w006
+INPUT A 0 0 1
+SHOT w007
+INPUT A 0 0 1
+SHOT w008
+INPUT A 0 0 1
+SHOT w009
+INPUT A 0 0 1
+SHOT w010
+INPUT A 0 0 1
+SHOT w011
+INPUT A 0 0 1
+SHOT w012
+INPUT A 0 0 1
+SHOT w013
+INPUT A 0 0 1
+SHOT w014
+INPUT A 0 0 1
+SHOT w015
+INPUT A 0 0 1
+SHOT w016
+INPUT A 0 0 1
+SHOT w017
+INPUT A 0 0 1
+SHOT w018
+INPUT A 0 0 1
+SHOT w019
+INPUT A 0 0 1
+SHOT w020
+INPUT A 0 0 1
+SHOT w021
+INPUT A 0 0 1
+SHOT w022
+INPUT A 0 0 1
+SHOT w023
+INPUT A 0 0 1
+SHOT w024
+INPUT A 0 0 1
+SHOT w025
+INPUT A 0 0 1
+SHOT w026
+INPUT A 0 0 1
+SHOT w027
+INPUT A 0 0 1
+SHOT w028
+INPUT A 0 0 1
+SHOT w029
+INPUT A 0 0 1
+SHOT w030
+INPUT A 0 0 1
+SHOT w031
+INPUT A 0 0 1
+SHOT w032
+INPUT A 0 0 1
+SHOT w033
+INPUT A 0 0 1
+SHOT w034
+INPUT A 0 0 1
+SHOT w035
+INPUT A 0 0 1
+SHOT w036
+INPUT A 0 0 1
+SHOT w037
+INPUT A 0 0 1
+SHOT w038
+INPUT A 0 0 1
+SHOT w039
+INPUT A 0 0 1
+SHOT w040
+INPUT A 0 0 1
+SHOT w041
+INPUT A 0 0 1
+SHOT w042
+INPUT A 0 0 1
+SHOT w043
+INPUT A 0 0 1
+SHOT w044
+INPUT A 0 0 1
+SHOT w045
+INPUT A 0 0 1
+SHOT w046
+INPUT A 0 0 1
+SHOT w047
+INPUT A 0 0 1
+SHOT w048
+INPUT A 0 0 1
+SHOT w049
+INPUT A 0 0 1
+SHOT w050
+INPUT A 0 0 1
+SHOT w051
+INPUT A 0 0 1
+SHOT w052
+INPUT A 0 0 1
+SHOT w053
+INPUT A 0 0 1
+SHOT w054
+INPUT A 0 0 1
+SHOT w055
+INPUT A 0 0 1
+SHOT w056
+INPUT A 0 0 1
+SHOT w057
+INPUT A 0 0 1
+SHOT w058
+INPUT A 0 0 1
+SHOT w059
+WAIT 10
+QUIT

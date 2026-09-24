@@ -11,6 +11,13 @@
 
 #include "gdx_log.h"
 
+/* [native] dspcensus clock. Defined in gdx_rt_glue.cpp (3DS) / the host harness. `child`
+ * mirrors gdx3ds_prof_child_ticks so a per-opcode timer can subtract the [prof] sections
+ * (vtx/tri/imp/drw/mtx) that ran INSIDE the handler -- without itself becoming a child, which
+ * would empty the enclosing RUN bucket the census is explaining. */
+extern "C" long long gdx_ninterp_now(void);
+extern "C" unsigned long long gdx_ninterp_child_ticks(void);
+
 namespace gdxn {
 
 static inline float Clampf(float v, float lo, float hi) {
@@ -38,6 +45,10 @@ void Interp::Walk(const ListRef& root) {
     if (!PushList(root)) {
         return;
     }
+    if (mDspCensus) {
+        WalkCensus();
+        return;
+    }
     while (mSp > 0) {
         Frame& f = mStack[mSp - 1];
         if (f.idx >= f.list.limit) {
@@ -55,12 +66,62 @@ void Interp::Walk(const ListRef& root) {
             mStats.droppedOps++;
             continue;
         }
-        mBackend->VerifyNoteCmd(c.w0, c.w1);
+        if (mVerifyActive) { /* [nverify] diagnostic; free with interp_verify=0 */
+            mBackend->VerifyNoteCmd(c.w0, c.w1);
+        }
         const int r = Exec(c, f, f3dXfer);
         if (r == 1) {
             mSp--;
         }
     }
+}
+
+/* [native] dspcensus: the same loop with three tick reads per command. Kept as a SEPARATE
+ * body so the shipping loop above carries no census branch at all -- the whole point of the
+ * measurement is the per-command cost, and a predicted-not-taken branch per command is
+ * exactly the size of the thing being measured. */
+void Interp::WalkCensus() {
+    const uint64_t walkT0 = static_cast<uint64_t>(gdx_ninterp_now());
+    while (mSp > 0) {
+        Frame& f = mStack[mSp - 1];
+        if (f.idx >= f.list.limit) {
+            mStats.runaway++;
+            mSp--;
+            continue;
+        }
+        const uint64_t tFetch = static_cast<uint64_t>(gdx_ninterp_now());
+        Cmd c = ReadCmd(f.list, f.idx);
+        f.idx++;
+        const uint8_t rawOp = Opcode(c.w0);
+        mStats.op[rawOp]++;
+        mStats.cmds++;
+        size_t f3dXfer = 0;
+        const bool dropped = f.list.isF3d && !RemapF3d(c, f.list, &f3dXfer);
+        const uint64_t tExec = static_cast<uint64_t>(gdx_ninterp_now());
+        mStats.phTicks[DSP_PH_FETCH] += tExec - tFetch;
+        mStats.phCalls[DSP_PH_FETCH]++;
+        if (dropped) {
+            mStats.droppedOps++;
+            continue;
+        }
+        if (mVerifyActive) {
+            mBackend->VerifyNoteCmd(c.w0, c.w1);
+        }
+        const uint64_t childT0 = gdx_ninterp_child_ticks();
+        const int r = Exec(c, f, f3dXfer);
+        const uint64_t tEnd = static_cast<uint64_t>(gdx_ninterp_now());
+        /* Self time: the handler minus the [prof] sections it entered. The subtraction can
+         * only underflow if a section straddled the bracket, which cannot happen on one
+         * thread with balanced ProfScopes; clamp anyway so one bad frame cannot poison a
+         * uint64 accumulator for the rest of the window. */
+        const uint64_t gross = tEnd - tExec;
+        const uint64_t child = gdx_ninterp_child_ticks() - childT0;
+        mStats.opTicks[rawOp] += (child < gross) ? (gross - child) : 0; /* rawOp: same index as mStats.op[] */
+        if (r == 1) {
+            mSp--;
+        }
+    }
+    mStats.walkTicks += static_cast<uint64_t>(gdx_ninterp_now()) - walkT0;
 }
 
 /* Legacy F3D -> F3DEX2, one command. Mirrors n64_gfx_bridge.cpp ProcessList's isF3DSource
@@ -206,12 +267,33 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
 
         case OP_DL: {
             ListRef sub;
-            if (!mSrc.ResolveList(c, sub)) {
+            /* [native] dspcensus>=2: split the G_DL handler into resolve / hook / push. The
+             * reads are inside the opcode's own bracket, so they inflate 0xDE's self time by
+             * ~6 clock reads; compare shares, not the absolute, at level 2. */
+            const bool ph = mDspCensus >= 2;
+            uint64_t t0 = ph ? static_cast<uint64_t>(gdx_ninterp_now()) : 0;
+            const bool resolved = mSrc.ResolveList(c, sub);
+            if (ph) {
+                const uint64_t t1 = static_cast<uint64_t>(gdx_ninterp_now());
+                mStats.phTicks[DSP_PH_DLRESOLVE] += t1 - t0;
+                mStats.phCalls[DSP_PH_DLRESOLVE]++;
+                t0 = t1;
+            }
+            if (!resolved) {
                 mStats.noopLists++;
                 return 0;
             }
-            if (mDlHook != nullptr && mDlHook(mDlHookUser, sub.base, this) != 0) {
-                return 0;
+            if (mDlHook != nullptr) {
+                const int taken = mDlHook(mDlHookUser, sub.base, this);
+                if (ph) {
+                    const uint64_t t1 = static_cast<uint64_t>(gdx_ninterp_now());
+                    mStats.phTicks[DSP_PH_DLHOOK] += t1 - t0;
+                    mStats.phCalls[DSP_PH_DLHOOK]++;
+                    t0 = t1;
+                }
+                if (taken != 0) {
+                    return 0;
+                }
             }
             if (C0(c.w0, 16, 1) == 0) {
                 PushList(sub);
@@ -221,6 +303,10 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
                 mStats.lists++;
                 mStats.listsByClass[static_cast<int>(ClassOf(sub))]++;
                 if (sub.isF3d) mStats.listsF3d++;
+            }
+            if (ph) {
+                mStats.phTicks[DSP_PH_DLPUSH] += static_cast<uint64_t>(gdx_ninterp_now()) - t0;
+                mStats.phCalls[DSP_PH_DLPUSH]++;
             }
             return 2;
         }

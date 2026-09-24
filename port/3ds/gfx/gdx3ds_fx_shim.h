@@ -37,6 +37,16 @@
 extern "C" {
 #endif
 
+/* ---- COVERAGE ([debug] cov, NEXT.md B15/B43) ----
+ * Lever-INDEPENDENT effect-class presence. gdxfx_setup's own class attribution only runs when
+ * the sink is recording ([native] fx_sink), and a coverage census that only worked with one
+ * lever set would be measuring the lever, not the replay. These two symbols are declared here
+ * rather than by including gdx3ds_cov.h so the decomp translation unit that pulls this header
+ * in (racer.c) keeps its own include set. */
+extern int gdx3ds_cov_on;
+void gdxfx_cov_setup(const void* dl);
+void gdxfx_cov_vertex(void);
+
 /* ---- sink (port/3ds/gfx/gdx3ds_fx_sink.c) ---- */
 extern int gdxfx_active;
 void gdxfx_begin(int poolIndex, unsigned frame, int playerIndex);
@@ -44,7 +54,7 @@ void gdxfx_end(void);
 int gdxfx_pending(void);
 int gdxfx_marker(void* slot);
 int gdxfx_setup(void* slot, const void* dl);
-int gdxfx_texload(void* slot);
+int gdxfx_texload(void* slot, const void* img);
 int gdxfx_vertex(void* slot, const void* vtx, int n, int v0, int advanced);
 int gdxfx_tri(void* slot, int a, int b, int c, int advanced);
 int gdxfx_tri2(void* slot, int a, int b, int c, int d, int e, int f, int advanced);

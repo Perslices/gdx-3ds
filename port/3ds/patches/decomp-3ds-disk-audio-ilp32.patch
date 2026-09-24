@@ -1,0 +1,38 @@
+diff --git a/src/audio/disk/lib/load.c b/src/audio/disk/lib/load.c
+index f945cd5..5ec9024 100644
+--- a/src/audio/disk/lib/load.c
++++ b/src/audio/disk/lib/load.c
+@@ -3,7 +3,11 @@
+ #ifdef PORT
+ /* Host CRT headers collide with the decomp libc typedefs; allocation goes
+    through the port shims instead. */
+-extern void* gdx_host_calloc(unsigned long long count, unsigned long long size);
++/* `unsigned int`, not `unsigned long long`: the real shim (port/shims.c) takes size_t, which
++   is 32 bits on the ILP32 3DS build. The u64 spelling passes each argument in an ARM32
++   register PAIR, so the callee would read `size` out of the high half of `count`. Same class
++   of bug as the gdx_rdram_persist_alloc_raw declaration below. */
++extern void* gdx_host_calloc(unsigned int count, unsigned int size);
+ extern void gdx_host_free(void* ptr);
+ #endif
+ 
+@@ -937,9 +941,17 @@ static void* gdx_fontconv_alloc(s32 fontId, size_t size) {
+        space until sample chunks false-matched into font memory. Must be the persistent
+        top-of-RDRAM region: fonts are CACHEPOLICY_0 and the main arena is rewound at every
+        game-mode transition, which would leave soundFontList pointing into reclaimed
+-       memory. */
+-    extern void* gdx_rdram_persist_alloc_raw(unsigned long long size, unsigned long long align);
+-    void* p = gdx_rdram_persist_alloc_raw((unsigned long long) size, 16u);
++       memory.
++
++       `unsigned int` spelling, not `unsigned long long`: the real definition
++       (port/decomp_port.c) takes size_t, which is 32 bits on the ILP32 3DS build. The u64
++       spelling only happened to work on LP64 desktop; on ARM32 AAPCS each u64 argument takes
++       a REGISTER PAIR, so the callee read `align` out of the high half of `size` (always 0),
++       computed base = (top - size) & ~(0u - 1u) = 0, and aborted with
++       "[rdram] FATAL: arena exhausted (persist)" on the first soundfont conversion. Mirrors
++       the same fix already carried by audio/rom/lib/load.c. */
++    extern void* gdx_rdram_persist_alloc_raw(unsigned int size, unsigned int align);
++    void* p = gdx_rdram_persist_alloc_raw((unsigned int) size, 16u);
+     if (p != NULL) {
+         u8* b = p;
+         size_t i;

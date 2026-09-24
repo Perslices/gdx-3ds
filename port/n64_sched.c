@@ -27,6 +27,7 @@
 #pragma comment(lib, "Dbghelp.lib")
 #elif defined(GDX_PLATFORM_3DS)
 #include <3ds.h>       /* LightLock (gdx_mq_lock) + svcSleepThread(0) (spin-yield); devkitARM has no pthread */
+#include "3ds/gdx3ds_mainprof.h" /* MAINPROF: [mprof] buckets around the submit path */
 #else
 #include <sched.h>     /* sched_yield() for the audio-thread affinity spin-guard */
 #include <pthread.h>   /* gdx_mq_lock: cross-OS-thread message-queue guard */
@@ -538,6 +539,21 @@ void gdx_dbg_logf(const char* fmt, ...) {
 void gdx_ck(const char* s) {
     if (!gdx_trace_enabled()) return;
     gdx_port_logf("%s\n", s);
+}
+
+/* MAINPROF (3DS, port/3ds/gdx3ds_mainprof.h): the decomp's per-VI frame function
+   (decomp/src/sys/sys_gfx.c func_80067D64, via decomp-3ds-mainprof-checkpoints.patch) calls
+   this at each phase boundary so the [mprof] timeline can attribute the game thread's
+   milliseconds. Declared in decomp/include/global.h and defined here so the decomp keeps
+   building for every platform; off-3DS it is an empty call, and on 3DS the callee's first
+   statement is a test of one int. */
+void gdx_mprof_ck(int step) {
+#if defined(GDX_PLATFORM_3DS)
+    extern void gdx3ds_mprof_ck(int step);
+    gdx3ds_mprof_ck(step);
+#else
+    (void) step;
+#endif
 }
 
 void gdx_cki(const char* s, int v) {
@@ -1087,6 +1103,11 @@ int gdx_audio_produce_one_tick(void) {
      * gated on gAudioContextInitialized, which AudioLoad_Init sets only AFTER zeroing
      * gResetTimer (rom lib load.c), so this can only ever log 0 on a healthy boot -- a
      * nonzero value here is the historical mute-gate bug resurfacing. */
+    /* B11: gResetTimer is a ROM-audio-library symbol (decomp/src/audio/rom/lib/audio_context.c).
+     * GDX_EXPANSION_KIT=ON swaps audio/rom -> audio/disk wholesale and the disk library has no
+     * such variable and no equivalent mute gate, so the probe is rom-build-only. This block is
+     * inside the GDX_PLATFORM_3DS arm, which is why the desktop EK build never saw it. */
+#ifndef EXPANSION_KIT
     {
         extern volatile u32 gResetTimer;
         static int sResetProbed = 0;
@@ -1097,6 +1118,16 @@ int gdx_audio_produce_one_tick(void) {
                           gResetTimer != 0 ? " -- NONZERO: play-seq commands are being dropped" : "");
         }
     }
+#else
+    {
+        static int sResetProbed = 0;
+        if (!sResetProbed) {
+            sResetProbed = 1;
+            gdx_port_logf("[audio-reset] skipped: EXPANSION_KIT build uses the disk audio library "
+                          "(no gResetTimer mute gate)\n");
+        }
+    }
+#endif
 
     gdx_watch_audio_tick_enter++;
     gdx_watch_audio_stage = 1;
@@ -1121,7 +1152,14 @@ void osSpTaskStartGo(OSTask* tp) {
        interpreter instead; anything else (neither GFX nor AUDIO) is acked so the game's
        scheduler still advances, then return. */
     if (tp->t.type == M_AUDTASK) {
+#if defined(GDX_PLATFORM_3DS)
+        /* MAINPROF: an audio RSP task run from a game fiber IS audio work on main. */
+        const int mpAud = gdx3ds_mprof_enter(GDX3DS_MPROF_AUD);
         gdx_audio_lle_run(tp->t.data_ptr, tp->t.data_size);
+        gdx3ds_mprof_leave(mpAud);
+#else
+        gdx_audio_lle_run(tp->t.data_ptr, tp->t.data_size);
+#endif
         osSendMesg(&gMainThreadMesgQueue, (OSMesg)(uintptr_t)EVENT_MESG_SP, OS_MESG_NOBLOCK);
         osSendMesg(&D_800DCAC8, (OSMesg)(uintptr_t)0x2A, OS_MESG_NOBLOCK);
         return;
@@ -1165,6 +1203,7 @@ void osSpTaskStartGo(OSTask* tp) {
         }
     }
 #if defined(GDX_PLATFORM_3DS)
+    gdx3ds_mprof_note_task((unsigned long) tp->t.data_size); /* [mprof] dl= load proxy */
     /* RENDER THREAD (port/3ds/gdx3ds_renderthread.cpp, docs/research/renderthread-audit.md):
        the fork. 0 = killswitch off (render inline below, byte-identical); 1 = executed to
        completion on core 2 (sync mode: post SP + DP as before); 2 = in flight (pipe mode: SP

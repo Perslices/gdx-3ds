@@ -1,0 +1,99 @@
+# Trimmed from the 2026-09-20 hardware session for tools/dev/tests. One guest
+# boot = one config; receipt lines only; LAN addresses scrubbed.
+# gputrace=0, native all=0 interp=0, repeat 2 of 3. Complete.
+19:22:15 [net] init port=17492 log_port=17491 host=10.0.0.1 soc=1024KiB target=/3ds/G-Diffuser-3DS.3dsx build=native/main@8b3ecfab
+19:22:15 [net] soc rc=0x00000000 size=1024KiB
+19:22:15 [net] thread up prio=0x3E core=0
+19:22:15 [net] ctl listening 10.0.0.1:17492
+19:22:15 [rec] replay header build native/oracle@c3021cfb
+19:22:15 [rec] replay header seed1 0x1234abcd
+19:22:15 [rec] replay header seed2 0x0fedcba9
+19:22:15 [rec] replay header pins renderthread=0 rival_detail_auto=1 stereo=1 fh_every=1
+19:22:15 [rec] replay armed sdmc:/3ds/gdiffuser/rec/race-mutecity-start.gdxrec frames=6001 (starts at the next tick)
+19:22:15 [rec] replay: [perf] rival_detail_auto pinned to 0 for this run
+19:22:15 [net] link up build=native/main@8b3ecfab host=10.0.0.1:17491
+19:22:15 [apt] hooks: ours ahead of citro3d's (debug.apt_hook_first=1), suspended-mode watchdog poll=1 (debug.apt_watch), wake event=1
+19:22:15 [net] ctl accept from 10.0.0.1
+19:22:15 [net] ctl closed (peer closed)
+19:22:16 [rt] mode=ahead core=2 prio=0x24 stack=192K bridgemain=1
+19:22:16 [rec] replay sdmc:/3ds/gdiffuser/rec/race-mutecity-start.gdxrec frames=6001 base=0
+19:22:21 [watchdog] beat=1 frame=271(+271) stage=8 fiber=-1 aud=304/304 astage=0 spec=0 hle=304 op=15 idx=80 heapUsed=41924272 heapFree=6048016 hwm=41924272 base=0 net=1
+19:22:22 [rec] SHOT 'title' at tick 350
+19:22:24 [autotest] SHOT dumped -> autotest/title.bmp
+19:22:26 [autotest] SHOT scanout dumped -> autotest/title_scan.bmp
+19:22:26 [watchdog] beat=2 frame=359(+88) stage=8 fiber=-1 aud=611/611 astage=0 spec=0 hle=611 op=15 idx=51 heapUsed=41924280 heapFree=6048008 hwm=41924280 base=0 net=1
+19:22:31 [watchdog] beat=3 frame=638(+279) stage=7 fiber=-1 aud=911/911 astage=0 spec=0 hle=911 op=15 idx=51 heapUsed=42659992 heapFree=5312296 hwm=42659992 base=0 net=1
+19:22:36 [watchdog] beat=4 frame=938(+300) stage=7 fiber=-1 aud=1214/1214 astage=0 spec=0 hle=1214 op=15 idx=51 heapUsed=42659992 heapFree=5312296 hwm=42659992 base=0 net=1
+19:22:37 [rec] SHOT 'mainmenu' at tick 1000
+19:22:39 [autotest] SHOT dumped -> autotest/mainmenu.bmp
+19:22:41 [autotest] SHOT scanout dumped -> autotest/mainmenu_scan.bmp
+19:22:41 [watchdog] beat=5 frame=1023(+85) stage=8 fiber=-1 aud=1518/1518 astage=0 spec=0 hle=1518 op=15 idx=51 heapUsed=42665984 heapFree=5306304 hwm=42665984 base=0 net=1
+19:22:46 [watchdog] beat=6 frame=1323(+300) stage=8 fiber=-1 aud=1821/1821 astage=0 spec=0 hle=1821 op=15 idx=51 heapUsed=42665984 heapFree=5306304 hwm=42665984 base=0 net=1
+19:22:51 [watchdog] beat=7 frame=1616(+293) stage=8 fiber=-1 aud=2125/2125 astage=0 spec=0 hle=2125 op=15 idx=51 heapUsed=42741960 heapFree=5230328 hwm=42741960 base=0 net=1
+19:22:56 [watchdog] beat=8 frame=1849(+233) stage=2 fiber=3 aud=2428/2428 astage=0 spec=0 hle=2428 op=15 idx=51 heapUsed=42867472 heapFree=5104816 hwm=42867472 base=0 net=1
+19:23:01 [watchdog] beat=9 frame=2049(+200) stage=2 fiber=3 aud=2732/2732 astage=0 spec=0 hle=2732 op=15 idx=80 heapUsed=43311656 heapFree=4660632 hwm=43311656 base=0 net=1
+19:23:06 [watchdog] beat=10 frame=2215(+166) stage=2 fiber=3 aud=3035/3035 astage=0 spec=0 hle=3035 op=15 idx=51 heapUsed=43911504 heapFree=4060784 hwm=43911504 base=0 net=1
+19:23:09 [rec] SHOT 'machsel' at tick 2300
+19:23:10 [autotest] SHOT dumped -> autotest/machsel.bmp
+19:23:11 [watchdog] beat=11 frame=2301(+86) stage=2 fiber=3 aud=3340/3340 astage=0 spec=0 hle=3340 op=15 idx=55 heapUsed=43913776 heapFree=4058512 hwm=43913776 base=0 net=1
+19:23:12 [autotest] SHOT scanout dumped -> autotest/machsel_scan.bmp
+19:23:16 [watchdog] beat=12 frame=2433(+132) stage=2 fiber=3 aud=3643/3643 astage=0 spec=0 hle=3643 op=15 idx=55 heapUsed=43911504 heapFree=4060784 hwm=43913776 base=43911504 net=1
+19:23:21 [watchdog] beat=13 frame=2604(+171) stage=2 fiber=3 aud=3947/3947 astage=0 spec=0 hle=3947 op=15 idx=80 heapUsed=43907960 heapFree=4064328 hwm=43913776 base=43911504 net=1
+19:23:26 [watchdog] beat=14 frame=2897(+293) stage=8 fiber=-1 aud=4250/4250 astage=0 spec=0 hle=4250 op=15 idx=51 heapUsed=44321072 heapFree=3651216 hwm=44321072 base=43911504 net=1
+19:23:31 [watchdog] beat=15 frame=3198(+301) stage=8 fiber=-1 aud=4555/4555 astage=0 spec=0 hle=4555 op=15 idx=51 heapUsed=44321072 heapFree=3651216 hwm=44321072 base=43911504 net=1
+19:23:33 [rec] SHOT 'race00' at tick 3300
+19:23:35 [autotest] SHOT dumped -> autotest/race00.bmp
+19:23:36 [watchdog] beat=16 frame=3301(+103) stage=2 fiber=3 aud=4858/4858 astage=0 spec=0 hle=4858 op=15 idx=79 heapUsed=45357760 heapFree=2614528 hwm=45357760 base=43911504 net=1
+19:23:37 [autotest] SHOT scanout dumped -> autotest/race00_scan.bmp
+19:23:41 [watchdog] beat=17 frame=3557(+256) stage=2 fiber=3 aud=5162/5162 astage=0 spec=0 hle=5162 op=15 idx=104 heapUsed=45963256 heapFree=2009032 hwm=45963256 base=43911504 net=1
+19:23:46 [watchdog] beat=18 frame=3852(+295) stage=8 fiber=-1 aud=5466/5466 astage=0 spec=0 hle=5466 op=15 idx=162 heapUsed=46037544 heapFree=1934744 hwm=46037544 base=43911504 net=1
+19:23:49 [rec] SHOT 'race01' at tick 4000
+19:23:50 [autotest] SHOT dumped -> autotest/race01.bmp
+19:23:51 [watchdog] beat=19 frame=4002(+150) stage=2 fiber=3 aud=5771/5771 astage=0 spec=0 hle=5771 op=15 idx=131 heapUsed=46060608 heapFree=1911680 hwm=46060608 base=43911504 net=1
+19:23:52 [autotest] SHOT scanout dumped -> autotest/race01_scan.bmp
+19:23:56 [watchdog] beat=20 frame=4233(+231) stage=8 fiber=-1 aud=6074/6074 astage=0 spec=0 hle=6074 op=15 idx=107 heapUsed=46062168 heapFree=1910120 hwm=46062168 base=43911504 net=1
+19:24:01 [watchdog] beat=21 frame=4533(+300) stage=8 fiber=-1 aud=6378/6378 astage=0 spec=0 hle=6378 op=15 idx=107 heapUsed=46217424 heapFree=1754864 hwm=46217424 base=43911504 net=1
+19:24:06 [watchdog] beat=22 frame=4808(+275) stage=2 fiber=3 aud=6682/6682 astage=0 spec=0 hle=6682 op=15 idx=51 heapUsed=46235376 heapFree=1736912 hwm=46235376 base=43911504 net=1
+19:24:11 [rec] SHOT 'race02' at tick 5000
+19:24:11 [watchdog] beat=23 frame=5001(+193) stage=2 fiber=3 aud=6986/6986 astage=0 spec=0 hle=6986 op=15 idx=55 heapUsed=46235400 heapFree=1736888 hwm=46235400 base=43911504 net=1
+19:24:13 [autotest] SHOT dumped -> autotest/race02.bmp
+19:24:15 [autotest] SHOT scanout dumped -> autotest/race02_scan.bmp
+19:24:16 [watchdog] beat=24 frame=5078(+77) stage=2 fiber=3 aud=7290/7289 astage=2 spec=0 hle=7290 op=13 idx=47 heapUsed=46235376 heapFree=1736912 hwm=46235400 base=43911504 net=1
+19:24:21 [watchdog] beat=25 frame=5291(+213) stage=2 fiber=3 aud=7593/7593 astage=0 spec=0 hle=7593 op=15 idx=51 heapUsed=46235376 heapFree=1736912 hwm=46235400 base=43911504 net=1
+19:24:26 [watchdog] beat=26 frame=5504(+213) stage=2 fiber=3 aud=7897/7897 astage=0 spec=0 hle=7897 op=15 idx=51 heapUsed=46235376 heapFree=1736912 hwm=46235400 base=43911504 net=1
+19:24:32 [watchdog] beat=27 frame=5717(+213) stage=2 fiber=3 aud=8200/8200 astage=0 spec=0 hle=8200 op=15 idx=55 heapUsed=46235376 heapFree=1736912 hwm=46235400 base=43911504 net=1
+19:24:35 [net] ctl accept from 10.0.0.1
+19:24:35 [net] cmd INI [native] all=1 rc=0
+19:24:35 [net] ctl closed (peer closed)
+19:24:35 [net] ctl accept from 10.0.0.1
+19:24:35 [net] cmd INI [native] interp=1 rc=0
+19:24:35 [net] cmd INI SAVE rc=0
+19:24:35 [net] ctl closed (peer closed)
+19:24:35 [net] ctl accept from 10.0.0.1
+19:24:52 [rec] SHOT 'race04' at tick 5900
+19:24:52 [watchdog] beat=28 frame=5901(+184) stage=2 fiber=3 aud=8504/8504 astage=0 spec=0 hle=8504 op=15 idx=51 heapUsed=46238496 heapFree=1733792 hwm=46238496 base=43911504 net=2
+19:24:52 [autotest] SHOT dumped -> autotest/race04.bmp
+19:24:52 [autotest] SHOT scanout dumped -> autotest/race04_scan.bmp
+19:24:52 [watchdog] beat=29 frame=5977(+76) stage=2 fiber=3 aud=8807/8807 astage=0 spec=0 hle=8807 op=15 idx=51 heapUsed=46236464 heapFree=1735824 hwm=46238496 base=43911504 net=2
+19:24:52 [rec] SHOT 'race03' at tick 6000
+19:24:52 [autotest] SHOT dumped -> autotest/race03.bmp
+19:24:52 [autotest] SHOT scanout dumped -> autotest/race03_scan.bmp
+19:24:52 [rec] end tick=6001 lines=6001
+19:24:52 [watchdog] beat=30 frame=6022(+45) stage=2 fiber=3 aud=9112/9112 astage=0 spec=0 hle=9112 op=15 idx=55 heapUsed=46235400 heapFree=1736888 hwm=46238496 base=43911504 net=2
+19:24:52 [watchdog] beat=31 frame=6233(+211) stage=2 fiber=3 aud=9414/9414 astage=0 spec=0 hle=9414 op=15 idx=55 heapUsed=46235400 heapFree=1736888 hwm=46238496 base=43911504 net=2
+19:24:52 [net] recv ok path=sdmc:/3ds/G-Diffuser-3DS.3dsx size=3205740 crc=684D1A21
+19:24:52 [net] cmd RELOAD staged=/3ds/G-Diffuser-3DS.3dsx -> quit + hb:ldr
+19:24:52 [net] ctl closed (reload accepted)
+19:24:52 [exit] cause=app quit suspended=0
+19:24:52 [exit] disk_save_flush done
+19:24:52 [exit] audio_thread_stop enter
+19:24:52 [exit] audio_thread_stop done
+19:24:52 [exit] audio_shutdown enter
+19:24:52 [exit] audio_shutdown done
+19:24:52 [exit] render_thread_join enter
+19:24:52 [exit] render_thread_join done
+19:24:52 [exit] window_shutdown enter
+19:24:52 [exit] window_shutdown done
+19:24:52 [exit] fs_shutdown done
+19:24:52 --- log link closed ---
+19:24:56 --- log link from 10.0.0.1 ---

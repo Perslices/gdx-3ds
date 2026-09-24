@@ -44,6 +44,7 @@ class MockBackend final : public gdxn::Backend {
     int frames = 0, clears = 0;
     std::vector<float> pool = std::vector<float>(65536);
     size_t poolOff = 0;
+    unsigned packSplits = 0; /* GEOMLOSS: begins that had to cap the batch below 256 tris */
     void* current = nullptr;
     bool trect = false;
 
@@ -134,7 +135,8 @@ class MockBackend final : public gdxn::Backend {
     }
     void DrawTriangles(float[], size_t, size_t) override {
     }
-    float* VboPackBegin(Gdx3dsVboPackParams* p) override {
+    float* VboPackBegin(Gdx3dsVboPackParams* p, uint32_t* capTris) override {
+        if (capTris != nullptr) *capTris = 0;
         if (current == nullptr) return nullptr;
         const Prg* prg = static_cast<const Prg*>(current);
         memset(p, 0, sizeof(*p));
@@ -147,7 +149,18 @@ class MockBackend final : public gdxn::Backend {
         p->vtxColorInput = prg->numInputs > 0 ? 1 : 0;
         p->vtxAlphaInput = prg->numInputs > 0 ? 1 : 0;
         p->wantVtxAlpha = prg->numInputs > 0 ? 1 : 0;
-        if (poolOff + 256 * 3 * 12 > pool.size()) return nullptr;
+        /* GEOMLOSS: mirror the backend contract — report the triangles that still fit and
+         * refuse only at genuine exhaustion. capTris == nullptr keeps the all-or-nothing
+         * reservation the LUS path relies on. */
+        const size_t freeFloats = pool.size() > poolOff ? pool.size() - poolOff : 0;
+        if (capTris == nullptr) {
+            if (freeFloats < 256 * 3 * 12) return nullptr;
+        } else {
+            const size_t fitTris = freeFloats / (3 * 12);
+            if (fitTris == 0) return nullptr;
+            *capTris = (unsigned)fitTris;
+            if (fitTris < 256) packSplits++;
+        }
         return pool.data() + poolOff;
     }
     void DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux) override {
@@ -194,6 +207,9 @@ class MockBackend final : public gdxn::Backend {
     }
     void ProfExit(int, uint64_t, uint64_t) override {
     }
+    bool VerifyActive() override {
+        return false;
+    }
     void VerifyNoteTri(const void*) override {
     }
     void VerifyNoteCmd(uint32_t, uint32_t) override {
@@ -202,6 +218,20 @@ class MockBackend final : public gdxn::Backend {
     }
     void TexCacheNoteMiss(const void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                           unsigned) override {
+    }
+    /* Const-input mask the fold rule reads. By default every input is a stage constant
+     * (nothing folds), so the mock's default behaviour is the pre-fold one; a test sets
+     * constRgbMask/constAlphaMask to model a shader that carries an input per vertex. */
+    uint32_t constRgbMask = 0x7F;
+    uint32_t constAlphaMask = 0x7F;
+    bool constInputsOk = true;
+    bool BatchConstInputs(uint32_t* rgbMask, uint32_t* alphaMask) override {
+        if (!constInputsOk) {
+            return false;
+        }
+        if (rgbMask != nullptr) *rgbMask = constRgbMask;
+        if (alphaMask != nullptr) *alphaMask = constAlphaMask;
+        return true;
     }
     bool TrectBatchEnabled() override {
         return trect;

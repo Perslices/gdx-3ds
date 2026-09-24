@@ -156,6 +156,7 @@ add_executable(G-Diffuser
     gdx_imgui_nav.cpp
     gdx_workshop.cpp
     mio0_wrap.c
+    gdx_stall.c                # A10 load-stall census (no-op unless armed)
     gdx_segment_source.c       # in the exe, not gdiffuser_game: needs symbols from AssetLoader.cpp,
                                 # rom_buffer.cpp and gen/AssetBindings.c
     gdx_linkstubs_desktop.c    # symbols the DEFAULT config gets from a TU a non-default config
@@ -616,6 +617,7 @@ if(GDX_BUILD_JP)
         gdx_imgui_nav.cpp
         gdx_workshop.cpp
         mio0_wrap.c
+        gdx_stall.c
         gdx_segment_source.c
         "${CMAKE_CURRENT_SOURCE_DIR}/../torch/lib/libmio0/mio0.c"
         $<TARGET_OBJECTS:gdiffuser_game_jp>)

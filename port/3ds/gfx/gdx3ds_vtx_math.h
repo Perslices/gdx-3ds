@@ -333,6 +333,15 @@ static inline void gdx3ds_vtx_update_clip_flags(Gdx3dsLoadedVtx* v) {
 
 #define GDX3DS_CLIP_POLY_MAX 16
 
+/* DROPSITES site 3, mesh half. The cap below is the LUS/owned-interpreter cap, kept identical
+ * on purpose (gdx_tri.cpp carries the same reasoning): clipping a CONVEX polygon by a half-
+ * space adds at most one vertex, so from a triangle the output is bounded by 3 + 7 = 10 and
+ * the 16-slot buffer has slack it cannot use. The cap is counted rather than raised -- raising
+ * it would diverge from the path this clipper exists to match. One copy per translation unit
+ * (the mesh walker's is the live one; the host tests get their own and ignore it). */
+static uint32_t gdx3ds_clip_poly_hw __attribute__((unused)) = 0;
+static uint32_t gdx3ds_clip_poly_trunc __attribute__((unused)) = 0;
+
 /* Homogeneous 7-plane clip of one triangle (requiresClipping = OR of clip_out != 0).
  * Writes the polygon to out (<= 16), returns its vertex count (< 3 = fully clipped).
  * The caller fans (0, i, i+1) for i in 1..n-2, clamps each fan vertex's w to
@@ -348,13 +357,44 @@ static inline int gdx3ds_tri_clip(const Gdx3dsLoadedVtx* v1, const Gdx3dsLoadedV
     size_t inputCount = 3;
     uint32_t plane;
     size_t i;
-    memset(polygonA, 0, sizeof(polygonA));
-    memset(polygonB, 0, sizeof(polygonB));
+    /* B26: two 512-byte zero-fills stood here. They were dead stores on the per-clipped-
+     * triangle owned path -- no lever, so paid in the shipped build.
+     *
+     * They are NOT removed because "only polygonA[0..2] are read". That was the filed
+     * premise and it is WRONG: the loop below ping-pongs, so polygonA is the INPUT buffer on
+     * planes 0/2/4/6 and is read at [0..inputCount-1], up to the cap, not just [0..2].
+     *
+     * They are removed because no slot of EITHER buffer is ever read before this function
+     * writes it. outputCount is incremented only on the two arms that write the slot they
+     * consume (the struct copy at the `currentInside` arm, and the interpolate), never on
+     * the truncation arms -- so on exit from a plane, output[0..outputCount-1] is exactly
+     * the set of slots written. `inputCount = outputCount` plus the swap then makes the next
+     * plane's read range exactly that prefix, and induction from polygonA[0..2] = v1,v2,v3
+     * below carries it to every plane and to the final copy into `out`. Both buffers are
+     * covered symmetrically, which is why both memsets go and the dead store was 1024 B per
+     * clipped triangle rather than 512.
+     *
+     * Escape routes closed in docs/research/native/vtxmath-progress.md B26 §2-§3: aliasing /
+     * escaped pointers, callers reading past the returned count, partially-written structs
+     * (gdx3ds_vtx_interpolate does its OWN memset, so interpolated vertices are unaffected),
+     * a byte-wise read of the named pad[2] member (read nowhere in the tree), and the clip
+     * flags (both call sites recompute them via gdx3ds_vtx_update_clip_flags). The argument
+     * is also EXECUTED: docs/research/native/vtxmath-evidence/ poisons 64 KiB of stack with
+     * 0xCD before every call and compares 198683 clipped triangles against a zero-initialised
+     * reference, pad[2] and clip flags included -- 610969 vertex checks, 0 failures, with a
+     * control proving the poison reaches this frame.
+     *
+     * Size, measured, so nobody re-finds this expecting a win: hardware session
+     * hw-crash-0923 averages 8.5 clipped triangles per frame, 18.6 over frames that clip at
+     * all, peak window 135. At ~250-500 ARM11 cycles per 1024 B (estimate, not a
+     * measurement) that is ~0.003-0.005 ms/frame typical and ~0.04-0.08 ms/frame at the worst
+     * window of a whole session -- correctness tidying, not a perf lever. */
     polygonA[0] = *v1;
     polygonA[1] = *v2;
     polygonA[2] = *v3;
     for (plane = 0; plane < 7 && inputCount >= 3; ++plane) {
         size_t outputCount = 0;
+        int truncated = 0;
         for (i = 0; i < inputCount; ++i) {
             const Gdx3dsLoadedVtx* current = &input[i];
             const Gdx3dsLoadedVtx* next = &input[(i + 1) % inputCount];
@@ -362,14 +402,27 @@ static inline int gdx3ds_tri_clip(const Gdx3dsLoadedVtx* v1, const Gdx3dsLoadedV
             const float nextDistance = gdx3ds_tri_clip_distance(next, plane);
             const int currentInside = currentDistance >= 0.0f;
             const int nextInside = nextDistance >= 0.0f;
-            if (currentInside && outputCount < GDX3DS_CLIP_POLY_MAX) {
-                output[outputCount++] = *current;
+            if (currentInside) {
+                if (outputCount < GDX3DS_CLIP_POLY_MAX) {
+                    output[outputCount++] = *current;
+                } else {
+                    truncated = 1;
+                }
+            }
+            if (currentInside != nextInside && outputCount >= GDX3DS_CLIP_POLY_MAX) {
+                truncated = 1;
             }
             if (currentInside != nextInside && outputCount < GDX3DS_CLIP_POLY_MAX) {
                 const float denominator = currentDistance - nextDistance;
                 const float t = denominator != 0.0f ? currentDistance / denominator : 0.0f;
                 gdx3ds_vtx_interpolate(current, next, gdx3ds_clampf(t, 0.0f, 1.0f), &output[outputCount++]);
             }
+        }
+        if (outputCount > (size_t)gdx3ds_clip_poly_hw) {
+            gdx3ds_clip_poly_hw = (uint32_t)outputCount;
+        }
+        if (truncated) {
+            gdx3ds_clip_poly_trunc++;
         }
         inputCount = outputCount;
         {

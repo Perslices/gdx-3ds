@@ -81,6 +81,12 @@ extern s32 gControllersConnected;
 extern int gdx_lus_read_pads(int capacity, u16* out_buttons, s8* out_stick_x, s8* out_stick_y,
                              u8* out_connected);
 
+// How many ports mirror port 1 after the scripted-input injector has run. Defined only by a
+// backend that reports more ports than it physically has ([debug] pads on 3DS,
+// port/3ds/os/gdx3ds_os_ctru.c); weak so the desktop build, which has real pads, links with
+// nothing here and never mirrors.
+extern int gdx_port_mirror_count(void) __attribute__((weak));
+
 // Zero exactly the input fields Controller_ClearInputs() clears (decomp/src/sys/controller.c:47-51)
 // without touching pfs / rumble bookkeeping. Used when a port goes away mid-session so a pad that
 // was unplugged mid-corner cannot leave a latched throttle behind, and to initialise the
@@ -762,6 +768,21 @@ void gdx_controller_poll(void) {
         buttons[0] = scriptPad.buttons;
         stick_x[0] = scriptPad.stickX;
         stick_y[0] = scriptPad.stickY;
+    }
+
+    // Ports spoofed connected by a backend that has fewer real pads than it reports
+    // ([debug] pads on 3DS, port/3ds/os/gdx3ds_os_ctru.c) have no input source of their
+    // own. Mirror port 1 into them HERE, downstream of the injector, so a .gdxrec replay
+    // reaches them too: VS machine select needs every player to confirm, and idle ports
+    // wedge it forever. Weak — the desktop backend has real pads and defines nothing, so
+    // the loop never runs there.
+    if (&gdx_port_mirror_count != NULL) {
+        int mirror = gdx_port_mirror_count();
+        for (i = 1; i < mirror && i < MAXCONTROLLERS; i++) {
+            buttons[i] = buttons[0];
+            stick_x[i] = stick_x[0];
+            stick_y[i] = stick_y[0];
+        }
     }
     s_input_tick++; /* exactly once per poll: the poll IS the tick */
 

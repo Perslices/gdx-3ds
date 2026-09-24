@@ -50,7 +50,10 @@ class Backend {
     virtual void SetCurrentAlphaCompareThreshold(float threshold) = 0;
 
     virtual void DrawTriangles(float bufVbo[], size_t bufVboLen, size_t bufVboNumTris) = 0;
-    virtual float* VboPackBegin(Gdx3dsVboPackParams* params) = 0;
+    /* GEOMLOSS: capTris receives how many triangles still fit in the backend's pool.
+     * The owned interpreter has no legacy variable-stride path, so it splits its batch
+     * at that cap instead of dropping it; a NULL return now means genuine exhaustion. */
+    virtual float* VboPackBegin(Gdx3dsVboPackParams* params, uint32_t* capTris) = 0;
     virtual void DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux) = 0;
 
     virtual void StartFrame() = 0;
@@ -70,7 +73,12 @@ class Backend {
     virtual uint64_t ProfEnter(uint64_t* childSnap) = 0;
     virtual void ProfExit(int sec, uint64_t t0, uint64_t childSnap) = 0;
 
-    /* [nverify] per-tri interpreter inputs (Gdx3dsVerifyTri*); no-op outside verify. */
+    /* [nverify] per-tri interpreter inputs (Gdx3dsVerifyTri*); no-op outside verify.
+     * VerifyActive is latched ONCE per task in RunFrame (Interp::mVerifyActive) and the two
+     * hot sites test that bool, so with [native] interp_verify=0 the per-command and
+     * per-triangle diagnostics cost one predictable branch and nothing else -- no memset, no
+     * FNV, no virtual call (audit 2026-09-23 finding 31). */
+    virtual bool VerifyActive() = 0;
     virtual void VerifyNoteTri(const void* tri) = 0;
     virtual void VerifyNoteCmd(uint32_t w0, uint32_t w1) = 0;
 
@@ -81,6 +89,13 @@ class Backend {
 
     /* [trectbatch] atlas contract (weak on the LUS side; here plain virtuals the glue routes to
      * the C shims). page < 0 = standalone texture. */
+    /* Gdx_NativeBatchConstInputs: the combiner-input slots (1-based, as a bitmask over
+     * shader_input_mapping[..][0..6]) that the CURRENT shader binds as TexEnv stage
+     * constants from vertex 0. An input NOT in the mask rides the vertex colour attribute,
+     * so a register feeding only such inputs may change without splitting the batch.
+     * Returns false when no shader is bound (then nothing may be folded). */
+    virtual bool BatchConstInputs(uint32_t* rgbMask, uint32_t* alphaMask) = 0;
+
     virtual bool TrectBatchEnabled() = 0;
     virtual void AtlasArm(bool on) = 0;
     virtual int TexPage(uint32_t texId) = 0;

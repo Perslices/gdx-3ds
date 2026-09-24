@@ -9,6 +9,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "gdx_log.h"
+
 namespace gdxn {
 
 static constexpr float kMinClipW = 1.0e-5f;
@@ -115,12 +117,49 @@ void Interp::SpPopMatrix(uint32_t count) {
 
 static const uint8_t kFallbackVtx[16 * 64] = {};
 
+/* == SpVertex -- DROPSITE 2.
+ *
+ * Pre-fix: `mStats.vtx` was incremented by the FULL n_vertices and then the whole G_VTX load
+ * was dropped if it ran past the 64-slot window -- so the receipt over-reported exactly the
+ * vertices that were never transformed, and nothing counted the drop. LUS has no bound check
+ * here at all (Interpreter::GfxSpVertex writes straight into loaded_vertices), so an over-range
+ * load is a buffer overrun there and a silent hole here; neither is a behaviour to keep.
+ *
+ * Now the in-range PREFIX is loaded and only the out-of-range tail is refused. That is the part
+ * LUS would also have written into real slots, so it is strictly closer to the reference than
+ * dropping everything, and it is still incapable of overrunning. `vtxOver` / `vtxOverDropped`
+ * carry the refusal on the always-on receipt. [native] vtxclamp=0 restores the pre-fix arm. */
 void Interp::SpVertex(size_t n_vertices, size_t dest_index, const Cmd& c, const ListRef& list) {
     ProfScope prof(mBackend, 2);
-    mStats.vtx += static_cast<uint32_t>(n_vertices);
-    if (n_vertices == 0 || dest_index + n_vertices > static_cast<size_t>(kMaxVertices)) {
+    if (n_vertices == 0) {
         return;
     }
+    const size_t window = static_cast<size_t>(mVtxSoftCap);
+    if (dest_index + n_vertices > window) {
+        const size_t fits = dest_index < window ? window - dest_index : 0u;
+        mStats.vtxOver++;
+        mStats.vtxOverDropped += static_cast<uint32_t>(mVtxClamp ? (n_vertices - fits) : n_vertices);
+        if (dest_index + n_vertices > mVtxHwEnd) {
+            mVtxHwEnd = static_cast<uint32_t>(dest_index + n_vertices);
+        }
+        if (mDropsiteVtxLogged == 0) {
+            mDropsiteVtxLogged = 1;
+            GDXN_LOG("DROPSITE: G_VTX n=%u dest=%u runs past the %u-vertex window -- %s "
+                     "(pre-fix the WHOLE load was dropped and the receipt still counted all %u)",
+                     static_cast<unsigned>(n_vertices), static_cast<unsigned>(dest_index),
+                     static_cast<unsigned>(window),
+                     mVtxClamp ? "the in-range prefix is loaded and the tail refused"
+                               : "[native] vtxclamp=0: the whole load is dropped",
+                     static_cast<unsigned>(n_vertices));
+        }
+        if (!mVtxClamp || fits == 0) {
+            return;
+        }
+        n_vertices = fits;
+    } else if (dest_index + n_vertices > mVtxHwEnd) {
+        mVtxHwEnd = static_cast<uint32_t>(dest_index + n_vertices);
+    }
+    mStats.vtx += static_cast<uint32_t>(n_vertices); /* only what is actually transformed */
     const size_t need = n_vertices * 16u;
     uintptr_t p = mSrc.ResolveData(c, need, /*preferPhysical=*/true, reinterpret_cast<uintptr_t>(list.base));
     if (p == 0 || DlSrc::ReadableBytes(p) < need) {

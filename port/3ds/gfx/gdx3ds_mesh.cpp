@@ -30,10 +30,12 @@
  * no bridge conversion, so the G_DL hook meets the game's registered list itself and bakes it
  * lazily with the walker's own vertex resolver (gdx3ds_mesh_dl_hook_seam). */
 #include "gdx3ds_mesh.h"
+#include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
 #include "gdx3ds_native_cfg.h"
 
 #include <3ds.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -44,12 +46,34 @@
 #include "gdx3ds_vbopack.h"
 #include "gdx3ds_vtx_math.h"
 
+/* [native] cpuclip, owned by the interpreter glue (port/3ds/gfx/n64/gdx_rt_glue.cpp). Weak:
+ * the DL-test harness links this library without the glue, and absent the lever the historical
+ * behaviour (always clip) is the right default. */
+extern "C" int gdx_ninterp_cpuclip(void) __attribute__((weak));
+
+/* The ONE read of the lever on this path. [native] cpuclip is a whole-frame semantic, not an
+ * interpreter-local one: with the emit loop clipping unconditionally, cpuclip=0 used to mean
+ * "the owned interpreter hands PICA the unclipped triangles while the retained-mesh path still
+ * Sutherland-Hodgman clips its own", i.e. two clip semantics inside one frame, which is not a
+ * state the N64 can be in and not something an A/B can attribute. Read once per mesh draw in
+ * NativeDraw and handed to BOTH the RunHasSurvivor screen and the emit loop: the two ran the
+ * same arithmetic off two different reads of this lever after the merge, and the screen's read
+ * was missing, so cpuclip=0 machines=1 dropped whole runs the emit loop would have drawn. */
+static inline bool CpuClipEnabled() {
+    return (&gdx_ninterp_cpuclip == nullptr) || gdx_ninterp_cpuclip() != 0;
+}
+
 extern "C" int gdx3ds_config_get_int(const char* section, const char* key, int fallback) __attribute__((weak));
 extern "C" const char* gdx3ds_config_get_string(const char* section, const char* key, const char* fallback)
     __attribute__((weak));
 extern "C" int gdx3ds_config_loaded(void) __attribute__((weak));
 extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__((weak));
 extern "C" void gdx3ds_fog_note_params(int mul, int off, int exact) __attribute__((weak));
+/* Render-thread identity (port/3ds/gdx3ds_renderthread.cpp). Weak: the DL-test harness and
+ * the desktop unit builds link gdx3ds_gfx without it, and then main IS the drawing thread. */
+extern "C" int gdx3ds_rt_mode(void) __attribute__((weak));
+extern "C" int gdx3ds_rt_on_render_thread(void) __attribute__((weak));
+extern "C" int gdx3ds_rt_task_rendering(void) __attribute__((weak));
 /* racer.c: Gfx* D_800CDDB0[30 * 6] — machine model lists (5 LODs + the empty LOD 6). Weak:
  * the DL-test harness links gdx3ds_gfx without the game, and the seam entries now pull this
  * object in unconditionally (gdx3ds_seam_lus.cpp -> gdx3ds_mesh_dl_hook_seam). */
@@ -74,7 +98,12 @@ struct Mesh {
     uint16_t* tris;   /* nTris * 3 mesh-global vertex indices */
     uint8_t* vtxChunk; /* mesh-global vertex -> chunk index (walk_only replay) */
     uint16_t nRuns, nChunks, nTris, nVerts;
+    uint32_t magic;    /* kMeshMagic while live, poisoned at free (stale-draw detector) */
+    Mesh* retireNext;  /* retire queue link; only the retire lock touches it */
 };
+
+constexpr uint32_t kMeshMagic = 0x4D534831u;  /* "MSH1" */
+constexpr uint32_t kMeshPoison = 0xDEADBEEFu;
 
 /* The 8-byte command the bridge emits in place of the converted list: a G_ENDDL packet in
  * the interpreter's own word layout (two uintptr_t words, as Fast::F3DGfx on this port). */
@@ -100,7 +129,88 @@ Stub sStubs[kEntries];
 Entry sEntries[kEntries];
 bool sRegistered = false;
 int sRegisteredCount = 0;
-volatile uint32_t sGeneration = 1;
+
+/* ---- mesh lifetime: the free/draw ownership invariant ---------------------------------
+ *
+ * INVARIANT: a Mesh* that a render task may still dereference is never free()d, and a
+ * baked Mesh* is only ever REPLACED in its Entry, never cleared while a valid mesh exists.
+ *
+ * Two threads reach this registry, and until 2026-09-23 nothing fenced them:
+ *
+ *   bake/free  With `[debug] bridgemain=1` (the hardware default) the bridge's G_DL
+ *              conversion -- and with it gdx3ds_mesh_bridge_lookup -> LookupForDraw ->
+ *              Bake -- runs on the SUBMITTING (game/main) thread, inside
+ *              gdx3ds_rt_submit_task and deliberately BEFORE that call's backpressure
+ *              wait, "so the bridge of N+1 overlaps the tail of render(N)"
+ *              (gdx3ds_renderthread.cpp). Under `[native] interp=1` the owned walker's
+ *              G_DL hook bakes on the render thread as well, so BOTH threads can bake.
+ *   draw       DrawMesh runs on the render thread, replaying task N.
+ *
+ * gdx3ds_mesh_lists_rebuilt() (racer.c: machine select, the records screen, a custom
+ * machine, func_8008D97C's all-30 rebuild) bumps sGeneration, so the next prepare rebakes
+ * every entry -- freeing, in place, exactly the Mesh* the live render is walking.
+ *
+ * The fix has the same shape as the texture cache's render-thread ownership (M7,
+ * gdx_texcache_request_clear / GdxDrainTextureCacheRequests, renderthread-progress.md):
+ * the baking thread only RETIRES the superseded mesh onto a queue; the DRAWING thread
+ * frees it, from RetireDrain() at a frame boundary, one drain later.
+ *
+ * Why one extra drain is enough. RetireDrain runs only on the drawing thread (the render
+ * thread when it exists, else main), so every draw it has ever issued has returned by the
+ * time it runs -- program order is the fence, exactly as it is for the texture cache. A
+ * mesh is pushed onto `pending` only AFTER its Entry has been repointed, so no draw can
+ * newly reach it afterwards. Draining in two steps (free what the previous drain stole,
+ * then steal `pending`) leaves a full inter-frame gap between "no longer reachable" and
+ * "freed", which also covers a mesh retired by the render thread itself mid-task.
+ *
+ * Bake() additionally holds sBakeLock: sWalkScratch is a single file-scope buffer and two
+ * threads reading the same stale Entry would otherwise retire the same Mesh* twice (a
+ * double free). Uncontended it is one atomic; it is only ever contended during a
+ * list rebuild, which happens on screen transitions and never in steady state.
+ *
+ * `[native] machines_defer_free = 0` restores the pre-fix in-place free, so the race can
+ * be A/B'd on one artifact. Receipt: `[native] meshlife ...` (overlap= is the measured
+ * race window; stale= and unsafe= must stay 0).
+ */
+std::atomic<uint32_t> sGeneration{1};
+
+struct MeshLock {
+    LightLock l;
+    MeshLock() { LightLock_Init(&l); }  /* static init: single-threaded, no lazy-init race */
+};
+MeshLock sRetireLock;
+MeshLock sBakeLock;
+struct RetireGuard {
+    RetireGuard() { LightLock_Lock(&sRetireLock.l); }
+    ~RetireGuard() { LightLock_Unlock(&sRetireLock.l); }
+};
+struct BakeGuard {
+    BakeGuard() { LightLock_Lock(&sBakeLock.l); }
+    ~BakeGuard() { LightLock_Unlock(&sBakeLock.l); }
+};
+
+Mesh* sRetirePending = nullptr; /* retired, not yet stolen  (retire lock) */
+Mesh* sRetireStolen = nullptr;  /* stolen last drain, freed at the next (retire lock) */
+int sDeferFree = 1;             /* [native] machines_defer_free */
+
+/* Race receipt. DrawMesh publishes the mesh it is inside so a retire/free on the other
+ * thread can see -- and count -- the overlap it would otherwise have corrupted. */
+std::atomic<uintptr_t> sDrawingMesh{0};
+std::atomic<uint32_t> sDrawingTid{0};
+/* Atomic because both threads bump them and a lost update could hide a violation; relaxed
+ * because they are counters, not a synchronisation mechanism. */
+struct Life {
+    std::atomic<unsigned> retired, freed, held, overlap, overlapSame, unsafeFree, staleDraw, bakeWait, inflight, lookupOvl, bakeOvl;
+} sLife;
+inline unsigned Bump(std::atomic<unsigned>& c) { return c.fetch_add(1u, std::memory_order_relaxed) + 1u; }
+inline unsigned Get(const std::atomic<unsigned>& c) { return c.load(std::memory_order_relaxed); }
+int sLifeLogs = 0;
+
+/* GEOMLOSS: one-shot loudness for a truncated run. A renderer that silently stops drawing
+ * under pool pressure is invisible on a console we can only observe through a log, so the
+ * first truncation of the session names itself; poolTrunc on the [native] machines receipt
+ * (pool=refused/trunc) stays the recurring signal. */
+int sTruncLogged = 0;
 
 /* pointer -> entry hash (open addressing, 512 slots for 150 entries) */
 constexpr int kHashSize = 512;
@@ -113,12 +223,20 @@ int sVerify = 0;
 uint32_t sSlotMask = 0xFFFFFFFFu;
 uint32_t sLodMask = 0x1Fu;
 int sVerbose = 0;
+/* GEOMLOSS killswitch: [debug] meshtruncfix=0 restores the pre-fix mid-triangle break, which
+ * leaves nIdx misaligned and draws the rest of the run from mismatched vertices. Test-only —
+ * it exists so the corruption and the fix can be A/B'd from one binary. Never ship it at 0. */
+int sTruncFix = 1;
+/* GEOMLOSS test knob: [debug] meshcapverts=N caps the per-run vertex budget directly, so the
+ * truncation path can be reached deterministically instead of by sweeping pool sizes until a
+ * clipped machine happens to straddle the cap. 0 = off = whatever the pool actually offers. */
+int sCapVerts = 0;
 
 /* receipts */
 unsigned long sFrame = 0;
 struct Stats {
     unsigned draws, walkDraws, runs, verts, tris, rejected, allOut, culled, clipped, fanTris, bindFallbacks, poolRefused,
-        poolTrunc;
+        poolTrunc, emptyRuns, idxMisaligned;
     unsigned bakes, bakeFails, rebakes;
     unsigned vfyDraws, vfyTris, vfyTriMismatch, vfyCountMismatch, vfyMatMismatch, vfyAuxDiff;
     uint64_t ticks, tnlTicks, bindTicks, emitTicks, drawTicks;
@@ -147,6 +265,16 @@ void Log(const char* fmt, ...) {
     }
 }
 
+void TruncLoud(uint32_t maxVerts, uint32_t nOut, uint32_t need, unsigned triCount, unsigned tri) {
+    if (sTruncLogged) {
+        return;
+    }
+    sTruncLogged = 1;
+    Log("GEOMLOSS: machines run TRUNCATED — VBO pool cap %u verts reached at %u (+%u needed) on "
+        "triangle %u of %u; the run now ends on a triangle boundary and the rest of it is NOT drawn",
+        maxVerts, nOut, need, tri, triCount);
+}
+
 uint32_t ParseHex(const char* s, uint32_t fallback) {
     if (s == nullptr || *s == '\0') {
         return fallback;
@@ -171,13 +299,23 @@ int Enabled() {
     sEnabled = gdx3ds_native_lever("machines", 0) != 0 ? 1 : 0; /* [native] all=1 turns it on */
     sWalkOnly = gdx3ds_config_get_int("native", "machines_walk_only", 0) != 0 ? 1 : 0;
     sVerify = gdx3ds_config_get_int("native", "machines_verify", 0) != 0 ? 1 : 0;
+    /* Killswitch for the deferred-retire fix: 0 frees a superseded mesh in place, which is
+     * the pre-2026-09-23 behaviour and races the render thread (meshrace-progress.md). */
+    sDeferFree = gdx3ds_config_get_int("native", "machines_defer_free", 1) != 0 ? 1 : 0;
     sVerbose = gdx3ds_config_get_int("debug", "verbose", 0) != 0 ? 1 : 0;
+    sTruncFix = gdx3ds_config_get_int("debug", "meshtruncfix", 1) != 0 ? 1 : 0;
+    sCapVerts = gdx3ds_config_get_int("debug", "meshcapverts", 0);
+    if (sCapVerts < 0) {
+        sCapVerts = 0;
+    }
     if (&gdx3ds_config_get_string != nullptr) {
         sSlotMask = ParseHex(gdx3ds_config_get_string("native", "machines_mask", "ffffffff"), 0xFFFFFFFFu);
         sLodMask = ParseHex(gdx3ds_config_get_string("native", "machines_lod_mask", "1f"), 0x1Fu);
     }
-    Log("[native] machines=%d walk_only=%d verify=%d mask=%08lx lod_mask=%02lx (ini latched)", sEnabled, sWalkOnly,
-        sVerify, (unsigned long)sSlotMask, (unsigned long)sLodMask);
+    Log("[native] machines=%d walk_only=%d verify=%d defer_free=%d truncfix=%d capverts=%d "
+        "mask=%08lx lod_mask=%02lx (ini latched)",
+        sEnabled, sWalkOnly, sVerify, sDeferFree, sTruncFix, sCapVerts,
+        (unsigned long)sSlotMask, (unsigned long)sLodMask);
     return sEnabled;
 }
 
@@ -248,7 +386,110 @@ void FreeMesh(Mesh* m) {
     free(m->chunks);
     free(m->tris);
     free(m->vtxChunk);
+    m->magic = kMeshPoison; /* a draw that still holds this pointer reports itself */
     free(m);
+}
+
+inline uint32_t SelfTid() {
+    u32 tid = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+    return (uint32_t)tid;
+}
+
+/* The one thread that runs DrawMesh: the render thread when there is one, else whatever
+ * thread runs the frame. Only it may free a retired mesh; every other thread enqueues. */
+bool OnDrawingThread() {
+    if (&gdx3ds_rt_mode == nullptr || gdx3ds_rt_mode() == 0) {
+        return true; /* sequential path: one thread bakes, draws and frees */
+    }
+    return &gdx3ds_rt_on_render_thread != nullptr && gdx3ds_rt_on_render_thread() != 0;
+}
+
+/* "This call is touching the registry from a thread that never draws, while a render TASK
+ * is queued or executing" -- the bridgemain overlap, measured at the point of use. Every
+ * such call is one the replay of that task could be racing through the same Entry. */
+bool OffThreadWhileRendering() {
+    return !OnDrawingThread() && &gdx3ds_rt_task_rendering != nullptr && gdx3ds_rt_task_rendering() != 0;
+}
+
+/* Hand a superseded mesh to the drawing thread. PRECONDITION: its Entry no longer points
+ * at it, so no draw can newly reach it (see the ownership note above). */
+void RetireMesh(Mesh* m) {
+    if (m == nullptr) {
+        return;
+    }
+    /* STRUCTURAL window: this retire comes from a thread that never draws, while a render
+     * TASK is queued or executing. Every one of these is a mesh the replay of that task can
+     * still reach through its Entry -- i.e. exactly the free the pre-fix code performed in
+     * place. It is the measurement that does not depend on catching the two threads inside
+     * DrawMesh at the same instant. */
+    if (OffThreadWhileRendering()) {
+        const unsigned n = Bump(sLife.inflight);
+        if (n <= 4) {
+            Log("[native] meshlife INFLIGHT tick=%llu retire tid=%lu mesh=%p while a render task is live "
+                "(defer=%d)",
+                (unsigned long long)svcGetSystemTick(), (unsigned long)SelfTid(), (void*)m, sDeferFree);
+        }
+    }
+    const uintptr_t drawing = sDrawingMesh.load(std::memory_order_acquire);
+    if (drawing != 0) {
+        /* Measured proof that the free/draw window is real: another thread is inside
+         * DrawMesh right now. Harmless with the deferral on; a use-after-free with it off. */
+        Bump(sLife.overlap);
+        if (drawing == (uintptr_t)m) {
+            Bump(sLife.overlapSame);
+        }
+        if (sLifeLogs < 8) {
+            sLifeLogs++;
+            Log("[native] meshlife OVERLAP tick=%llu retire tid=%lu mesh=%p | drawing tid=%lu mesh=%p same=%d "
+                "defer=%d",
+                (unsigned long long)svcGetSystemTick(), (unsigned long)SelfTid(), (void*)m,
+                (unsigned long)sDrawingTid.load(std::memory_order_relaxed), (void*)drawing,
+                drawing == (uintptr_t)m ? 1 : 0, sDeferFree);
+        }
+    }
+    if (!sDeferFree) {
+        if (drawing != 0) {
+            Bump(sLife.unsafeFree); /* the pre-fix behaviour, kept only for the A/B */
+        }
+        FreeMesh(m);
+        Bump(sLife.freed);
+        return;
+    }
+    RetireGuard g;
+    m->retireNext = sRetirePending;
+    sRetirePending = m;
+    Bump(sLife.retired);
+    Bump(sLife.held);
+}
+
+/* Drawing thread, at a frame boundary: free what the previous drain stole, then steal the
+ * current pending list. The two steps are what put a whole frame between "unreachable"
+ * and "freed"; both run on the thread that issues every DrawMesh, so program order -- not
+ * a guess about task overlap -- is what makes the free safe. */
+void RetireDrain() {
+    if (!OnDrawingThread()) {
+        return;
+    }
+    Mesh* freeNow = nullptr;
+    {
+        RetireGuard g;
+        freeNow = sRetireStolen;
+        sRetireStolen = sRetirePending;
+        sRetirePending = nullptr;
+    }
+    while (freeNow != nullptr) {
+        Mesh* const next = freeNow->retireNext;
+        if (sDrawingMesh.load(std::memory_order_acquire) != 0) {
+            Bump(sLife.unsafeFree); /* must stay 0: a draw is live on some thread at free time */
+        }
+        FreeMesh(freeNow);
+        Bump(sLife.freed);
+        if (Get(sLife.held) != 0) {
+            sLife.held.fetch_sub(1u, std::memory_order_relaxed);
+        }
+        freeNow = next;
+    }
 }
 
 template <typename T> T* DupArray(const T* src, size_t n) {
@@ -259,20 +500,40 @@ template <typename T> T* DupArray(const T* src, size_t n) {
     return p;
 }
 
+/* Retire the mesh this bake supersedes. The Entry is repointed FIRST (here, or at the
+ * successful publish below) and only then is the old pointer queued, so a concurrent draw
+ * always loads a live allocation -- old or new, never null and never freed. */
+inline void RetireOld(Entry& e, Mesh* old) {
+    if (old != nullptr) {
+        e.mesh = nullptr;
+        RetireMesh(old);
+    }
+}
+
 bool Bake(Entry& e, Gdx3dsMeshResolveFn resolve, void* user) {
     const uint64_t t0 = svcGetSystemTick();
-    if (e.mesh != nullptr) {
-        FreeMesh(e.mesh);
-        e.mesh = nullptr;
+    /* One baker at a time: sWalkScratch is a single file-scope buffer, and two threads
+     * that both read the same stale Entry would retire the same Mesh* twice. */
+    BakeGuard bakeGuard;
+    const uint32_t gen = sGeneration.load(std::memory_order_acquire);
+    if (e.mesh != nullptr && e.gen == gen && !e.failed) {
+        Bump(sLife.bakeWait); /* the other thread baked this entry while we waited on the lock */
+        return true;
+    }
+    /* Keep the old mesh installed for the whole walk: a draw racing this bake keeps
+     * drawing last generation's machine instead of losing the model for a frame. */
+    Mesh* const old = e.mesh;
+    if (old != nullptr) {
         sWin.rebakes++;
         sTot.rebakes++;
     }
-    e.gen = sGeneration;
+    e.gen = gen;
     e.failed = 0;
     Gdx3dsMeshWalkOut& w = sWalkScratch;
     gdx3ds_mesh_walk(e.src, GDX3DS_MESH_MAX_CMDS, resolve, user, &w);
     if (w.status != GDX3DS_MESH_WALK_OK || w.nTris == 0 || w.nVerts == 0) {
         e.failed = 1;
+        RetireOld(e, old);
         sWin.bakeFails++;
         sTot.bakeFails++;
         if (sFailLogs < 64) {
@@ -285,8 +546,10 @@ bool Bake(Entry& e, Gdx3dsMeshResolveFn resolve, void* user) {
     Mesh* m = (Mesh*)calloc(1, sizeof(Mesh));
     if (m == nullptr) {
         e.failed = 1;
+        RetireOld(e, old);
         return false;
     }
+    m->magic = kMeshMagic;
     m->nRuns = w.nRuns;
     m->nChunks = w.nChunks;
     m->nTris = w.nTris;
@@ -296,8 +559,9 @@ bool Bake(Entry& e, Gdx3dsMeshResolveFn resolve, void* user) {
     m->tris = DupArray(w.tris, (size_t)w.nTris * 3);
     m->vtxChunk = (uint8_t*)malloc(w.nVerts);
     if (m->runs == nullptr || m->chunks == nullptr || m->tris == nullptr || m->vtxChunk == nullptr) {
-        FreeMesh(m);
+        FreeMesh(m); /* never published: no other thread can hold it */
         e.failed = 1;
+        RetireOld(e, old);
         sWin.bakeFails++;
         sTot.bakeFails++;
         return false;
@@ -307,7 +571,8 @@ bool Bake(Entry& e, Gdx3dsMeshResolveFn resolve, void* user) {
             m->vtxChunk[w.chunks[c].baseVertex + k] = (uint8_t)c;
         }
     }
-    e.mesh = m;
+    e.mesh = m; /* the single publishing store; only now is `old` unreachable */
+    RetireMesh(old);
     sWin.bakes++;
     sTot.bakes++;
     const uint64_t dt = svcGetSystemTick() - t0;
@@ -492,9 +757,68 @@ int CullModeOf(uint32_t geometry_mode) {
     return GDX3DS_CULL_NONE;
 }
 
+/* Does any triangle of this run survive reject/clip/cull?
+ *
+ * GfxSpTri1 screens EVERY triangle (reject box, clip-out fan, all-out, backface cull) and
+ * returns BEFORE its draw-state resolution, so a run whose triangles are all rejected never
+ * resolves a material: no ImportTexture, no shader load, no sampler/viewport write, and
+ * crucially `mRdp->textures_changed[]` is left ARMED. The native path resolves per run, so
+ * without this screen it imported for invisible runs and disarmed textures_changed — a later
+ * run re-asserting the same tile then kept a binding the texture cache had since recycled.
+ * The screen is the same arithmetic as the emit loop below -- INCLUDING the [native] cpuclip
+ * lever, which both take from one read in NativeDraw (see CpuClipEnabled) so they cannot drift
+ * apart again -- and returns at the first survivor, so a visible run pays ~one triangle. */
+bool RunHasSurvivor(const Mesh* m, const Gdx3dsMeshRun& run, bool rejVariant, int cullMode, int invert,
+                    bool cpuClipOn) {
+    const uint16_t* tris = &m->tris[(size_t)run.firstTri * 3];
+    for (unsigned t = 0; t < run.triCount; t++) {
+        const Gdx3dsLoadedVtx* v1 = &sLoaded[tris[t * 3 + 0]];
+        const Gdx3dsLoadedVtx* v2 = &sLoaded[tris[t * 3 + 1]];
+        const Gdx3dsLoadedVtx* v3 = &sLoaded[tris[t * 3 + 2]];
+        if (rejVariant && gdx3ds_tri_rej_reject(v1, v2, v3)) {
+            continue;
+        }
+        if (cpuClipOn && (v1->clip_out | v2->clip_out | v3->clip_out) != 0) {
+            Gdx3dsLoadedVtx poly[GDX3DS_CLIP_POLY_MAX];
+            const int n = gdx3ds_tri_clip(v1, v2, v3, poly);
+            if (n < 3) {
+                continue;
+            }
+            for (int i = 1; i + 1 < n; i++) {
+                Gdx3dsLoadedVtx fan[3];
+                fan[0] = poly[0];
+                fan[1] = poly[i];
+                fan[2] = poly[i + 1];
+                for (int j = 0; j < 3; j++) {
+                    if (fan[j].w < GDX3DS_VTX_MIN_CLIP_W) {
+                        fan[j].w = GDX3DS_VTX_MIN_CLIP_W;
+                    }
+                    gdx3ds_vtx_update_clip_flags(&fan[j]);
+                }
+                if (gdx3ds_tri_all_out(&fan[0], &fan[1], &fan[2])) {
+                    continue;
+                }
+                if (gdx3ds_tri_cull(&fan[0], &fan[1], &fan[2], cullMode, invert)) {
+                    continue;
+                }
+                return true;
+            }
+            continue;
+        }
+        if (gdx3ds_tri_all_out(v1, v2, v3)) {
+            continue;
+        }
+        if (gdx3ds_tri_cull(v1, v2, v3, cullMode, invert)) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 /* Native draw of one run. Returns false if the backend refused (caller replays). */
 bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const GdxSeamMaterial& mat,
-               bool rejVariant) {
+               bool rejVariant, bool cpuClipOn) {
     const GdxSeamRegs& R = g.R();
     const uint64_t te0 = svcGetSystemTick();
     struct EmitTimer {
@@ -503,6 +827,16 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
             sWin.emitTicks += svcGetSystemTick() - t0;
         }
     } emitTimer = { te0 };
+    /* G_CCMUX_LOD_FRACTION is the one combiner input GfxSpTri1's gdxInput lambda evaluates
+     * PER TRIANGLE (from v1->w under G_TL_LOD), which neither the per-run constant below nor
+     * the batch aux record can represent. InputFor() has no case for it and would silently
+     * emit black, so refuse the native path and let the caller replay the run through the
+     * interpreter (counted as `fb` on the receipt). No built machine list uses it today. */
+    for (int j = 0; j < mat.numInputs && j < 7; j++) {
+        if (mat.inputMap[0][j] == GDXSEAM_CCMUX_LOD_FRACTION || mat.inputMap[1][j] == GDXSEAM_CCMUX_LOD_FRACTION) {
+            return false;
+        }
+    }
     Gdx3dsVboPackParams params;
     memset(&params, 0, sizeof(params));
     /* Minimum: every mesh vertex once; fan vertices (rare) take whatever the pool still has
@@ -511,6 +845,9 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
     const uint32_t maxIdx = (uint32_t)run.triCount * 3u * 8u;
     uint32_t maxVerts = 0;
     float* dst = gdx3ds_mesh_backend_begin(&params, minVerts, maxIdx, &maxVerts);
+    if (sCapVerts > 0 && maxVerts > (uint32_t)sCapVerts) {
+        maxVerts = (uint32_t)sCapVerts; /* GEOMLOSS test knob: force the truncation path */
+    }
     if (dst == nullptr) {
         sWin.poolRefused++;
         sTot.poolRefused++;
@@ -566,6 +903,7 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
     const int invert = (*R.extra_geometry_mode & GDXSEAM_G_EX_INVERT_CULLING) != 0;
     memset(sRemap, 0xFF, sizeof(uint16_t) * m->nVerts);
     uint32_t nOut = 0, nIdx = 0;
+    bool runTrunc = false; /* GEOMLOSS: set when a cap ends the run on a triangle boundary */
     Gdx3dsLoadedVtx first;
     bool haveFirst = false;
     memset(&first, 0, sizeof(first));
@@ -578,7 +916,7 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
             sWin.rejected++;
             continue;
         }
-        if ((v1->clip_out | v2->clip_out | v3->clip_out) != 0) {
+        if (cpuClipOn && (v1->clip_out | v2->clip_out | v3->clip_out) != 0) {
             Gdx3dsLoadedVtx poly[GDX3DS_CLIP_POLY_MAX];
             const int n = gdx3ds_tri_clip(v1, v2, v3, poly);
             sWin.clipped++;
@@ -605,7 +943,13 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
                     continue;
                 }
                 if (nOut + 3 > maxVerts || nIdx + 3 > kMaxIdxScratch) {
+                    /* GEOMLOSS: whole-triple pre-check (already correct); stop the RUN, not
+                     * just this fan, so a truncated run is a clean prefix of the geometry
+                     * instead of a hole with later triangles still drawn over it. */
                     sWin.poolTrunc++;
+                    sTot.poolTrunc++;
+                    TruncLoud(maxVerts, nOut, 3, run.triCount, t);
+                    runTrunc = true;
                     break;
                 }
                 if (!haveFirst) {
@@ -619,6 +963,9 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
                 }
                 sWin.fanTris++;
             }
+            if (runTrunc && sTruncFix) {
+                break;
+            }
             continue;
         }
         if (gdx3ds_tri_all_out(v1, v2, v3)) {
@@ -630,14 +977,50 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
             continue;
         }
         if (nIdx + 3 > kMaxIdxScratch) {
+            /* GEOMLOSS: index scratch is the other cap; it was already a whole-triple
+             * pre-check but it left no trace at all. Count it with the pool truncations. */
+            sWin.poolTrunc++;
+            sTot.poolTrunc++;
+            TruncLoud(maxVerts, nOut, 3, run.triCount, t);
+            runTrunc = true;
             break;
         }
         const Gdx3dsLoadedVtx* vv[3] = { v1, v2, v3 };
+        /* GEOMLOSS: the vertex-cap check must clear the WHOLE triple before any index is
+         * pushed. It used to sit inside the j loop, so hitting the cap at j==1 or j==2 left
+         * one or two indices already appended and broke only the inner loop — nIdx stayed
+         * permanently off by 1 or 2 and every remaining triangle of the run was assembled
+         * from mismatched vertices. Count the distinct vertices this triangle still has to
+         * pack (duplicated corners of a degenerate triangle are packed once), and stop the
+         * run on a triangle boundary when they do not fit. */
+        const uint16_t g0 = tris[t * 3 + 0];
+        const uint16_t g1 = tris[t * 3 + 1];
+        const uint16_t g2 = tris[t * 3 + 2];
+        uint32_t need = 0;
+        if (sRemap[g0] == 0xFFFF) {
+            need++;
+        }
+        if (sRemap[g1] == 0xFFFF && g1 != g0) {
+            need++;
+        }
+        if (sRemap[g2] == 0xFFFF && g2 != g0 && g2 != g1) {
+            need++;
+        }
+        if (sTruncFix && nOut + need > maxVerts) {
+            sWin.poolTrunc++;
+            sTot.poolTrunc++;
+            TruncLoud(maxVerts, nOut, need, run.triCount, t);
+            runTrunc = true;
+            break;
+        }
         for (int j = 0; j < 3; j++) {
             const uint16_t gi = tris[t * 3 + j];
             if (sRemap[gi] == 0xFFFF) {
-                if (nOut >= maxVerts) {
+                if (!sTruncFix && nOut >= maxVerts) {
+                    /* pre-fix arm ([debug] meshtruncfix=0): breaks the INNER loop with
+                     * indices for this triangle already pushed — nIdx misaligns here. */
                     sWin.poolTrunc++;
+                    sTot.poolTrunc++;
                     break;
                 }
                 sRemap[gi] = (uint16_t)nOut;
@@ -653,6 +1036,22 @@ bool NativeRun(GdxInterpSeam& g, const Mesh* m, const Gdx3dsMeshRun& run, const 
     }
     sWin.tris += run.triCount;
     sTot.tris += run.triCount;
+    /* GEOMLOSS invariant guard: an index buffer must end on a triangle boundary. Every cap
+     * above is a whole-triple pre-check, so this can no longer trip — but a misaligned tail
+     * draws every following triangle from mismatched vertices, which is the worst failure
+     * this path has, so it is checked rather than assumed. Trimming is the safe answer. */
+    if (nIdx % 3u != 0u) {
+        sWin.idxMisaligned++;
+        sTot.idxMisaligned++;
+        if (!sTruncLogged) {
+            sTruncLogged = 1;
+            Log("GEOMLOSS: machines index buffer MISALIGNED (nIdx=%u, not a multiple of 3) — trimmed to "
+                "%u; a cap broke mid-triangle, which would have drawn the rest of the run from "
+                "mismatched vertices",
+                nIdx, nIdx - (nIdx % 3u));
+        }
+        nIdx -= nIdx % 3u;
+    }
     if (nIdx == 0) {
         gdx3ds_mesh_backend_draw(0, sIdx, 0, nullptr); /* releases the reservation */
         return true;
@@ -832,7 +1231,7 @@ void VerifyDraw(GdxInterpSeam& g, const Mesh* m, int slot, int lod) {
     const uint32_t nW = sCapCount[0], nN = sCapCount[1];
     const uint32_t n = nW < nN ? nW : nN;
     unsigned triMis = 0, matMis = 0, auxDiff = 0;
-    int firstTri = -1, firstSlot = -1;
+    int firstTri = -1, firstSlot = -1, firstMat = -1;
     for (uint32_t t = 0; t < n; t++) {
         const CapTri& a = sCap[0][t];
         const CapTri& b = sCap[1][t];
@@ -850,6 +1249,9 @@ void VerifyDraw(GdxInterpSeam& g, const Mesh* m, int slot, int lod) {
         }
         if (a.id0 != b.id0 || a.id1 != b.id1 || a.tex0 != b.tex0 || a.tex1 != b.tex1) {
             matMis++;
+            if (firstMat < 0) {
+                firstMat = (int)t;
+            }
         }
         if (memcmp(a.aux, b.aux, sizeof(a.aux)) != 0) {
             auxDiff++;
@@ -875,8 +1277,21 @@ void VerifyDraw(GdxInterpSeam& g, const Mesh* m, int slot, int lod) {
                 "float=%d walk=%08lx(%g) native=%08lx(%g)",
                 slot, lod + 1, (unsigned long)nW, (unsigned long)nN, triMis, matMis, firstTri, firstSlot,
                 (unsigned long)ua, (double)a.v[firstSlot], (unsigned long)ub, (double)b.v[firstSlot]);
+        } else if (firstMat >= 0) {
+            /* Name the disagreeing field: a material-only mismatch means BindMaterial resolved a
+             * different shader program or bound a different texture than GfxSpTri1 did for the
+             * same draw state — the drift class the replica is exposed to. */
+            const CapTri& a = sCap[0][firstMat];
+            const CapTri& b = sCap[1][firstMat];
+            Log("[native] verify MISMATCH slot=%d lod=%d tris walk=%lu native=%lu matMis=%u first tri=%d "
+                "id0 w=%08lx%08lx n=%08lx%08lx id1 w=%08lx%08lx n=%08lx%08lx tex0 w=%lu n=%lu tex1 w=%lu n=%lu",
+                slot, lod + 1, (unsigned long)nW, (unsigned long)nN, matMis, firstMat,
+                (unsigned long)(a.id0 >> 32), (unsigned long)(uint32_t)a.id0, (unsigned long)(b.id0 >> 32),
+                (unsigned long)(uint32_t)b.id0, (unsigned long)(a.id1 >> 32), (unsigned long)(uint32_t)a.id1,
+                (unsigned long)(b.id1 >> 32), (unsigned long)(uint32_t)b.id1, (unsigned long)a.tex0,
+                (unsigned long)b.tex0, (unsigned long)a.tex1, (unsigned long)b.tex1);
         } else {
-            Log("[native] verify MISMATCH slot=%d lod=%d tris walk=%lu native=%lu matMis=%u (ids/tex)", slot,
+            Log("[native] verify MISMATCH slot=%d lod=%d tris walk=%lu native=%lu matMis=%u (count)", slot,
                 lod + 1, (unsigned long)nW, (unsigned long)nN, matMis);
         }
     }
@@ -907,11 +1322,24 @@ void NativeDraw(GdxInterpSeam& g, const Mesh* m, bool allowWalkFallback) {
         sWin.tnlTicks += svcGetSystemTick() - tt0;
     }
     const bool rejVariant = g.RejectVariant();
+    const bool cpuClipOn = CpuClipEnabled(); /* one read per draw, shared by the screen and the emit loop */
+    const int cullMode = native ? CullModeOf(*g.R().geometry_mode) : GDX3DS_CULL_NONE;
+    const int cullInvert = native ? ((*g.R().extra_geometry_mode & GDXSEAM_G_EX_INVERT_CULLING) != 0) : 0;
     for (unsigned r = 0; r < m->nRuns; r++) {
         const Gdx3dsMeshRun& run = m->runs[r];
         const uint64_t tb0 = svcGetSystemTick();
         ApplyRunState(g, run);
         if (run.triCount == 0) {
+            continue;
+        }
+        /* An invisible run must not resolve draw state — GfxSpTri1 returns before its state
+         * block for every screened-out triangle. See RunHasSurvivor. */
+        if (native && !RunHasSurvivor(m, run, rejVariant, cullMode, cullInvert, cpuClipOn)) {
+            sWin.emptyRuns++;
+            sTot.emptyRuns++;
+            sWin.tris += run.triCount;
+            sTot.tris += run.triCount;
+            sWin.bindTicks += svcGetSystemTick() - tb0;
             continue;
         }
         bool done = false;
@@ -921,7 +1349,7 @@ void NativeDraw(GdxInterpSeam& g, const Mesh* m, bool allowWalkFallback) {
             const bool bound = g.BindMaterial(mat);
             sWin.bindTicks += svcGetSystemTick() - tb0;
             if (bound) {
-                done = NativeRun(g, m, run, mat, rejVariant);
+                done = NativeRun(g, m, run, mat, rejVariant, cpuClipOn);
             }
             if (!done) {
                 sWin.bindFallbacks++;
@@ -938,7 +1366,29 @@ void NativeDraw(GdxInterpSeam& g, const Mesh* m, bool allowWalkFallback) {
 }
 
 void DrawMesh(GdxInterpSeam& g, const Mesh* m, int slot, int lod) {
+    /* Debug assertion for the ownership invariant: a live mesh always carries kMeshMagic,
+     * and FreeMesh poisons the header before releasing it. A nonzero stale= on the
+     * `[native] meshlife` receipt means something freed a mesh a draw still held -- i.e.
+     * the race this file's ownership note exists to prevent has regressed. */
+    if (m == nullptr || m->magic != kMeshMagic) {
+        Bump(sLife.staleDraw);
+        if (sLifeLogs < 8) {
+            sLifeLogs++;
+            Log("[native] meshlife STALE DRAW tick=%llu tid=%lu slot=%d lod=%d mesh=%p magic=%08lx",
+                (unsigned long long)svcGetSystemTick(), (unsigned long)SelfTid(), slot, lod + 1, (const void*)m,
+                (unsigned long)(m != nullptr ? m->magic : 0u));
+        }
+        return;
+    }
+    /* COVERAGE: which machine slot at which LOD actually reached the screen this frame. The
+     * 4P material bug (B10/machfix) was invisible to a frame hash unless the scene also
+     * recycled a texture id, and the LOD ladder is exactly the axis a hand-placed SHOT never
+     * walked. value = (lod << 8) | slot. */
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_MACH,
+                                   ((uint32_t)(lod & 0xFF) << 8) | (uint32_t)(slot & 0xFF)));
     const uint64_t t0 = svcGetSystemTick();
+    sDrawingTid.store(SelfTid(), std::memory_order_relaxed);
+    sDrawingMesh.store((uintptr_t)m, std::memory_order_release);
     g.Flush();
     if (sVerify) {
         VerifyDraw(g, m, slot, lod);
@@ -959,6 +1409,7 @@ void DrawMesh(GdxInterpSeam& g, const Mesh* m, int slot, int lod) {
         sWin.draws++;
         sTot.draws++;
     }
+    sDrawingMesh.store(0, std::memory_order_release);
     sWin.ticks += svcGetSystemTick() - t0;
 }
 
@@ -977,8 +1428,17 @@ Entry* LookupForDraw(const void* src, Gdx3dsMeshResolveFn resolve, void* user) {
     if ((sSlotMask & (1u << e->slot)) == 0 || (sLodMask & (1u << e->lod)) == 0) {
         return nullptr;
     }
-    const uint32_t gen = sGeneration;
+    /* Overlap census: this registry read is happening on the conversion (game) thread with
+     * a render task live, i.e. inside the bridgemain window the free used to land in. */
+    const bool offThread = OffThreadWhileRendering();
+    if (offThread) {
+        Bump(sLife.lookupOvl);
+    }
+    const uint32_t gen = sGeneration.load(std::memory_order_acquire);
     if (e->mesh == nullptr || e->gen != gen) {
+        if (offThread) {
+            Bump(sLife.bakeOvl); /* a BAKE -- and pre-fix, a FreeMesh -- inside that window */
+        }
         if (e->failed && e->gen == gen) {
             return nullptr;
         }
@@ -1007,6 +1467,7 @@ int gdx3ds_mesh_dl_hook_seam(GdxInterpSeam& I, const void* listPtr, Gdx3dsMeshRe
     const uintptr_t p = (uintptr_t)listPtr;
     const uintptr_t base = (uintptr_t)sStubs;
     Entry* e = nullptr;
+    const Mesh* mesh = nullptr;
     if (p >= base && p < base + sizeof(sStubs) && ((p - base) % sizeof(Stub)) == 0) {
         /* The bridge's redirect (LUS path): the stub names its entry. */
         const Stub* stub = (const Stub*)listPtr;
@@ -1014,7 +1475,10 @@ int gdx3ds_mesh_dl_hook_seam(GdxInterpSeam& I, const void* listPtr, Gdx3dsMeshRe
             return 0;
         }
         e = &sEntries[stub->entry];
-        if (e->mesh == nullptr) {
+        /* Load the pointer ONCE. The entry is repointed by whichever thread bakes (main,
+         * under bridgemain=1), so a second read could see a different generation's mesh. */
+        mesh = e->mesh;
+        if (mesh == nullptr) {
             return 1; /* nothing to draw (cannot happen: the bridge only redirects baked entries) */
         }
     } else {
@@ -1029,12 +1493,20 @@ int gdx3ds_mesh_dl_hook_seam(GdxInterpSeam& I, const void* listPtr, Gdx3dsMeshRe
         if (e == nullptr) {
             return 0;
         }
+        mesh = e->mesh; /* loaded once, as above */
+        if (mesh == nullptr) {
+            return 0;
+        }
     }
-    DrawMesh(I, e->mesh, e->slot, e->lod);
+    DrawMesh(I, mesh, e->slot, e->lod);
     return 1;
 }
 
 extern "C" void gdx3ds_mesh_frame_begin(void) {
+    /* Frame boundary on the DRAWING thread (the render thread when [debug] renderthread is
+     * on, else main): the only place a retired mesh is ever free()d. Before the cadence
+     * early-out -- the queue must drain every frame, not every 64th. */
+    RetireDrain();
     sFrame++;
     if ((sFrame & 63) != 0 || sEnabled != 1) {
         return;
@@ -1049,11 +1521,12 @@ extern "C" void gdx3ds_mesh_frame_begin(void) {
         }
     }
     Log("[native] machines=1%s lists=%d baked=%d bakes=%u/%u fails=%u draws=%u walk=%u runs=%u verts=%u tris=%u "
-        "rej=%u out=%u cull=%u clip=%u fan=%u fb=%u pool=%u/%u us=%lu/f (tnl=%lu bind=%lu emit=%lu draw=%lu) "
+        "rej=%u out=%u cull=%u clip=%u fan=%u fb=%u pool=%u/%u empty=%u misidx=%u us=%lu/f (tnl=%lu bind=%lu emit=%lu draw=%lu) "
         "linfree=%luK",
         sWalkOnly ? " walk_only=1" : (sVerify ? " verify=1" : ""), sRegisteredCount, baked, sWin.bakes, sTot.bakes,
         sTot.bakeFails, sWin.draws, sWin.walkDraws, sWin.runs, sWin.verts, sWin.tris, sWin.rejected, sWin.allOut,
-        sWin.culled, sWin.clipped, sWin.fanTris, sWin.bindFallbacks, sWin.poolRefused, sWin.poolTrunc,
+        sWin.culled, sWin.clipped, sWin.fanTris, sWin.bindFallbacks, sWin.poolRefused, sWin.poolTrunc, sWin.emptyRuns,
+        sWin.idxMisaligned,
         (unsigned long)(sWin.ticks * 1000ull / (uint64_t)CPU_TICKS_PER_MSEC / 64ull),
         (unsigned long)(sWin.tnlTicks * 1000ull / (uint64_t)CPU_TICKS_PER_MSEC / 64ull),
         (unsigned long)(sWin.bindTicks * 1000ull / (uint64_t)CPU_TICKS_PER_MSEC / 64ull),
@@ -1068,11 +1541,30 @@ extern "C" void gdx3ds_mesh_frame_begin(void) {
         sTot.vfyTriMismatch += sWin.vfyTriMismatch;
         sTot.vfyDraws += sWin.vfyDraws;
     }
+    /* Mesh-lifetime receipt (the ownership note at the top of this file). overlap= counts
+     * retires that happened while the other thread was inside DrawMesh -- the strictest
+     * form, and rare. The `window` group is the structural measurement and does not depend
+     * on catching both threads in DrawMesh at one instant:
+     *   lookupOvl  registry reads made from a non-drawing thread with a render TASK live
+     *              (the bridgemain overlap, counted at the point of use)
+     *   bakeOvl    of those, the ones that had to bake
+     *   inflight   of those, the ones that superseded an existing mesh -- i.e. EXACTLY the
+     *              free the pre-fix code performed in place, inside the window
+     * All three are expected to be nonzero and are harmless with the deferral on.
+     * stale= and unsafe= are the regression detectors and MUST stay 0. */
+    Log("[native] meshlife defer=%d retired=%u freed=%u held=%u | window lookupOvl=%u bakeOvl=%u inflight=%u "
+        "overlap=%u/%u | bakeWait=%u stale=%u unsafe=%u",
+        sDeferFree, Get(sLife.retired), Get(sLife.freed), Get(sLife.held), Get(sLife.lookupOvl),
+        Get(sLife.bakeOvl), Get(sLife.inflight), Get(sLife.overlapSame), Get(sLife.overlap),
+        Get(sLife.bakeWait), Get(sLife.staleDraw), Get(sLife.unsafeFree));
     const Stats keepTot = sTot;
     memset(&sWin, 0, sizeof(sWin));
     sTot = keepTot;
 }
 
 extern "C" void gdx3ds_mesh_lists_rebuilt(void) {
-    sGeneration = sGeneration + 1;
+    /* Release: everything the game wrote into the rebuilt lists must be visible to the
+     * thread that observes the bump and rebakes from them (audit S3 -- the ordering half
+     * of the free/draw race). Called from the game thread only. */
+    sGeneration.fetch_add(1u, std::memory_order_release);
 }

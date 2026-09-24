@@ -28,8 +28,13 @@ cannot do what you need, say so in your report — do not write a `/tmp` script.
 ## Global flags
 
 `--track NAME` (default: worktree basename) · `--run-root DIR` (default `/tmp/gdx-runs`) ·
-`--json` (machine-readable result on stdout) · `--quiet` · `--dry-run` (prints the legacy
-shell the subcommand replaces and changes nothing).
+`--json` (machine-readable result on stdout) · `--quiet` · `--dry-run` (prints exactly what
+the invocation would do and does **none** of it: nothing launched, written, downloaded or
+locked).
+
+> `retro run --dry-run` used to be a lie: the flag was parsed, documented, and read by
+> nobody, so it booted a real instance on a real private SD (NEXT.md B45). It is now the
+> first thing `retro run` acts on and `RetroDryRunTest` detonates on every side effect.
 
 `GDX_TRACK` and `GDX_RUN_ROOT` work as environment equivalents.
 
@@ -51,6 +56,34 @@ PROTOCOL.md's "snapshot your artifacts every 25 s" with no per-agent bookkeeping
 
 `manifest.json` promotes **`gputrace` to a top-level field**, out of `ini`, on purpose:
 PROTOCOL.md requires every perf claim to state it, so no report can quietly omit it.
+
+### `tree`: which tree produced this run
+
+PROTOCOL.md: **a parity cell is a claim about a tree.** Every manifest therefore carries
+
+```json
+"tree": {
+  "branch": "native/tooling2", "head": "1727d579…",
+  "base": "native/main", "base_head": "1727d579…",
+  "branch_point": "1727d579…", "behind": 0, "ahead": 4,
+  "dirty": false, "current": true
+}
+```
+
+`branch_point` is the merge-base against `native/main` (override with `GDX_BASE_BRANCH`)
+and `behind` is how many commits on main this tree does not have. `runs.validate`
+**refuses** a manifest with no branch point, so a parity number cannot be quoted out of a
+run without the tree it was measured on. Every run prints the receipt line
+
+```
+tree: native/tooling2@1727d579, branch point 1727d579 off native/main@1727d579 (+4/-0)
+```
+
+and WARNS when `behind > 0`, because that is exactly the condition under which a claim of
+"pre-existing on `native/main`" cannot be checked from where the branch stands: a bug
+fixed on main after the branch point is still present in the branch and looks identical to
+one the branch found. That cost one agent a full bisect of B42, a bug already fixed. Quote
+the receipt line, or forward-merge and re-gate.
 
 ---
 
@@ -92,12 +125,15 @@ tools/dev/gdx-dev emu run build-3ds/port/3ds/G-Diffuser-3DS.3dsx \
 |---|---|
 | `--replay ID\|FILE` | stage a replay from `tools/dev/replays/` (see below) |
 | `--ini K=V` | merge one ini key; `[debug]` by default, `section.k=v` to target a section |
-| `--seconds N` | run length (default 60) |
+| `--seconds N` | run **ceiling** in seconds (default 60; see `retro run` for the staged-replay default) |
 | `--gputrace` | set `[debug] gputrace=1` — inflates profiles, recorded in the manifest |
 | `--name S` | slug for the run id |
 | `--shots` | collect `autotest/*.bmp` written by `SHOT` events |
+| `--3d [MODE]` | render in stereoscopic 3D so the guest's right-eye pass runs — see **Stereoscopic 3D** below |
+| `--depth-3d PCT` | 3D depth for `--3d`, 1..100 (default 100) |
 | `--lock-wait S` | how long to wait for another agent to finish (default 900) |
-| `--dry-run` | print the legacy shell instead of running it |
+| `--no-replay-quit` | play PAST the replay's last tick and end on `--seconds` (`[debug] replay_quit=0`) |
+| `--dry-run` | print what the run would do and do none of it |
 
 Always sets the measurement ini set (`console=1 filelog=1 filelog_max_kb=4096
 verbose=1`). `gputrace` is deliberately **not** in that set.
@@ -210,8 +246,101 @@ tools/dev/gdx-dev diff hashes runA.log runB.log # -> tools/dev/fhdiff.py      (o
 tools/dev/gdx-dev hw push --ip 192.168.1.50     # -> tools/dev/hw.py          (hwlink)
 ```
 
+**Clearing an ini key on hardware needs `--delete`, not an empty value.**
+
+```sh
+tools/dev/gdx-dev hw ini --delete debug input_replay --save   # remove the key
+tools/dev/gdx-dev hw replay --off                             # the same, as one verb
+```
+
+An empty value is still an *entry*: the guest getters return `""` instead of the key's
+DEFAULT, and `INI SAVE` writes the key straight back out — so `ini debug input_replay ""`
+left a replay armed across reloads (and the control protocol dropped the empty token
+anyway, so the set never happened). `INI DEL <section> <key>` removes the entry;
+`gdx3ds_config_unset` returns 0 when a key was removed and 3 when there was none, and the
+guest logs `[net] ini del [<section>] <key> rc=<n>`.
+
 If the peer track has not merged into your branch, they exit **7** and name the track and
 the plan section to ask for. That is the signal to merge or to ask — not to reimplement.
+
+## `gdx-dev hw-run` — unattended hardware A/B
+
+One command measures a branch on the console with nobody watching: a config matrix, the
+canonical replay, per-config ini + reload, a marker-delimited log slice per config, a
+manifest per slice and a summary table with an A/B delta. It replaces the throwaway
+`artifacts/hwprof.sh` / `hwfps3.sh` pair that produced the 2026-09-20 hardware numbers.
+
+```sh
+tools/dev/gdx-dev hw-run \
+    --config 'native.all=0,native.interp=0' \
+    --config 'native.all=1,native.interp=1' \
+    --replay race-mutecity-start --repeats 3 \
+    --3dsx ~/Desktop/G-Diffuser-3DS-<track>/G-Diffuser-3DS.3dsx
+
+tools/dev/gdx-dev hw-run --config ... --gputrace      # [prof] ms (inflated, and stated)
+tools/dev/gdx-dev hw-run --config ... --dry-run       # the exact sequence, no sockets
+```
+
+Preconditions: the console is on the WiFi link (`tools/dev/gdx-dev hw ping` answers
+`OK PONG`), `[net] enabled = 1` on the card, and `tools/dev/hw.ini` holds its IP.
+
+- `--config SPEC` (repeatable) — one config, `section.key=value` comma-separated. A bare
+  key is `[debug]`. **An empty value DELETES the key** (`--config 'debug.input_replay='`),
+  which is the only way to clear a lever: an empty value is still an entry and survives
+  `INI SAVE`.
+- `--repeats N` — the **outer** loop, so thermal or cache drift over a long session hits
+  every config equally instead of loading onto whichever ran last.
+- `--seconds` is a **ceiling**, not a sleep: a slice ends at the replay's own `[rec] end`.
+- `--gputrace` sets `[debug] gputrace=1`, records it in every manifest and prints it in
+  the header. PROTOCOL.md line 22: it inflates every millisecond, so it must be stated.
+- `--base-ini` / `--restore` — the ini applied to every config, and once at the end.
+  The default restore **deletes** `[debug] input_replay`, so a replay cannot survive the
+  session, and turns `gputrace`/`det` off.
+
+**How a config's log is delimited.** Not by byte offset. Before each slice the runner
+makes the guest write its own boundary — `INI debug hwrun_mark <token>` is echoed by the
+console as `[net] cmd INI [debug] hwrun_mark=<token> rc=0`
+(`port/3ds/net/gdx3ds_net.c`) — and the key is deleted immediately, so no `INI SAVE` can
+persist it. The boundary therefore travels in the same stream as the data and cannot
+drift when another process appends to the log. When `hw-run` also manages to bind
+port 17491 it rotates the sink per slice as well and cross-checks the two.
+
+The byte-offset version did drift: `artifacts/hwfps3-r1-all1-interp1.log` opens with the
+*previous* config's `race03`/`race04` SHOTs.
+
+**What it writes.**
+
+```
+/tmp/gdx-runs/<track>/<run_id>/
+    manifest.json        lane=hw, result.slices = every slice id
+    hw-link.log          the whole session, if we owned port 17491
+    cfg00-rep01/
+        log.txt          THIS config's slice, marker to marker
+        manifest.json    schema-1: build sha256, ini, replay, gputrace, uptimes
+        VERDICT
+```
+
+Each slice manifest records the console's build/frame/uptime from `PONG` before and after
+and the Mac's uptime, so a console that rebooted or a host that slept mid-matrix is
+visible afterwards rather than being an unexplained outlier.
+
+**Completion.** A slice PASSes only with the replay's `[rec] end` receipt *and* every
+scheduled SHOT — the rule `gdx-dev emu run` already uses. A guest that dies mid-replay
+keeps logging an advancing heartbeat and zero `[fatal]` lines, so without this a crash at
+frame 433 of 6001 reads as a healthy run. This matters in practice: two of the three
+configs in the published 2026-09-20 `[prof]` table never reached `[rec] end` — the fixed
+`sleep 150` reloaded on top of them. `tests/fixtures/hw-prof-all0-interp0.log` is that
+slice, and a test asserts it is detected as truncated.
+
+**The summary.** `[prof]` sections by `--by-vtxn` nD bucket per config (repeats pooled),
+in-race fps percentiles, the error census, and an A/B delta table of config 0 against
+every later config. fps is pooled from `[watchdog]` deltas over the first 60 s after the
+`race00` SHOT, counted in **beats, not host timestamps** — the log link flushes in bursts
+(beats 30-32 of the 2026-09-20 session share one host second), so a wall-clock window
+would cut wherever the network hiccuped.
+
+Exit 1 if any slice is incomplete or carries a `[fatal]`; 7 if `tools/dev/hw.py` (the
+hwlink track) has not merged into your branch.
 
 ## `gdx-dev retro` — the RetroArch lane
 
@@ -221,13 +350,15 @@ at once. See `docs/research/native/devcli-progress.md` for the spike verdict and
 working configuration; Azahar Qt remains the default lane.
 
 ```sh
-tools/dev/gdx-dev retro run build-3ds/port/3ds/G-Diffuser-3DS.3dsx --seconds 300 --replay storm2
+tools/dev/gdx-dev retro run build-3ds/port/3ds/G-Diffuser-3DS.3dsx --replay storm2
+tools/dev/gdx-dev retro run <3dsx> --replay storm2 --dry-run   # says everything, does nothing
 tools/dev/gdx-dev retro status            # who owns which instance; flags orphans
 tools/dev/gdx-dev retro reap              # kill RetroArch whose driver is gone
 tools/dev/gdx-dev retro reap --prune      # also delete idle instance dirs >2 days old
 tools/dev/gdx-dev retro reap --prune --days 7 --dry-run
 tools/dev/gdx-dev retro setup --instance a
 tools/dev/gdx-dev retro cmd SCREENSHOT --instance a
+tools/dev/gdx-dev retro run <3dsx> --3d   # stereoscopic — see "Stereoscopic 3D" below
 ```
 
 ### Renderer (`--gfx`)
@@ -301,6 +432,80 @@ pruned nothing at any threshold.
 and no pid file is left alone — several tracks share this machine, and "no lock" means
 "started before this feature", not "orphan".
 
+## Stereoscopic 3D (`--3d`, both lanes)
+
+```sh
+tools/dev/gdx-dev retro run <3dsx> --3d --replay race-mutecity-start --ini fh_every=1
+tools/dev/gdx-dev emu   run <3dsx> --3d --depth-3d 60 --replay race-mutecity-start
+tools/dev/fhdiff.py A/log.txt B/log.txt --eye both
+```
+
+**`[stereo] enabled = 1` on the guest does nothing on its own.** `Gdx3dsStereo::FrameBegin`
+gates the right-eye pass on `osGet3DSliderState() > 0`, and the emulated slider is driven
+by the *emulator's* own 3D settings — it reads 0 whenever the host is not rendering in 3D.
+Every emulator parity run up to 2026-09-23 set `[stereo] enabled=1` and still rendered
+mono, which is why no `[c3d] … eyeR=`/`anchor=` receipt had ever appeared in one. `--3d`
+is the host knob:
+
+| lane | what `--3d` sets |
+|---|---|
+| `emu run` (Azahar Qt) | `qt-config.ini` `[Layout] render_3d` + `factor_3d`, each with its `\default` sibling forced `false`, patched inside the lock and **restored to the previous values afterwards** |
+| `retro run` (RetroArch) | the `citra_render_3d` / `citra_factor_3d` core options, against a 3D-capable core |
+
+`--3d` also implies `[stereo] enabled=1` and `[debug] fh_eye=both` on the guest (an
+explicit `--ini` still wins). `fh_eye=both` makes every capture emit an `eye=L` **and** an
+`eye=R` `[fh]` receipt, and every `SHOT` write `autotest/<tag>_L.bmp` *and* `_R.bmp` — the
+two-eye evidence. Modes: `side-by-side` (default; the only one where a single host frame
+visibly contains both eyes), `side-by-side-full`, `anaglyph`, `interlaced`,
+`reverse-interlaced`, `cardboard`, `off`.
+
+Read the receipts, not the flag: `[stereo] right-eye pass ACTIVE (slider=…)` once when it
+engages, ` eyeR=<n> stereo=1` on every `[c3d]` line, and ` anchor=<draws>/<dmin>/<dmax>`
+on the windows that drew a prim-depth-anchored rect. `eye=R inactive` on the `[fh]` lines
+means the pass never ran.
+
+### Two traps, both measured
+
+**Qt: the `\default` sibling.** `QtConfig::ReadBasicSetting` reads `<key>\default` first
+and, when it is true, throws your stored value away and uses the compiled default. Writing
+`render_3d=1` alone is inert — `render_3d\default=false` has to go with it. Azahar also
+rewrites the whole file when it exits, so it may only be edited while no Azahar is running.
+The enum is **Azahar's**, not Citra's: `Off=0 SideBySide=1 SideBySideFull=2 Anaglyph=3
+Interlaced=4 ReverseInterlaced=5 CardboardVR=6` — Azahar inserted `SideBySideFull`.
+
+**RetroArch: the pinned core has no 3D option, and the options file was never read.**
+The Azahar 2126.0 release core exposes 30 `citra_*` options and not one of them is stereo
+(`core_settings.cpp` never touches `render_3d`, and the core reads no ini). The libretro
+**nightly** does expose `citra_render_3d`/`citra_factor_3d`, so `--3d` installs it to
+`~/Library/Application Support/gdx-retro/cores-3d/` and runs against that, leaving the
+shared release core other agents are mid-run on alone. Two cores are two emulators, so
+**a `--3d` run's hashes compare only with another `--3d` run's** — the same-platform rule
+one level down.
+
+> ⚠ **Lane-wide, still open: `core_options_path` does not work.** RetroArch 1.22 only
+> consults it when `global_core_options` is true; otherwise it uses a per-core
+> `<rgui_config_directory>/<corename>/<corename>.opt`, which by default is the **shared**
+> `~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt`. Measured: a legal
+> `citra_layout_option = "side_by_side"` in the instance file still arrived at the core as
+> `"default"`, and the frontend log says `Saved core options file to
+> .../RetroArch/config/Azahar/Azahar.opt`. **Every `retro run` to date has therefore run on
+> the core's compiled defaults, and `--gfx` has never reached the core** (it only changed
+> RetroArch's own `video_driver`). The defaults happen to be New 3DS + Vulkan, which is why
+> the lane worked. `--3d` fixes it for itself by pointing `rgui_config_directory` at the
+> instance; fixing it for the mono lane changes what that lane runs and needs its own
+> re-baseline. Three values in `CORE_OPTIONS_TEMPLATE` are also not legal for their options
+> (`citra_is_new_3ds = "enabled"` — the legal pair is `"New 3DS"`/`"Old 3DS"` —
+> `"1x (Native)"`, `"Default Top-Bottom Screen"`); they resolve to the defaults, which is
+> the only reason nothing broke.
+
+### `fhdiff --eye both`
+
+A `fh_eye=both` run emits two receipts per captured frame sharing one `frame` number.
+`--eye both` compares the L and R streams **separately** (an eye is only ever matched
+against the same eye), prints a summary line per eye plus `eyes=L,R status=PASS|FAIL`, and
+fails if either diverges. A missing R stream is reported as "the right-eye pass did not
+run" rather than as a bare no-data. `--eye L` (the default) is unchanged.
+
 ## Replays
 
 `tools/dev/replays/` — see its own README for the grammar and the three rules that cost
@@ -333,6 +538,46 @@ A run stopped deliberately by `[debug] quit_at_tick` counts as complete once the
 reached (the `[oracle] quit requested: [debug] quit_at_tick reached` receipt only exists
 because it was), and SHOTs scheduled *after* that tick are dropped from the expectation
 rather than failing a run that did exactly what it was told.
+
+### `--seconds` is a ceiling, and a staged replay sets its own
+
+`--seconds` bounds a run; it never paces one. The default is **60 s for a bare boot** and
+**300 s when a replay is staged** (`GDX_RETRO_REPLAY_SECONDS`). The old flat 60 s was
+shorter than every replay in the corpus, so a staged replay could only ever be cut short —
+and the cut printed `RESULT FAIL`, which reads like a crash (NEXT.md B45). It no longer
+does: a deadline that expires with the emulator alive and the guest still beating scores
+
+```
+RESULT TIMEOUT frame=2118 fatals=0 replay=race-mutecity-start(gdxrec) complete=False …
+```
+
+whose detail names the frame reached and the tick it was short of. **TIMEOUT is not FAIL**:
+FAIL means a fatal, a dead core or a replay that never loaded. Both exit 1.
+
+### A staged replay ends the run (`replay_quit`)
+
+`--replay` alone never *ended* a run: the guest reached the replay's last tick and kept
+playing, unscripted and unrecorded, until `--seconds` expired — ~150 s of noise appended to
+every canonical-replay run (NEXT.md B19). Staging a replay now implies
+`[debug] replay_quit=1` on **both** lanes, so the run leaves the frame loop at `[rec] end`.
+That is also what makes the 300 s ceiling free: a well-behaved replay never reaches it.
+
+It is **implied, not forced**. Override it with either spelling:
+
+```sh
+tools/dev/gdx-dev retro run <3dsx> --replay race-mutecity-start --no-replay-quit
+tools/dev/gdx-dev retro run <3dsx> --replay race-mutecity-start --ini debug.replay_quit=0
+```
+
+Use the override for diagnostics that watch what the guest does *after* the scripted inputs
+stop — the wobble investigation (post-replay drift) and dynlod (LOD settling) both do, and
+a hardcoded flip would have silently truncated them. The run says which way it went, so the
+transcript always carries the answer.
+
+The clean exit `replay_quit` causes goes through `exit()`, which logs
+`[fatal-trace] atexit: process exiting via exit()`. That receipt is **benign** in
+`prof.error_census` (`BENIGN_RECEIPTS`) and is not counted as a fatal — older progress
+files that call it a false-negative FAIL predate that fix.
 
 **Both lanes return as soon as the guest is finished**, rather than idling out the rest of
 `--seconds`. The emulator routinely outlives the guest — a `.3dsx` that exits leaves
@@ -369,7 +614,50 @@ normally, never replayed, and still reported PASS.
 python3 tools/dev/tests/test_gdxdev.py
 ```
 
-Stdlib `unittest`. Covers the manifest schema, the ini merge preserving a foreign agent's
-key, autoinput grammar rejection, the log parser against a golden fixture, the `[fatal]`
-scoping fix, delegate exit 7, and an import under `python3 -S` (no site-packages) to
-catch stdlib-only drift.
+Stdlib `unittest`, and **gated by `tools/ci-3ds.sh`** (step `gdxdev_harness_tests`). It was
+not, which is how `--dry-run` shipped not dry-running and how four stale assertions about
+the replay corpus sat red on main unnoticed. The harness decides what every run *means*, so
+a broken harness is a broken measurement.
+
+Covers the manifest schema (including the `tree` block and the `TIMEOUT` verdict), the ini
+merge preserving a foreign agent's key, autoinput grammar rejection, the log parser against
+a golden fixture, the `[fatal]` scoping fix, delegate exit 7, and an import under
+`python3 -S` (no site-packages) to catch stdlib-only drift.
+
+`RetroDryRunTest` replaces every side-effecting function in `retro` — core download,
+instance lock, SD seed, config write, `_attempt`, `runs.create`, `subprocess.Popen` — with
+a detonator and asserts a `--dry-run` reaches none of them, plus one test that a REAL run
+still does (so the bug cannot be "fixed" by making every run dry). Assertions about the
+replay corpus are **derived from the replay files**, never frozen: the coverage track
+rewrites those schedules, and a hardcoded copy goes stale silently.
+
+`hw-run` is tested with the console **off**: `tests/fixtures/hw-*.log` are trimmed slices
+of the real 2026-09-20 session (one guest boot each, receipt lines only, LAN addresses
+scrubbed), and the tests re-derive the published numbers from them — the crowd bucket's
+33.97 / 24.54 ms and the fps beat sequence `21 51 59 30 46 60 55 39 15 43 43 43`. The
+whole run then executes against a mocked control link (`HwRunSequenceTest`) which proves
+the ordering, the ini application, the marker set/delete pairs, the per-slice manifests
+and the restore, without a console.
+
+### Host gate (shared Mac)
+
+`retro run` waits before launching when the machine is already busy: at most
+`GDX_RETRO_SLOTS` (default 3) gdx-dev RetroArch instances, and a 1-minute load average at or
+below `GDX_RETRO_MAXLOAD` (default 40). It polls every 20 s, gives up after
+`GDX_RETRO_GATE_TIMEOUT` (default 300 s) and launches anyway with a warning — a stuck gate
+must not silently eat a night's work. `GDX_RETRO_SLOTS=0` disables the gate entirely.
+
+Every run records `host.loadavg_at_launch` / `loadavg_at_end` in its manifest. **Treat any ms
+or fps number from a run whose load was above ~40 as host contention, not guest cost.** Parity
+and mismatch counts stay valid under load; timing does not. This is not theoretical: on
+2026-09-23 eleven agents drove the load average to 111 with ten instances up, and at that point
+boot SIGBUS becomes common as well.
+
+### `--by-vtxn` and draw-count levers
+
+`prof --ab --by-vtxn` buckets windows by `nD`, so it is only valid when the two runs have the
+same draw count. For a lever that *changes* draws it is actively misleading — windows migrate
+between buckets and each bucket ends up comparing different scenes. The owned-interpreter batch
+fold (−22% draws) read as **+5.9% slower in every bucket** while the whole-run total was flat.
+`--ab` now warns when the two runs' mean `nD` differ by more than 5%. Cut the band by scene tag
+(between two SHOT receipts) instead.

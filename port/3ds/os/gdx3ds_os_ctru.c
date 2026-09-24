@@ -50,12 +50,14 @@
  */
 #include "gdx3ds_os.h"
 #include "gdx3ds_config.h"
+#include "gdx3ds_filelog.h"
 #include "gdx3ds_input_map.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #include <3ds.h>
+#include <citro3d.h> /* HOMEFIX2: C3D_Fini in the teardown below */
 
 /* Standard N64 OSContPad button bitmask -- identical in the decomp (PR/os_cont.h) and LUS
  * (see the mask table in port/input_bridge.c). Defined locally because the decomp headers
@@ -99,6 +101,28 @@ static int sYMapsToB = 1;
 #define GDX_DPAD_RAMP_START 24
 static int sCpadCurve = GDX_CPAD_CURVE_DEFAULT;
 static int sDpadSteer = GDX_DPAD_STEER_DEFAULT;
+
+/* [debug] pads (default 1, range 1..4): report N controller ports connected even though
+ * the 3DS has exactly one pad. Ports 1..N-1 carry neutral input.
+ *
+ * Why it exists: the decomp gates VS Battle on the port count in two places
+ * (decomp/src/overlays/ovl_i6/main_menu.c:205 snaps the cursor off VS BATTLE while
+ * gControllersConnected < 2, and :317-324 clamps the 2P/3P/4P sub-option to
+ * gControllersConnected - 2), so with one real pad the split-screen modes -- and the
+ * render paths behind them -- are unreachable on this platform and cannot be put in a
+ * replay at all.
+ *
+ * Mirroring rather than idling is deliberate: VS machine select needs every player to
+ * confirm before the race starts, and only port 0 has a source of input, so idle ports
+ * wedge the menu forever (measured: mode 8 from tick 2540 to the end of the replay).
+ * Mirrored ports move together, which is exactly as deterministic and does start the
+ * race. The four machines then drive identically -- fine for a render A/B, which is what
+ * the split-screen viewports are wanted for.
+ *
+ * Dev lever: pads=1 is the shipping behaviour, byte for byte. */
+static int sFakePads = 1;
+
+extern void gdx_dbg_logf(const char* fmt, ...) __attribute__((weak));
 static int sDpadHeldX = 0; /* consecutive polls the d-pad x axis has been held (ramp) */
 static int sDpadHeldY = 0;
 static int sReadRawX = 0, sReadRawY = 0;     /* menu readout: last raw pad + scaled stick */
@@ -303,6 +327,12 @@ void gdx3ds_input_stick_readout(int* rawX, int* rawY, int* stickX, int* stickY) 
     if (stickY) { *stickY = sReadStickY; }
 }
 
+/* port/input_bridge.c calls this (weakly) after the scripted-input injector to decide how
+ * many ports mirror port 1. Defined only by this backend: the desktop build has real pads. */
+int gdx_port_mirror_count(void) {
+    return sFakePads;
+}
+
 int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
     /* Config first: input tuning below and other streams' keys must be readable before
      * any subsystem init. Missing file is fine -- defaults hold. (main_3ds.cpp calling
@@ -316,6 +346,17 @@ int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
     gdx3ds_input_set_curve(gdx3ds_config_get_int("input", "curve", GDX_CPAD_CURVE_DEFAULT));
     gdx3ds_input_set_dpad_steer(gdx3ds_config_get_int("input", "dpad_steer", GDX_DPAD_STEER_DEFAULT));
     sYMapsToB = gdx3ds_config_get_bool("input", "y_maps_to_b", 1);
+    sFakePads = gdx3ds_config_get_int("debug", "pads", 1);
+    if (sFakePads < 1) {
+        sFakePads = 1;
+    } else if (sFakePads > 4) {
+        sFakePads = 4; /* MAXCONTROLLERS (decomp/include/fzx_types.h) */
+    }
+    if (sFakePads != 1 && &gdx_dbg_logf != NULL) {
+        gdx_dbg_logf("[input] pads=%d (ports 1..%d reported connected and mirroring port 1; "
+                     "[debug] pads=1 restores hardware behaviour)\n",
+                     sFakePads, sFakePads - 1);
+    }
     gdx3ds_input_load_binds(); /* MENU: compiled defaults + persisted bind_* overrides */
 
     gfxInitDefault();
@@ -339,7 +380,46 @@ int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
     return 0;
 }
 
+/* HOMEFIX2 — C3D_Fini (2026-09-23 audit, finding 8: "gfxExit() runs with citro3d never
+ * finalised"). Verified: grep finds no C3D_Fini anywhere outside the vendored tree, and
+ * gfxExit() -> gspExit() closes the GSP session while citro3d still holds its render-queue
+ * gspSetEventCallback registrations and its aptHook cookie, which aptExit() then fires
+ * APTHOOK_ONEXIT on against a dead session.
+ *
+ * Does its absence wedge the GPU handover to the HOME menu? NO — and that is worth writing
+ * down, because it is the reason this is a separate fix and not the HOME-hang fix. C3D_Fini
+ * is teardown-only; nothing calls it during a suspend, and citro3d's own ONSUSPEND hook
+ * (base.c:41-44 C3Di_RenderQueueWaitDone + C3Di_RenderQueueDisableVBlank) handles the HOME
+ * transition whether or not C3D_Fini ever runs. The bug it causes is on the EXIT path only.
+ *
+ * Why it is guarded rather than unconditional: C3D_Fini -> C3Di_RenderQueueExit ->
+ * C3Di_WaitAndClearQueue(-1) -> gxCmdQueueWait(queue, -1) is itself an UNBOUNDED wait on GSP
+ * (citro3d renderqueue.c:92-100, 125-131), i.e. exactly the class this card removes. On a
+ * close from the HOME menu the GPU right is already released and GSP delivers nothing, so
+ * calling it there could trade one silent wedge for another. Two things make it safe:
+ *   - main()'s teardown has already run gdx3ds_rt_shutdown(), so no command is in flight;
+ *   - citro3d's ONSUSPEND already did gxCmdQueueStop + gxCmdQueueClear, which leaves
+ *     numCommands == curCommand, the case gxCmdQueueWait returns from immediately.
+ * The gspHasGpuRight() guard keeps the promise honest: with no right we do NOT enter that
+ * wait, we say so, and we let aptExit fire citro3d's ONEXIT as before (unchanged behaviour,
+ * which is what the release build shipped). [debug] c3d_fini = 0 restores the old teardown. */
+static void osExitReceipt(const char* msg) {
+    svcOutputDebugString(msg, strlen(msg));
+    gdx3ds_filelog_write(msg, strlen(msg));
+    gdx3ds_filelog_flush();
+}
+
 void gdx3ds_os_window_shutdown(void) {
+    if (gdx3ds_config_get_bool("debug", "c3d_fini", 1)) {
+        if (gspHasGpuRight()) {
+            osExitReceipt("[exit] c3d_fini enter (gpu right held; gxCmdQueueWait next)");
+            C3D_Fini(); /* early-outs on !C3DiF_Active; unhooks citro3d's APT cookie */
+            osExitReceipt("[exit] c3d_fini done");
+        } else {
+            osExitReceipt("[exit] c3d_fini SKIPPED (no gpu right: closed from the HOME menu; "
+                          "gxCmdQueueWait would never return)");
+        }
+    }
     gfxExit();
 }
 
@@ -428,13 +508,14 @@ void gdx3ds_os_poll_input(Gdx3dsPadState* outPads, int maxPads) {
     }
     outPads[0].connected = 1;
 
-    /* Only pad 0 exists on 3DS; report the rest explicitly disconnected so the
-     * multi-pad consumer never reads stale data. */
+    /* Only pad 0 physically exists on 3DS; the rest are reported disconnected so the
+     * multi-pad consumer never reads stale data -- unless [debug] pads asks for more
+     * ports, in which case they are connected but always neutral (see sFakePads). */
     for (i = 1; i < maxPads; i++) {
         outPads[i].buttons = 0;
         outPads[i].stickX = 0;
         outPads[i].stickY = 0;
-        outPads[i].connected = 0;
+        outPads[i].connected = (i < sFakePads) ? 1 : 0;
     }
 }
 

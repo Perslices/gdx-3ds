@@ -1,0 +1,495 @@
+# Trimmed from the 2026-09-20 hardware session for tools/dev/tests. One guest
+# boot = one config; receipt lines only; LAN addresses scrubbed.
+# gputrace=1, native all=1 interp=1. Complete: 8 of 8 SHOTs and the final receipt.
+19:02:26 [net] init port=17492 log_port=17491 host=10.0.0.1 soc=1024KiB target=/3ds/G-Diffuser-3DS.3dsx build=native/main@8b3ecfab
+19:02:26 [net] soc rc=0x00000000 size=1024KiB
+19:02:26 [net] thread up prio=0x3E core=0
+19:02:26 [net] ctl listening 10.0.0.1:17492
+19:02:26 [rec] replay header build native/oracle@c3021cfb
+19:02:26 [rec] replay header seed1 0x1234abcd
+19:02:26 [rec] replay header seed2 0x0fedcba9
+19:02:26 [rec] replay header pins renderthread=0 rival_detail_auto=1 stereo=1 fh_every=1
+19:02:26 [rec] replay armed sdmc:/3ds/gdiffuser/rec/race-mutecity-start.gdxrec frames=6001 (starts at the next tick)
+19:02:26 [rec] replay: [perf] rival_detail_auto pinned to 0 for this run
+19:02:26 [net] link up build=native/main@8b3ecfab host=10.0.0.1:17491
+19:02:26 [apt] hooks: ours ahead of citro3d's (debug.apt_hook_first=1), suspended-mode watchdog poll=1 (debug.apt_watch), wake event=1
+19:02:26 [net] ctl accept from 10.0.0.1
+19:02:26 [net] ctl closed (peer closed)
+19:02:27 [rt] mode=ahead core=2 prio=0x24 stack=192K bridgemain=1
+19:02:27 [rec] replay sdmc:/3ds/gdiffuser/rec/race-mutecity-start.gdxrec frames=6001 base=0
+19:02:27 [gpu] tracing enabled (debug.gputrace=1)
+19:02:29 [gpu] frame=65 n=65 wall=21.5 build=11.7 proc=11.7 gpu=1.6 wVbl=0.0 wP3D=0.1 cmd=0% draws=1 tris=2 imp=65 rl=0 rm=0 md=0
+19:02:29 [prof] frame=65 n=65 br=0.00 dsp=0.00 vtx=0.00 tri=0.06 imp=6.27 drw=0.10 mtx=0.00 oth=5.31 | vtxN=0 nV=0 nT=2 nI=1 nD=1 nM=0 nRun=0
+19:02:29 [profop] n=65 top:
+19:02:30 [rt] mode=ahead frame=69 n=69 tasks=0 waitMain=0.00 waitRender=5.66 fence=0/0 segMerge=0 pace=64/5 latency=1 | ovl=0.00 jdp=0.00 jtop=0.00 brMain=0.00 bm=0 relWait=0 | bg=0.03 tk=0.00 en=12.65 ql=0.00 tb=0 texcacheMainMut=0
+19:02:30 [gpu] frame=129 n=64 wall=18.3 build=11.9 proc=11.9 gpu=1.6 wVbl=0.0 wP3D=0.1 cmd=8% draws=6 tris=740 imp=432 rl=0 rm=0 md=0
+19:02:30 [prof] frame=129 n=64 br=0.00 dsp=0.27 vtx=0.00 tri=0.17 imp=6.16 drw=0.06 mtx=0.00 oth=5.20 | vtxN=0 nV=0 nT=23 nI=6 nD=2 nM=0 nRun=0
+19:02:30 [prof!] frame=129 n=1 br=0.00 dsp=3.82 vtx=0.00 tri=2.30 imp=25.34 drw=1.95 mtx=0.00 oth=-0.18 | vtxN=0 nV=0 nT=320 nI=93 nD=94 nM=0 nRun=1
+19:02:30 [profop] n=64 top:
+19:02:30 [rt] mode=ahead frame=133 n=64 tasks=8 waitMain=0.61 waitRender=1.66 fence=0/0 segMerge=10 pace=61/3 latency=1 | ovl=2.21 jdp=0.61 jtop=0.00 brMain=0.32 bm=8 relWait=0 | bg=0.02 tk=1.08 en=10.26 ql=0.13 tb=0 texcacheMainMut=0
+19:02:31 [gpu] frame=193 n=64 wall=16.6 build=6.5 proc=6.5 gpu=2.9 wVbl=0.0 wP3D=0.1 cmd=1% draws=3 tris=186 imp=5859 rl=0 rm=0 md=0
+19:02:31 [prof] frame=193 n=64 br=0.00 dsp=2.53 vtx=0.00 tri=1.94 imp=1.19 drw=0.09 mtx=0.00 oth=0.71 | vtxN=0 nV=0 nT=325 nI=91 nD=3 nM=0 nRun=0
+19:02:31 [profop] n=64 top:
+19:02:31 [rt] mode=ahead frame=197 n=64 tasks=64 waitMain=0.63 waitRender=0.20 fence=1/0 segMerge=0 pace=63/1 latency=1 | ovl=16.06 jdp=0.54 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=6.58 en=0.91 ql=0.14 tb=0 texcacheMainMut=0
+19:02:32 [gpu] frame=257 n=64 wall=16.7 build=5.4 proc=5.4 gpu=2.6 wVbl=0.0 wP3D=0.0 cmd=1% draws=5 tris=194 imp=6100 rl=0 rm=0 md=0
+19:02:32 [prof] frame=257 n=64 br=0.00 dsp=2.48 vtx=0.00 tri=1.39 imp=1.03 drw=0.07 mtx=0.00 oth=0.42 | vtxN=0 nV=0 nT=190 nI=95 nD=4 nM=0 nRun=1
+19:02:32 [profop] n=64 top:
+19:02:32 [rt] mode=ahead frame=261 n=64 tasks=64 waitMain=0.22 waitRender=0.14 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.47 jdp=0.13 jtop=0.09 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=5.49 en=1.09 ql=0.07 tb=0 texcacheMainMut=0
+19:02:32 [watchdog] beat=1 frame=269(+269) stage=8 fiber=-1 aud=304/304 astage=0 spec=0 hle=304 op=15 idx=80 heapUsed=42203528 heapFree=5768760 hwm=42203528 base=0 net=1
+19:02:33 [gpu] frame=321 n=64 wall=16.7 build=5.3 proc=5.3 gpu=2.7 wVbl=0.0 wP3D=0.0 cmd=1% draws=5 tris=194 imp=6208 rl=0 rm=0 md=0
+19:02:33 [prof] frame=321 n=64 br=0.00 dsp=2.46 vtx=0.00 tri=1.45 imp=1.04 drw=0.08 mtx=0.00 oth=0.32 | vtxN=0 nV=0 nT=194 nI=97 nD=5 nM=0 nRun=1
+19:02:33 [profop] n=64 top:
+19:02:34 [rt] mode=ahead frame=325 n=64 tasks=64 waitMain=0.00 waitRender=0.15 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.59 jdp=0.00 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=5.37 en=1.16 ql=0.03 tb=0 texcacheMainMut=0
+19:02:34 [rec] SHOT 'title' at tick 350
+19:02:35 [autotest] SHOT dumped -> autotest/title.bmp
+19:02:37 [autotest] SHOT scanout dumped -> autotest/title_scan.bmp
+19:02:37 [gpu] tag=title frame=351 n=1 wall=3647.4 build=3619.7 proc=3619.7 gpu=2.9 wVbl=0.0 wP3D=0.0 cmd=1% draws=5 tris=194 imp=97 rl=0 rm=0 md=0
+19:02:37 [watchdog] beat=2 frame=354(+85) stage=8 fiber=-1 aud=608/608 astage=0 spec=0 hle=608 op=15 idx=51 heapUsed=42203528 heapFree=5768760 hwm=42203528 base=0 net=1
+19:02:38 [gpu] frame=385 n=64 wall=73.1 build=61.9 proc=61.9 gpu=2.7 wVbl=0.0 wP3D=0.1 cmd=1% draws=5 tris=194 imp=6208 rl=0 rm=0 md=0
+19:02:38 [prof] frame=385 n=64 br=0.00 dsp=2.55 vtx=0.00 tri=1.43 imp=1.05 drw=0.08 mtx=0.00 oth=56.82 | vtxN=0 nV=0 nT=194 nI=97 nD=5 nM=0 nRun=1
+19:02:38 [profop] n=64 top:
+19:02:38 [rt] mode=ahead frame=389 n=64 tasks=64 waitMain=56.58 waitRender=0.15 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.43 jdp=56.58 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=62.01 en=1.13 ql=0.07 tb=0 texcacheMainMut=0
+19:02:39 [gpu] frame=449 n=64 wall=18.1 build=10.5 proc=10.5 gpu=4.3 wVbl=0.0 wP3D=2.0 cmd=5% draws=8 tris=290 imp=8234 rl=0 rm=0 md=0
+19:02:39 [prof] frame=449 n=64 br=0.00 dsp=6.65 vtx=0.00 tri=3.10 imp=1.77 drw=0.14 mtx=0.00 oth=-1.10 | vtxN=0 nV=0 nT=446 nI=128 nD=8 nM=0 nRun=1
+19:02:39 [profop] n=64 top:
+19:02:39 [rt] mode=ahead frame=453 n=64 tasks=64 waitMain=7.10 waitRender=0.76 fence=1/0 segMerge=0 pace=39/25 latency=1 | ovl=10.16 jdp=7.02 jtop=0.00 brMain=0.13 bm=64 relWait=0 | bg=0.02 tk=12.09 en=1.23 ql=0.69 tb=0 texcacheMainMut=0
+19:02:41 [gpu] frame=513 n=64 wall=22.2 build=16.3 proc=16.3 gpu=4.6 wVbl=0.0 wP3D=2.7 cmd=10% draws=25 tris=284 imp=10179 rl=0 rm=0 md=7
+19:02:41 [prof] frame=513 n=64 br=0.00 dsp=8.86 vtx=0.00 tri=3.59 imp=2.38 drw=0.33 mtx=0.00 oth=1.13 | vtxN=0 nV=0 nT=513 nI=159 nD=24 nM=0 nRun=1
+19:02:41 [prof!] frame=513 n=1 br=0.00 dsp=7.67 vtx=0.00 tri=5.43 imp=33.46 drw=1.48 mtx=0.00 oth=0.13 | vtxN=0 nV=0 nT=718 nI=190 nD=113 nM=0 nRun=1
+19:02:41 [profop] n=64 top:
+19:02:41 [rt] mode=ahead frame=517 n=64 tasks=64 waitMain=12.38 waitRender=3.58 fence=3/0 segMerge=0 pace=24/40 latency=1 | ovl=6.27 jdp=11.89 jtop=0.18 brMain=0.14 bm=64 relWait=0 | bg=0.02 tk=15.72 en=1.35 ql=1.05 tb=0 texcacheMainMut=0
+19:02:42 [gpu] frame=577 n=64 wall=16.6 build=7.9 proc=7.9 gpu=3.2 wVbl=0.0 wP3D=0.0 cmd=2% draws=24 tris=270 imp=8577 rl=0 rm=0 md=7
+19:02:42 [prof] frame=577 n=64 br=0.00 dsp=3.74 vtx=0.00 tri=2.18 imp=1.49 drw=0.29 mtx=0.00 oth=0.25 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:42 [profop] n=64 top:
+19:02:42 [rt] mode=ahead frame=581 n=64 tasks=64 waitMain=0.00 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.33 jdp=0.00 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.73 en=0.83 ql=0.01 tb=0 texcacheMainMut=0
+19:02:42 [watchdog] beat=3 frame=627(+273) stage=8 fiber=-1 aud=908/908 astage=0 spec=0 hle=908 op=15 idx=55 heapUsed=42599480 heapFree=5372808 hwm=42599480 base=0 net=1
+19:02:43 [gpu] frame=641 n=64 wall=16.7 build=7.6 proc=7.6 gpu=3.3 wVbl=0.0 wP3D=0.0 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:43 [prof] frame=641 n=64 br=0.00 dsp=3.59 vtx=0.00 tri=2.08 imp=1.53 drw=0.29 mtx=0.00 oth=0.16 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:43 [profop] n=64 top:
+19:02:43 [rt] mode=ahead frame=645 n=64 tasks=64 waitMain=0.00 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.59 jdp=0.00 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.70 en=0.87 ql=0.01 tb=0 texcacheMainMut=0
+19:02:44 [gpu] frame=705 n=64 wall=16.7 build=7.8 proc=7.8 gpu=3.2 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:44 [prof] frame=705 n=64 br=0.00 dsp=3.67 vtx=0.00 tri=2.10 imp=1.53 drw=0.29 mtx=0.00 oth=0.20 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:44 [profop] n=64 top:
+19:02:44 [rt] mode=ahead frame=709 n=64 tasks=64 waitMain=0.02 waitRender=0.16 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.58 jdp=0.02 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.79 en=0.86 ql=0.04 tb=0 texcacheMainMut=0
+19:02:45 [gpu] frame=769 n=64 wall=16.7 build=7.9 proc=7.9 gpu=3.2 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:45 [prof] frame=769 n=64 br=0.00 dsp=3.67 vtx=0.00 tri=2.11 imp=1.52 drw=0.29 mtx=0.00 oth=0.35 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:45 [profop] n=64 top:
+19:02:45 [rt] mode=ahead frame=773 n=64 tasks=64 waitMain=0.35 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.38 jdp=0.21 jtop=0.13 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=8.06 en=0.85 ql=0.04 tb=0 texcacheMainMut=0
+19:02:46 [gpu] frame=833 n=64 wall=16.8 build=8.1 proc=8.1 gpu=3.3 wVbl=0.0 wP3D=0.2 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:46 [prof] frame=833 n=64 br=0.00 dsp=3.73 vtx=0.00 tri=2.12 imp=1.52 drw=0.29 mtx=0.00 oth=0.39 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:46 [profop] n=64 top:
+19:02:46 [rt] mode=ahead frame=837 n=64 tasks=64 waitMain=0.50 waitRender=0.14 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.10 jdp=0.50 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=8.23 en=0.88 ql=0.09 tb=0 texcacheMainMut=0
+19:02:47 [gpu] frame=897 n=64 wall=16.6 build=7.9 proc=7.9 gpu=3.3 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:47 [prof] frame=897 n=64 br=0.00 dsp=3.69 vtx=0.00 tri=2.12 imp=1.50 drw=0.29 mtx=0.00 oth=0.29 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:47 [profop] n=64 top:
+19:02:47 [rt] mode=ahead frame=901 n=64 tasks=64 waitMain=0.06 waitRender=0.14 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.53 jdp=0.06 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.98 en=0.83 ql=0.04 tb=0 texcacheMainMut=0
+19:02:47 [watchdog] beat=4 frame=928(+301) stage=8 fiber=-1 aud=1211/1211 astage=0 spec=0 hle=1211 op=15 idx=55 heapUsed=42599480 heapFree=5372808 hwm=42599480 base=0 net=1
+19:02:48 [gpu] frame=961 n=64 wall=16.7 build=7.8 proc=7.8 gpu=3.3 wVbl=0.0 wP3D=0.0 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:48 [prof] frame=961 n=64 br=0.00 dsp=3.59 vtx=0.00 tri=2.14 imp=1.50 drw=0.29 mtx=0.00 oth=0.24 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:48 [profop] n=64 top:
+19:02:48 [rt] mode=ahead frame=965 n=64 tasks=64 waitMain=0.00 waitRender=0.17 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.59 jdp=0.00 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.81 en=0.90 ql=0.01 tb=0 texcacheMainMut=0
+19:02:49 [rec] SHOT 'mainmenu' at tick 1000
+19:02:50 [autotest] SHOT dumped -> autotest/mainmenu.bmp
+19:02:52 [autotest] SHOT scanout dumped -> autotest/mainmenu_scan.bmp
+19:02:52 [gpu] tag=mainmenu frame=1001 n=1 wall=3598.0 build=3569.7 proc=3569.7 gpu=3.3 wVbl=0.0 wP3D=0.0 cmd=2% draws=24 tris=270 imp=134 rl=0 rm=0 md=7
+19:02:52 [watchdog] beat=5 frame=1015(+87) stage=8 fiber=-1 aud=1516/1516 astage=0 spec=0 hle=1516 op=15 idx=51 heapUsed=42599480 heapFree=5372808 hwm=42599480 base=0 net=1
+19:02:53 [gpu] frame=1025 n=64 wall=72.3 build=63.6 proc=63.6 gpu=3.4 wVbl=0.0 wP3D=0.2 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:53 [prof] frame=1025 n=64 br=0.00 dsp=3.78 vtx=0.00 tri=2.16 imp=1.54 drw=0.29 mtx=0.00 oth=55.85 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:53 [profop] n=64 top:
+19:02:53 [rt] mode=ahead frame=1029 n=64 tasks=64 waitMain=56.14 waitRender=0.16 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=16.21 jdp=56.01 jtop=0.12 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=63.88 en=0.94 ql=0.11 tb=0 texcacheMainMut=0
+19:02:54 [gpu] frame=1089 n=64 wall=16.7 build=8.0 proc=8.0 gpu=3.4 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:54 [prof] frame=1089 n=64 br=0.00 dsp=3.75 vtx=0.00 tri=2.11 imp=1.51 drw=0.29 mtx=0.00 oth=0.37 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:54 [profop] n=64 top:
+19:02:54 [rt] mode=ahead frame=1093 n=64 tasks=64 waitMain=0.44 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.16 jdp=0.44 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=8.20 en=0.91 ql=0.06 tb=0 texcacheMainMut=0
+19:02:55 [gpu] frame=1153 n=64 wall=16.7 build=7.9 proc=7.9 gpu=3.3 wVbl=0.0 wP3D=0.0 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:55 [prof] frame=1153 n=64 br=0.00 dsp=3.67 vtx=0.00 tri=2.12 imp=1.59 drw=0.29 mtx=0.00 oth=0.26 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:55 [profop] n=64 top:
+19:02:55 [rt] mode=ahead frame=1157 n=64 tasks=64 waitMain=0.03 waitRender=0.15 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.56 jdp=0.03 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=8.00 en=0.83 ql=0.04 tb=0 texcacheMainMut=0
+19:02:56 [gpu] frame=1217 n=64 wall=16.7 build=8.0 proc=8.0 gpu=3.3 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:56 [prof] frame=1217 n=64 br=0.00 dsp=3.72 vtx=0.00 tri=2.14 imp=1.50 drw=0.29 mtx=0.00 oth=0.32 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:56 [profop] n=64 top:
+19:02:56 [rt] mode=ahead frame=1221 n=64 tasks=64 waitMain=0.16 waitRender=0.15 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.44 jdp=0.16 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=8.09 en=0.82 ql=0.05 tb=0 texcacheMainMut=0
+19:02:57 [gpu] frame=1281 n=64 wall=16.7 build=7.9 proc=7.9 gpu=3.3 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:57 [prof] frame=1281 n=64 br=0.00 dsp=3.66 vtx=0.00 tri=2.09 imp=1.51 drw=0.28 mtx=0.00 oth=0.32 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:57 [profop] n=64 top:
+19:02:58 [rt] mode=ahead frame=1285 n=64 tasks=64 waitMain=0.27 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.46 jdp=0.14 jtop=0.12 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.98 en=0.84 ql=0.04 tb=0 texcacheMainMut=0
+19:02:58 [watchdog] beat=6 frame=1314(+299) stage=8 fiber=-1 aud=1819/1819 astage=0 spec=0 hle=1819 op=15 idx=51 heapUsed=42599480 heapFree=5372808 hwm=42599480 base=0 net=1
+19:02:58 [gpu] frame=1345 n=64 wall=16.7 build=7.8 proc=7.8 gpu=3.4 wVbl=0.0 wP3D=0.0 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:58 [prof] frame=1345 n=64 br=0.00 dsp=3.57 vtx=0.00 tri=2.09 imp=1.56 drw=0.29 mtx=0.00 oth=0.25 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:58 [profop] n=64 top:
+19:02:58 [rt] mode=ahead frame=1349 n=64 tasks=64 waitMain=0.00 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.59 jdp=0.00 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=7.85 en=0.91 ql=0.02 tb=0 texcacheMainMut=0
+19:02:59 [gpu] frame=1409 n=64 wall=16.7 build=8.0 proc=8.0 gpu=3.3 wVbl=0.0 wP3D=0.1 cmd=2% draws=24 tris=270 imp=8576 rl=0 rm=0 md=7
+19:02:59 [prof] frame=1409 n=64 br=0.00 dsp=3.70 vtx=0.00 tri=2.11 imp=1.53 drw=0.29 mtx=0.00 oth=0.38 | vtxN=0 nV=0 nT=270 nI=134 nD=24 nM=0 nRun=1
+19:02:59 [profop] n=64 top:
+19:02:59 [rt] mode=ahead frame=1413 n=64 tasks=64 waitMain=0.42 waitRender=0.16 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.17 jdp=0.42 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=8.18 en=0.86 ql=0.05 tb=0 texcacheMainMut=0
+19:03:00 [gpu] frame=1473 n=64 wall=17.5 build=7.4 proc=7.4 gpu=2.7 wVbl=0.0 wP3D=0.1 cmd=2% draws=7 tris=200 imp=6672 rl=0 rm=0 md=10
+19:03:00 [prof] frame=1473 n=64 br=0.00 dsp=2.90 vtx=0.00 tri=1.75 imp=1.25 drw=0.16 mtx=0.00 oth=1.29 | vtxN=0 nV=0 nT=208 nI=104 nD=9 nM=0 nRun=1
+19:03:00 [profop] n=64 top:
+19:03:00 [rt] mode=ahead frame=1477 n=64 tasks=64 waitMain=0.23 waitRender=1.13 fence=1/0 segMerge=0 pace=63/1 latency=1 | ovl=16.15 jdp=0.12 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=6.39 en=0.85 ql=0.10 tb=0 texcacheMainMut=0
+19:03:01 [gpu] frame=1537 n=64 wall=16.7 build=6.0 proc=6.0 gpu=2.6 wVbl=0.0 wP3D=0.0 cmd=1% draws=7 tris=200 imp=6400 rl=0 rm=0 md=10
+19:03:01 [prof] frame=1537 n=64 br=0.00 dsp=2.69 vtx=0.00 tri=1.66 imp=1.12 drw=0.17 mtx=0.00 oth=0.32 | vtxN=0 nV=0 nT=200 nI=100 nD=7 nM=0 nRun=1
+19:03:01 [profop] n=64 top:
+19:03:01 [rt] mode=ahead frame=1541 n=64 tasks=64 waitMain=0.13 waitRender=0.14 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.56 jdp=0.04 jtop=0.10 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=6.03 en=0.84 ql=0.07 tb=0 texcacheMainMut=0
+19:03:02 [gpu] frame=1601 n=64 wall=16.7 build=6.2 proc=6.2 gpu=2.7 wVbl=0.0 wP3D=0.1 cmd=1% draws=7 tris=200 imp=6400 rl=0 rm=0 md=10
+19:03:02 [prof] frame=1601 n=64 br=0.00 dsp=2.80 vtx=0.00 tri=1.63 imp=1.13 drw=0.13 mtx=0.00 oth=0.49 | vtxN=0 nV=0 nT=200 nI=100 nD=7 nM=0 nRun=1
+19:03:02 [profop] n=64 top:
+19:03:02 [rt] mode=ahead frame=1605 n=64 tasks=64 waitMain=0.35 waitRender=0.15 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.25 jdp=0.35 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=6.28 en=0.84 ql=0.06 tb=0 texcacheMainMut=0
+19:03:03 [watchdog] beat=7 frame=1612(+298) stage=8 fiber=-1 aud=2124/2124 astage=0 spec=0 hle=2124 op=15 idx=51 heapUsed=42679088 heapFree=5293200 hwm=42679088 base=0 net=1
+19:03:03 [gpu] frame=1665 n=64 wall=16.7 build=6.2 proc=6.2 gpu=2.7 wVbl=0.0 wP3D=0.1 cmd=1% draws=7 tris=200 imp=6400 rl=0 rm=0 md=10
+19:03:03 [prof] frame=1665 n=64 br=0.00 dsp=2.80 vtx=0.00 tri=1.64 imp=1.11 drw=0.13 mtx=0.00 oth=0.50 | vtxN=0 nV=0 nT=200 nI=100 nD=7 nM=0 nRun=1
+19:03:03 [profop] n=64 top:
+19:03:03 [rt] mode=ahead frame=1669 n=64 tasks=64 waitMain=0.42 waitRender=0.15 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.18 jdp=0.42 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=6.31 en=0.95 ql=0.06 tb=0 texcacheMainMut=0
+19:03:05 [gpu] frame=1729 n=64 wall=22.6 build=14.7 proc=14.7 gpu=3.2 wVbl=0.0 wP3D=1.0 cmd=4% draws=29 tris=3752 imp=6988 rl=0 rm=0 md=10
+19:03:05 [prof] frame=1729 n=64 br=0.00 dsp=5.08 vtx=0.60 tri=7.45 imp=1.22 drw=0.24 mtx=0.01 oth=0.10 | vtxN=0 nV=29 nT=1754 nI=109 nD=16 nM=1 nRun=1
+19:03:05 [profop] n=64 top:
+19:03:05 [rt] mode=ahead frame=1733 n=64 tasks=64 waitMain=13.14 waitRender=0.65 fence=0/1 segMerge=0 pace=33/31 latency=1 | ovl=9.13 jdp=13.04 jtop=0.00 brMain=0.14 bm=64 relWait=0 | bg=0.02 tk=16.11 en=1.21 ql=0.78 tb=0 texcacheMainMut=0
+19:03:07 [gpu] frame=1793 n=64 wall=28.5 build=24.5 proc=24.5 gpu=3.8 wVbl=0.0 wP3D=2.3 cmd=3% draws=29 tris=3752 imp=7744 rl=0 rm=0 md=10
+19:03:07 [prof] frame=1793 n=64 br=0.00 dsp=8.12 vtx=1.32 tri=14.82 imp=1.20 drw=0.41 mtx=0.02 oth=-1.39 | vtxN=0 nV=68 nT=3752 nI=121 nD=29 nM=3 nRun=1
+19:03:07 [profop] n=64 top:
+19:03:07 [rt] mode=ahead frame=1797 n=64 tasks=64 waitMain=26.79 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=2.07 jdp=26.36 jtop=0.43 brMain=0.18 bm=64 relWait=0 | bg=0.02 tk=26.87 en=1.50 ql=1.49 tb=0 texcacheMainMut=0
+19:03:08 [watchdog] beat=8 frame=1825(+213) stage=2 fiber=3 aud=2426/2426 astage=0 spec=0 hle=2426 op=15 idx=51 heapUsed=42764904 heapFree=5207384 hwm=42764904 base=0 net=1
+19:03:09 [gpu] frame=1857 n=64 wall=28.0 build=24.1 proc=24.1 gpu=3.8 wVbl=0.0 wP3D=2.4 cmd=3% draws=29 tris=3752 imp=7744 rl=0 rm=0 md=10
+19:03:09 [prof] frame=1857 n=64 br=0.00 dsp=8.22 vtx=1.29 tri=14.67 imp=1.27 drw=0.39 mtx=0.02 oth=-1.76 | vtxN=0 nV=68 nT=3752 nI=121 nD=29 nM=3 nRun=1
+19:03:09 [profop] n=64 top:
+19:03:09 [rt] mode=ahead frame=1861 n=64 tasks=64 waitMain=26.53 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.50 jdp=26.53 jtop=0.00 brMain=0.18 bm=64 relWait=0 | bg=0.02 tk=26.56 en=1.45 ql=1.46 tb=0 texcacheMainMut=0
+19:03:10 [gpu] frame=1921 n=64 wall=28.3 build=24.4 proc=24.4 gpu=3.8 wVbl=0.0 wP3D=2.4 cmd=3% draws=29 tris=3752 imp=7744 rl=0 rm=0 md=10
+19:03:10 [prof] frame=1921 n=64 br=0.00 dsp=8.21 vtx=1.29 tri=14.71 imp=1.25 drw=0.38 mtx=0.02 oth=-1.48 | vtxN=0 nV=68 nT=3752 nI=121 nD=29 nM=3 nRun=1
+19:03:10 [profop] n=64 top:
+19:03:10 [rt] mode=ahead frame=1925 n=64 tasks=64 waitMain=26.97 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.30 jdp=26.97 jtop=0.00 brMain=0.19 bm=64 relWait=0 | bg=0.02 tk=26.84 en=1.43 ql=1.44 tb=0 texcacheMainMut=0
+19:03:12 [gpu] frame=1985 n=64 wall=28.3 build=24.3 proc=24.3 gpu=3.8 wVbl=0.0 wP3D=2.3 cmd=3% draws=29 tris=3752 imp=7744 rl=0 rm=0 md=10
+19:03:12 [prof] frame=1985 n=64 br=0.00 dsp=8.10 vtx=1.31 tri=14.68 imp=1.20 drw=0.39 mtx=0.02 oth=-1.35 | vtxN=0 nV=68 nT=3752 nI=121 nD=29 nM=3 nRun=1
+19:03:12 [profop] n=64 top:
+19:03:12 [rt] mode=ahead frame=1989 n=64 tasks=64 waitMain=26.77 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.50 jdp=26.77 jtop=0.00 brMain=0.18 bm=64 relWait=0 | bg=0.02 tk=26.71 en=1.55 ql=1.56 tb=0 texcacheMainMut=0
+19:03:13 [watchdog] beat=9 frame=2003(+178) stage=2 fiber=3 aud=2732/2732 astage=0 spec=0 hle=2732 op=15 idx=80 heapUsed=42765064 heapFree=5207224 hwm=42765064 base=0 net=1
+19:03:14 [gpu] frame=2049 n=64 wall=29.7 build=24.0 proc=24.0 gpu=4.1 wVbl=0.0 wP3D=2.5 cmd=24% draws=174 tris=1725 imp=7766 rl=0 rm=0 md=8
+19:03:14 [prof] frame=2049 n=64 br=0.00 dsp=8.62 vtx=1.25 tri=14.04 imp=1.46 drw=0.43 mtx=0.03 oth=-1.87 | vtxN=0 nV=63 nT=3521 nI=121 nD=33 nM=3 nRun=0
+19:03:14 [prof!] frame=2049 n=2 br=0.00 dsp=20.04 vtx=0.00 tri=0.73 imp=10.29 drw=2.62 mtx=0.25 oth=-1.15 | vtxN=0 nV=0 nT=90 nI=253 nD=184 nM=31 nRun=1
+19:03:14 [profop] n=64 top:
+19:03:14 [rt] mode=ahead frame=2053 n=64 tasks=63 waitMain=25.90 waitRender=1.37 fence=1/0 segMerge=0 pace=4/60 latency=1 | ovl=4.00 jdp=24.94 jtop=0.39 brMain=0.18 bm=63 relWait=0 | bg=0.02 tk=26.33 en=1.59 ql=1.58 tb=0 texcacheMainMut=0
+19:03:16 [gpu] frame=2113 n=64 wall=25.9 build=21.9 proc=21.9 gpu=3.3 wVbl=0.0 wP3D=1.8 cmd=23% draws=173 tris=1721 imp=16192 rl=0 rm=0 md=8
+19:03:16 [prof] frame=2113 n=64 br=0.00 dsp=18.54 vtx=0.00 tri=0.64 imp=1.37 drw=2.52 mtx=0.31 oth=-1.50 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:16 [prof!] frame=2113 n=64 br=0.00 dsp=18.54 vtx=0.00 tri=0.64 imp=1.37 drw=2.52 mtx=0.31 oth=-1.50 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:16 [profop] n=64 top:
+19:03:16 [rt] mode=ahead frame=2117 n=64 tasks=64 waitMain=23.20 waitRender=0.00 fence=1/0 segMerge=0 pace=4/60 latency=1 | ovl=2.57 jdp=22.81 jtop=0.00 brMain=0.17 bm=64 relWait=1 | bg=0.01 tk=23.38 en=1.41 ql=1.39 tb=0 texcacheMainMut=0
+19:03:17 [gpu] frame=2177 n=64 wall=25.0 build=21.8 proc=21.8 gpu=3.1 wVbl=0.0 wP3D=1.7 cmd=23% draws=173 tris=1731 imp=16192 rl=0 rm=0 md=8
+19:03:17 [prof] frame=2177 n=64 br=0.00 dsp=18.07 vtx=0.00 tri=0.64 imp=1.31 drw=2.57 mtx=0.27 oth=-1.03 | vtxN=0 nV=0 nT=88 nI=253 nD=173 nM=31 nRun=1
+19:03:17 [prof!] frame=2177 n=64 br=0.00 dsp=18.07 vtx=0.00 tri=0.64 imp=1.31 drw=2.57 mtx=0.27 oth=-1.03 | vtxN=0 nV=0 nT=88 nI=253 nD=173 nM=31 nRun=1
+19:03:17 [profop] n=64 top:
+19:03:17 [rt] mode=ahead frame=2181 n=64 tasks=64 waitMain=23.49 waitRender=0.00 fence=0/0 segMerge=0 pace=2/62 latency=1 | ovl=1.48 jdp=23.49 jtop=0.00 brMain=0.17 bm=64 relWait=0 | bg=0.02 tk=23.57 en=1.41 ql=1.40 tb=0 texcacheMainMut=0
+19:03:18 [watchdog] beat=10 frame=2191(+188) stage=2 fiber=3 aud=3035/3035 astage=0 spec=0 hle=3035 op=15 idx=51 heapUsed=43036072 heapFree=4936216 hwm=43036072 base=0 net=1
+19:03:19 [gpu] frame=2241 n=64 wall=24.8 build=21.6 proc=21.6 gpu=3.1 wVbl=0.0 wP3D=1.8 cmd=23% draws=173 tris=1722 imp=16192 rl=0 rm=0 md=8
+19:03:19 [prof] frame=2241 n=64 br=0.00 dsp=18.23 vtx=0.00 tri=0.64 imp=1.34 drw=2.49 mtx=0.26 oth=-1.35 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:19 [prof!] frame=2241 n=64 br=0.00 dsp=18.23 vtx=0.00 tri=0.64 imp=1.34 drw=2.49 mtx=0.26 oth=-1.35 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:19 [profop] n=64 top:
+19:03:19 [rt] mode=ahead frame=2245 n=64 tasks=64 waitMain=23.11 waitRender=0.00 fence=0/0 segMerge=0 pace=3/61 latency=1 | ovl=1.68 jdp=23.11 jtop=0.00 brMain=0.17 bm=64 relWait=0 | bg=0.01 tk=23.42 en=1.38 ql=1.36 tb=0 texcacheMainMut=0
+19:03:20 [rec] SHOT 'machsel' at tick 2300
+19:03:22 [autotest] SHOT dumped -> autotest/machsel.bmp
+19:03:23 [watchdog] beat=11 frame=2301(+110) stage=2 fiber=3 aud=3341/3341 astage=0 spec=0 hle=3341 op=15 idx=51 heapUsed=43038392 heapFree=4933896 hwm=43038392 base=0 net=1
+19:03:24 [autotest] SHOT scanout dumped -> autotest/machsel_scan.bmp
+19:03:24 [gpu] tag=machsel frame=2300 n=1 wall=3652.1 build=3648.9 proc=3648.9 gpu=3.0 wVbl=0.0 wP3D=1.9 cmd=23% draws=172 tris=1721 imp=253 rl=0 rm=0 md=8
+19:03:24 [gpu] frame=2305 n=64 wall=81.3 build=78.1 proc=78.1 gpu=3.1 wVbl=0.0 wP3D=1.8 cmd=23% draws=172 tris=1722 imp=16192 rl=0 rm=0 md=8
+19:03:24 [prof] frame=2305 n=64 br=0.00 dsp=18.16 vtx=0.00 tri=0.64 imp=1.34 drw=2.54 mtx=0.26 oth=55.17 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:24 [prof!] frame=2305 n=64 br=0.00 dsp=18.16 vtx=0.00 tri=0.64 imp=1.34 drw=2.54 mtx=0.26 oth=55.17 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:24 [profop] n=64 top:
+19:03:24 [rt] mode=ahead frame=2309 n=64 tasks=64 waitMain=78.78 waitRender=0.00 fence=0/0 segMerge=0 pace=5/59 latency=1 | ovl=2.88 jdp=78.40 jtop=0.38 brMain=0.16 bm=64 relWait=0 | bg=0.01 tk=79.85 en=1.39 ql=1.36 tb=0 texcacheMainMut=0
+19:03:26 [gpu] frame=2369 n=64 wall=25.5 build=22.3 proc=22.3 gpu=3.1 wVbl=0.0 wP3D=1.7 cmd=23% draws=173 tris=1728 imp=16192 rl=0 rm=0 md=8
+19:03:26 [prof] frame=2369 n=64 br=0.00 dsp=18.31 vtx=0.00 tri=0.64 imp=1.37 drw=2.60 mtx=0.28 oth=-0.94 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:26 [prof!] frame=2369 n=64 br=0.00 dsp=18.31 vtx=0.00 tri=0.64 imp=1.37 drw=2.60 mtx=0.28 oth=-0.94 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:26 [profop] n=64 top:
+19:03:26 [rt] mode=ahead frame=2373 n=64 tasks=64 waitMain=24.19 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=1.22 jdp=24.19 jtop=0.00 brMain=0.18 bm=64 relWait=0 | bg=0.01 tk=24.03 en=1.40 ql=1.39 tb=0 texcacheMainMut=0
+19:03:27 [gpu] frame=2433 n=64 wall=25.2 build=22.0 proc=22.0 gpu=3.1 wVbl=0.0 wP3D=1.7 cmd=23% draws=173 tris=1724 imp=16192 rl=0 rm=0 md=8
+19:03:27 [prof] frame=2433 n=64 br=0.00 dsp=18.10 vtx=0.00 tri=0.64 imp=1.35 drw=2.54 mtx=0.28 oth=-0.88 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:27 [prof!] frame=2433 n=64 br=0.00 dsp=18.10 vtx=0.00 tri=0.64 imp=1.35 drw=2.54 mtx=0.28 oth=-0.88 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:27 [profop] n=64 top:
+19:03:27 [rt] mode=ahead frame=2437 n=64 tasks=64 waitMain=23.37 waitRender=0.00 fence=0/0 segMerge=0 pace=3/61 latency=1 | ovl=1.84 jdp=23.37 jtop=0.00 brMain=0.17 bm=64 relWait=0 | bg=0.02 tk=23.78 en=1.44 ql=1.43 tb=0 texcacheMainMut=0
+19:03:28 [watchdog] beat=12 frame=2448(+147) stage=2 fiber=3 aud=3644/3644 astage=0 spec=0 hle=3644 op=15 idx=51 heapUsed=43036112 heapFree=4936176 hwm=43038392 base=43036112 net=1
+19:03:29 [gpu] frame=2497 n=64 wall=24.7 build=21.5 proc=21.5 gpu=3.1 wVbl=0.0 wP3D=1.8 cmd=23% draws=172 tris=1719 imp=16192 rl=0 rm=0 md=8
+19:03:29 [prof] frame=2497 n=64 br=0.00 dsp=18.10 vtx=0.00 tri=0.64 imp=1.36 drw=2.55 mtx=0.27 oth=-1.43 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:29 [prof!] frame=2497 n=64 br=0.00 dsp=18.10 vtx=0.00 tri=0.64 imp=1.36 drw=2.55 mtx=0.27 oth=-1.43 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:29 [profop] n=64 top:
+19:03:29 [rt] mode=ahead frame=2501 n=64 tasks=64 waitMain=23.38 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=1.27 jdp=23.38 jtop=0.00 brMain=0.18 bm=64 relWait=0 | bg=0.02 tk=23.29 en=1.36 ql=1.35 tb=0 texcacheMainMut=0
+19:03:31 [gpu] frame=2561 n=64 wall=25.1 build=21.9 proc=21.9 gpu=3.1 wVbl=0.0 wP3D=1.7 cmd=23% draws=173 tris=1725 imp=16192 rl=0 rm=0 md=8
+19:03:31 [prof] frame=2561 n=64 br=0.00 dsp=18.21 vtx=0.00 tri=0.64 imp=1.34 drw=2.46 mtx=0.28 oth=-1.01 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:31 [prof!] frame=2561 n=64 br=0.00 dsp=18.21 vtx=0.00 tri=0.64 imp=1.34 drw=2.46 mtx=0.28 oth=-1.01 | vtxN=0 nV=0 nT=88 nI=253 nD=172 nM=31 nRun=1
+19:03:31 [profop] n=64 top:
+19:03:31 [rt] mode=ahead frame=2565 n=64 tasks=64 waitMain=23.17 waitRender=0.00 fence=0/0 segMerge=0 pace=5/59 latency=1 | ovl=2.28 jdp=22.80 jtop=0.38 brMain=0.17 bm=64 relWait=0 | bg=0.02 tk=23.65 en=1.38 ql=1.35 tb=0 texcacheMainMut=0
+19:03:32 [gpu] frame=2625 n=64 wall=23.5 build=18.1 proc=18.1 gpu=3.1 wVbl=0.0 wP3D=1.4 cmd=23% draws=28 tris=502 imp=13397 rl=0 rm=0 md=9
+19:03:32 [prof] frame=2625 n=64 br=0.00 dsp=14.04 vtx=0.05 tri=1.21 imp=2.01 drw=1.77 mtx=0.18 oth=-1.20 | vtxN=0 nV=1 nT=164 nI=209 nD=122 nM=21 nRun=0
+19:03:32 [prof!] frame=2625 n=43 br=0.00 dsp=18.56 vtx=0.00 tri=0.77 imp=2.40 drw=2.48 mtx=0.25 oth=-1.40 | vtxN=0 nV=0 nT=95 nI=250 nD=172 nM=30 nRun=1
+19:03:32 [profop] n=64 top:
+19:03:32 [rt] mode=ahead frame=2629 n=64 tasks=60 waitMain=16.36 waitRender=1.42 fence=1/1 segMerge=0 pace=23/41 latency=1 | ovl=5.14 jdp=16.10 jtop=0.00 brMain=0.14 bm=60 relWait=0 | bg=0.02 tk=19.29 en=1.60 ql=1.23 tb=0 texcacheMainMut=0
+19:03:33 [watchdog] beat=13 frame=2666(+218) stage=8 fiber=-1 aud=3950/3950 astage=0 spec=0 hle=3950 op=15 idx=80 heapUsed=43400632 heapFree=4571656 hwm=43400632 base=43036112 net=1
+19:03:33 [gpu] frame=2689 n=64 wall=16.8 build=10.5 proc=10.5 gpu=3.3 wVbl=0.0 wP3D=0.3 cmd=3% draws=27 tris=502 imp=10432 rl=0 rm=0 md=9
+19:03:33 [prof] frame=2689 n=64 br=0.00 dsp=5.53 vtx=0.19 tri=2.75 imp=1.69 drw=0.37 mtx=0.04 oth=-0.11 | vtxN=0 nV=4 nT=400 nI=163 nD=27 nM=5 nRun=1
+19:03:33 [profop] n=64 top:
+19:03:33 [rt] mode=ahead frame=2693 n=64 tasks=64 waitMain=0.10 waitRender=0.14 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.24 jdp=0.10 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.47 en=1.11 ql=0.13 tb=0 texcacheMainMut=0
+19:03:34 [gpu] frame=2753 n=64 wall=17.0 build=10.8 proc=10.8 gpu=3.2 wVbl=0.0 wP3D=0.1 cmd=3% draws=29 tris=493 imp=10432 rl=0 rm=0 md=9
+19:03:34 [prof] frame=2753 n=64 br=0.00 dsp=5.74 vtx=0.19 tri=2.72 imp=1.66 drw=0.38 mtx=0.04 oth=0.02 | vtxN=0 nV=4 nT=400 nI=163 nD=27 nM=5 nRun=1
+19:03:34 [profop] n=64 top:
+19:03:34 [rt] mode=ahead frame=2757 n=64 tasks=64 waitMain=0.72 waitRender=0.14 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=16.13 jdp=0.72 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.96 en=1.06 ql=0.11 tb=0 texcacheMainMut=0
+19:03:35 [gpu] frame=2817 n=64 wall=17.0 build=10.7 proc=10.7 gpu=3.2 wVbl=0.0 wP3D=0.2 cmd=3% draws=29 tris=510 imp=10432 rl=0 rm=0 md=9
+19:03:35 [prof] frame=2817 n=64 br=0.00 dsp=5.73 vtx=0.19 tri=2.72 imp=1.62 drw=0.40 mtx=0.04 oth=0.02 | vtxN=0 nV=4 nT=400 nI=163 nD=29 nM=5 nRun=1
+19:03:35 [profop] n=64 top:
+19:03:35 [rt] mode=ahead frame=2821 n=64 tasks=64 waitMain=0.92 waitRender=0.15 fence=0/0 segMerge=0 pace=61/3 latency=1 | ovl=16.15 jdp=0.70 jtop=0.22 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.88 en=1.01 ql=0.06 tb=0 texcacheMainMut=0
+19:03:36 [gpu] frame=2881 n=64 wall=16.9 build=10.5 proc=10.5 gpu=3.2 wVbl=0.0 wP3D=0.1 cmd=3% draws=27 tris=505 imp=10432 rl=0 rm=0 md=9
+19:03:36 [prof] frame=2881 n=64 br=0.00 dsp=5.54 vtx=0.19 tri=2.69 imp=1.61 drw=0.39 mtx=0.04 oth=0.06 | vtxN=0 nV=4 nT=400 nI=163 nD=28 nM=5 nRun=1
+19:03:36 [profop] n=64 top:
+19:03:36 [rt] mode=ahead frame=2885 n=64 tasks=64 waitMain=0.78 waitRender=0.15 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=15.84 jdp=0.78 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.76 en=1.02 ql=0.11 tb=0 texcacheMainMut=0
+19:03:37 [gpu] frame=2945 n=64 wall=16.8 build=10.6 proc=10.6 gpu=3.2 wVbl=0.0 wP3D=0.2 cmd=3% draws=29 tris=510 imp=10432 rl=0 rm=0 md=9
+19:03:37 [prof] frame=2945 n=64 br=0.00 dsp=5.72 vtx=0.20 tri=2.70 imp=1.60 drw=0.41 mtx=0.04 oth=-0.06 | vtxN=0 nV=4 nT=400 nI=163 nD=28 nM=5 nRun=1
+19:03:37 [profop] n=64 top:
+19:03:37 [rt] mode=ahead frame=2949 n=64 tasks=64 waitMain=1.09 waitRender=0.15 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=15.59 jdp=1.09 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.91 en=1.16 ql=0.16 tb=0 texcacheMainMut=0
+19:03:38 [watchdog] beat=14 frame=2964(+298) stage=8 fiber=-1 aud=4254/4254 astage=0 spec=0 hle=4254 op=15 idx=80 heapUsed=43400632 heapFree=4571656 hwm=43400632 base=43036112 net=1
+19:03:38 [gpu] frame=3009 n=64 wall=16.5 build=10.5 proc=10.5 gpu=3.2 wVbl=0.0 wP3D=0.3 cmd=3% draws=29 tris=488 imp=10432 rl=0 rm=0 md=9
+19:03:38 [prof] frame=3009 n=64 br=0.00 dsp=5.63 vtx=0.19 tri=2.73 imp=1.65 drw=0.41 mtx=0.04 oth=-0.18 | vtxN=0 nV=4 nT=400 nI=163 nD=29 nM=5 nRun=1
+19:03:38 [profop] n=64 top:
+19:03:38 [rt] mode=ahead frame=3013 n=64 tasks=64 waitMain=0.19 waitRender=0.14 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.29 jdp=0.19 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.03 tk=10.77 en=1.08 ql=0.16 tb=0 texcacheMainMut=0
+19:03:40 [gpu] frame=3073 n=64 wall=17.0 build=10.6 proc=10.6 gpu=3.2 wVbl=0.0 wP3D=0.1 cmd=3% draws=27 tris=497 imp=10432 rl=0 rm=0 md=9
+19:03:40 [prof] frame=3073 n=64 br=0.00 dsp=5.66 vtx=0.19 tri=2.68 imp=1.60 drw=0.38 mtx=0.04 oth=0.07 | vtxN=0 nV=4 nT=400 nI=163 nD=27 nM=5 nRun=1
+19:03:40 [profop] n=64 top:
+19:03:40 [rt] mode=ahead frame=3077 n=64 tasks=64 waitMain=0.94 waitRender=0.16 fence=0/0 segMerge=0 pace=61/3 latency=1 | ovl=16.13 jdp=0.72 jtop=0.22 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.74 en=1.01 ql=0.07 tb=0 texcacheMainMut=0
+19:03:41 [gpu] frame=3137 n=64 wall=17.0 build=10.7 proc=10.7 gpu=3.1 wVbl=0.0 wP3D=0.1 cmd=3% draws=27 tris=492 imp=10432 rl=0 rm=0 md=9
+19:03:41 [prof] frame=3137 n=64 br=0.00 dsp=5.66 vtx=0.19 tri=2.72 imp=1.62 drw=0.39 mtx=0.04 oth=0.06 | vtxN=0 nV=4 nT=400 nI=163 nD=26 nM=5 nRun=1
+19:03:41 [profop] n=64 top:
+19:03:41 [rt] mode=ahead frame=3141 n=64 tasks=64 waitMain=0.74 waitRender=0.15 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=16.12 jdp=0.74 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.86 en=0.97 ql=0.07 tb=0 texcacheMainMut=0
+19:03:42 [gpu] frame=3201 n=64 wall=16.8 build=10.5 proc=10.5 gpu=3.3 wVbl=0.0 wP3D=0.2 cmd=3% draws=29 tris=491 imp=10432 rl=0 rm=0 md=9
+19:03:42 [prof] frame=3201 n=64 br=0.00 dsp=5.55 vtx=0.19 tri=2.69 imp=1.61 drw=0.39 mtx=0.04 oth=0.02 | vtxN=0 nV=4 nT=400 nI=163 nD=28 nM=5 nRun=1
+19:03:42 [profop] n=64 top:
+19:03:42 [rt] mode=ahead frame=3205 n=64 tasks=64 waitMain=0.70 waitRender=0.14 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=15.92 jdp=0.70 jtop=0.00 brMain=0.09 bm=64 relWait=0 | bg=0.02 tk=10.73 en=0.97 ql=0.13 tb=0 texcacheMainMut=0
+19:03:43 [watchdog] beat=15 frame=3254(+290) stage=2 fiber=5 aud=4559/4559 astage=0 spec=0 hle=4559 op=15 idx=107 heapUsed=43551552 heapFree=4420736 hwm=43551552 base=43036112 net=1
+19:03:43 [gpu] frame=3265 n=64 wall=18.9 build=10.9 proc=10.9 gpu=3.6 wVbl=0.0 wP3D=1.4 cmd=6% draws=57 tris=345 imp=6283 rl=0 rm=0 md=1
+19:03:43 [prof] frame=3265 n=64 br=0.00 dsp=5.97 vtx=0.41 tri=2.61 imp=1.12 drw=0.48 mtx=0.13 oth=0.18 | vtxN=0 nV=29 nT=383 nI=98 nD=37 nM=16 nRun=0
+19:03:43 [profop] n=64 top:
+19:03:43 [rt] mode=ahead frame=3269 n=64 tasks=55 waitMain=4.35 waitRender=3.34 fence=2/3 segMerge=0 pace=58/6 latency=1 | ovl=14.01 jdp=3.30 jtop=0.00 brMain=0.10 bm=55 relWait=1 | bg=0.02 tk=10.92 en=1.42 ql=0.87 tb=0 texcacheMainMut=0
+19:03:44 [rec] SHOT 'race00' at tick 3300
+19:03:45 [autotest] SHOT dumped -> autotest/race00.bmp
+19:03:47 [autotest] SHOT scanout dumped -> autotest/race00_scan.bmp
+19:03:47 [gpu] tag=race00 frame=3300 n=1 wall=3702.1 build=3698.1 proc=3698.1 gpu=3.8 wVbl=0.0 wP3D=2.2 cmd=7% draws=82 tris=470 imp=99 rl=0 rm=0 md=1
+19:03:48 [gpu] frame=3329 n=64 wall=74.9 build=70.5 proc=70.5 gpu=3.5 wVbl=0.0 wP3D=1.2 cmd=7% draws=44 tris=317 imp=5555 rl=0 rm=0 md=1
+19:03:48 [prof] frame=3329 n=64 br=0.00 dsp=7.30 vtx=0.86 tri=3.65 imp=0.72 drw=0.78 mtx=0.30 oth=56.88 | vtxN=0 nV=62 nT=603 nI=86 nD=58 nM=34 nRun=1
+19:03:48 [profop] n=64 top:
+19:03:48 [watchdog] beat=16 frame=3332(+78) stage=8 fiber=-1 aud=4864/4864 astage=0 spec=0 hle=4864 op=15 idx=109 heapUsed=43553984 heapFree=4418304 hwm=43553984 base=43036112 net=1
+19:03:48 [rt] mode=ahead frame=3333 n=64 tasks=64 waitMain=61.23 waitRender=0.13 fence=0/0 segMerge=0 pace=55/9 latency=1 | ovl=13.77 jdp=61.08 jtop=0.15 brMain=0.12 bm=64 relWait=0 | bg=0.02 tk=71.56 en=1.33 ql=0.91 tb=0 texcacheMainMut=0
+19:03:49 [gpu] frame=3393 n=64 wall=17.0 build=10.2 proc=10.2 gpu=3.1 wVbl=0.0 wP3D=0.2 cmd=5% draws=33 tris=272 imp=5448 rl=0 rm=0 md=1
+19:03:49 [prof] frame=3393 n=64 br=0.00 dsp=5.08 vtx=0.44 tri=2.98 imp=0.56 drw=0.54 mtx=0.14 oth=0.48 | vtxN=0 nV=42 nT=554 nI=85 nD=39 nM=17 nRun=1
+19:03:49 [profop] n=64 top:
+19:03:49 [rt] mode=ahead frame=3397 n=64 tasks=64 waitMain=0.89 waitRender=0.14 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=15.96 jdp=0.89 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=10.41 en=1.00 ql=0.29 tb=0 texcacheMainMut=0
+19:03:50 [gpu] frame=3457 n=64 wall=17.8 build=11.6 proc=11.6 gpu=3.6 wVbl=0.0 wP3D=0.9 cmd=10% draws=98 tris=559 imp=6275 rl=0 rm=0 md=1
+19:03:50 [prof] frame=3457 n=64 br=0.00 dsp=7.10 vtx=0.52 tri=2.68 imp=0.67 drw=0.74 mtx=0.20 oth=-0.27 | vtxN=0 nV=46 nT=470 nI=98 nD=55 nM=25 nRun=1
+19:03:50 [prof!] frame=3457 n=13 br=0.00 dsp=11.53 vtx=0.94 tri=3.24 imp=0.83 drw=1.26 mtx=0.38 oth=-2.04 | vtxN=0 nV=75 nT=537 nI=127 nD=97 nM=47 nRun=1
+19:03:50 [profop] n=64 top:
+19:03:50 [rt] mode=ahead frame=3461 n=64 tasks=64 waitMain=5.76 waitRender=0.09 fence=0/0 segMerge=0 pace=50/14 latency=1 | ovl=11.94 jdp=5.76 jtop=0.00 brMain=0.11 bm=64 relWait=0 | bg=0.02 tk=12.97 en=1.27 ql=0.78 tb=0 texcacheMainMut=0
+19:03:51 [gpu] frame=3521 n=64 wall=18.4 build=14.1 proc=14.1 gpu=4.0 wVbl=0.0 wP3D=2.1 cmd=10% draws=84 tris=422 imp=6254 rl=0 rm=0 md=1
+19:03:51 [prof] frame=3521 n=64 br=0.00 dsp=10.07 vtx=0.97 tri=2.67 imp=0.74 drw=1.15 mtx=0.40 oth=-1.93 | vtxN=0 nV=72 nT=469 nI=97 nD=87 nM=47 nRun=1
+19:03:51 [prof!] frame=3521 n=27 br=0.00 dsp=10.59 vtx=0.99 tri=3.12 imp=0.86 drw=1.27 mtx=0.38 oth=-1.98 | vtxN=0 nV=73 nT=525 nI=120 nD=93 nM=47 nRun=1
+19:03:51 [profop] n=64 top:
+19:03:51 [rt] mode=ahead frame=3525 n=64 tasks=64 waitMain=10.56 waitRender=0.28 fence=0/0 segMerge=0 pace=35/29 latency=1 | ovl=7.71 jdp=10.56 jtop=0.00 brMain=0.46 bm=64 relWait=0 | bg=0.01 tk=16.06 en=1.91 ql=1.87 tb=0 texcacheMainMut=0
+19:03:52 [gpu] frame=3585 n=64 wall=17.1 build=13.0 proc=13.0 gpu=3.9 wVbl=0.0 wP3D=2.1 cmd=8% draws=84 tris=420 imp=5184 rl=0 rm=0 md=1
+19:03:52 [prof] frame=3585 n=64 br=0.00 dsp=9.47 vtx=0.92 tri=2.36 imp=0.66 drw=1.10 mtx=0.40 oth=-1.90 | vtxN=0 nV=72 nT=429 nI=81 nD=84 nM=47 nRun=1
+19:03:52 [profop] n=64 top:
+19:03:52 [rt] mode=ahead frame=3589 n=64 tasks=64 waitMain=8.19 waitRender=0.18 fence=0/0 segMerge=0 pace=59/5 latency=1 | ovl=9.18 jdp=7.95 jtop=0.24 brMain=0.49 bm=64 relWait=0 | bg=0.01 tk=15.13 en=1.79 ql=1.73 tb=0 texcacheMainMut=0
+19:03:53 [watchdog] beat=17 frame=3619(+287) stage=2 fiber=3 aud=5168/5168 astage=0 spec=0 hle=5168 op=15 idx=104 heapUsed=43569312 heapFree=4402976 hwm=43569312 base=43036112 net=1
+19:03:54 [gpu] frame=3649 n=64 wall=17.2 build=12.9 proc=12.9 gpu=3.9 wVbl=0.0 wP3D=2.0 cmd=8% draws=84 tris=420 imp=5184 rl=0 rm=0 md=1
+19:03:54 [prof] frame=3649 n=64 br=0.00 dsp=9.30 vtx=0.93 tri=2.34 imp=0.67 drw=1.05 mtx=0.39 oth=-1.76 | vtxN=0 nV=72 nT=429 nI=81 nD=84 nM=47 nRun=1
+19:03:54 [profop] n=64 top:
+19:03:54 [rt] mode=ahead frame=3653 n=64 tasks=64 waitMain=2.10 waitRender=0.25 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=15.12 jdp=2.10 jtop=0.00 brMain=0.43 bm=64 relWait=0 | bg=0.01 tk=14.88 en=1.91 ql=1.79 tb=0 texcacheMainMut=0
+19:03:55 [gpu] frame=3713 n=64 wall=17.5 build=13.2 proc=13.2 gpu=3.9 wVbl=0.0 wP3D=1.6 cmd=9% draws=83 tris=455 imp=5405 rl=0 rm=0 md=1
+19:03:55 [prof] frame=3713 n=64 br=0.00 dsp=9.28 vtx=0.90 tri=2.24 imp=0.72 drw=1.16 mtx=0.40 oth=-1.47 | vtxN=0 nV=68 nT=398 nI=84 nD=85 nM=46 nRun=1
+19:03:55 [profop] n=64 top:
+19:03:55 [rt] mode=ahead frame=3717 n=64 tasks=64 waitMain=7.80 waitRender=0.10 fence=0/0 segMerge=0 pace=61/3 latency=1 | ovl=9.49 jdp=7.80 jtop=0.00 brMain=0.49 bm=64 relWait=0 | bg=0.04 tk=14.90 en=2.25 ql=2.23 tb=0 texcacheMainMut=0
+19:03:56 [gpu] frame=3777 n=64 wall=17.1 build=13.1 proc=13.1 gpu=3.6 wVbl=0.0 wP3D=1.3 cmd=9% draws=71 tris=407 imp=4531 rl=0 rm=0 md=1
+19:03:56 [prof] frame=3777 n=64 br=0.00 dsp=8.56 vtx=0.79 tri=2.28 imp=0.68 drw=0.92 mtx=0.42 oth=-0.56 | vtxN=0 nV=59 nT=352 nI=70 nD=74 nM=41 nRun=1
+19:03:56 [profop] n=64 top:
+19:03:56 [rt] mode=ahead frame=3781 n=64 tasks=64 waitMain=4.22 waitRender=0.12 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=12.82 jdp=4.22 jtop=0.00 brMain=0.22 bm=64 relWait=0 | bg=0.02 tk=14.43 en=1.96 ql=1.66 tb=0 texcacheMainMut=0
+19:03:57 [gpu] frame=3841 n=64 wall=17.0 build=12.2 proc=12.2 gpu=3.4 wVbl=0.0 wP3D=0.7 cmd=7% draws=71 tris=499 imp=4216 rl=0 rm=0 md=1
+19:03:57 [prof] frame=3841 n=64 br=0.00 dsp=7.69 vtx=0.81 tri=2.35 imp=0.58 drw=0.94 mtx=0.34 oth=-0.48 | vtxN=0 nV=60 nT=365 nI=65 nD=68 nM=39 nRun=1
+19:03:57 [profop] n=64 top:
+19:03:57 [rt] mode=ahead frame=3845 n=64 tasks=64 waitMain=0.64 waitRender=0.52 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=16.10 jdp=0.40 jtop=0.24 brMain=0.45 bm=64 relWait=0 | bg=0.02 tk=12.95 en=1.38 ql=0.38 tb=0 texcacheMainMut=0
+19:03:58 [gpu] frame=3905 n=64 wall=17.5 build=13.2 proc=13.2 gpu=3.7 wVbl=0.0 wP3D=1.6 cmd=8% draws=74 tris=499 imp=4570 rl=0 rm=0 md=1
+19:03:58 [prof] frame=3905 n=64 br=0.00 dsp=9.33 vtx=0.83 tri=2.68 imp=0.54 drw=0.92 mtx=0.38 oth=-1.49 | vtxN=0 nV=62 nT=419 nI=71 nD=74 nM=42 nRun=1
+19:03:58 [profop] n=64 top:
+19:03:58 [rt] mode=ahead frame=3909 n=64 tasks=64 waitMain=4.29 waitRender=0.34 fence=0/0 segMerge=0 pace=57/7 latency=1 | ovl=13.15 jdp=4.29 jtop=0.00 brMain=0.52 bm=64 relWait=0 | bg=0.05 tk=14.99 en=1.54 ql=1.26 tb=0 texcacheMainMut=0
+19:03:58 [watchdog] beat=18 frame=3910(+291) stage=8 fiber=-1 aud=5472/5472 astage=0 spec=0 hle=5472 op=15 idx=131 heapUsed=43567920 heapFree=4404368 hwm=43569312 base=43036112 net=1
+19:04:00 [gpu] frame=3969 n=64 wall=16.8 build=11.8 proc=11.8 gpu=3.6 wVbl=0.0 wP3D=1.0 cmd=7% draws=37 tris=340 imp=4179 rl=0 rm=0 md=1
+19:04:00 [prof] frame=3969 n=64 br=0.00 dsp=7.13 vtx=0.67 tri=3.18 imp=0.51 drw=0.82 mtx=0.33 oth=-0.88 | vtxN=0 nV=58 nT=547 nI=65 nD=61 nM=34 nRun=1
+19:04:00 [profop] n=64 top:
+19:04:00 [rt] mode=ahead frame=3973 n=64 tasks=64 waitMain=0.53 waitRender=0.60 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=15.87 jdp=0.53 jtop=0.00 brMain=0.54 bm=64 relWait=0 | bg=0.02 tk=12.55 en=1.10 ql=0.54 tb=0 texcacheMainMut=0
+19:04:00 [rec] SHOT 'race01' at tick 4000
+19:04:01 [autotest] SHOT dumped -> autotest/race01.bmp
+19:04:03 [watchdog] beat=19 frame=4002(+92) stage=2 fiber=3 aud=5776/5776 astage=0 spec=0 hle=5776 op=15 idx=135 heapUsed=43580536 heapFree=4391752 hwm=43580536 base=43036112 net=1
+19:04:03 [autotest] SHOT scanout dumped -> autotest/race01_scan.bmp
+19:04:03 [gpu] tag=race01 frame=4001 n=1 wall=3754.1 build=3741.5 proc=3741.5 gpu=3.4 wVbl=0.0 wP3D=0.0 cmd=4% draws=42 tris=342 imp=52 rl=0 rm=0 md=1
+19:04:04 [gpu] frame=4033 n=64 wall=75.3 build=66.3 proc=66.3 gpu=3.2 wVbl=0.0 wP3D=0.2 cmd=5% draws=32 tris=294 imp=2860 rl=0 rm=0 md=1
+19:04:04 [prof] frame=4033 n=64 br=0.00 dsp=4.21 vtx=0.29 tri=2.44 imp=0.45 drw=0.47 mtx=0.18 oth=58.25 | vtxN=0 nV=30 nT=406 nI=44 nD=32 nM=15 nRun=1
+19:04:04 [profop] n=64 top:
+19:04:04 [rt] mode=ahead frame=4037 n=64 tasks=64 waitMain=58.54 waitRender=0.14 fence=0/0 segMerge=0 pace=62/2 latency=1 | ovl=16.55 jdp=58.54 jtop=0.00 brMain=0.10 bm=64 relWait=0 | bg=0.02 tk=66.35 en=1.01 ql=0.30 tb=0 texcacheMainMut=0
+19:04:05 [gpu] frame=4097 n=64 wall=16.6 build=7.7 proc=7.7 gpu=3.0 wVbl=0.0 wP3D=0.1 cmd=4% draws=36 tris=305 imp=2755 rl=0 rm=0 md=1
+19:04:05 [prof] frame=4097 n=64 br=0.00 dsp=3.71 vtx=0.29 tri=2.42 imp=0.43 drw=0.59 mtx=0.15 oth=0.07 | vtxN=0 nV=30 nT=344 nI=43 nD=32 nM=15 nRun=1
+19:04:05 [profop] n=64 top:
+19:04:05 [rt] mode=ahead frame=4101 n=64 tasks=64 waitMain=0.31 waitRender=0.52 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.02 jdp=0.20 jtop=0.11 brMain=0.47 bm=64 relWait=0 | bg=0.02 tk=7.75 en=0.94 ql=0.28 tb=0 texcacheMainMut=0
+19:04:07 [gpu] frame=4161 n=64 wall=17.0 build=7.5 proc=7.5 gpu=3.0 wVbl=0.0 wP3D=0.0 cmd=4% draws=33 tris=289 imp=2829 rl=0 rm=0 md=1
+19:04:07 [prof] frame=4161 n=64 br=0.00 dsp=3.87 vtx=0.32 tri=2.14 imp=0.42 drw=0.50 mtx=0.13 oth=0.13 | vtxN=0 nV=31 nT=287 nI=44 nD=34 nM=16 nRun=1
+19:04:07 [profop] n=64 top:
+19:04:07 [rt] mode=ahead frame=4165 n=64 tasks=64 waitMain=0.08 waitRender=0.56 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.36 jdp=0.08 jtop=0.00 brMain=0.50 bm=64 relWait=0 | bg=0.02 tk=7.55 en=0.85 ql=0.16 tb=0 texcacheMainMut=0
+19:04:07 [gpu] frame=4225 n=64 wall=17.0 build=7.0 proc=7.0 gpu=3.1 wVbl=0.0 wP3D=0.1 cmd=4% draws=33 tris=292 imp=2834 rl=0 rm=0 md=1
+19:04:07 [prof] frame=4225 n=64 br=0.00 dsp=3.52 vtx=0.30 tri=1.81 imp=0.48 drw=0.53 mtx=0.13 oth=0.28 | vtxN=0 nV=39 nT=270 nI=44 nD=32 nM=14 nRun=1
+19:04:07 [profop] n=64 top:
+19:04:07 [rt] mode=ahead frame=4229 n=64 tasks=64 waitMain=0.08 waitRender=0.54 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.37 jdp=0.08 jtop=0.00 brMain=0.50 bm=64 relWait=0 | bg=0.02 tk=7.17 en=0.83 ql=0.17 tb=0 texcacheMainMut=0
+19:04:08 [watchdog] beat=20 frame=4281(+279) stage=8 fiber=-1 aud=6079/6079 astage=0 spec=0 hle=6079 op=15 idx=106 heapUsed=43574344 heapFree=4397944 hwm=43580536 base=43036112 net=1
+19:04:08 [gpu] frame=4289 n=64 wall=17.0 build=7.0 proc=7.0 gpu=3.3 wVbl=0.0 wP3D=0.0 cmd=4% draws=34 tris=317 imp=2899 rl=0 rm=0 md=1
+19:04:08 [prof] frame=4289 n=64 br=0.00 dsp=3.56 vtx=0.33 tri=1.94 imp=0.45 drw=0.49 mtx=0.13 oth=0.12 | vtxN=0 nV=62 nT=289 nI=45 nD=33 nM=14 nRun=1
+19:04:08 [profop] n=64 top:
+19:04:08 [rt] mode=ahead frame=4293 n=64 tasks=64 waitMain=0.08 waitRender=0.60 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.33 jdp=0.08 jtop=0.00 brMain=0.53 bm=64 relWait=0 | bg=0.02 tk=7.16 en=0.86 ql=0.12 tb=0 texcacheMainMut=0
+19:04:09 [gpu] frame=4353 n=64 wall=16.7 build=8.3 proc=8.3 gpu=3.4 wVbl=0.0 wP3D=0.2 cmd=4% draws=26 tris=242 imp=2759 rl=0 rm=0 md=1
+19:04:09 [prof] frame=4353 n=64 br=0.00 dsp=3.74 vtx=0.53 tri=2.66 imp=0.47 drw=0.47 mtx=0.11 oth=0.29 | vtxN=0 nV=90 nT=426 nI=43 nD=30 nM=14 nRun=1
+19:04:09 [profop] n=64 top:
+19:04:09 [rt] mode=ahead frame=4357 n=64 tasks=64 waitMain=0.56 waitRender=0.25 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.07 jdp=0.43 jtop=0.13 brMain=0.19 bm=64 relWait=0 | bg=0.02 tk=8.57 en=0.94 ql=0.30 tb=0 texcacheMainMut=0
+19:04:10 [gpu] frame=4417 n=64 wall=16.9 build=7.2 proc=7.2 gpu=3.1 wVbl=0.0 wP3D=0.0 cmd=3% draws=21 tris=208 imp=2388 rl=0 rm=0 md=1
+19:04:10 [prof] frame=4417 n=64 br=0.00 dsp=2.84 vtx=0.64 tri=2.55 imp=0.40 drw=0.41 mtx=0.11 oth=0.20 | vtxN=0 nV=73 nT=411 nI=37 nD=23 nM=14 nRun=1
+19:04:10 [profop] n=64 top:
+19:04:10 [rt] mode=ahead frame=4421 n=64 tasks=64 waitMain=0.11 waitRender=0.57 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.32 jdp=0.11 jtop=0.00 brMain=0.51 bm=64 relWait=0 | bg=0.02 tk=7.16 en=1.10 ql=0.15 tb=0 texcacheMainMut=0
+19:04:12 [gpu] frame=4481 n=64 wall=16.8 build=7.9 proc=7.9 gpu=4.3 wVbl=0.0 wP3D=0.6 cmd=6% draws=71 tris=623 imp=2347 rl=0 rm=0 md=1
+19:04:12 [prof] frame=4481 n=64 br=0.00 dsp=3.53 vtx=0.58 tri=3.29 imp=0.36 drw=0.41 mtx=0.13 oth=-0.36 | vtxN=0 nV=33 nT=624 nI=36 nD=27 nM=14 nRun=1
+19:04:12 [profop] n=64 top:
+19:04:12 [rt] mode=ahead frame=4485 n=64 tasks=64 waitMain=0.23 waitRender=0.34 fence=0/0 segMerge=0 pace=64/0 latency=1 | ovl=16.15 jdp=0.23 jtop=0.00 brMain=0.31 bm=64 relWait=0 | bg=0.02 tk=8.72 en=1.20 ql=0.35 tb=0 texcacheMainMut=0
+19:04:12 [gpu] frame=4545 n=64 wall=16.9 build=10.3 proc=10.3 gpu=5.6 wVbl=0.0 wP3D=1.8 cmd=17% draws=228 tris=615 imp=2247 rl=0 rm=0 md=1
+19:04:12 [prof] frame=4545 n=64 br=0.00 dsp=5.30 vtx=0.52 tri=3.98 imp=0.31 drw=1.61 mtx=0.15 oth=-1.61 | vtxN=0 nV=32 nT=802 nI=35 nD=179 nM=14 nRun=1
+19:04:12 [prof!] frame=4545 n=59 br=0.00 dsp=5.35 vtx=0.52 tri=3.96 imp=0.30 drw=1.66 mtx=0.16 oth=-1.65 | vtxN=0 nV=32 nT=801 nI=35 nD=187 nM=14 nRun=1
+19:04:12 [profop] n=64 top:
+19:04:12 [rt] mode=ahead frame=4549 n=64 tasks=64 waitMain=2.54 waitRender=0.35 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=13.95 jdp=2.54 jtop=0.00 brMain=0.36 bm=64 relWait=0 | bg=0.03 tk=12.15 en=1.68 ql=1.31 tb=0 texcacheMainMut=0
+19:04:13 [watchdog] beat=21 frame=4580(+299) stage=2 fiber=3 aud=6383/6383 astage=0 spec=0 hle=6383 op=15 idx=89 heapUsed=43579696 heapFree=4392592 hwm=43580536 base=43036112 net=1
+19:04:13 [gpu] frame=4609 n=64 wall=16.8 build=10.5 proc=10.5 gpu=5.8 wVbl=0.0 wP3D=3.4 cmd=17% draws=179 tris=615 imp=2240 rl=0 rm=0 md=1
+19:04:13 [prof] frame=4609 n=64 br=0.00 dsp=6.81 vtx=0.53 tri=3.94 imp=0.30 drw=2.00 mtx=0.12 oth=-3.22 | vtxN=0 nV=32 nT=794 nI=35 nD=222 nM=14 nRun=1
+19:04:13 [prof!] frame=4609 n=64 br=0.00 dsp=6.81 vtx=0.53 tri=3.94 imp=0.30 drw=2.00 mtx=0.12 oth=-3.22 | vtxN=0 nV=32 nT=794 nI=35 nD=222 nM=14 nRun=1
+19:04:13 [profop] n=64 top:
+19:04:13 [rt] mode=ahead frame=4613 n=64 tasks=64 waitMain=2.67 waitRender=0.36 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=14.34 jdp=2.47 jtop=0.20 brMain=0.49 bm=64 relWait=0 | bg=0.01 tk=13.85 en=1.87 ql=1.54 tb=0 texcacheMainMut=0
+19:04:14 [gpu] frame=4673 n=64 wall=17.0 build=9.0 proc=9.0 gpu=5.3 wVbl=0.0 wP3D=0.4 cmd=14% draws=22 tris=615 imp=2240 rl=0 rm=0 md=1
+19:04:14 [prof] frame=4673 n=64 br=0.00 dsp=3.68 vtx=0.52 tri=3.88 imp=0.30 drw=0.69 mtx=0.11 oth=-0.19 | vtxN=0 nV=32 nT=794 nI=35 nD=68 nM=14 nRun=1
+19:04:14 [prof!] frame=4673 n=22 br=0.00 dsp=3.51 vtx=0.51 tri=3.89 imp=0.30 drw=1.18 mtx=0.11 oth=0.12 | vtxN=0 nV=32 nT=794 nI=35 nD=133 nM=14 nRun=1
+19:04:14 [profop] n=64 top:
+19:04:15 [rt] mode=ahead frame=4677 n=64 tasks=64 waitMain=0.23 waitRender=0.62 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.13 jdp=0.23 jtop=0.00 brMain=0.58 bm=64 relWait=0 | bg=0.02 tk=9.35 en=0.97 ql=0.16 tb=0 texcacheMainMut=0
+19:04:16 [gpu] frame=4737 n=64 wall=17.0 build=8.7 proc=8.7 gpu=5.4 wVbl=0.0 wP3D=0.1 cmd=3% draws=25 tris=621 imp=2369 rl=0 rm=0 md=1
+19:04:16 [prof] frame=4737 n=64 br=0.00 dsp=3.45 vtx=0.53 tri=3.82 imp=0.33 drw=0.37 mtx=0.12 oth=0.07 | vtxN=0 nV=34 nT=800 nI=37 nD=24 nM=14 nRun=1
+19:04:16 [profop] n=64 top:
+19:04:16 [rt] mode=ahead frame=4741 n=64 tasks=64 waitMain=0.11 waitRender=0.55 fence=0/0 segMerge=0 pace=63/1 latency=1 | ovl=16.41 jdp=0.11 jtop=0.00 brMain=0.50 bm=64 relWait=0 | bg=0.02 tk=8.90 en=1.02 ql=0.16 tb=0 texcacheMainMut=0
+19:04:17 [gpu] frame=4801 n=64 wall=25.4 build=20.6 proc=20.6 gpu=4.2 wVbl=0.0 wP3D=2.0 cmd=4% draws=22 tris=3724 imp=5896 rl=0 rm=0 md=15
+19:04:17 [prof] frame=4801 n=64 br=0.00 dsp=6.83 vtx=1.12 tri=12.35 imp=0.98 drw=0.32 mtx=0.04 oth=-1.07 | vtxN=0 nV=60 nT=3118 nI=92 nD=22 nM=5 nRun=1
+19:04:17 [profop] n=64 top:
+19:04:17 [rt] mode=ahead frame=4805 n=64 tasks=64 waitMain=21.45 waitRender=0.64 fence=3/0 segMerge=0 pace=12/52 latency=1 | ovl=3.64 jdp=20.91 jtop=0.00 brMain=0.35 bm=64 relWait=1 | bg=0.02 tk=22.90 en=1.46 ql=1.33 tb=0 texcacheMainMut=0
+19:04:18 [watchdog] beat=22 frame=4828(+248) stage=2 fiber=3 aud=6686/6686 astage=0 spec=0 hle=6686 op=15 idx=51 heapUsed=43580592 heapFree=4391696 hwm=43580592 base=43036112 net=1
+19:04:19 [gpu] frame=4865 n=64 wall=27.2 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:19 [prof] frame=4865 n=64 br=0.00 dsp=7.39 vtx=1.29 tri=14.58 imp=1.05 drw=0.29 mtx=0.02 oth=-1.34 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:19 [profop] n=64 top:
+19:04:19 [rt] mode=ahead frame=4869 n=64 tasks=64 waitMain=25.63 waitRender=0.00 fence=0/0 segMerge=0 pace=2/62 latency=1 | ovl=2.18 jdp=25.00 jtop=0.63 brMain=0.19 bm=64 relWait=0 | bg=0.02 tk=25.36 en=1.76 ql=1.74 tb=0 texcacheMainMut=0
+19:04:21 [gpu] frame=4929 n=64 wall=27.2 build=23.2 proc=23.2 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:21 [prof] frame=4929 n=64 br=0.00 dsp=7.39 vtx=1.32 tri=14.45 imp=1.02 drw=0.29 mtx=0.02 oth=-1.27 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:21 [profop] n=64 top:
+19:04:21 [rt] mode=ahead frame=4933 n=64 tasks=64 waitMain=25.38 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.68 jdp=25.38 jtop=0.00 brMain=0.30 bm=64 relWait=0 | bg=0.03 tk=25.34 en=1.72 ql=1.72 tb=0 texcacheMainMut=0
+19:04:22 [gpu] frame=4993 n=64 wall=27.1 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:22 [prof] frame=4993 n=64 br=0.00 dsp=7.40 vtx=1.30 tri=14.53 imp=1.03 drw=0.29 mtx=0.02 oth=-1.31 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:22 [profop] n=64 top:
+19:04:22 [rt] mode=ahead frame=4997 n=64 tasks=64 waitMain=25.45 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.64 jdp=25.45 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.45 en=1.63 ql=1.64 tb=0 texcacheMainMut=0
+19:04:23 [rec] SHOT 'race02' at tick 5000
+19:04:23 [watchdog] beat=23 frame=5001(+173) stage=2 fiber=3 aud=6991/6991 astage=0 spec=0 hle=6991 op=15 idx=51 heapUsed=43580616 heapFree=4391672 hwm=43580616 base=43036112 net=1
+19:04:25 [autotest] SHOT dumped -> autotest/race02.bmp
+19:04:26 [autotest] SHOT scanout dumped -> autotest/race02_scan.bmp
+19:04:26 [gpu] tag=race02 frame=5000 n=1 wall=3667.2 build=3663.4 proc=3663.4 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=107 rl=0 rm=0 md=15
+19:04:28 [gpu] frame=5057 n=64 wall=83.8 build=79.9 proc=79.9 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:28 [prof] frame=5057 n=64 br=0.00 dsp=7.45 vtx=1.35 tri=14.47 imp=1.05 drw=0.30 mtx=0.02 oth=55.30 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:28 [profop] n=64 top:
+19:04:28 [rt] mode=ahead frame=5061 n=64 tasks=64 waitMain=81.87 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.82 jdp=81.87 jtop=0.00 brMain=0.51 bm=64 relWait=0 | bg=0.03 tk=82.15 en=1.54 ql=1.54 tb=0 texcacheMainMut=0
+19:04:28 [watchdog] beat=24 frame=5064(+63) stage=2 fiber=3 aud=7294/7294 astage=0 spec=0 hle=7294 op=15 idx=51 heapUsed=43580592 heapFree=4391696 hwm=43580616 base=43036112 net=1
+19:04:29 [gpu] frame=5121 n=64 wall=27.3 build=23.5 proc=23.5 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:30 [prof] frame=5121 n=64 br=0.00 dsp=7.47 vtx=1.28 tri=14.55 imp=1.05 drw=0.29 mtx=0.02 oth=-1.14 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:30 [profop] n=64 top:
+19:04:30 [rt] mode=ahead frame=5125 n=64 tasks=64 waitMain=25.49 waitRender=0.00 fence=0/0 segMerge=0 pace=2/62 latency=1 | ovl=2.34 jdp=25.01 jtop=0.48 brMain=0.30 bm=64 relWait=0 | bg=0.03 tk=25.70 en=1.58 ql=1.57 tb=0 texcacheMainMut=0
+19:04:31 [gpu] frame=5185 n=64 wall=27.1 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:31 [prof] frame=5185 n=64 br=0.00 dsp=7.46 vtx=1.30 tri=14.51 imp=1.06 drw=0.31 mtx=0.02 oth=-1.33 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:31 [profop] n=64 top:
+19:04:31 [rt] mode=ahead frame=5189 n=64 tasks=64 waitMain=25.62 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.47 jdp=25.62 jtop=0.00 brMain=0.34 bm=64 relWait=0 | bg=0.03 tk=25.50 en=1.60 ql=1.60 tb=0 texcacheMainMut=0
+19:04:33 [watchdog] beat=25 frame=5248(+184) stage=2 fiber=3 aud=7598/7598 astage=0 spec=0 hle=7598 op=15 idx=51 heapUsed=43580592 heapFree=4391696 hwm=43580616 base=43036112 net=1
+19:04:34 [gpu] frame=5249 n=64 wall=27.2 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:34 [prof] frame=5249 n=64 br=0.00 dsp=7.49 vtx=1.29 tri=14.60 imp=1.01 drw=0.30 mtx=0.02 oth=-1.37 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:34 [profop] n=64 top:
+19:04:34 [rt] mode=ahead frame=5253 n=64 tasks=64 waitMain=25.45 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=1.61 jdp=25.45 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.59 en=1.47 ql=1.47 tb=0 texcacheMainMut=0
+19:04:35 [gpu] frame=5313 n=64 wall=27.2 build=23.4 proc=23.4 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:35 [prof] frame=5313 n=64 br=0.00 dsp=7.48 vtx=1.31 tri=14.51 imp=1.06 drw=0.30 mtx=0.02 oth=-1.24 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:35 [profop] n=64 top:
+19:04:35 [rt] mode=ahead frame=5317 n=64 tasks=64 waitMain=25.74 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=1.63 jdp=25.74 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.64 en=1.73 ql=1.73 tb=0 texcacheMainMut=0
+19:04:38 [gpu] frame=5377 n=64 wall=27.3 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:38 [prof] frame=5377 n=64 br=0.00 dsp=7.48 vtx=1.30 tri=14.53 imp=1.02 drw=0.29 mtx=0.02 oth=-1.31 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:38 [profop] n=64 top:
+19:04:38 [rt] mode=ahead frame=5381 n=64 tasks=64 waitMain=25.45 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=2.26 jdp=24.93 jtop=0.52 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.52 en=1.61 ql=1.60 tb=0 texcacheMainMut=0
+19:04:38 [watchdog] beat=26 frame=5432(+184) stage=2 fiber=3 aud=7901/7901 astage=0 spec=0 hle=7901 op=15 idx=51 heapUsed=43580592 heapFree=4391696 hwm=43580616 base=43036112 net=1
+19:04:38 [gpu] frame=5441 n=64 wall=27.0 build=23.1 proc=23.1 gpu=3.6 wVbl=0.0 wP3D=2.0 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:38 [prof] frame=5441 n=64 br=0.00 dsp=7.38 vtx=1.31 tri=14.45 imp=1.05 drw=0.29 mtx=0.02 oth=-1.37 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:38 [profop] n=64 top:
+19:04:39 [rt] mode=ahead frame=5445 n=64 tasks=64 waitMain=25.34 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.52 jdp=25.34 jtop=0.00 brMain=0.34 bm=64 relWait=0 | bg=0.03 tk=25.21 en=1.65 ql=1.65 tb=0 texcacheMainMut=0
+19:04:40 [gpu] frame=5505 n=64 wall=27.1 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:40 [prof] frame=5505 n=64 br=0.00 dsp=7.52 vtx=1.29 tri=14.45 imp=1.06 drw=0.32 mtx=0.02 oth=-1.41 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:40 [profop] n=64 top:
+19:04:40 [rt] mode=ahead frame=5509 n=64 tasks=64 waitMain=25.51 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.59 jdp=25.51 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.51 en=1.60 ql=1.59 tb=0 texcacheMainMut=0
+19:04:42 [gpu] frame=5569 n=64 wall=27.2 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:42 [prof] frame=5569 n=64 br=0.00 dsp=7.41 vtx=1.32 tri=14.52 imp=1.08 drw=0.30 mtx=0.02 oth=-1.34 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:42 [profop] n=64 top:
+19:04:42 [rt] mode=ahead frame=5573 n=64 tasks=64 waitMain=25.56 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.57 jdp=25.56 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.53 en=1.59 ql=1.59 tb=0 texcacheMainMut=0
+19:04:43 [watchdog] beat=27 frame=5617(+185) stage=2 fiber=3 aud=8205/8205 astage=0 spec=0 hle=8205 op=15 idx=51 heapUsed=43580592 heapFree=4391696 hwm=43580616 base=43036112 net=1
+19:04:43 [gpu] frame=5633 n=64 wall=27.1 build=23.2 proc=23.2 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:43 [prof] frame=5633 n=64 br=0.00 dsp=7.48 vtx=1.29 tri=14.50 imp=1.00 drw=0.30 mtx=0.02 oth=-1.35 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:43 [profop] n=64 top:
+19:04:43 [rt] mode=ahead frame=5637 n=64 tasks=64 waitMain=25.46 waitRender=0.00 fence=0/0 segMerge=0 pace=2/62 latency=1 | ovl=2.08 jdp=25.00 jtop=0.46 brMain=0.32 bm=64 relWait=0 | bg=0.02 tk=25.45 en=1.56 ql=1.55 tb=0 texcacheMainMut=0
+19:04:45 [gpu] frame=5697 n=64 wall=27.1 build=23.2 proc=23.2 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:45 [prof] frame=5697 n=64 br=0.00 dsp=7.49 vtx=1.29 tri=14.48 imp=1.04 drw=0.30 mtx=0.02 oth=-1.42 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:45 [profop] n=64 top:
+19:04:45 [rt] mode=ahead frame=5701 n=64 tasks=64 waitMain=25.34 waitRender=0.00 fence=0/0 segMerge=0 pace=1/63 latency=1 | ovl=1.76 jdp=25.34 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=25.41 en=1.69 ql=1.70 tb=0 texcacheMainMut=0
+19:04:47 [gpu] frame=5761 n=64 wall=27.2 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:47 [prof] frame=5761 n=64 br=0.00 dsp=7.48 vtx=1.30 tri=14.53 imp=1.03 drw=0.32 mtx=0.02 oth=-1.42 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:47 [profop] n=64 top:
+19:04:47 [rt] mode=ahead frame=5765 n=64 tasks=64 waitMain=25.49 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.60 jdp=25.49 jtop=0.00 brMain=0.28 bm=64 relWait=0 | bg=0.03 tk=25.47 en=1.62 ql=1.62 tb=0 texcacheMainMut=0
+19:04:48 [watchdog] beat=28 frame=5802(+185) stage=2 fiber=3 aud=8508/8508 astage=0 spec=0 hle=8508 op=15 idx=51 heapUsed=43580592 heapFree=4391696 hwm=43580616 base=43036112 net=1
+19:04:49 [gpu] frame=5825 n=64 wall=27.1 build=23.3 proc=23.3 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:49 [prof] frame=5825 n=64 br=0.00 dsp=7.49 vtx=1.32 tri=14.45 imp=1.05 drw=0.29 mtx=0.02 oth=-1.36 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:49 [profop] n=64 top:
+19:04:49 [rt] mode=ahead frame=5829 n=64 tasks=64 waitMain=25.55 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.61 jdp=25.55 jtop=0.00 brMain=0.39 bm=64 relWait=0 | bg=0.03 tk=25.47 en=1.69 ql=1.69 tb=0 texcacheMainMut=0
+19:04:50 [gpu] frame=5889 n=64 wall=27.2 build=23.2 proc=23.2 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:50 [prof] frame=5889 n=64 br=0.00 dsp=7.51 vtx=1.30 tri=14.51 imp=1.01 drw=0.29 mtx=0.02 oth=-1.44 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:50 [profop] n=64 top:
+19:04:50 [rt] mode=ahead frame=5893 n=64 tasks=64 waitMain=25.34 waitRender=0.00 fence=0/0 segMerge=0 pace=2/62 latency=1 | ovl=2.25 jdp=24.82 jtop=0.52 brMain=0.33 bm=64 relWait=0 | bg=0.03 tk=25.44 en=1.57 ql=1.56 tb=0 texcacheMainMut=0
+19:04:51 [rec] SHOT 'race04' at tick 5900
+19:04:52 [autotest] SHOT dumped -> autotest/race04.bmp
+19:04:53 [watchdog] beat=29 frame=5901(+99) stage=2 fiber=3 aud=8812/8812 astage=0 spec=0 hle=8812 op=15 idx=51 heapUsed=43582864 heapFree=4389424 hwm=43582864 base=43036112 net=1
+19:04:54 [autotest] SHOT scanout dumped -> autotest/race04_scan.bmp
+19:04:54 [gpu] tag=race04 frame=5900 n=1 wall=3705.2 build=3701.4 proc=3701.4 gpu=3.6 wVbl=0.0 wP3D=2.3 cmd=2% draws=22 tris=3724 imp=107 rl=0 rm=0 md=15
+19:04:56 [gpu] frame=5953 n=64 wall=84.7 build=80.8 proc=80.8 gpu=3.6 wVbl=0.0 wP3D=2.1 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:04:56 [prof] frame=5953 n=64 br=0.00 dsp=7.54 vtx=1.31 tri=14.58 imp=1.01 drw=0.29 mtx=0.02 oth=56.09 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:04:56 [profop] n=64 top:
+19:04:56 [rt] mode=ahead frame=5957 n=64 tasks=64 waitMain=82.87 waitRender=0.00 fence=0/0 segMerge=0 pace=0/64 latency=1 | ovl=1.80 jdp=82.87 jtop=0.00 brMain=0.29 bm=64 relWait=0 | bg=0.03 tk=83.05 en=1.62 ql=1.62 tb=0 texcacheMainMut=0
+19:04:58 [net] ctl accept from 10.0.0.1
+19:04:58 [rec] SHOT 'race03' at tick 6000
+19:04:58 [net] ctl closed (peer closed)
+19:04:58 [net] ctl accept from 10.0.0.1
+19:05:00 [watchdog] beat=30 frame=6001(+100) stage=2 fiber=3 aud=9115/9115 astage=0 spec=0 hle=9115 op=15 idx=51 heapUsed=43582632 heapFree=4389656 hwm=43582864 base=43036112 net=2
+19:05:00 [autotest] SHOT dumped -> autotest/race03.bmp
+19:05:00 [net] ctl closed (peer closed)
+19:05:00 [net] ctl accept from 10.0.0.1
+19:05:01 [net] ctl closed (peer closed)
+19:05:01 [net] ctl accept from 10.0.0.1
+19:05:01 [autotest] SHOT scanout dumped -> autotest/race03_scan.bmp
+19:05:01 [gpu] tag=race03 frame=6000 n=1 wall=3741.1 build=3737.4 proc=3737.4 gpu=3.6 wVbl=0.0 wP3D=2.4 cmd=2% draws=22 tris=3724 imp=107 rl=0 rm=0 md=15
+19:05:01 [net] cmd INI [debug] gputrace=0 rc=0
+19:05:01 [net] ctl closed (peer closed)
+19:05:01 [rec] end tick=6001 lines=6001
+19:05:01 [net] ctl accept from 10.0.0.1
+19:05:01 [net] cmd INI [native] interp=0 rc=0
+19:05:01 [net] cmd INI SAVE rc=0
+19:05:01 [net] ctl closed (peer closed)
+19:05:01 [gpu] frame=6017 n=64 wall=85.3 build=81.3 proc=81.3 gpu=3.6 wVbl=0.0 wP3D=2.2 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:05:01 [prof] frame=6017 n=64 br=0.00 dsp=7.52 vtx=1.27 tri=14.56 imp=1.08 drw=0.30 mtx=0.02 oth=56.54 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:05:01 [profop] n=64 top:
+19:05:01 [rt] mode=ahead frame=6021 n=64 tasks=64 waitMain=82.60 waitRender=0.00 fence=0/0 segMerge=0 pace=2/62 latency=1 | ovl=2.55 jdp=82.60 jtop=0.00 brMain=0.32 bm=64 relWait=0 | bg=0.03 tk=83.57 en=1.44 ql=1.43 tb=0 texcacheMainMut=0
+19:05:01 [net] ctl accept from 10.0.0.1
+19:05:14 [watchdog] beat=31 frame=6082(+81) stage=2 fiber=3 aud=9420/9420 astage=0 spec=0 hle=9420 op=15 idx=51 heapUsed=43580616 heapFree=4391672 hwm=43582864 base=43036112 net=2
+19:05:14 [gpu] frame=6081 n=64 wall=27.4 build=23.5 proc=23.5 gpu=3.8 wVbl=0.0 wP3D=2.4 cmd=2% draws=22 tris=3724 imp=6848 rl=0 rm=0 md=15
+19:05:14 [prof] frame=6081 n=64 br=0.00 dsp=7.93 vtx=1.32 tri=14.77 imp=1.05 drw=0.31 mtx=0.02 oth=-1.86 | vtxN=0 nV=68 nT=3724 nI=107 nD=22 nM=3 nRun=1
+19:05:14 --- log link closed ---
+19:05:16 --- log link from 10.0.0.1 ---

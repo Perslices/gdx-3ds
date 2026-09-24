@@ -72,6 +72,12 @@ const char* gdx3ds_config_get_string(const char* section, const char* key, const
  * keys/sections survive (the loader stores everything it parses); comments do not. */
 int gdx3ds_config_set_string(const char* section, const char* key, const char* value);
 int gdx3ds_config_set_int(const char* section, const char* key, int value);
+/* Remove a key entirely, so the next gdx3ds_config_get_* falls back to its DEFAULT.
+ * Setting the empty string cannot do this: the entry survives and the getters return ""
+ * (and for input_replay, main_3ds.cpp:772 only treats a MISSING/empty string as off,
+ * while gdx3ds_config_save would keep writing the key back out). Returns 0 if a key was
+ * removed, 3 if there was none (both leave the key absent), 1 on bad arguments. */
+int gdx3ds_config_unset(const char* section, const char* key);
 int gdx3ds_config_save(const char* path);
 
 #ifdef __cplusplus

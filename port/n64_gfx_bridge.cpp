@@ -35,8 +35,12 @@ extern "C" char __end__[];
 #include "port_log.h"
 #include "rom_buffer.h"
 #include "gdx_segment_source.h"
+#include "gdx_stall.h" /* A10: load-stall census (no-op unless [debug] stall = 1) */
 #include "n64_rdram.h"
 #include "n64_gfx_bridge.h"
+#if defined(GDX_PLATFORM_3DS)
+#include "3ds/gdx3ds_mainprof.h" /* MAINPROF: the [mprof] seg bucket */
+#endif
 #include "n64_gfx_convert.h"
 #include "gdx_vi_convert.h"
 #include "gdx_interp.h"
@@ -169,6 +173,108 @@ static inline void GdxRtFence() {
 }
 #else
 static inline void GdxRtFence() {}
+#endif
+
+/* [resolverace] THREAD-REACH CENSUS for the process-wide bridge state that `[native] interp=1`
+ * put on a second thread. Reading the code says which paths CAN reach a shared table; this says
+ * which threads DID, on real content, per window. Each site keeps a 2-bit mask (bit0 = the
+ * submitting/game thread, bit1 = the render thread) and a render-thread touch count, drained on
+ * the [race-dl] cadence as `[resolverace] ...`. A site whose mask reaches 3 is genuinely shared
+ * and needs an ordering argument; a site that stays 1 or 2 has a single owner in this
+ * configuration and the argument is "one owner", which is cheaper and stronger.
+ *
+ * Cost: one __thread read (cached after the first call on each thread) plus an OR per touch.
+ * The two hot memo sites are noted on the MISS path only, next to the gGdxBrFastStat miss
+ * counters that were already there. */
+enum GdxRaceSite {
+    GDX_RACE_SEG_APPEND = 0,    /* EnsureAssetSegmentImageImpl's three walk-scanned vector appends */
+    GDX_RACE_VER_BUMP,          /* GdxBumpResolveTablesVersion(), any site */
+    GDX_RACE_RESOLVE_MEMO,      /* gResolveMemo[8192] entry (re)write */
+    GDX_RACE_STUB_MEMO,         /* gWideStubMemo[1024] entry (re)write */
+    GDX_RACE_CLASS_MEMO,        /* gRangeClassMemo[1024] entry (re)write */
+    GDX_RACE_N64RANGE_MEMO,     /* gN64RangeMemo[1024] entry (re)write */
+    GDX_RACE_RANGE_SCAN,        /* a linear scan of gHostRanges / gLoadedAssetSegments */
+    GDX_RACE_PLACEHOLDER_MEMO,  /* gPlaceholderMemo[2048] entry (re)write */
+    GDX_RACE_TEXCOPY,           /* gRawTextureCopies / gRawTextureCopyIndex mutation */
+    GDX_RACE_SITE_COUNT
+};
+static uint8_t gGdxRaceMask[GDX_RACE_SITE_COUNT];
+static uint32_t gGdxRaceRtTouch[GDX_RACE_SITE_COUNT];
+/* Peak sizes of the three tables EnsureAssetSegmentImageImpl appends to, against the capacity
+ * sGdxTablesReserved pins. size == capacity is the moment a push_back reallocates under a
+ * concurrent scan, so the receipt has to carry the headroom, not just "it is reserved". */
+static uint32_t gGdxRacePeak[3];
+#if defined(GDX_PLATFORM_3DS)
+extern "C" int gdx3ds_rt_on_render_thread(void) __attribute__((weak));
+static __thread uint8_t tGdxRaceBit = 0; /* 0 = not yet resolved, 1 = submitter, 2 = render */
+static inline uint8_t GdxRaceBit() {
+    if (tGdxRaceBit == 0) {
+        const int rt = (&gdx3ds_rt_on_render_thread != nullptr) ? gdx3ds_rt_on_render_thread() : 0;
+        tGdxRaceBit = rt != 0 ? 2u : 1u;
+    }
+    return tGdxRaceBit;
+}
+static inline void GdxRaceNote(GdxRaceSite site) {
+    const uint8_t bit = GdxRaceBit();
+    gGdxRaceMask[site] = (uint8_t)(gGdxRaceMask[site] | bit);
+    if (bit == 2u) {
+        gGdxRaceRtTouch[site]++;
+    }
+}
+#else
+static inline uint8_t GdxRaceBit() { return 1u; }
+static inline void GdxRaceNote(GdxRaceSite site) { gGdxRaceMask[site] |= 1u; }
+#endif
+
+/* [resolverace] 6d: THE FOUR [brfast] MEMOS HAVE ONE OWNER THREAD.
+ *
+ * gResolveMemo[8192] (256 KiB), gWideStubMemo[1024], gRangeClassMemo[1024] and
+ * gN64RangeMemo[1024] are process-wide, and every writer publishes its KEYS before its PAYLOAD
+ * (TryResolveAddress writes e.raw/e.required/e.ver/e.segGen and only then e.full/e.offset/
+ * e.segment/e.ok, with e.filled already 1 on a reused slot). They cannot fault -- the keys
+ * reject a foreign entry -- but a concurrent reader can match the new keys and read the
+ * PREVIOUS entry's payload: a wrong host pointer for a VTX/MTX/SETTIMG operand, silently wrong
+ * geometry, no crash.
+ *
+ * The census says which configurations actually share them, and the answer decided this fix.
+ * Probing the entry of all four accessors on race-mutecity-start (--gfx vulkan, det=1,
+ * [rt] mode=pipe bridgemain=1):
+ *
+ *   [native] interp=0                     mask=1   the submitting thread only
+ *   [native] interp=1                     mask=2   the RENDER thread only
+ *   [native] all=1 interp=1               mask=2   the RENDER thread only
+ *   [native] interp=1 interp_verify=1     mask=3   BOTH -- the verify lane runs the LUS
+ *                                                  conversion on the submitter while the owned
+ *                                                  walker runs on core 2
+ *
+ * So the owner MOVES with the lever but there is only ever one of it -- except under
+ * interp_verify, whose whole job is to run both walkers at once. Paying a dmb on every memo
+ * probe in every shipping configuration to fix a lane that is already twice as slow is the
+ * wrong trade, and a release/acquire pair would not remove the sharing anyway; it would only
+ * make the torn read orderly. Removing the sharing is what fixed the facts memo (factsrace
+ * §3), and it is what happens here: the first thread to reach a memo claims it, and any other
+ * thread falls through to the uncached path those memos memoise. Identical answers by
+ * construction -- the memo is a pure function of its keys -- just not cached for the loser.
+ *
+ * Hot-path cost: one __thread byte, loaded and tested. The verdict is latched per thread on
+ * first use and can never change afterwards (the claim is a one-shot CAS), so there is no
+ * second read of the shared byte. Measured cost below the profiler's resolution -- see
+ * docs/research/native/resolverace-progress.md. */
+static std::atomic<uint8_t> gGdxMemoOwnerBit{0};
+#if defined(GDX_PLATFORM_3DS)
+static __thread uint8_t tGdxMemoOwned = 0; /* 0 = not yet decided, 1 = owner, 2 = foreign */
+static inline bool GdxMemoOwnedHere() {
+    if (tGdxMemoOwned == 0) {
+        const uint8_t bit = GdxRaceBit();
+        uint8_t expected = 0;
+        gGdxMemoOwnerBit.compare_exchange_strong(expected, bit, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire);
+        tGdxMemoOwned = (gGdxMemoOwnerBit.load(std::memory_order_relaxed) == bit) ? 1u : 2u;
+    }
+    return tGdxMemoOwned == 1u;
+}
+#else
+static inline bool GdxMemoOwnedHere() { return true; }
 #endif
 
 extern "C" uint8_t D_3000000[];
@@ -338,6 +444,7 @@ int gdx_trifast_enabled(void);
 // the [race-dl]/[wide] census gate reads [debug] verbose with it (n64_sched.c's
 // gdx_diag_audio_enabled uses the same extern-declaration pattern).
 int gdx3ds_config_get_bool(const char* section, const char* key, int fallback);
+int gdx3ds_native_lever(const char* key, int fallback);
 }
 #endif
 
@@ -606,6 +713,14 @@ struct N64AddressRange {
 struct PersistentRawTextureCopy {
     uintptr_t source = 0;
     size_t size = 0;
+    /* Bytes actually COPIED at the last (re)write. `size` is the ALLOCATION, which grows to the
+       largest extent any load of this source ever asked for and never shrinks; a later, smaller
+       load refreshes only its own extent and zero-fills the rest. Without this field a load that
+       needs more than the last refresh copied passed the `size < requiredBytes` resize test,
+       skipped the refill, and read the ZEROED tail as texels -- the LargeTiles transition, where
+       tile (0,0) refreshes 16058 bytes and tile (0,1) then reads to 16131. Same class as the
+       copy-shorter-than-the-load bug above, one level in. */
+    size_t copied = 0;
     std::unique_ptr<uint8_t[]> bytes;
     uint64_t dmaGenAtCopy = UINT64_MAX;
     /* gNativeRgba16Generation at the last content (re)write of this copy. While the generation
@@ -641,7 +756,39 @@ std::vector<uintptr_t> gPendingNativeRgba16RangeClears;
    copy taken under generation G stays content-valid until the generation changes — the
    invariant the per-frame compare skip in MakePersistentRawTextureCopy rests on. Framebuffer
    shadows are excluded from the skip (they mutate without re-registration). */
-uint64_t gNativeRgba16Generation = 1;
+/* [stubmemo] 6c, the sibling resolverace left: ATOMIC, for the same reason and on the same
+   shape as gGdxResolveTablesVersion / gConvertEpoch. Two threads read-modify-write this word:
+   gdx_set_native_rgba16_texture_range on the GAME thread (it opens with GdxRtFence(), which is
+   a join and says nothing about the other thread as a writer) and GdxGfxJobRelease's deferred
+   nativeClears retirement on the WALKING thread, which under `[native] interp=1` is the render
+   thread. A non-atomic `++` is load/add/store and loses increments when they interleave, and a
+   lost bump makes MakePersistentRawTextureCopy's compare skip (:3261) accept a copy minted
+   BEFORE a range mutation as if it were minted after it -- a persistent texture copy holding
+   the previous transition's screen, silently, with no fault. loadblock added a second consumer
+   (gdx_gfx_timg_class_epoch), so it is now load-bearing twice.
+
+   CORRECTION to the shape as filed (loadblock §7.2): the stated worst case was a TORN READ,
+   64-bit on ARM11 therefore strictly worse than the 32-bit siblings. That is not observable.
+   The counter starts at 1 and is bumped ~15 times in a whole corpus replay, so its high word is
+   0 for the life of the process and any tear yields the correct low word beside a zero high
+   word -- i.e. the correct value. The real hazard is exactly the 32-bit one: the LOST
+   INCREMENT. It is fixed the same way, and the 64-bit width is kept because the field it is
+   compared against (PersistentRawTextureCopy::nativeGenAtCopy) is 64-bit.
+
+   RELEASE on the bump, RELAXED on the read, the same pairing resolverace argued: release is
+   what orders the gNativeRgba16Ranges rows and the registered buffer's CONTENT before the
+   generation that advertises them, and the read sits on the per-frame texture-refresh path
+   where an acquire would be a dmb per persistent copy. */
+std::atomic<uint64_t> gNativeRgba16Generation{1};
+static_assert(std::atomic<uint64_t>::is_always_lock_free,
+              "gNativeRgba16Generation must not fall back to a libatomic lock: it is bumped "
+              "from the render thread inside GdxGfxJobRelease");
+static inline void GdxBumpNativeRgba16Generation() {
+    gNativeRgba16Generation.fetch_add(1u, std::memory_order_release);
+}
+static inline uint64_t GdxNativeRgba16Generation() {
+    return gNativeRgba16Generation.load(std::memory_order_relaxed);
+}
 std::vector<uint8_t> gSetupGfxSegment;
 std::vector<PersistentRawTextureCopy> gRawTextureCopies;
 /* [brfast] source -> index into gRawTextureCopies. The table is append-only (emplace_back only,
@@ -685,13 +832,49 @@ size_t gDiagTransitionCaptureSize = 0;
 // Bumped whenever an asset/ROM-backed segment image is (re)decoded, to invalidate converted
 // lists built against the old image. Declared ahead of EnsureAssetSegmentImage; the rest of the
 // converter state lives below, after the resolver helpers it needs.
-uint32_t gConvertEpoch = 1;
+/* [resolverace] 6c, second counter: ATOMIC for the same reason as gGdxResolveTablesVersion.
+   This is the wide-conversion cache's freshness key and EnsureAssetSegmentImageImpl bumps it
+   from whichever thread decoded the image, so under `[native] interp=1` the owned walker on
+   core 2 and the submitting thread inside prepare(N+1) can RMW it at the same time. A lost
+   bump here serves a wide conversion built against the PREVIOUS segment image. */
+std::atomic<uint32_t> gConvertEpoch{1};
+static inline void GdxBumpConvertEpoch() {
+    gConvertEpoch.fetch_add(1u, std::memory_order_release);
+}
+static inline uint32_t GdxConvertEpoch() {
+    return gConvertEpoch.load(std::memory_order_relaxed);
+}
 
 /* [brfast] Bumped at EVERY bridge-side mutation of the state TryResolveAddress reads: the
    append-only range/asset tables and the gSegments[] writes the bridge itself performs. The
    game-thread gSegments writers (decomp segment.c / decomp_port.c) are captured by the per-
    adapter snapshot in N64DisplayListAdapter::RefreshResolveGen. */
-static uint32_t gGdxResolveTablesVersion = 1;
+/* [resolverace] 6c: ATOMIC, because this counter is now read-modify-written from TWO threads.
+   `[native] interp=1` put the owned walker on the render thread, and its G_MOVEWORD segment
+   writes bump this from NativeSetSegment while the submitting thread is inside
+   gdx_gfx_job_prepare(N+1) bumping it from EnsureAssetSegmentForSymbol / EnsureSetupGfxSegment
+   (gdx3ds_rt_submit_task runs prepare BEFORE the backpressure wait, so the two overlap by
+   design). A non-atomic `++` is a load/add/store and loses increments when they interleave --
+   and this word is the SOLE freshness key of four process-wide memos, so a lost bump serves a
+   memo entry minted before a table mutation as if it were minted after it: a resolve that
+   returns the pre-mutation host pointer for a VTX/MTX/SETTIMG operand.
+
+   RELEASE on the bump, RELAXED on the read. The bump is rare (asset loads, segment writes) and
+   release is what makes the table rows and gSegments[] stores that precede it visible to a
+   thread that observes the new version. The read is in the hottest path in the bridge (every
+   memo probe), so it stays a plain `ldr`: an acquire there would put a dmb on every resolve.
+   The reader-side ordering that pairs with this lives on the memo entries themselves
+   (GdxResolveMemoEntry::ver, see [resolverace] 6d) rather than on this counter. */
+static std::atomic<uint32_t> gGdxResolveTablesVersion{1};
+/* Every mutation of the state TryResolveAddress reads goes through here, so the census can
+   see WHICH threads bump and a future reader cannot reintroduce a plain `++`. */
+static inline void GdxBumpResolveTablesVersion() {
+    GdxRaceNote(GDX_RACE_VER_BUMP);
+    gGdxResolveTablesVersion.fetch_add(1u, std::memory_order_release);
+}
+static inline uint32_t GdxResolveTablesVersion() {
+    return gGdxResolveTablesVersion.load(std::memory_order_relaxed);
+}
 /* [brfast] TryResolveAddress memo (direct-mapped, gfx thread only). Valid iff both the tables
    version and the adapter's gSegments/seg9/epoch snapshot match. Only the deterministic path
    is memoized (no legacy-resolve guessing, no seg9 diag gates) -- see TryResolveAddress. */
@@ -712,6 +895,27 @@ static GdxResolveMemoEntry gResolveMemo[8192]; // ~1.5k distinct VTX/MTX/SETTIMG
 static GdxResolveMemoEntry gWideStubMemo[1024];
 /* [brfast] receipt counters (drained on the [race-dl] cadence): memo hits/misses. */
 static uint32_t gGdxBrFastStat[6]; // resolve hit/miss, stub hit/miss, class miss, refreshGen
+/* [stubmemo] how often the NARROWED stub generation actually turns over, against mSegGen's
+   once-per-task. Cumulative over the run (mSegGen's own counter, gGdxTimgEpochChg[3], is too),
+   so the per-window rate is the difference between two consecutive [brfast] receipts. */
+static uint32_t gGdxStubGenLast = 0;
+static uint32_t gGdxStubGenChg = 0;
+/* [timgmemo] the terms of the last SETTIMG classification epoch, and how often each one moved.
+   Kept, because it is what found the mSegGen result below: when a memo under-hits, this names
+   the churning term outright instead of by elimination.
+     [0] gNativeRgba16Generation  [1] sVenueBuildingTexBase  [2] gGdxResolveTablesVersion
+     [3] mSegGen -- reported, NOT in the epoch
+   mSegGen is tracked but deliberately NOT keyed on: RefreshResolveGen folds all 16 gSegments
+   entries, and gSegments[1] is the double-buffered GfxPool the game rewrites at Gfx_InitBuffer
+   of the NEXT frame (see the comment on gSegments above). So mSegGen changes ONCE PER TASK by
+   construction -- measured at +64 per 64-task window, against +0 for every other term -- and
+   any memo keyed on it is a per-task memo whatever it claims to be. That is also why
+   gWideStubMemo takes 6592 misses and 0 hits per window ([brfast] stub=0/6592): it is keyed on
+   mSegGen for a SETTIMG answer that does not depend on segment 1 at all.
+   Diagnostic only, written on the walking thread. */
+static uint32_t gGdxTimgEpochParts[4];
+static uint32_t gGdxTimgEpochChg[4];
+
 /* [brfast] Host-range class of a command-source pointer (wide-command / raw-N64 / narrow
    host-command range membership): a pure function of the pointer and the append-only range
    tables, and the legacy path re-scanned all three tables (one of them ~140 rows) for every
@@ -725,6 +929,7 @@ struct GdxRangeClassMemoEntry {
     uint8_t isN64Cmd = 0;
 };
 static GdxRangeClassMemoEntry gRangeClassMemo[1024];
+
 
 // Set by gdx_gfx_run() whenever a real GFX task renders into the current host
 // frame; checked + cleared once per frame by gdx_vi_present_fallback(). When it
@@ -775,9 +980,92 @@ struct LoadedAssetSegment {
 };
 
 std::vector<LoadedAssetSegment> gLoadedAssetSegments;
+/* [resolverace] 6b: THE RENDER THREAD NEVER APPENDS TO THE WALK-SCANNED TABLES.
+ *
+ * EnsureAssetSegmentImageImpl publishes a freshly decoded segment image with three
+ * push_backs into gHostRanges / gRawN64Ranges / gLoadedAssetSegments. On the game thread that
+ * is safe because the GdxRtFence() above it is a JOIN: it waits out the in-flight task, so no
+ * walk is scanning when the appends land. On the RENDER thread the very same fence is a no-op
+ * (gdx3ds_renderthread.cpp: `if (sMode == kOff || tOnRenderThread || !OnMainThread()) return;`),
+ * and `[native] interp=1` put the owned walker there -- gdx_gfx_job_resolve_data ->
+ * NativeResolveData -> ResolveGuarded -> TryResolveAddress -> TryResolveAddressUncached ->
+ * ResolveGeneratedAssetStub -> EnsureAssetSegmentImage. A walk-time first load would then
+ * append from core 2 while the submitting thread, inside gdx_gfx_job_prepare(N+1), scans the
+ * same vectors (measured: the [resolverace] census reports scan mask=3, both threads).
+ *
+ * Two things go wrong in that direction, and the reserve above only covers the first:
+ *  - a push_back at capacity reallocates and frees the buffer the other thread is walking;
+ *  - even below capacity, push_back constructs the element and THEN bumps `finish`, with no
+ *    barrier between them, so a reader that observes the new size can still read the
+ *    unconstructed element -- for gLoadedAssetSegments that is a garbage bytes.data().
+ *
+ * So the render thread hands the finished image to the game thread instead, and the three
+ * tables keep exactly one writer. The buffer itself is NOT deferred: it is fully decoded,
+ * fixed up and range-registered before it gets here, `loaded.bytes` owns it, and moving that
+ * vector twice (here, then into gLoadedAssetSegments at the drain) never moves the heap block,
+ * so the `base` this function returns stays valid for the walk that asked for it. What the
+ * walk loses until the drain is only gHostRanges/gRawN64Ranges MEMBERSHIP of the new image --
+ * the same answer those tables give for any not-yet-registered pointer, and a graceful one.
+ *
+ * Drained by the first non-render-thread caller of EnsureAssetSegmentImageImpl or
+ * gdx_gfx_job_prepare. The pending queue is consulted by the cache-hit scan at the top of
+ * EnsureAssetSegmentImageImpl so a pending image is never decoded twice. Precedents in this
+ * file for exactly this shape: gPendingTextureCacheDeletes (main enqueues, the render thread
+ * drains) and gPendingNativeRgba16RangeClears. */
+static void GdxNoteSegTablePeaks(); /* defined with the reserve it audits, just below */
+static void GdxBumpConvertEpoch();
+static std::vector<LoadedAssetSegment> gPendingSegmentPublishes;
+static uint32_t gGdxSegPublishDeferred = 0; /* [resolverace] receipt: cumulative, both counters */
+static uint32_t gGdxSegPublishDrained = 0;
+#if defined(GDX_PLATFORM_3DS)
+static LightLock sGdxSegPublishLock; /* zero-init == unlocked, as sGdxTexDeletesLock */
+struct GdxSegPublishGuard {
+    GdxSegPublishGuard() { LightLock_Lock(&sGdxSegPublishLock); }
+    ~GdxSegPublishGuard() { LightLock_Unlock(&sGdxSegPublishLock); }
+};
+#else
+struct GdxSegPublishGuard {};
+#endif
+static inline bool GdxOnRenderThread() {
+    return GdxRaceBit() == 2u;
+}
+/* Append the three table rows for one image. Callers must be off the render thread. */
+static void GdxPublishSegmentImageRows(LoadedAssetSegment&& loaded) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(loaded.bytes.data());
+    const size_t size = loaded.bytes.size();
+    GdxNoteSegTablePeaks();
+    gHostRanges.push_back({ base, size });
+    gRawN64Ranges.push_back({ base, size });
+    gLoadedAssetSegments.emplace_back(std::move(loaded));
+    GdxNoteSegTablePeaks();
+    GdxBumpResolveTablesVersion();
+    /* A freshly decoded image may rebind a segment or move the targets converted lists resolved
+       against, so every cached wide conversion in the asset/ROM stamp space must be rebuilt. */
+    GdxBumpConvertEpoch();
+}
+/* Drain whatever a walk on the render thread deferred. No-op (one lock-free size read) in every
+   configuration measured so far, because the render thread has never reached a first load. */
+static void GdxDrainPendingSegmentPublishes() {
+    if (gPendingSegmentPublishes.empty() || GdxOnRenderThread()) {
+        return;
+    }
+    std::vector<LoadedAssetSegment> pending;
+    {
+        GdxSegPublishGuard segPublishGuard;
+        pending.swap(gPendingSegmentPublishes);
+    }
+    for (LoadedAssetSegment& loaded : pending) {
+        ++gGdxSegPublishDrained;
+        GdxPublishSegmentImageRows(std::move(loaded));
+    }
+}
 /* RENDER THREAD: these append-only tables are scanned by the walk on core 2 while the game
  * thread may append (asset first-loads, venue loads). A reallocation under a scan is UB, so
  * pin the storage once; the counts stay far below these ([bcache-census] tables=...). */
+/* [resolverace] Headroom receipt for the reserve below: the three tables
+   EnsureAssetSegmentImageImpl appends to, sampled either side of every append. A push_back only
+   reallocates (and so only frees a buffer a concurrent scan is walking) when size reaches
+   capacity, so "reserved" is a claim about these numbers, and this is the number. */
 static const bool sGdxTablesReserved = [] {
     gHostRanges.reserve(1024);
     gRawN64Ranges.reserve(1024);
@@ -787,6 +1075,15 @@ static const bool sGdxTablesReserved = [] {
     gLoadedAssetSegments.reserve(128);
     return true;
 }();
+static void GdxNoteSegTablePeaks() {
+    const uint32_t sizes[3] = { (uint32_t)gHostRanges.size(), (uint32_t)gRawN64Ranges.size(),
+                                (uint32_t)gLoadedAssetSegments.size() };
+    for (int i = 0; i < 3; ++i) {
+        if (sizes[i] > gGdxRacePeak[i]) {
+            gGdxRacePeak[i] = sizes[i];
+        }
+    }
+}
 
 /* Segments whose display-list dialect is KNOWN, so DLs inside their decompressed images can
  * skip the per-DL opcode scan (which misclassifies F3DEX2 setup DLs whose byte stream happens
@@ -815,6 +1112,7 @@ static GdxSegmentUcode GdxSegmentDialect(uint8_t segment) {
 }
 
 GdxSegmentUcode GdxAssetPointerDialect(uintptr_t addr) {
+    GdxRaceNote(GDX_RACE_RANGE_SCAN);
     for (const LoadedAssetSegment& seg : gLoadedAssetSegments) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(seg.bytes.data());
         if ((base != 0) && (addr >= base) && (addr < base + seg.bytes.size())) {
@@ -913,6 +1211,14 @@ bool IsN64FramebufferRange(uintptr_t source, size_t size) {
     return false;
 }
 
+/* [rawcopy-whole] True when `source` STARTS inside a registered native-RGBA16 range, whatever
+ * the load extent. The byte-order of a buffer is a property of the buffer, not of how many bytes
+ * a particular load asks for, and the owned interpreter has always decided it this way
+ * (DlSrc::TexelsAreNativeRgba16(p, 2)). The whole-span test below additionally required the load
+ * to FIT, which turned a load running one row past its own buffer into an unswapped copy --
+ * rainbow noise -- and is why the copy used to be clamped to the range instead. */
+bool NativeRgba16SourceStart(uintptr_t source);
+
 bool IsNativeRgba16Range(uintptr_t source, size_t size) {
     for (const HostRange& range : gNativeRgba16Ranges) {
         if (source >= range.begin && source + size <= range.begin + range.size) {
@@ -926,6 +1232,15 @@ bool IsNativeRgba16Range(uintptr_t source, size_t size) {
 // estimate that rounds up past the registered image (the WIPE transition's single wide LOADBLOCK
 // overshoots WIDTH*HEIGHT*2 by a row) would otherwise disable the byte swap for the whole copy;
 // clamping to this extent keeps CopyRawTextureBytes swapping.
+bool NativeRgba16SourceStart(uintptr_t source) {
+    for (const HostRange& range : gNativeRgba16Ranges) {
+        if (source >= range.begin && source < range.begin + range.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 size_t NativeRgba16RangeRemaining(uintptr_t source) {
     size_t best = 0;
     for (const HostRange& range : gNativeRgba16Ranges) {
@@ -937,6 +1252,14 @@ size_t NativeRgba16RangeRemaining(uintptr_t source) {
         }
     }
     return best;
+}
+
+/* [native] rawcopywhole killswitch, owned by the interpreter glue (gdx_rt_glue.cpp). Weak:
+ * desktop and the DL harness link neither that TU nor an ini, and there the fix is unconditional
+ * -- it removes an out-of-bounds read of the copy on every path. */
+extern "C" int gdx_ninterp_rawcopywhole(void) __attribute__((weak));
+static inline bool RawCopyWholeLoad() {
+    return (&gdx_ninterp_rawcopywhole == nullptr) || (gdx_ninterp_rawcopywhole() != 0);
 }
 
 bool NativeRgba16CopyMatches(const uint8_t* copy, uintptr_t source, size_t size) {
@@ -956,7 +1279,8 @@ bool NativeRgba16CopyMatches(const uint8_t* copy, uintptr_t source, size_t size)
 
 void CopyRawTextureBytes(uint8_t* destination, uintptr_t source, size_t size) {
     const auto* input = reinterpret_cast<const uint8_t*>(source);
-    if (!IsNativeRgba16Range(source, size)) {
+    const bool native = RawCopyWholeLoad() ? NativeRgba16SourceStart(source) : IsNativeRgba16Range(source, size);
+    if (!native) {
         std::memcpy(destination, input, size);
         return;
     }
@@ -1215,7 +1539,12 @@ static GdxPlaceholderMemoEntry gPlaceholderMemo[2048];
 
 bool IsAssetPlaceholderPointer(uint32_t low32) {
     GdxPlaceholderMemoEntry* memo = nullptr;
-    if (GdxBrFastOn()) {
+    /* [resolverace] 6d: process-wide, and it publishes keys (low32, valid) before payload
+       (result), so a foreign thread can match the new keys and read the previous entry's
+       answer. The factsrace audit did not name this one. Same owner latch as the other four;
+       LookupAssetSegment below is the uncached path a foreign thread falls through to. */
+    if (GdxBrFastOn() && GdxMemoOwnedHere()) {
+        GdxRaceNote(GDX_RACE_PLACEHOLDER_MEMO);
         memo = &gPlaceholderMemo[((low32 >> 3) ^ (low32 >> 14)) & 2047u];
         if (memo->valid != 0 && memo->low32 == low32) {
             return memo->result != 0;
@@ -1231,7 +1560,39 @@ bool IsAssetPlaceholderPointer(uint32_t low32) {
     return result;
 }
 
+static uintptr_t EnsureAssetSegmentImageImpl(const AssetSegmentLookup& lookup);
+
+/* MAINPROF: an asset segment fault (first load / mode reload) is one of the things the game
+ * thread does per frame that nobody had ever measured. This is the only wrapper; the body is
+ * unchanged below. _safe because the bridge walk reaches this from the render thread too --
+ * only main-context calls are charged, and the [mprof] `seg` column is therefore exactly the
+ * segment-fault milliseconds the SUBMITTING side pays. */
 uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
+#if defined(GDX_PLATFORM_3DS)
+    const int mpSeg = gdx3ds_mprof_enter_safe(GDX3DS_MPROF_SEG);
+    const uintptr_t r = EnsureAssetSegmentImageImpl(lookup);
+    gdx3ds_mprof_leave(mpSeg);
+    return r;
+#else
+    return EnsureAssetSegmentImageImpl(lookup);
+#endif
+}
+
+static uintptr_t EnsureAssetSegmentImageImpl(const AssetSegmentLookup& lookup) {
+    /* [resolverace] 6b: land anything a walk deferred BEFORE the cache scan below, so a pending
+       image is found by it and never decoded a second time. No-op off the deferral path. */
+    GdxDrainPendingSegmentPublishes();
+    if (!gPendingSegmentPublishes.empty()) {
+        /* Still pending (we are on the render thread): serve it from the queue rather than
+           decode a duplicate. */
+        GdxSegPublishGuard segPublishGuard;
+        for (LoadedAssetSegment& loaded : gPendingSegmentPublishes) {
+            if ((loaded.segment == lookup.segment) && (loaded.romBase == lookup.romBase) &&
+                (loaded.compressed == lookup.compressed) && !loaded.bytes.empty()) {
+                return reinterpret_cast<uintptr_t>(loaded.bytes.data());
+            }
+        }
+    }
     for (LoadedAssetSegment& loaded : gLoadedAssetSegments) {
         if ((loaded.segment == lookup.segment) &&
             (loaded.romBase == lookup.romBase) &&
@@ -1253,11 +1614,16 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
                bracketed. */
             if (gSegments[lookup.segment] == 0) {
                 gSegments[lookup.segment] = reinterpret_cast<uintptr_t>(loaded.bytes.data());
-                ++gGdxResolveTablesVersion;
+                GdxBumpResolveTablesVersion();
             }
             return reinterpret_cast<uintptr_t>(loaded.bytes.data());
         }
     }
+
+    /* A10 census: past the cache loop this is a first build of the segment image -- archive
+       read (nested GDX_STALL_SEG_BLOB/GDX_STALL_FS), MIO0 decode, fixups and range
+       registration. Scoped so every failure return is accounted for too. */
+    GdxStallScope gdxSegDecodeScope(GDX_STALL_SEG_DECODE);
 
     // Byte content comes from the shim only; gdx_rom_buffer/gdx_rom_size appear in this function
     // for bounds arithmetic, never as a content read. Gating on gdx_rom_buffer != NULL before the
@@ -1458,16 +1824,38 @@ uintptr_t EnsureAssetSegmentImage(const AssetSegmentLookup& lookup) {
        graphics thread reaches it. */
     if (gSegments[lookup.segment] == 0) {
         gSegments[lookup.segment] = base;
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
     }
-    GdxRtFence(); /* RENDER THREAD: a game-thread first-load appends to walk-scanned tables */
-    gHostRanges.push_back({ base, loaded.bytes.size() });
-    gRawN64Ranges.push_back({ base, loaded.bytes.size() });
-    gLoadedAssetSegments.emplace_back(std::move(loaded));
-    ++gGdxResolveTablesVersion;
-    // A freshly decoded image may rebind a segment or move the targets converted lists resolved
-    // against, so every cached wide conversion in the asset/ROM stamp space must be rebuilt.
-    ++gConvertEpoch;
+    /* On the game thread this fence is a JOIN and is what makes the appends below safe: it
+       waits out the in-flight task, so no walk is scanning the tables. On the RENDER thread it
+       returns immediately, which is why that thread defers instead -- see the
+       gPendingSegmentPublishes comment. */
+    GdxRtFence();
+    GdxRaceNote(GDX_RACE_SEG_APPEND);
+    if (GdxOnRenderThread()) {
+        /* [resolverace] 6b: a walk-time first load on core 2. The image is complete and `base`
+           stays valid (moving the bytes vector does not move its heap block); only the table
+           rows wait for the game thread. Bump the two freshness keys here anyway: the segment
+           claim above already changed what a resolve should return, and both counters are
+           atomic (6c), so bumping them from this thread is well-defined. */
+        {
+            GdxSegPublishGuard segPublishGuard;
+            gPendingSegmentPublishes.emplace_back(std::move(loaded));
+        }
+        ++gGdxSegPublishDeferred;
+        GdxBumpResolveTablesVersion();
+        GdxBumpConvertEpoch();
+        static int sSegDeferLogs = 0;
+        if (sSegDeferLogs < 8) {
+            ++sSegDeferLogs;
+            gdx_port_logf("[resolverace] segment first-load on the RENDER thread: seg=%u "
+                          "romBase=%08X bytes=%u -- rows deferred to the game thread\n",
+                          (unsigned) lookup.segment, (unsigned) lookup.romBase,
+                          (unsigned) gLoadedAssetSegments.size());
+        }
+        return base;
+    }
+    GdxPublishSegmentImageRows(std::move(loaded));
     return base;
 }
 
@@ -1528,6 +1916,7 @@ uintptr_t NormalizeLusDirectPointer(uintptr_t pointer) {
 }
 
 size_t RegisteredHostRemaining(uintptr_t full_addr) {
+    GdxRaceNote(GDX_RACE_RANGE_SCAN);
     for (const HostRange& range : gHostRanges) {
         if ((range.begin == 0) || (range.size == 0)) {
             continue;
@@ -1901,7 +2290,7 @@ uint64_t G2StampFor(const N64Gfx* src) {
     if (IsRdramHostPointer(reinterpret_cast<uintptr_t>(src))) {
         return gDmaGeneration;
     }
-    return 0x8000000000000000ull | static_cast<uint64_t>(gConvertEpoch);
+    return 0x8000000000000000ull | static_cast<uint64_t>(GdxConvertEpoch());
 }
 
 /* [traffic] Wide-cache stamp revalidator. An RDRAM-backed list's stamp is the GLOBAL DMA
@@ -2194,10 +2583,10 @@ uintptr_t EnsureSetupGfxSegment() {
         // overwrite gSegments[3] with a garbage arena-buffer address.
         gHostRanges.push_back({ segBase, gSetupGfxSegment.size() });
         gHostN64CommandRanges.push_back({ segBase, gSetupGfxSegment.size() });
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
         if (gSegments[3] == 0) {
             gSegments[3] = segBase;
-            ++gGdxResolveTablesVersion;
+            GdxBumpResolveTablesVersion();
         }
         return segBase;
     }
@@ -2350,7 +2739,7 @@ struct MapsRegion {
    to share, and the per-task Reset is a per-thread staleness bound anyway. */
 static std::vector<MapsRegion> s3dsMemoryRegionSlots[2];
 static __thread std::vector<MapsRegion>* t3dsMemoryRegions = nullptr;
-extern "C" int gdx3ds_rt_on_render_thread(void) __attribute__((weak));
+/* [resolverace] declared at file scope with the thread-reach census above. */
 static inline std::vector<MapsRegion>& S3dsRegions() {
     if (t3dsMemoryRegions == nullptr) {
         const int rt = (&gdx3ds_rt_on_render_thread != nullptr) ? gdx3ds_rt_on_render_thread() : 0;
@@ -2811,6 +3200,166 @@ static bool IsVenueBuildingTextureRange(uintptr_t source) {
     return (base != 0) && (source >= base) && (source < base + 0x800);
 }
 
+/* =============================================================================================
+ * [tmemblock] SOURCE-STABILITY SEAM (port/gdx_dlsrc_bridge.h, docs/research/native/
+ * tmemblock-progress.md S2)
+ *
+ * The owned walker re-mirrors ~4 KiB into mRdp.tmem on every G_LOADBLOCK and then re-hashes it,
+ * 128 times a task, and the texture cache reports hit=6848 miss=0 -- every one of those loads
+ * ends at last frame's entry. Its only skip (Interp::SameContentLoad) is gated on the o2r
+ * resource class, which the crowd's textures are not in, so it fires 1.1 % of the time.
+ *
+ * MakePersistentRawTextureCopy asks the SAME question of the SAME sources and answers it
+ * without a compare, by source class (:3280-3318). This seam is that classification and those
+ * two tests, lifted out so the owned walk can run them too, and DELIBERATELY NARROWER than the
+ * bridge's version in two places -- see gdx_gfx_tmem_source_unchanged.
+ *
+ * This is the dlfacts parity argument in the same shape: not a new derivation, the derivation
+ * the bridge has always used for the same question. What it is NOT is a content hash -- the
+ * texture cache already computes one over mRdp.tmem, and feeding it is the cost being removed.
+ * ============================================================================================= */
+
+/* The class values. gdx_dlsrc_bridge.h is only included at the [native] interp export block
+   far below (and including it HERE would drop its extern "C" declarations into this anonymous
+   namespace), so the names are restated and a static_assert beside the exports proves the two
+   spellings agree -- a mismatch would silently reclassify every source. */
+constexpr unsigned kTmemSrcUnknown = 0u;
+constexpr unsigned kTmemSrcNative = 1u;
+constexpr unsigned kTmemSrcDma = 2u;
+constexpr unsigned kTmemSrcStable = 3u;
+
+/* Source class, as MakePersistentRawTextureCopy's cascade orders it. The ORDER is part of the
+   definition: a native-RGBA16 framebuffer shadow is NATIVE by address and DMA by test, and the
+   bridge resolves that by testing IsN64FramebufferRange inside the native arm.
+   Exported as gdx_gfx_tmem_source_class() from the [native] interp export block below. */
+static bool TmemRangeOverlapsFramebuffer(uintptr_t source, size_t size) {
+    if (size > UINTPTR_MAX - source) {
+        return true; /* nonsense extent: answer the unsafe way round */
+    }
+    const uintptr_t end = source + size;
+    for (const N64FramebufferInfo& fb : gN64Framebuffers) {
+        const size_t fbSize = static_cast<size_t>(fb.width) * fb.height * sizeof(uint16_t);
+        if (fbSize != 0 && fbSize <= UINTPTR_MAX - fb.address && source < fb.address + fbSize &&
+            end > fb.address) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool TmemRangeOverlaps(uintptr_t source, size_t size, uintptr_t base, size_t span) {
+    return base != 0 && span != 0 && source < base + span && source + size > base;
+}
+
+static bool TmemRangeOverlapsGfxPool(uintptr_t source, size_t size) {
+    const size_t poolSize = gdx_gfxpool_sizeof();
+    return poolSize != 0 &&
+           TmemRangeOverlaps(source, size, reinterpret_cast<uintptr_t>(&D_8024DCE0[0]), poolSize * 2);
+}
+
+static bool TmemRangeOverlapsVenueBuildingTexture(uintptr_t source, size_t size) {
+    return TmemRangeOverlaps(source, size, sVenueBuildingTexBase.load(std::memory_order_relaxed), 0x800);
+}
+
+/* Every containment/exclusion test here is over the WHOLE extent, where the bridge's cascade
+   tests only the START. That is the third deliberate narrowing (tmemblock-progress.md S2): the
+   caller may hand a size that is an UPPER BOUND on what it will read, and an over-large extent
+   must only ever move a source toward a stricter class, never toward a laxer one. */
+unsigned GdxTmemSourceClass(uintptr_t source, size_t size) {
+    if (source == 0 || size == 0 || size > UINTPTR_MAX - source) {
+        return kTmemSrcUnknown;
+    }
+    if (NativeRgba16SourceStart(source)) {
+        /* Starts in a native-RGBA16 range. If it does not END in the same one it reads bytes
+           the generation says nothing about, and it must NOT be allowed to fall through to the
+           registered-host arm below, which answers "stable" unconditionally. */
+        if (!IsNativeRgba16Range(source, size)) {
+            return kTmemSrcUnknown;
+        }
+        /* Framebuffer shadows are rewritten by the fbmirror readback WITHOUT a re-registration,
+           so the generation does not cover them; the bridge hands them to the compare and this
+           seam hands them to the DMA test, which is what RecordHostWrite(:12869) feeds. */
+        return TmemRangeOverlapsFramebuffer(source, size) ? kTmemSrcDma : kTmemSrcNative;
+    }
+    if (IsRdramHostPointer(source) || TmemRangeOverlapsFramebuffer(source, size)) {
+        return kTmemSrcDma;
+    }
+    /* ROM-backed and stable after its segment is loaded. The two carve-outs are the bridge's
+       own: the GfxPools are registered host ranges but per-frame RAM scratch, and the venue
+       building-texture window is re-DMAed over a decoded asset image at every course load.
+       RegisteredHostRemaining() >= size, not > 0: the whole read has to be inside ONE registered
+       range for "stable by construction" to be a statement about all of the bytes. */
+    if (RegisteredHostRemaining(source) >= size && !TmemRangeOverlapsGfxPool(source, size) &&
+        !TmemRangeOverlapsVenueBuildingTexture(source, size)) {
+        return kTmemSrcStable;
+    }
+    return kTmemSrcUnknown;
+}
+
+/* The two generations, sampled together, for a caller about to read `source`. Sampled BEFORE
+   the read, never after: see GdxTmemSourceUnchanged. */
+void GdxTmemSourceStamp(uint64_t out[2]) {
+    out[0] = GdxNativeRgba16Generation();
+    out[1] = gDmaGeneration;
+}
+
+/* 1 when the bytes of [source, source+size) are provably identical to what they held when
+   `stamp` was taken. 0 means "not provably unchanged" and never "changed": every uncertainty
+   -- an unknown class, a class mismatch, a null stamp -- answers 0.
+ *
+ * TWO DELIBERATE NARROWINGS against MakePersistentRawTextureCopy, both stated in
+ * tmemblock-progress.md S2 rather than inherited:
+ *
+ * 1. The UNKNOWN class never answers 1. The bridge falls back to memcmp there and keeps a
+ *    correct answer; this seam has no copy to compare against (the owned walk reads the LIVE
+ *    source -- gdx_tmem.cpp's ResolveTextureSource is the bridge's translate "minus the
+ *    persistent copy"), so the only sound answer is "do the work".
+ *
+ * 2. The CLASS is re-derived and must MATCH the class the stamp was taken under. A source whose
+ *    class changed between two loads -- a range registered as native-RGBA16 after the first
+ *    load, a segment image whose registration appeared -- has had a table mutated under it, and
+ *    a stamp taken under the old class says nothing about the new one.
+ *
+ * 3. GdxTmemSourceClass tests the WHOLE extent where the bridge's cascade tests only the start,
+ *    so that a caller passing an upper bound on what it will read can only ever be classified
+ *    more strictly, never less.
+ *
+ * The RDRAM arm is also narrower than it looks and the narrowing is the caller's, not this
+ * function's: gDmaGeneration is bumped by DMA (Dma_LoadAssets / object.c / mio0_wrap) and by
+ * the bridge's own two RecordHostWrite sites, NOT by plain CPU stores into RDRAM. That is the
+ * one input this seam does not cover, and gdx_tmem.cpp's caller is what decides whether to use
+ * the arm at all. */
+int GdxTmemSourceUnchanged(uintptr_t source, size_t size, unsigned clsAtStamp,
+                           const uint64_t stamp[2]) {
+    if (source == 0 || size == 0 || stamp == nullptr) {
+        return 0;
+    }
+    const unsigned cls = GdxTmemSourceClass(source, size);
+    if (cls != clsAtStamp) {
+        return 0;
+    }
+    switch (cls) {
+        case kTmemSrcNative:
+            /* Every CPU writer of a non-framebuffer native-RGBA16 range finishes BEFORE the
+               gdx_set_native_rgba16_texture_range call that (re)registers it, and every
+               registration, re-registration and clear bumps gNativeRgba16Generation. So an
+               unchanged generation proves the bytes are unchanged. Always through the accessor
+               (release/relaxed pairing, CI-fenced): a bare read of that word is what the
+               `bridge cross-thread invariants` step exists to reject. */
+            return stamp[0] == GdxNativeRgba16Generation() ? 1 : 0;
+        case kTmemSrcDma:
+            return HostRangeChanged(source, size, stamp[1]) ? 0 : 1;
+        case kTmemSrcStable:
+            /* Stable by construction once its segment is loaded, and gLoadedAssetSegments never
+               evicts. A course load that replaces the image goes through the two carve-outs
+               gdx_gfx_tmem_source_class already applies, and a segment claim bumps the resolve
+               tables version, which moves the SETTIMG resolution the descriptor key holds. */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, bool* outRefreshed) {
     if (outRefreshed != nullptr) {
         *outRefreshed = false;
@@ -2828,9 +3377,30 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
     }
 
     const size_t copyBytes = std::min(requiredBytes, readable);
+    /* [rawcopy-short] A short copy is SILENT and its tail stays zero-filled, so the interpreter
+       samples transparent black for the bytes the load asked for and never got. Named because it
+       is the shape the interp track has now found twice (the o2r-by-name truncation of 2026-09-17
+       and the transition-strip residual of 2026-09-23): the owned walk reads the live source and
+       gets real texels there. Capped receipt, no behaviour change. */
+    if (copyBytes < requiredBytes) {
+        static int sShortCopyLogs = 0;
+        if (sShortCopyLogs < 24) {
+            ++sShortCopyLogs;
+            gdx_port_logf("[rawcopy-short] src=%p want=%zu readable=%zu copied=%zu (tail zero-filled)\n",
+                          reinterpret_cast<void*>(source), requiredBytes, readable, copyBytes);
+        }
+    }
 
     PersistentRawTextureCopy* foundCopy = nullptr;
-    if (GdxBrFastOn()) {
+    /* [resolverace] 6d, sixth memo: gRawTextureCopyIndex is an unordered_map rebuilt in place
+       whenever it disagrees with gRawTextureCopies. Two walkers rebuilding it at once corrupt
+       the container outright -- worse than a torn memo entry -- so it takes the same owner
+       latch and a foreign thread uses the linear scan below, which is what this index memoises.
+       (gRawTextureCopies itself is still appended by whichever thread walks; the census site
+       here is what says whether that is ever two threads. Measured mask so far: see
+       docs/research/native/resolverace-progress.md.) */
+    GdxRaceNote(GDX_RACE_TEXCOPY);
+    if (GdxBrFastOn() && GdxMemoOwnedHere()) {
         if (gRawTextureCopyIndex.size() != gRawTextureCopies.size()) {
             gRawTextureCopyIndex.clear();
             gRawTextureCopyIndex.reserve(gRawTextureCopies.size() + 64);
@@ -2853,9 +3423,21 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
     if (foundCopy != nullptr) {
         PersistentRawTextureCopy& copy = *foundCopy;
         const bool needsResize = (copy.bytes == nullptr) || (copy.size < requiredBytes);
-        bool changed = needsResize;
-        if (!needsResize) {
-            if (IsNativeRgba16Range(source, copyBytes)) {
+        /* [rawcopy-whole] The allocation may be big enough while the CONTENT is not: the last
+           refresh only copied its own (smaller) extent and zeroed the rest. Refill whenever this
+           load reaches past what was actually copied, or the interpreter samples zeros. */
+        const bool needsRefill = RawCopyWholeLoad() && !needsResize && (copy.copied < copyBytes);
+        if (needsRefill) {
+            static int sRefillLogs = 0;
+            if (sRefillLogs < 24) {
+                ++sRefillLogs;
+                gdx_port_logf("[rawcopy-whole] refill src=%p alloc=%zu copied=%zu now=%zu\n",
+                              reinterpret_cast<void*>(source), copy.size, copy.copied, copyBytes);
+            }
+        }
+        bool changed = needsResize || needsRefill;
+        if (!needsResize && !needsRefill) {
+            if (RawCopyWholeLoad() ? NativeRgba16SourceStart(source) : IsNativeRgba16Range(source, copyBytes)) {
                 /* Transition captures live in the back arena.  That address is
                    deliberately reused for the next transition, so treating a
                    registered host range as immutable leaves the persistent
@@ -2873,12 +3455,12 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
                    Framebuffer shadows keep the full compare: they are rewritten
                    (fbmirror readbacks) without re-registration. */
                 if (!IsN64FramebufferRange(source, copyBytes) &&
-                    copy.nativeGenAtCopy == gNativeRgba16Generation) {
+                    copy.nativeGenAtCopy == GdxNativeRgba16Generation()) {
                     changed = false;
                 } else {
                     changed = !NativeRgba16CopyMatches(copy.bytes.get(), source, copyBytes);
                     if (!changed) {
-                        copy.nativeGenAtCopy = gNativeRgba16Generation;
+                        copy.nativeGenAtCopy = GdxNativeRgba16Generation();
                     }
                 }
             } else if (IsRdramHostPointer(source) || IsN64FramebufferRange(source, copy.size)) {
@@ -2925,6 +3507,7 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
                 }
                 std::memset(copy.bytes.get(), 0, copy.size);
                 CopyRawTextureBytes(copy.bytes.get(), source, copyBytes);
+                copy.copied = copyBytes;
             } else {
                 if (copy.bytes != nullptr) {
                     {
@@ -2938,21 +3521,27 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
                 CopyRawTextureBytes(refreshed.get(), source, copyBytes);
                 copy.bytes = std::move(refreshed);
                 copy.size = requiredBytes;
+                copy.copied = copyBytes;
             }
             copy.dmaGenAtCopy = gDmaGeneration;
-            copy.nativeGenAtCopy = gNativeRgba16Generation;
+            copy.nativeGenAtCopy = GdxNativeRgba16Generation();
         }
         return reinterpret_cast<uintptr_t>(copy.bytes.get());
     }
 
+    /* A10 census: MINT path only. The cache-hit/compare path above is per-frame draw cost
+       the [prof] sections already price; this branch is a texture seen for the FIRST time,
+       which is load work landing inside the race window. */
+    GdxStallScope gdxTexMintScope(GDX_STALL_TEX_BUILD);
     PersistentRawTextureCopy copy = {};
     copy.source = source;
     copy.size = requiredBytes;
     copy.bytes = std::make_unique<uint8_t[]>(requiredBytes);
     std::memset(copy.bytes.get(), 0, requiredBytes);
     CopyRawTextureBytes(copy.bytes.get(), source, copyBytes);
+    copy.copied = copyBytes;
     copy.dmaGenAtCopy = gDmaGeneration;
-    copy.nativeGenAtCopy = gNativeRgba16Generation;
+    copy.nativeGenAtCopy = GdxNativeRgba16Generation();
 
     const uintptr_t out = reinterpret_cast<uintptr_t>(copy.bytes.get());
     gRawTextureCopies.emplace_back(std::move(copy));
@@ -3534,6 +4123,32 @@ static inline bool GdxBrOpGateOn() {
 }
 #endif
 
+/* [native] dlfacts -- the owned walker's list facts through the SAME per-list memo the
+   bridge's own EnqueueList uses. NativeListFacts (the owned path's only list-entry
+   derivation) calls CommandStrideForSource, CommandSourceIsBigEndian, GdxAssetPointerDialect
+   and DisplayListUsesF3D RAW on every G_DL, while the bridge routes the identical four
+   through ListFacts (FactsFor / FactsDialect / FactsUsesF3D). GdxAssetPointerDialect is a
+   linear scan of gLoadedAssetSegments, so under interp=1 that scan runs ~56 times per task
+   for answers the memo already holds -- the [dspop] census puts G_DL's resolve phase at
+   17.9 us/call, second only to G_LOADBLOCK. Latched once.
+   Requires brfast (the memo itself); with brfast off this is inert by construction.
+
+   PROMOTED to default 1 on native/tmemblock (stubmemo-progress.md S6): its own 12/12 corpus
+   gate is green (dispatch-progress.md "Parity", 0 divergent over 12 pairs) and the three memo
+   levers were then re-gated TOGETHER at these new defaults. `[native] dlfacts = 0` still
+   restores the raw derivation expression for expression. */
+static bool GdxDlFactsOn() {
+#ifdef __3DS__
+    static int sDlFacts = -1;
+    if (sDlFacts < 0) {
+        sDlFacts = gdx3ds_native_lever("dlfacts", 1) ? 1 : 0;
+    }
+    return sDlFacts == 1;
+#else
+    return false;
+#endif
+}
+
 /* [brfast] Per-list micro-optimisation killswitch for the bridge pre-pass. [debug] brfast=0
    (3DS ini) or GDX_BRFAST=0 (desktop env) restores the byte-identical legacy path: every
    fast helper below is an exact re-implementation that memoizes results of pure functions
@@ -3552,6 +4167,40 @@ static bool GdxBrFastOn() {
     }
     return sOn == 1;
 #endif
+}
+
+/* [stubmemo] Killswitch for the NARROWED gWideStubMemo key. [debug] stubgen=0 (3DS ini) or
+   GDX_STUBGEN=0 (desktop env) restores the byte-identical old key -- the all-sixteen mSegGen --
+   so the A/B and any bisect are one ini key, not two builds. Default 1: the narrow key is the
+   shipping one, because the wide key made the memo a pure cost (0 hits / 6592 misses per
+   window, [brfast] stub=). Read live from the adapter constructor, like brfast, and latched for
+   the task's lifetime so a mid-task toggle cannot split one walk across two keys. */
+static bool GdxStubGenNarrowOn() {
+#ifdef __3DS__
+    return gdx3ds_config_get_bool("debug", "stubgen", 1) != 0;
+#else
+    static int sOn = -1;
+    if (sOn < 0) {
+        const char* env = std::getenv("GDX_STUBGEN");
+        sOn = (env != nullptr && env[0] == '0') ? 0 : 1;
+    }
+    return sOn == 1;
+#endif
+}
+
+/* The RESOLVED values of the two bridge-side memo levers, for the [native] receipt that
+   gdx_rt_glue.cpp's Latch() prints. Every leg of every gate in this fork is checked against
+   its own receipt and never against the command line (resolverace's zsh word-splitting
+   gotcha). Once a lever ships default-ON that discipline needs the receipt to print what
+   RESOLVED, because "key absent" and "key = 1" now agree and a misspelt override no longer
+   shows up as a changed number. These two live in the bridge, so the receipt has to reach
+   them through a seam. */
+extern "C" int gdx_bridge_dlfacts_on(void) {
+    return GdxDlFactsOn() ? 1 : 0;
+}
+
+extern "C" int gdx_bridge_stubgen_narrow_on(void) {
+    return GdxStubGenNarrowOn() ? 1 : 0;
 }
 
 /* [brfast] Memo for TryResolveAddress's explicit-token (EK overlay) range scan: ~600 rows walked
@@ -3626,15 +4275,14 @@ class N64DisplayListAdapter {
           mRootByteEnd(reinterpret_cast<uintptr_t>(root) + rootSizeBytes),
           mIsBig(isBig),
           mStats(stats),
-          mBrFast(GdxBrFastOn()) {
+          mBrFast(GdxBrFastOn()),
+          mStubGenNarrow(GdxStubGenNarrowOn()) {
         GetMainModuleRange(mModuleBegin, mModuleEnd);
         if (mBrFast) {
             RefreshResolveGen();
-            // [brfast] one adapter = one gfx task: drop every per-list fact from the last one.
-            ListFacts* table = ListFactsTable();
-            for (size_t i = 0; i < kListFactsSlots; i++) {
-                table[i].src = nullptr;
-            }
+            // [brfast] one adapter = one gfx task: every per-list fact from the last task is
+            // already gone -- mFacts is this adapter's own array, empty by construction. The
+            // wipe loop this replaced was the shared-table hazard itself ([factsrace]).
         }
     }
 
@@ -4739,6 +5387,8 @@ class N64DisplayListAdapter {
     bool mIsBig = false;
     ConversionStats* mStats = nullptr;
     const bool mBrFast = false; // [brfast] per-list memo path (see ListFacts)
+    // [stubmemo] narrowed gWideStubMemo key ([debug] stubgen). Latched per task like mBrFast.
+    const bool mStubGenNarrow = true;
     std::unordered_map<const N64Gfx*, std::unique_ptr<ConvertedList>> mLists;
     std::vector<QueueItem> mWorkQueue;
     std::vector<Fast::F3DGfx> mNoopList{ MakeLusGfx(static_cast<uintptr_t>(kOpEndDl) << 24, 0) };
@@ -4805,7 +5455,7 @@ class N64DisplayListAdapter {
         /* Some game-built lists live inside the emulated RDRAM arena but use the
          * PORT Gfx ABI (16-byte packets with a pointer-width w1). They must win
          * over the general "RDRAM is raw N64" classification. */
-        if (mBrFast) {
+        if (mBrFast && GdxMemoOwnedHere()) {
             const GdxRangeClassMemoEntry& c = RangeClassFor(ptr);
             if (c.isWide != 0) {
                 return kHostBuiltGfxStride;
@@ -4819,10 +5469,11 @@ class N64DisplayListAdapter {
     }
     const GdxRangeClassMemoEntry& RangeClassFor(uintptr_t ptr) const {
         GdxRangeClassMemoEntry& e = gRangeClassMemo[static_cast<size_t>((ptr >> 4) ^ (ptr >> 14)) & 1023u];
-        if (e.filled == 0 || e.ptr != ptr || e.ver != gGdxResolveTablesVersion) {
+        if (e.filled == 0 || e.ptr != ptr || e.ver != GdxResolveTablesVersion()) {
             gGdxBrFastStat[4]++;
+            GdxRaceNote(GDX_RACE_CLASS_MEMO);
             e.ptr = ptr;
-            e.ver = gGdxResolveTablesVersion;
+            e.ver = GdxResolveTablesVersion();
             e.isWide = IsHostWideCommandPointer(ptr) ? 1 : 0;
             e.isRaw = IsRawN64HostPointer(ptr) ? 1 : 0;
             e.isN64Cmd = IsHostN64CommandPointer(ptr) ? 1 : 0;
@@ -4924,7 +5575,7 @@ class N64DisplayListAdapter {
         }
 
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(source);
-        if (mBrFast) {
+        if (mBrFast && GdxMemoOwnedHere()) {
             const GdxRangeClassMemoEntry& c = RangeClassFor(ptr);
             if (c.isRaw == 0 || c.isN64Cmd != 0) {
                 return false;
@@ -5007,7 +5658,23 @@ class N64DisplayListAdapter {
     }
 
     mutable uint32_t mSegGen = 0;     // [brfast] FNV of gSegments[] + seg9 state + epoch
+    /* [stubmemo] The SAME snapshot narrowed to the four segment slots ResolveWideAssetStubPointer
+       can actually read. See kStubResolverSegments and docs/research/native/
+       stubmemo-progress.md §1 for the enumeration that licenses the narrowing. */
+    mutable uint32_t mStubGen = 0;
     mutable uint32_t mEpochAtGen = 0; // epoch the snapshot was taken under
+    /* [stubmemo] The complete set of gSegments[] slots ResolveWideAssetStubPointer's three
+       resolvers can read:
+         0x0A  ResolveVenueBankAlias's guard and base, and ResolveGeneratedAssetStub's venue
+               live-carve preference (the ONLY segment that branch generalises to)
+         0x04  \
+         0x07   > ResolveGeneratedAssetStub's mode-owned live carve. gdx_mode_owns_segment
+         0x09  /  returns non-zero for these three and `default: return 0` for every other.
+       ResolveHostPointerStub reads no segment state, and EnsureAssetSegmentImage's touch of
+       gSegments[lookup.segment] is a first-claim store whose result the function discards
+       (§1c). Twelve slots -- including gSegments[1], the double-buffered GfxPool -- are not on
+       this path at all, and folding them is what made this memo take 0 hits per window. */
+    static constexpr uint8_t kStubResolverSegments[4] = { 0x04u, 0x07u, 0x09u, 0x0Au };
     void RefreshResolveGen() const {
         uint32_t h = 2166136261u;
         const auto mix = [&h](uint32_t v) {
@@ -5019,17 +5686,57 @@ class N64DisplayListAdapter {
             mix(static_cast<uint32_t>(base));
             mix(static_cast<uint32_t>(static_cast<uint64_t>(base) >> 32));
         }
-        mix(gdx_mode_segment9_state());
+        const uint32_t seg9State = gdx_mode_segment9_state();
+        mix(seg9State);
         gGdxBrFastStat[5]++;
         mEpochAtGen = GdxSegmentEpochSnapshot();
         mix(mEpochAtGen);
         mSegGen = h;
+        /* [stubmemo] The narrowed term, from the same sample of the same state -- so the two
+           generations can never disagree about WHEN they were taken, only about WHAT they fold.
+           The epoch is kept and is load-bearing, not decorative: it is the only term that covers
+           a seg-4/seg-7 CONTENT-family switch, which reloads a different ROM family into the
+           same address and therefore does not move gSegments[4]/[7] at all (decomp_port.c:855,
+           :873). Its only two assignment sites both sit inside gdx_segment_epoch_begin/end
+           (decomp_port.c:1312-1364), and the epoch is a strictly monotone fetch_add, so a family
+           switch always changes this hash. gdx_mode_segment9_state() covers sGdxSeg9Active /
+           sGdxSeg9ActiveSize, which gdx_mode_owns_segment(9) and
+           gdx_mode_segment_content_matches(9, ..) read. */
+        uint32_t sh = 2166136261u;
+        const auto smix = [&sh](uint32_t v) {
+            sh ^= v;
+            sh *= 16777619u;
+        };
+        for (uint8_t seg : kStubResolverSegments) {
+            const uintptr_t base = gSegments[seg];
+            smix(static_cast<uint32_t>(base));
+            smix(static_cast<uint32_t>(static_cast<uint64_t>(base) >> 32));
+        }
+        smix(seg9State);
+        smix(mEpochAtGen);
+        mStubGen = sh;
+        if (sh != gGdxStubGenLast) {
+            gGdxStubGenChg++;
+            gGdxStubGenLast = sh;
+        }
+        /* [timgmemo] churn probe: mSegGen folds gSegments[1], the double-buffered GfxPool the
+           game rewrites every frame, so this counter rises once per task and every memo keyed
+           on mSegGen is per-task. See gGdxTimgEpochParts. */
+        if (h != gGdxTimgEpochParts[3]) {
+            gGdxTimgEpochChg[3]++;
+            gGdxTimgEpochParts[3] = h;
+        }
     }
     /* [brfast] == ResolveWideAssetStubPointer(full, mModuleBegin, mModuleEnd, required): venue
        bank alias (gSegments[0xA]), generated asset stubs (const tables + loaded segments) and
-       host-pointer stubs -- all covered by the tables version + segment snapshot. */
+       host-pointer stubs -- all covered by the tables version + segment snapshot.
+       [stubmemo] ...and the segment snapshot is now the NARROWED one. With mSegGen this memo
+       measured 0 hits against 6592 misses per 64-task window, because mSegGen folds
+       gSegments[1] and so turns over once per task by construction -- the bridge was paying a
+       full resolve PLUS a probe PLUS a fill on every host-tagged SETTIMG. */
+    uint32_t StubMemoGen() const { return mStubGenNarrow ? mStubGen : mSegGen; }
     uintptr_t ResolveWideAssetStubPointerFast(uintptr_t full, size_t requiredBytes) const {
-        if (!mBrFast || full == 0 || requiredBytes > 0xFFFFFFFFu) {
+        if (!mBrFast || full == 0 || requiredBytes > 0xFFFFFFFFu || !GdxMemoOwnedHere()) {
             return ResolveWideAssetStubPointer(full, mModuleBegin, mModuleEnd, requiredBytes);
         }
         if (GdxSegmentEpochSnapshot() != mEpochAtGen) {
@@ -5039,16 +5746,17 @@ class N64DisplayListAdapter {
         const uint32_t h = (low * 2654435761u) ^ (static_cast<uint32_t>(requiredBytes) * 40503u) ^ 0x5bd1e995u;
         GdxResolveMemoEntry& e = gWideStubMemo[(h >> 22) & 1023u];
         if (e.filled != 0 && e.raw == low && e.required == static_cast<uint32_t>(requiredBytes) &&
-            e.ver == gGdxResolveTablesVersion && e.segGen == mSegGen && e.full == full) {
+            e.ver == GdxResolveTablesVersion() && e.segGen == StubMemoGen() && e.full == full) {
             gGdxBrFastStat[2]++;
             return e.result;
         }
         gGdxBrFastStat[3]++;
+        GdxRaceNote(GDX_RACE_STUB_MEMO);
         const uintptr_t out = ResolveWideAssetStubPointer(full, mModuleBegin, mModuleEnd, requiredBytes);
         e.raw = low;
         e.required = static_cast<uint32_t>(requiredBytes);
-        e.ver = gGdxResolveTablesVersion;
-        e.segGen = mSegGen;
+        e.ver = GdxResolveTablesVersion();
+        e.segGen = StubMemoGen();
         e.full = full;
         e.offset = 0;
         e.segment = 0;
@@ -5061,7 +5769,8 @@ class N64DisplayListAdapter {
     bool TryResolveAddress(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false,
                            uintptr_t sourceHint = 0) const {
         if (!mBrFast || preferPhysical || sourceHint != 0 || raw == 0 || requiredBytes > 0xFFFFFFFFu ||
-            LegacyResolveEnabled() || gdx_dev_gate(GDX_GATE_LOG_FILE) || gdx_dev_gate(GDX_GATE_DIAG_NODEINFO)) {
+            LegacyResolveEnabled() || gdx_dev_gate(GDX_GATE_LOG_FILE) || gdx_dev_gate(GDX_GATE_DIAG_NODEINFO) ||
+            !GdxMemoOwnedHere()) {
             return TryResolveAddressUncached(raw, out, requiredBytes, preferPhysical, sourceHint);
         }
         if (GdxSegmentEpochSnapshot() != mEpochAtGen) {
@@ -5070,7 +5779,7 @@ class N64DisplayListAdapter {
         const uint32_t h = (raw * 2654435761u) ^ (static_cast<uint32_t>(requiredBytes) * 40503u);
         GdxResolveMemoEntry& e = gResolveMemo[(h >> 19) & 8191u];
         if (e.filled != 0 && e.raw == raw && e.required == static_cast<uint32_t>(requiredBytes) &&
-            e.ver == gGdxResolveTablesVersion && e.segGen == mSegGen) {
+            e.ver == GdxResolveTablesVersion() && e.segGen == mSegGen) {
             gGdxBrFastStat[0]++;
             if (e.ok != 0) {
                 out.full = e.full;
@@ -5081,10 +5790,11 @@ class N64DisplayListAdapter {
             return e.ok != 0;
         }
         gGdxBrFastStat[1]++;
+        GdxRaceNote(GDX_RACE_RESOLVE_MEMO);
         const bool ok = TryResolveAddressUncached(raw, out, requiredBytes, false, 0);
         e.raw = raw;
         e.required = static_cast<uint32_t>(requiredBytes);
-        e.ver = gGdxResolveTablesVersion; // the call itself may have appended (asset load)
+        e.ver = GdxResolveTablesVersion(); // the call itself may have appended (asset load)
         e.segGen = mSegGen;
         e.full = out.full;
         e.offset = out.offset;
@@ -5137,7 +5847,7 @@ class N64DisplayListAdapter {
             int32_t matchIdx = -1;
             bool memoHit = false;
             GdxN64RangeMemoEntry* memo = nullptr;
-            if (GdxBrFastOn() && rangeCount != 0 && requiredBytes <= 0xFFFFFFFFu &&
+            if (GdxBrFastOn() && GdxMemoOwnedHere() && rangeCount != 0 && requiredBytes <= 0xFFFFFFFFu &&
                 rangeCount <= 0x7FFFFFFFu) {
                 const uint32_t h = (raw * 2654435761u) ^ (static_cast<uint32_t>(requiredBytes) * 40503u);
                 memo = &gN64RangeMemo[(h >> 22) & 1023u];
@@ -5160,6 +5870,7 @@ class N64DisplayListAdapter {
                     }
                 }
                 if (memo != nullptr) {
+                    GdxRaceNote(GDX_RACE_N64RANGE_MEMO);
                     memo->raw = raw;
                     memo->required = static_cast<uint32_t>(requiredBytes);
                     memo->count = static_cast<uint32_t>(rangeCount);
@@ -5751,8 +6462,29 @@ class N64DisplayListAdapter {
         // limit is coarse: the 8 MB RDRAM calloc is one VirtualAlloc block, so ReadableByteLimit
         // would report 7+ MB remaining for a pointer anywhere inside it.
         const size_t registeredRemaining = RegisteredHostRemaining(translated);
+        const size_t pageReadable = ReadableByteLimit(translated);
         size_t readable = registeredRemaining;
-        if (readable == 0) readable = ReadableByteLimit(translated);
+        if (readable == 0) readable = pageReadable;
+        /* [rawcopy-whole] A registered range is BOOKKEEPING, not a memory bound. The game does
+           issue loads that run past the end of the buffer they start in -- the last 3-row strip
+           of a transition reads one 592-byte row past backgroundBuffer -- and on the console DRAM
+           simply continues there, which is what the owned walk reads. Clamping the copy to the
+           registered extent did not prevent that read; it moved it, so the interpreter read past
+           the end of the COPY instead: unrelated host heap, decoded as texels. Serve the whole
+           load and bound it with the page-level limit, which is the only real safety bound. */
+        if (RawCopyWholeLoad() && estimatedBytes != 0 && readable < estimatedBytes && pageReadable > readable) {
+            const size_t whole = std::min<size_t>(pageReadable, estimatedBytes);
+            if (whole > readable) {
+                static int sWholeLogs = 0;
+                if (sWholeLogs < 24) {
+                    ++sWholeLogs;
+                    gdx_port_logf("[rawcopy-whole] src=%p load=%zu registered=%zu page=%zu served=%zu\n",
+                                  reinterpret_cast<const void*>(translated), estimatedBytes,
+                                  registeredRemaining, pageReadable, whole);
+                }
+                readable = whole;
+            }
+        }
 
         size_t required = estimatedBytes;
         if (required == 0) {
@@ -6010,16 +6742,39 @@ class N64DisplayListAdapter {
         GdxSegmentUcode dialect = GdxSegmentUcode::Unknown;
     };
     static constexpr size_t kListFactsSlots = 256;
-    static ListFacts* ListFactsTable() {
-        static ListFacts sTable[kListFactsSlots];
-        return sTable;
-    }
+    /* [factsrace] PER ADAPTER -- never a process-wide table. This memo used to live in a
+       function-local `static` table of 256 slots that the adapter constructor wiped once per
+       gfx task ("one adapter = one gfx task"). That was single-owner only while the BRIDGE walk
+       was its only reader. With `[native] interp=1` the OWNED walker reaches the very same memo
+       from the RENDER thread (gdx_gfx_job_resolve_list -> NativeResolveList ->
+       KnownCommandLimitFast / LooksLikeDisplayListFast -> FactsFor) while MAIN is already
+       constructing the NEXT task's adapter: gdx3ds_rt_submit_task runs gdx_gfx_job_prepare(N+1)
+       BEFORE the backpressure wait, deliberately, so the bridge of N+1 overlaps the tail of
+       render(N) (gdx3ds_renderthread.cpp, "BRIDGE ON MAIN"). Main's per-task wipe then nulled a
+       slot whose ListFacts& the render thread was still holding, and FactsScan dereferenced
+       nullptr + the host-endian +3 opcode offset -- the 2026-09-23 New 3DS hardware abort
+       (core 2, data abort, dfsr=0x05 translation fault, far=0x00000003, pc in FactsScan).
+       The adapter IS the per-task object, so the memo belongs to it: one adapter = one task =
+       one walker, the wipe disappears (a fresh adapter starts with empty slots by construction),
+       and neither thread can reach the other's facts. Deliberately NOT thread_local: the wipe
+       runs in the constructor, on MAIN, so a per-thread table would never be cleared on the
+       thread that does not construct adapters and would serve the PREVIOUS task's facts for a
+       recycled source pointer -- wrong facts, not just a crash. (Compare the
+       s3dsMemoryRegionSlots[2] split above, which can be per-thread precisely because its
+       staleness bound is per-thread too.)
+       Cost: sizeof(ListFacts) * 256 = 8 KiB per adapter on the 3DS, at most two live at a time
+       (the task rendering and the task being prepared), value-initialised at construction. */
+    mutable ListFacts mFacts[kListFactsSlots];
+    /* Bounds the per-adapter cost this move introduced: 8 words/slot = 8 KiB on the 3DS (32-bit),
+       and the assert fires if a new field pushes it past that. */
+    static_assert(sizeof(ListFacts) <= 8 * sizeof(size_t),
+                  "[factsrace] ListFacts grew: mFacts is kListFactsSlots of these PER ADAPTER");
     static size_t ListFactsSlot(const N64Gfx* src) {
         const uintptr_t p = reinterpret_cast<uintptr_t>(src);
         return static_cast<size_t>((p >> 4) ^ (p >> 12)) & (kListFactsSlots - 1);
     }
     ListFacts& FactsFor(const N64Gfx* src) const {
-        ListFacts& f = ListFactsTable()[ListFactsSlot(src)];
+        ListFacts& f = mFacts[ListFactsSlot(src)];
         if (f.src != src) {
 #ifdef __3DS__
             const bool timed = GdxBrOpGateOn();
@@ -6071,6 +6826,23 @@ class N64DisplayListAdapter {
         if (f.endIdx != SIZE_MAX || f.firstBadIdx != SIZE_MAX || bound <= f.scanBound) {
             return;
         }
+        /* [factsrace] ASSERTION, not a guard. Every caller reaches FactsScan through FactsFor,
+           which stores a non-null src, and the three Fast entry points null-check `source`
+           first -- so a null f.src here is proof that something is mutating this adapter's
+           facts underneath the walker again (the shared-table race the memo was moved out of).
+           Say so loudly and reject the list (render nothing) instead of faulting on
+           nullptr + 3, which is exactly what the 0923 hardware dump caught. */
+        if (f.src == nullptr) {
+            static int sFactsNullLogs = 0;
+            if (sFactsNullLogs < 8) {
+                ++sFactsNullLogs;
+                gdx_port_logf("[factsrace] ASSERT FactsScan: f.src == nullptr (slot torn under "
+                              "the walker) stride=%zu scanBound=%zu bound=%zu adapter=%p\n",
+                              f.stride, f.scanBound, bound, reinterpret_cast<const void*>(this));
+            }
+            f.firstBadIdx = f.scanBound;
+            return;
+        }
         // Opcode byte only: w0 is the first 4 bytes of every layout; a big-endian narrow
         // list keeps it at +0, a host-endian (wide or narrow) list at +3 -- exactly what
         // Opcode(ReadCommand(...).w0) yields, without the 8/16-byte memcpy + byteswap per step.
@@ -6114,7 +6886,9 @@ class N64DisplayListAdapter {
             return f.endIdx + 1;
         }
         if (f.firstBadIdx < limit) {
-            return TerminatorBoundedLimit(f.src, limit); // legacy scan ignores bad opcodes
+            // [factsrace] f.src is non-null by construction; the check pairs with the FactsScan
+            // assertion so a torn slot rejects the list instead of faulting in the legacy tail.
+            return (f.src != nullptr) ? TerminatorBoundedLimit(f.src, limit) : limit;
         }
         return limit;
     }
@@ -6129,7 +6903,8 @@ class N64DisplayListAdapter {
             return f.endIsF3d;
         }
         if (f.firstBadIdx < scanLimit) {
-            return DisplayListUsesF3D(f.src, limit, f.stride, f.isBig); // legacy scan ignores bad opcodes
+            // [factsrace] same pairing as FactsTerminatorBounded's tail.
+            return (f.src != nullptr) && DisplayListUsesF3D(f.src, limit, f.stride, f.isBig);
         }
         return false;
     }
@@ -6290,13 +7065,21 @@ class N64DisplayListAdapter {
     }
     void NativeListFacts(const N64Gfx* target, size_t limit, const N64Gfx** outPtr, size_t* outLimit,
                          size_t* outStride, bool* outBig, bool* outF3d) const {
-        const size_t stride = CommandStrideForSource(target);
-        const bool isBig = CommandSourceIsBigEndian(target, stride);
-        const GdxSegmentUcode dialect = GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(target));
+        /* [native] dlfacts: the memoized derivation, spelled exactly as EnqueueList spells it
+           (the `facts != nullptr` arms above) -- stride and endianness from FactsFor, the
+           dialect from FactsDialect, the F3D scan from FactsUsesF3D. Same four answers, each
+           computed once per list instead of once per G_DL. */
+        ListFacts* facts = (mBrFast && GdxDlFactsOn() && target != nullptr) ? &FactsFor(target) : nullptr;
+        const size_t stride = (facts != nullptr) ? facts->stride : CommandStrideForSource(target);
+        const bool isBig = (facts != nullptr) ? facts->isBig : CommandSourceIsBigEndian(target, stride);
+        const GdxSegmentUcode dialect = (facts != nullptr)
+                                            ? FactsDialect(*facts)
+                                            : GdxAssetPointerDialect(reinterpret_cast<uintptr_t>(target));
         const bool isF3d = (dialect == GdxSegmentUcode::F3D)    ? true
                            : (dialect == GdxSegmentUcode::F3DEX2) ? false
                            : (IsF3DAssetPointer(reinterpret_cast<uintptr_t>(target)) ||
-                              DisplayListUsesF3D(target, limit, stride, isBig));
+                              ((facts != nullptr) ? FactsUsesF3D(*facts, limit)
+                                                  : DisplayListUsesF3D(target, limit, stride, isBig)));
         *outPtr = target;
         *outLimit = limit;
         *outStride = stride;
@@ -6319,6 +7102,11 @@ class N64DisplayListAdapter {
             const size_t candidateLimit = KnownCommandLimitFast(candidate);
             return (candidateLimit != 0) && LooksLikeDisplayListFast(candidate, candidateLimit);
         };
+        /* NOTE the double validation below: isValidTarget() already ran both predicates on
+           this target, and the tail runs them again. With [debug] brfast on (the default)
+           both are ListFacts memo hits, so the cost is two hash probes, not two scans -- the
+           [dspop] census says the G_DL resolve phase is dominated by NativeListFacts, not by
+           these. Left as-is deliberately: collapsing it changes which call reports a failure. */
         if (!hostPtr && !isValidTarget(target)) {
             const uint32_t alignedRaw = raw & ~static_cast<uint32_t>(7u);
             if (alignedRaw != raw) {
@@ -6374,7 +7162,7 @@ class N64DisplayListAdapter {
         if (translated != 0) {
             const uintptr_t normalized = NormalizeLusDirectPointer(translated);
             if (gSegments[segIdx] != normalized) {
-                ++gGdxResolveTablesVersion;
+                GdxBumpResolveTablesVersion();
             }
             gSegments[segIdx] = normalized;
         } else if (raw != 0) {
@@ -7399,15 +8187,55 @@ class N64DisplayListAdapter {
                                    WITHOUT the swap, so the un-revealed wipe region renders as
                                    rainbow noise. The estimate's tail bytes lie beyond the last
                                    real load anyway. */
-                                const size_t nativeRemaining = NativeRgba16RangeRemaining(hostTextureSource);
-                                if (nativeRemaining != 0 && nativeRemaining < readable) {
-                                    readable = nativeRemaining;
+                                /* [rawcopy-whole] The clamp to the native extent existed only to
+                                   keep CopyRawTextureBytes swapping (its all-or-nothing whole-span
+                                   test); with the swap decided by the range the source STARTS in,
+                                   a copy that spills is still swapped, so the whole load can be
+                                   served. Page-bounded, like the segmented twin above. */
+                                if (!RawCopyWholeLoad()) {
+                                    const size_t nativeRemaining = NativeRgba16RangeRemaining(hostTextureSource);
+                                    if (nativeRemaining != 0 && nativeRemaining < readable) {
+                                        readable = nativeRemaining;
+                                    }
+                                } else if (readable != 0) {
+                                    const size_t pageReadable = ReadableByteLimit(hostTextureSource);
+                                    if (pageReadable > readable) {
+                                        if (estimatedBytes > readable) {
+                                            static int sWholeHostLogs = 0;
+                                            if (sWholeHostLogs < 24) {
+                                                ++sWholeHostLogs;
+                                                gdx_port_logf("[rawcopy-whole] native src=%p load=%zu registered=%zu "
+                                                              "page=%zu served=%zu\n",
+                                                              reinterpret_cast<const void*>(hostTextureSource),
+                                                              estimatedBytes, readable, pageReadable,
+                                                              std::min<size_t>(pageReadable, estimatedBytes));
+                                            }
+                                        }
+                                        readable = pageReadable;
+                                    }
                                 }
                                 size_t required = estimatedBytes;
                                 if (required == 0) {
                                     required = std::min(readable, kMaxRawTextureCopyBytes);
                                 }
+                                const size_t requiredBeforeClamp = required;
                                 required = std::min(required, readable);
+                                /* [rawcopy-short] The clamp is SILENT: the interpreter is handed a
+                                   copy shorter than the load it is about to issue, and its
+                                   LOADBLOCK then reads past the end of that heap allocation --
+                                   unrelated host bytes, not the bytes after the game's buffer.
+                                   Same shape as the o2r-by-name truncation of 2026-09-17. */
+                                if (requiredBeforeClamp != 0 && required < requiredBeforeClamp) {
+                                    static int sNativeShortLogs = 0;
+                                    if (sNativeShortLogs < 24) {
+                                        ++sNativeShortLogs;
+                                        gdx_port_logf("[rawcopy-short] native-rgba16 src=%p want=%zu "
+                                                      "nativeRemaining=%zu served=%zu\n",
+                                                      reinterpret_cast<void*>(hostTextureSource),
+                                                      requiredBeforeClamp,
+                                                      NativeRgba16RangeRemaining(hostTextureSource), required);
+                                    }
+                                }
 
                                 bool textureCopyRefreshed = false;
                                 outW1 = MakePersistentRawTextureCopy(hostTextureSource, required,
@@ -7881,7 +8709,7 @@ class N64DisplayListAdapter {
                                 }
                             }
                             if (gSegments[segIdx] != normalized) {
-                                ++gGdxResolveTablesVersion; // [brfast] same-value rewrites keep the memo
+                                GdxBumpResolveTablesVersion(); // [brfast] same-value rewrites keep the memo
                             }
                             gSegments[segIdx] = normalized;
                         } else if (in.w1 != 0 && segIdx < kGfxSegmentCount) {
@@ -8162,7 +8990,7 @@ class N64DisplayListAdapter {
                             if (translated != 0 && segIdx < kGfxSegmentCount) {
                                 const uintptr_t f3dSegBase = NormalizeLusDirectPointer(translated);
                                 if (gSegments[segIdx] != f3dSegBase) {
-                                    ++gGdxResolveTablesVersion; // [brfast] same-value rewrites keep the memo
+                                    GdxBumpResolveTablesVersion(); // [brfast] same-value rewrites keep the memo
                                 }
                                 gSegments[segIdx] = f3dSegBase;
                             }
@@ -8429,13 +9257,13 @@ class N64DisplayListAdapter {
 extern "C" void gdx_register_host_range(void* ptr, size_t size) {
     if ((ptr == nullptr) || (size == 0)) return;
     gHostRanges.push_back({ reinterpret_cast<uintptr_t>(ptr), size });
-    ++gGdxResolveTablesVersion;
+    GdxBumpResolveTablesVersion();
 }
 
 extern "C" void gdx_register_host_n64_command_range(void* ptr, size_t size) {
     if ((ptr == nullptr) || (size == 0)) return;
     gHostN64CommandRanges.push_back({ reinterpret_cast<uintptr_t>(ptr), size });
-    ++gGdxResolveTablesVersion;
+    GdxBumpResolveTablesVersion();
 }
 
 extern "C" void gdx_register_host_wide_command_range(void* ptr, size_t size) {
@@ -8448,7 +9276,7 @@ extern "C" void gdx_register_host_wide_command_range(void* ptr, size_t size) {
         });
     if (duplicate == gHostWideCommandRanges.end()) {
         gHostWideCommandRanges.push_back({ begin, size });
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
     }
 }
 
@@ -8462,7 +9290,7 @@ extern "C" void gdx_register_host_raw_n64_range(void* ptr, size_t size) {
         });
     if (duplicate == gRawN64Ranges.end()) {
         gRawN64Ranges.push_back({ begin, size });
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
     }
 }
 
@@ -8484,7 +9312,7 @@ extern "C" void gdx_register_host_pointer_stub(void* dest, size_t size) {
         });
     if (duplicate == gHostPointerStubs.end()) {
         gHostPointerStubs.push_back({ begin, size });
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
     }
 }
 
@@ -8498,10 +9326,10 @@ extern "C" void gdx_register_n64_address_range(unsigned int n64Begin, void* host
         });
     if (duplicate == gN64AddressRanges.end()) {
         gN64AddressRanges.push_back({ n64Begin, host, size });
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
         /* A newly registered exact token can change pointer widening for an
            already-seen binary list. Force the G2 cache to rebuild on next use. */
-        ++gConvertEpoch;
+        GdxBumpConvertEpoch();
     }
 }
 
@@ -8527,13 +9355,33 @@ extern "C" void gdx_register_n64_framebuffer(void* cpuAddr, unsigned int width, 
                                              return range.begin == address;
                                          });
     if (nativeRange == gNativeRgba16Ranges.end()) {
-        ++gNativeRgba16Generation;
+        GdxBumpNativeRgba16Generation();
         gNativeRgba16Ranges.push_back({ address, byteCount });
     }
 }
 
 /* Shared RGBA5551 -> 24bpp BMP writer for one-shot diagnostic dumps
    (transition capture, VI-fallback frame). Pixels are host-order u16, top-down. */
+/* A10 LOAD-STALL: `[debug] shot_fastwrite` (gdx3ds_oracle.c, default 1). Weak: desktop builds
+ * do not compile the 3DS oracle TU and never paid this cost anyway. See the comment on
+ * sFastWrite there for the 2-seconds-per-image measurement this exists to kill. */
+extern "C" int gdx3ds_shot_fastwrite(void) __attribute__((weak));
+
+/* Give a BMP stream one 64 KB stdio buffer instead of newlib's ~1 KB default, so a row-at-a-
+ * time dump goes to the SD card in a handful of FS transactions rather than one per row. The
+ * buffer must outlive the stream, hence static; both dumps below run on one thread, one image
+ * at a time. Returns nothing: an ignored setvbuf just leaves the default buffering. */
+static void GdxBmpUseBigBuffer(std::FILE* f) {
+    static unsigned char sBmpWriteBuf[64u * 1024u];
+    if (f == nullptr) {
+        return;
+    }
+    if (gdx3ds_shot_fastwrite != nullptr && gdx3ds_shot_fastwrite() == 0) {
+        return;
+    }
+    std::setvbuf(f, reinterpret_cast<char*>(sBmpWriteBuf), _IOFBF, sizeof(sBmpWriteBuf));
+}
+
 static void DumpRgba16Bmp(const char* filename, const uint16_t* pixels, unsigned int width,
                           unsigned int height) {
     std::FILE* f = std::fopen(filename, "wb");
@@ -8541,6 +9389,7 @@ static void DumpRgba16Bmp(const char* filename, const uint16_t* pixels, unsigned
         gdx_port_logf("[dump] BMP write failed: %s\n", filename);
         return;
     }
+    GdxBmpUseBigBuffer(f);
     const unsigned int rowBytes = (width * 3u + 3u) & ~3u;
     const unsigned int imageBytes = rowBytes * height;
     const unsigned int fileBytes = 14u + 40u + imageBytes;
@@ -8665,7 +9514,14 @@ static void SeedFramebufferQuad(Fast::Interpreter* interp, const uint16_t* srcPi
     // from loaded_texture's line/size below.
     tile.line_size_bytes = kFbW * 2;
 
+#ifdef __3DS__
+    // The 3DS carve stores TMEM as spans (port/3ds/vendor/lus/patches/lus-tmem-span-store.patch);
+    // MutableLoadedTextureAt materializes the span containing word 0 before handing out the ref.
     Fast::LoadedTexture& loaded = interp->mRdp->MutableLoadedTextureAt(0); // materializing write accessor (LOADBLOCK-OPT)
+#else
+    // Upstream libultraship (the desktop reference build, tools/refbuild) keeps the plain array.
+    Fast::LoadedTexture& loaded = interp->mRdp->loaded_texture[0];
+#endif
     loaded = Fast::LoadedTexture{};
     loaded.addr = sConverted;
     loaded.orig_size_bytes = kPixels * 4;
@@ -8843,6 +9699,7 @@ static void GdxDumpTopScanoutBmp(const char* label) {
         gdx_port_logf("[dump] scanout BMP write failed: %s\n", path);
         return;
     }
+    GdxBmpUseBigBuffer(f);
     const unsigned int rowBytes = (outW * 3u + 3u) & ~3u;
     const unsigned int imageBytes = rowBytes * outH;
     const unsigned int fileBytes = 14u + 40u + imageBytes;
@@ -8910,6 +9767,11 @@ static void GdxDumpNamedFrameIfRequested(const std::shared_ptr<Fast::Interpreter
         return;
     }
     gPendingNamedDumpArmed = false;
+
+    /* A10 census: the SHOT readback + two BMP writes are blocking MAIN-THREAD work that lands
+       inside whatever window is being measured. Attributed as filesystem so a `[stall-table]`
+       row says so out loud rather than leaving it in `other`. */
+    GdxStallScope gdxShotScope(GDX_STALL_FS);
 
 #ifdef _WIN32
     CreateDirectoryA("autotest", nullptr); // ERROR_ALREADY_EXISTS is fine (see disk_savefile.cpp)
@@ -9447,7 +10309,7 @@ extern "C" void gdx_vi_present_fallback(void) {
 extern "C" void gdx_set_native_rgba16_texture_range(void* ptr, size_t size, int enabled) {
     GdxRtFence(); /* RENDER THREAD: game-thread mutator (audit §4) */
     const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
-    ++gNativeRgba16Generation; // invalidates the persistent-copy compare skip (see HostRange table)
+    GdxBumpNativeRgba16Generation(); // invalidates the persistent-copy compare skip (see HostRange table)
     gNativeRgba16Ranges.erase(
         std::remove_if(gNativeRgba16Ranges.begin(), gNativeRgba16Ranges.end(),
                        [begin](const HostRange& range) { return range.begin == begin; }),
@@ -9495,13 +10357,28 @@ static bool GdxTexCacheDeferToRenderThread() {
 static bool GdxTexCacheDeferToRenderThread() { return false; }
 #endif
 
-/* Render thread (job run / fallback present): apply the queued clear + deletes. */
+/* [native] interp=1 keeps a SECOND texture cache inside the owned interpreter
+ * (port/3ds/gfx/n64/gdx_texcache.cpp), so a queued request has to reach both: under interp=1
+ * this drain is the owned path's (gdx_ninterp_job_run -> gdx_gfx_texcache_drain), under
+ * interp=0 it is GdxGfxJobRun's, and under interp_verify=1 both interpreters draw the same
+ * job. Consuming the queue once and applying it to both keeps the two caches in step whichever
+ * path got here first. Weak: desktop and the DL-test harness link neither. */
+extern "C" void gdx_ninterp_texcache_clear(void) __attribute__((weak));
+extern "C" void gdx_ninterp_texcache_delete(uintptr_t addr) __attribute__((weak));
+
+/* Render thread (job run / owned walk / fallback present): apply the queued clear + deletes. */
 static void GdxDrainTextureCacheRequests(Fast::Interpreter* interp) {
-    if (interp == nullptr) {
+    const bool ownedLive = (&gdx_ninterp_texcache_clear != nullptr) && (&gdx_ninterp_texcache_delete != nullptr);
+    if (interp == nullptr && !ownedLive) {
         return;
     }
     if (gPendingTextureCacheClear.exchange(0, std::memory_order_acq_rel) != 0) {
-        interp->TextureCacheClear();
+        if (interp != nullptr) {
+            interp->TextureCacheClear();
+        }
+        if (ownedLive) {
+            gdx_ninterp_texcache_clear();
+        }
     }
     std::vector<uintptr_t> pendingDeletes;
     {
@@ -9513,10 +10390,16 @@ static void GdxDrainTextureCacheRequests(Fast::Interpreter* interp) {
         pendingDeletes.erase(std::unique(pendingDeletes.begin(), pendingDeletes.end()),
                              pendingDeletes.end());
         for (uintptr_t ptr : pendingDeletes) {
-            interp->TextureCacheDelete(reinterpret_cast<const uint8_t*>(ptr));
+            if (interp != nullptr) {
+                interp->TextureCacheDelete(reinterpret_cast<const uint8_t*>(ptr));
+            }
+            if (ownedLive) {
+                gdx_ninterp_texcache_delete(ptr);
+            }
         }
     }
 }
+
 
 extern "C" void gdx_texcache_request_clear(void) {
     if (GdxTexCacheDeferToRenderThread()) {
@@ -9525,6 +10408,12 @@ extern "C" void gdx_texcache_request_clear(void) {
     }
     extern void gfx_texture_cache_clear(void);
     gfx_texture_cache_clear();
+    /* Render thread off (or we are on it): the queue is bypassed entirely, so the owned cache
+       has to be told here too -- it is the live one under interp=1 and it never sees the drain
+       that the deferred path feeds. Same thread as the LUS clear above, by construction. */
+    if (&gdx_ninterp_texcache_clear != nullptr) {
+        gdx_ninterp_texcache_clear();
+    }
 }
 
 extern "C" void gdx_invalidate_texture_address(const void* addr) {
@@ -9535,6 +10424,10 @@ extern "C" void gdx_invalidate_texture_address(const void* addr) {
     }
     if (addr == nullptr) {
         return;
+    }
+    /* Undeferred path: see gdx_texcache_request_clear -- the owned cache is not on the queue. */
+    if (&gdx_ninterp_texcache_delete != nullptr) {
+        gdx_ninterp_texcache_delete(reinterpret_cast<uintptr_t>(addr));
     }
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {
@@ -9579,7 +10472,7 @@ extern "C" void gdx_register_main_module_range(void) {
     }
 
     gHostRanges.push_back({ moduleBegin, moduleEnd - moduleBegin });
-    ++gGdxResolveTablesVersion;
+    GdxBumpResolveTablesVersion();
     gdx_port_logf("[bridge-init] registered EXE module range: base=%p low32=%08X size=0x%zx\n",
                   reinterpret_cast<void*>(moduleBegin),
                   static_cast<unsigned>(moduleBegin & 0xFFFFFFFFu),
@@ -9672,7 +10565,7 @@ static const void* const kGdxVenueSegmentSymbols[] = {
 //
 // WHY: the asset stalls were attributed by measurement, killing four theories in sequence.
 // Preloading the COMPRESSED blobs changed nothing (11/11 warmed in 1.6ms; Cup Select loads
-// unmoved). Fixups and command-range registration measured 0.00-0.01ms. The ++gConvertEpoch
+// unmoved). Fixups and command-range registration measured 0.00-0.01ms. The GdxBumpConvertEpoch()
 // cache invalidation measured flat (xlate 0.12-0.16ms for 8 ticks after each load). And the MIO0
 // decode itself -- the last suspect standing, and the one this function was first written to
 // avoid -- turned out to cost 2.2ms for ALL TWELVE segments when run here on the host thread.
@@ -9755,11 +10648,12 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
     // Two candidate causes, and they need opposite fixes, which is why this measures rather than
     // assumes: either the LOAD itself is expensive (archive read + MIO0 decode + fixups), in which
     // case preloading the blobs at boot removes it; or the load is cheap and the cost is the
-    // ++gConvertEpoch below invalidating every cached display-list conversion, in which case
+    // GdxBumpConvertEpoch() below invalidating every cached display-list conversion, in which case
     // preloading changes NOTHING and the fix is scoped epoch invalidation. The epoch counter is
     // logged alongside so the following ticks' xlate can be correlated.
+    GdxStallScope gdxVenueScope(GDX_STALL_VENUE_TEX); /* A10 census */
     const double gdxVenueT0 = (gGdxInterpNowFn != nullptr) ? gGdxInterpNowFn() : 0.0;
-    const uint32_t gdxEpochBefore = gConvertEpoch;
+    const uint32_t gdxEpochBefore = GdxConvertEpoch();
     const uintptr_t base = EnsureAssetSegmentForSymbol(symbol, &offset);
     if (base == 0) {
         gdx_port_logf("[segment] failed to load venue=%d symbol=%08X\n", venue, symbol);
@@ -9768,7 +10662,7 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
     if (gGdxInterpNowFn != nullptr && gdx_diag_audio_enabled()) {
         gdx_port_logf("[venueload] venue=%d symbol=%08X load=%.2fms epoch %u->%u\n", venue, symbol,
                       (gGdxInterpNowFn() - gdxVenueT0) * 1000.0, (unsigned) gdxEpochBefore,
-                      (unsigned) gConvertEpoch);
+                      (unsigned) GdxConvertEpoch());
         gGdxVenueWatchTicks = 8; // log the next 8 ticks' translation cost (see gdx_gfx_run)
     }
 
@@ -9789,7 +10683,7 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
         GdxRtFence(); /* RENDER THREAD: game-thread mutator (audit §4) -- rewrite path only */
         gdx_segment_epoch_begin();
         gSegments[0x0A] = base;
-        ++gGdxResolveTablesVersion;
+        GdxBumpResolveTablesVersion();
         gdx_segment_epoch_end();
     }
 
@@ -9828,6 +10722,7 @@ extern "C" int gdx_load_venue_texture_segment(int venue) {
  * keyed off the base recorded here. */
 extern "C" void gdx_load_venue_building_texture(unsigned int romOffset) {
     GdxRtFence(); /* RENDER THREAD: game-thread mutator (audit §4) */
+    GdxStallScope gdxBuildTexScope(GDX_STALL_VENUE_TEX); /* A10 census */
     uint32_t offset = 0;
     const uintptr_t base =
         EnsureAssetSegmentForSymbol(Low32(reinterpret_cast<uintptr_t>(D_8014A20)), &offset);
@@ -10375,11 +11270,42 @@ static void GdxEmitWalkReceipts() {
             gGdxBcCensus = GdxBcCensus{};
             /* [brfast] memo receipt: tables version (bumps at every asset/range append and
                segment write), resolve/stub memo hit/miss, range-class misses, snapshots. */
-            gdx_port_logf("[brfast] on=%d ver=%u resolve=%u/%u stub=%u/%u class_miss=%u gen=%u\n",
-                          GdxBrFastOn() ? 1 : 0, gGdxResolveTablesVersion, gGdxBrFastStat[0],
+            gdx_port_logf("[brfast] on=%d ver=%u resolve=%u/%u stub=%u/%u class_miss=%u gen=%u"
+                          " stubgen=%d chg=%u\n",
+                          GdxBrFastOn() ? 1 : 0, GdxResolveTablesVersion(), gGdxBrFastStat[0],
                           gGdxBrFastStat[1], gGdxBrFastStat[2], gGdxBrFastStat[3],
-                          gGdxBrFastStat[4], gGdxBrFastStat[5]);
+                          gGdxBrFastStat[4], gGdxBrFastStat[5],
+                          GdxStubGenNarrowOn() ? 1 : 0, gGdxStubGenChg);
             memset(gGdxBrFastStat, 0, sizeof(gGdxBrFastStat));
+            /* [resolverace] thread-reach census: which THREADS touched each process-wide
+               bridge structure this window. mask bit0 = submitter/game thread, bit1 = render
+               thread, so 3 = genuinely shared. rt= render-thread touches. peak=/cap= the
+               headroom on the three tables EnsureAssetSegmentImageImpl appends to. */
+            {
+                static const char* const kRaceSiteNames[GDX_RACE_SITE_COUNT] = {
+                    "seg", "ver", "rmemo", "smemo", "cmemo", "nmemo", "scan", "pmemo", "texcopy"
+                };
+                char raceLine[512];
+                int raceLen = snprintf(raceLine, sizeof(raceLine), "[resolverace] mask");
+                for (int i = 0; i < (int) GDX_RACE_SITE_COUNT; ++i) {
+                    raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
+                                        " %s=%u", kRaceSiteNames[i], (unsigned) gGdxRaceMask[i]);
+                }
+                raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen, " | rt");
+                for (int i = 0; i < (int) GDX_RACE_SITE_COUNT; ++i) {
+                    raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
+                                        " %s=%u", kRaceSiteNames[i], (unsigned) gGdxRaceRtTouch[i]);
+                }
+                snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
+                         " | owner=%u segdefer=%u/%u | peak host=%u/%u raw=%u/%u assets=%u/%u",
+                         (unsigned) gGdxMemoOwnerBit.load(std::memory_order_relaxed),
+                         (unsigned) gGdxSegPublishDeferred, (unsigned) gGdxSegPublishDrained,
+                         (unsigned) gGdxRacePeak[0], (unsigned) gHostRanges.capacity(),
+                         (unsigned) gGdxRacePeak[1], (unsigned) gRawN64Ranges.capacity(),
+                         (unsigned) gGdxRacePeak[2], (unsigned) gLoadedAssetSegments.capacity());
+                gdx_port_logf("%s\n", raceLine);
+            }
+            memset(gGdxRaceRtTouch, 0, sizeof(gGdxRaceRtTouch));
 #ifdef __3DS__
             /* [brop] top bridge-walk opcodes by accumulated wall ticks since the last emit
                (64 race frames): where [prof] br actually goes. ms figures are WINDOW TOTALS
@@ -10739,7 +11665,7 @@ static bool GdxGfxJobPrepare(GdxGfxJob& job) {
         --gGdxVenueWatchTicks;
         gdx_port_logf("[venueload] post tick=%d xlate=%.2fms lists=%zu cmds_out=%zu epoch=%u\n",
                       8 - gGdxVenueWatchTicks, (gGdxInterpNowFn() - gdxXlateT0) * 1000.0,
-                      stats.convertedLists, stats.commandsOut, (unsigned) gConvertEpoch);
+                      stats.convertedLists, stats.commandsOut, (unsigned) GdxConvertEpoch());
     }
     tGdxJobAllocs = gdxPrevJobAllocs;
     /* Deferred native-RGBA16 retirements the game thread pushed before this task belong to this
@@ -12143,7 +13069,7 @@ static void GdxGfxJobRelease(GdxGfxJob& job) {
        clearing lets the reused arena address misclassify ordinary menu textures on
        subsequent frames. */
     if (!job.nativeClears.empty()) {
-        ++gNativeRgba16Generation; // range set mutates below: invalidate the compare skip
+        GdxBumpNativeRgba16Generation(); // range set mutates below: invalidate the compare skip
         std::sort(job.nativeClears.begin(), job.nativeClears.end());
         job.nativeClears.erase(
             std::unique(job.nativeClears.begin(), job.nativeClears.end()),
@@ -12200,6 +13126,11 @@ extern "C" void gdx_gfx_run(void* dl, size_t dl_size, GdxTaskUcode taskUcode) {
    with the walk resolving against the job's private snapshot of the live segment table (the
    same view the render thread installs for run and the join merges back). */
 extern "C" GdxGfxJob* gdx_gfx_job_prepare(void* dl, size_t dlSize, GdxTaskUcode taskUcode) {
+    /* [resolverace] 6b: the second drain site. This runs on the SUBMITTING thread (main under
+       `[debug] bridgemain=1`, the shipping default), which is the thread that owns the
+       walk-scanned tables, and it runs before this task's walk touches them -- so rows a
+       previous task's owned walk deferred from core 2 land here, at most one task late. */
+    GdxDrainPendingSegmentPublishes();
     GdxGfxJob* job = new GdxGfxJob;
     job->dl = dl;
     job->dlSize = dlSize;
@@ -12645,6 +13576,69 @@ extern "C" uintptr_t gdx_gfx_job_resolve_timg_host(GdxGfxJob* job, uintptr_t hos
     return job->adapter->NativeResolveTimgHost(hostFull, requiredBytes);
 }
 
+/* [timgmemo] Freshness key for the OWNED walker's per-SETTIMG CLASSIFICATION memo: the
+ * (native_rgba16, immutable) pair Interp::ResolveTextureSource derives on EVERY load, for an
+ * already-resolved source pointer that did not change (docs/research/native/
+ * loadblock-progress.md S1, and S2 for why the resolved POINTER is not memoised with it).
+ *
+ * Given `p`, both answers are pure functions of the caller's key plus three mutable inputs, and
+ * this folds one term per input -- no SEGMENT state, because neither answer reads any:
+ *   gNativeRgba16Generation  gNativeRgba16Ranges, which IsNativeRgba16Range scans and which NO
+ *                            gGdxResolveTablesVersion bump covers (:8637 / :9591 / :12320 are
+ *                            its only three mutators and all three bump this instead)
+ *   sVenueBuildingTexBase    IsVenueBuildingTextureRange's window; monotone 0 -> B, and
+ *                            re-stored at :10025 with no version bump either
+ *   gGdxResolveTablesVersion NOT for the resolve -- for gHostRanges. gdx_gfx_timg_is_resource
+ *                            recomputes IsHostPtr, which calls IsPortBssAliasPointer, which
+ *                            latches sD1Size out of gHostRanges the first time D_1000000's
+ *                            entry is found (:1615). In practice that entry is registered in
+ *                            decomp_port.c's RDRAM init, before the bridge walks anything, so
+ *                            the latch is settled for every walk -- but "settled because of
+ *                            boot ordering" is an argument, and a term that the measurement
+ *                            says moves 3 times in a whole run is a proof. Keyed.
+ * Everything else that function reads is fixed after init: the gdx_rdram base, and
+ * sAssetSegmentMap[] / sAssetSegmentIndex[], a `static const` generated table behind a
+ * build-once latch (AssetBindings.c:4690, :7232). gLoadedAssetSegments is never read here, so
+ * its growth -- the sub-question dispatch flagged -- does not reach this answer.
+ *
+ * What is deliberately NOT keyed is mSegGen, and that is the whole design: it folds
+ * gSegments[1] and so turns over once per task, which is what made the first shape of this
+ * memo a 3.7 % per-task memo. See gGdxTimgEpochParts.
+ *
+ * Never returns 0: unlike the resolve, this classification is not memoised by the bridge and
+ * has no lever that withdraws its freshness contract, so there is nothing to stand down for. */
+extern "C" uint32_t gdx_gfx_timg_class_epoch(void) {
+    const uint64_t nativeGen = GdxNativeRgba16Generation();
+    const uint32_t term[3] = { static_cast<uint32_t>(nativeGen),
+                               static_cast<uint32_t>(sVenueBuildingTexBase.load(std::memory_order_relaxed)),
+                               GdxResolveTablesVersion() };
+    for (int i = 0; i < 3; i++) {
+        if (term[i] != gGdxTimgEpochParts[i]) {
+            gGdxTimgEpochChg[i]++;
+            gGdxTimgEpochParts[i] = term[i];
+        }
+    }
+    uint32_t h = 2166136261u;
+    h ^= term[0];
+    h *= 16777619u;
+    h ^= static_cast<uint32_t>(nativeGen >> 32);
+    h *= 16777619u;
+    h ^= (term[1] != 0u) ? 1u : 0u;
+    h *= 16777619u;
+    h ^= term[2];
+    h *= 16777619u;
+    return (h != 0) ? h : 1u;
+}
+
+/* [timgmemo] the terms behind the last classification epoch and their change counts, for the
+   receipt. Slot 3 is mSegGen, which the epoch does NOT key on -- see gGdxTimgEpochParts. */
+extern "C" void gdx_gfx_timg_class_epoch_parts(uint32_t out[8]) {
+    for (int i = 0; i < 4; i++) {
+        out[i] = gGdxTimgEpochParts[i];
+        out[4 + i] = gGdxTimgEpochChg[i];
+    }
+}
+
 extern "C" int gdx_gfx_timg_is_resource(uint32_t raw, int hostTagged, uintptr_t resolved, size_t loadBytes) {
     if (hostTagged != 0 || resolved == 0) return 0;
     if (IsRdramHostPointer(resolved) || IsVenueBuildingTextureRange(resolved)) return 0;
@@ -12658,6 +13652,27 @@ extern "C" int gdx_gfx_texels_are_native_rgba16(uintptr_t source, size_t size) {
 
 extern "C" size_t gdx_gfx_readable_bytes(uintptr_t address) {
     return (address != 0) ? ReadableByteLimit(address) : 0;
+}
+
+/* [tmemblock] the source-stability seam. Bodies are beside MakePersistentRawTextureCopy's own
+   cascade (GdxTmemSourceClass / GdxTmemSourceStamp / GdxTmemSourceUnchanged), so the two cannot
+   drift apart without the drift being visible in one screen of code. */
+static_assert(GDX_TMEMSRC_UNKNOWN == 0u && GDX_TMEMSRC_NATIVE == 1u && GDX_TMEMSRC_DMA == 2u &&
+                  GDX_TMEMSRC_STABLE == 3u,
+              "the seam's class values and the bodies' kTmemSrc* constants must agree: a silent "
+              "renumbering would reclassify every texture source");
+
+extern "C" unsigned gdx_gfx_tmem_source_class(uintptr_t source, size_t size) {
+    return GdxTmemSourceClass(source, size);
+}
+
+extern "C" void gdx_gfx_tmem_source_stamp(uint64_t out[2]) {
+    GdxTmemSourceStamp(out);
+}
+
+extern "C" int gdx_gfx_tmem_source_unchanged(uintptr_t source, size_t size, unsigned clsAtStamp,
+                                             const uint64_t stamp[2]) {
+    return GdxTmemSourceUnchanged(source, size, clsAtStamp, stamp);
 }
 
 extern "C" int gdx_gfx_low32_needs_resolver(uint32_t low32) {
@@ -12715,6 +13730,23 @@ extern "C" void gdx_gfx_job_bridge_stats(GdxGfxJob* job, unsigned long* lists, u
     *lists = static_cast<unsigned long>(st.convertedLists);
     *commands = static_cast<unsigned long>(st.commandsOut);
     for (int i = 0; i < 256; i++) opCounts[i] = static_cast<unsigned long>(st.opCounts[static_cast<size_t>(i)]);
+}
+
+/* The owned interpreter's prologue. gdx_ninterp_job_run returns 1 BEFORE GdxGfxJobRun, so the
+ * drain that sits there never runs under interp=1 and both live producers of invalidations --
+ * gdx_rdram_mode_reset's arena-rewind clear (decomp_port.c:432) and the per-race minimap
+ * invalidate (minimap.c:201) -- were dead, while gPendingTextureCacheDeletes grew unbounded.
+ * This belongs BEFORE the owned walk, not in gdx_gfx_job_epilogue: GdxGfxJobRun drains before
+ * interp->Run() on purpose ("so an in-place content refresh takes effect on the frame that
+ * produced it"), and an epilogue drain would serve the stale decode for the frame that asked
+ * for the eviction -- a divergence in itself. */
+extern "C" void gdx_gfx_texcache_drain(void) {
+    Fast::Fast3dWindow* fw = sGdxCachedWindow;
+    std::shared_ptr<Fast::Interpreter> interp;
+    if (fw != nullptr) {
+        interp = fw->GetInterpreterWeak().lock();
+    }
+    GdxDrainTextureCacheRequests(interp.get());
 }
 
 extern "C" void gdx_gfx_job_epilogue(GdxGfxJob* job) {
@@ -12837,6 +13869,22 @@ extern "C" void gdx_gfx_frame_publish(uintptr_t gfxFrameBuffer) {
  * bit2 native-RGBA16 range, bit3 registered host range; 0 = plain heap (a persistent raw-texture
  * copy or an asset). Runs on the render thread: only reads the stable range tables, never the
  * copy vector main is mutating for the next task. */
+/* [nverify] Which persistent raw-texture copy a pointer belongs to. The bridge hands the LUS
+ * interpreter a COPY of a texture source, so a verify mismatch that names two different source
+ * addresses cannot say whether the two sides read the same bytes: this maps the copy back to its
+ * original source and reports the copy's length, which is the number a truncated delivery shows. */
+extern "C" int gdx_gfx_rawcopy_origin(unsigned long p, unsigned long* outSource, unsigned* outSize) {
+    for (const PersistentRawTextureCopy& c : gRawTextureCopies) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(c.bytes.get());
+        if (begin != 0 && p >= begin && p < begin + c.size) {
+            if (outSource != nullptr) *outSource = static_cast<unsigned long>(c.source + (p - begin));
+            if (outSize != nullptr) *outSize = static_cast<unsigned>(c.size - (p - begin));
+            return 1;
+        }
+    }
+    return 0;
+}
+
 extern "C" unsigned gdx_gfx_classify_host_ptr(unsigned long p) {
     unsigned cls = 0;
     if (IsRdramHostPointer(p)) cls |= 1u;

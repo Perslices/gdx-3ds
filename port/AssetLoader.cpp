@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "gdx_stall.h" // A10: the archive read (SD + inflate) is the load-stall leaf
 #include "port_log.h" // gdx_port_logf (bounded archive-read failure diagnostics)
 
 namespace {
@@ -131,7 +132,13 @@ extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t
      * integrity gates downstream. File::TrueSize is the real byte count; Buffer->size()
      * survives only as a fallback when TrueSize is unset, and as a hard clamp so the copy
      * can never run past the allocation regardless of what TrueSize reports. */
+    /* A10 census: LoadFileProcess is where the bytes actually come off the SD and, for a
+       Deflate-stored entry, where they are inflated. It is the leaf of every segment/audio
+       blob first touch, so timing it here attributes the cost once, at the only place that
+       knows whether the entry was stored or compressed. */
+    gdx_stall_begin(GDX_STALL_FS);
     auto file = rm->LoadFileProcess(std::string(key));
+    gdx_stall_end();
     if ((file == nullptr) || (file->Buffer == nullptr)) {
         return archiveFail((file == nullptr) ? "LoadFileProcess-null (entry missing?)" : "null-buffer");
     }

@@ -78,6 +78,10 @@ class DlSrc {
                           uintptr_t sourceHint = 0) const;
     /* SETTIMG operand with the wide-stub hop for tagged pointers. */
     uintptr_t ResolveTimg(const Cmd& c, size_t requiredBytes) const;
+    /* [timgmemo] Freshness key for a caller-side memo of the ResolveTimg + TexelsAreNativeRgba16
+     * + TimgIsResource triple; 0 = do not memoise. See gdx_dlsrc_bridge.h and
+     * docs/research/native/loadblock-progress.md S1. */
+    uint32_t TimgClassEpoch() const;
     uintptr_t SetSegment(unsigned segment, const Cmd& c) const;
     /* G_LOAD_UCODE: 1 = known (variant 0/1/2, isLine), 0 = unknown load. */
     static int UcodeVariant(const Cmd& c, int* variant, int* isLine);

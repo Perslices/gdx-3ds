@@ -111,6 +111,7 @@ enum {
     REQ_CAPTURE,
     REQ_REPLAY,
     REQ_INI_SET,
+    REQ_INI_DEL,
     REQ_INI_SAVE
 };
 
@@ -474,6 +475,14 @@ void gdx3ds_net_tick(unsigned long frameNum) {
             rc = gdx3ds_config_set_string(sReqA, sReqB, sReqC);
             netLog("[net] cmd INI [%s] %s=%s rc=%d", sReqA, sReqB, sReqC, rc);
             break;
+        case REQ_INI_DEL:
+            /* Removing the key is not the same as setting it empty: an empty entry is
+             * still an entry, so the getters return "" instead of the DEFAULT and
+             * gdx3ds_config_save writes the key straight back out. That is why a replay
+             * stayed armed across reloads. rc 3 = the key was already absent. */
+            rc = gdx3ds_config_unset(sReqA, sReqB);
+            netLog("[net] ini del [%s] %s rc=%d", sReqA, sReqB, rc);
+            break;
         case REQ_INI_SAVE:
             rc = gdx3ds_config_save(GDX3DS_CONFIG_DEFAULT_PATH);
             netLog("[net] cmd INI SAVE rc=%d", rc);
@@ -698,8 +707,25 @@ static void netHandleCommand(char* line) {
             }
             return;
         }
+        /* Checked BEFORE the set form, which would otherwise read "DEL" as a section
+         * name. No real section is called DEL (they are debug/native/display/...), so
+         * the shadowing is safe; INI SAVE above is shadowed the same way. */
+        if (n >= 2 && strcmp(tok[1], "DEL") == 0) {
+            if (n < 4) {
+                netCtlReply("ERR INI usage: INI DEL <section> <key>");
+                return;
+            }
+            int rcd = netPostRequest(REQ_INI_DEL, tok[2], tok[3], NULL);
+            if (rcd == 0) {
+                netCtlReply("OK INI deleted");
+            } else {
+                netCtlReply("ERR INI %s", netReqErr(rcd));
+            }
+            return;
+        }
         if (n < 4) {
-            netCtlReply("ERR INI usage: INI <section> <key> <value> | INI SAVE");
+            netCtlReply("ERR INI usage: INI <section> <key> <value> | "
+                        "INI DEL <section> <key> | INI SAVE");
             return;
         }
         int rc = netPostRequest(REQ_INI_SET, tok[1], tok[2], tok[3]);
@@ -872,9 +898,15 @@ static void netThreadMain(void* arg) {
 
 /* ---- APT ----------------------------------------------------------------------------- */
 
-void gdx3ds_net_suspend(void) {
+/* HOMEFIX2: returns 1 when the net thread acknowledged the park inside the window, 0 when it
+ * did not (the caller logs an [apt] receipt for it -- netLog is a no-op with [net] enabled=0,
+ * which is every replay lane and most hardware runs, so the ack could never be seen before).
+ * WHO SIGNALS sNetSuspendAck: the net thread, at the TOP of its loop only -- a thread inside
+ * netRecvFileTo/netRecvExact misses the whole window and keeps doing SOC IPC across
+ * GSPGPU_ReleaseRight and APT_JumpToHomeMenu. Not signalled while it is absent => 1. */
+int gdx3ds_net_suspend(void) {
     if (!sNetEnabled || sNetSuspended) {
-        return;
+        return 1;
     }
     sNetSuspendAck = 0;
     sNetSuspended = 1;
@@ -884,6 +916,7 @@ void gdx3ds_net_suspend(void) {
         svcSleepThread(10000000LL); /* 10 ms */
     }
     netLog("[net] suspend ack=%d", sNetSuspendAck);
+    return sNetSuspendAck ? 1 : 0;
 }
 
 void gdx3ds_net_resume(void) {

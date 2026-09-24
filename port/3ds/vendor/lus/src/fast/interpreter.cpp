@@ -253,6 +253,22 @@ extern "C" int gdx3ds_trectbatch_enabled(void) __attribute__((weak));
 extern "C" void gdx3ds_atlas_arm(int on) __attribute__((weak));
 extern "C" int gdx3ds_tex_page(uint32_t texId) __attribute__((weak));
 extern "C" void gdx3ds_vbopack_refresh(Gdx3dsVboPackParams* params) __attribute__((weak));
+/* [nverify] The TMEM bytes a load actually occupies. size_bytes counts SOURCE bytes; LOADTILE
+ * writes each row at an 8-byte-aligned destination stride, so for a 74-byte row the footprint is
+ * 80 per row and the tile's last rows sit BEYOND size_bytes -- which is where the decode reads,
+ * and where a hash over size_bytes could not see a divergence. Must match gdx_tri.cpp's
+ * VfyTmemFootprint. */
+static inline unsigned GdxVfyTmemFootprint(unsigned sizeBytes, unsigned lineBytes) {
+    if (lineBytes == 0 || sizeBytes == 0) return sizeBytes;
+    const unsigned stride = (lineBytes + 7u) & ~7u;
+    if (stride == lineBytes) return sizeBytes;
+    const unsigned rows = sizeBytes / lineBytes;
+    if (rows == 0) return sizeBytes;
+    return (rows - 1u) * stride + lineBytes;
+}
+
+/* [native] palhash, owned by the interpreter glue; weak so desktop links without it. */
+extern "C" int gdx_ninterp_palhash(void) __attribute__((weak));
 extern "C" void gdx3ds_atlas_stats(unsigned long out[5]) __attribute__((weak));
 namespace {
 bool sTrectBatchOn = false;
@@ -3045,11 +3061,16 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     key.line_size_bytes = mRdp->LoadedTextureAt(tmemIdex).line_size_bytes;
     key.full_image_line_size_bytes = mRdp->LoadedTextureAt(tmemIdex).full_image_line_size_bytes;
 
-    // CI palette-content hash (opt-in: GDX_CI_PALETTE_HASH). The key carries the palette's DRAM
-    // address, which cannot see an in-place fade rewriting content at that same address, so the
-    // fade returned a stale decode and froze. Hashes the fixed 256-byte staging buffers, never raw
-    // DRAM, so it cannot fault. Off by default, leaving the proven CI path unchanged.
-    static const bool sCiPaletteHash = std::getenv("GDX_CI_PALETTE_HASH") != nullptr;
+    // CI palette-content hash ([native] palhash, or GDX_CI_PALETTE_HASH on desktop). The key
+    // carries the palette's DRAM address, which cannot see an in-place fade rewriting content at
+    // that same address, so the fade returned a stale decode and froze. The RDP re-reads the TLUT
+    // for every primitive, so the palette's CONTENT is part of the texture's identity. Hashes the
+    // fixed 256-byte staging buffers, never raw DRAM, so it cannot fault. The 3DS lever is read
+    // through the same latch the owned interpreter uses, so BOTH caches key CI the same way and
+    // interp=1 stays comparable with the stock path.
+    static const bool sCiPaletteHashEnv = std::getenv("GDX_CI_PALETTE_HASH") != nullptr;
+    const bool sCiPaletteHash =
+        sCiPaletteHashEnv || (&gdx_ninterp_palhash != nullptr && gdx_ninterp_palhash() != 0);
     if (sCiPaletteHash && fmt == G_IM_FMT_CI) {
         uint32_t palHash = 2166136261u;
         const auto foldPalette = [&palHash](const uint8_t* pal) {
@@ -5124,7 +5145,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
     // gdx_s7_geo_diag_enabled forces legacy: the verbose geometry diagnostics
     // ([geodiag]/[pit-uv-probe]/uvprobe UV ranges) live in the legacy loop, so
     // armed diagnostics keep full fidelity. Killswitch: [debug] triloop=0.
-    if (gdx3ds_verify_active()) { /* [nverify] temporary diagnostic (interp track) */
+    if (gdx3ds_verify_mode != 0) { /* [nverify] diagnostic, inline-gated: see gdx3ds_verify.h */
         Gdx3dsVerifyTri vt;
         memset(&vt, 0, sizeof(vt));
         const auto& t0 = mRdp->texture_tile[effective_tile[0]];
@@ -5144,19 +5165,53 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             const uint32_t tmemOff = static_cast<uint32_t>(t0.tmem_index) * 8u;
             vt.used0 = comb->usedTextures[0] ? 1u : 0u; vt.used1 = comb->usedTextures[1] ? 1u : 0u;
             vt.tmem0 = t0.tmem_index;
+            vt.rtLine0 = t0.line_size_bytes;
             if (t0.tmem_index < 512 && mRdp->tmem_span_base[t0.tmem_index] != 0) {
                 vt.base0 = mRdp->tmem_span_base[t0.tmem_index] - 1u;
                 const auto& br = mRdp->loaded_texture[vt.base0];
                 vt.baseAddr0 = reinterpret_cast<unsigned long>(br.addr); vt.baseSize0 = br.size_bytes; vt.baseOrig0 = br.orig_size_bytes;
             }
-            gdx3ds_verify_tri_source(&vt, vt.used0 ? l0.addr : nullptr, l0.size_bytes, tmemOff + 64u <= sizeof(mRdp->tmem) ? mRdp->tmem + tmemOff : nullptr);
+            /* [nverify] fmt/siz/palette of the render tile + the live palette staging, so a
+             * texture-identity mismatch names the format and says whether the TLUT moved. */
+            vt.tc1 = ((unsigned)t0.fmt << 8) | (unsigned)t0.siz | ((unsigned)t0.palette << 16) |
+                     (l0.raw_tex_metadata.resource != nullptr ? 0x1000000u : 0u);
+            /* CI only, and only the palette half the decode reads: this is per-triangle. */
+            vt.tc0 = 0;
+            if (t0.fmt == G_IM_FMT_CI && (t0.siz == G_IM_SIZ_4b || t0.siz == G_IM_SIZ_8b)) {
+                uint32_t ph = 2166136261u;
+                if (t0.siz == G_IM_SIZ_4b) {
+                    const uint8_t* pal = mRdp->palette_staging[(t0.palette / 8) & 1] + (t0.palette % 8) * 32u;
+                    for (unsigned b = 0; b < 32u; b++) ph = (ph ^ pal[b]) * 16777619u;
+                } else {
+                    for (unsigned h = 0; h < 2u; h++) {
+                        for (unsigned b = 0; b < 256u; b++) ph = (ph ^ mRdp->palette_staging[h][b]) * 16777619u;
+                    }
+                }
+                vt.tc0 = ph;
+            }
+            /* The TMEM bytes the load actually occupies: size_bytes counts SOURCE bytes, while
+               LOADTILE writes each row at an 8-byte-aligned destination stride, so for a 74-byte
+               row the footprint is 80 per row and the tile's last rows sit BEYOND size_bytes --
+               which is where the decode reads. Must match gdx_tri.cpp's VfyTmemFootprint. */
+            const unsigned tmemFoot0 = GdxVfyTmemFootprint(l0.size_bytes, l0.line_size_bytes);
+            const unsigned tmemSpan0 =
+                tmemOff < sizeof(mRdp->tmem)
+                    ? (unsigned)std::min<size_t>(sizeof(mRdp->tmem) - tmemOff, std::max<unsigned>(tmemFoot0, 8u))
+                    : 0u;
+            gdx3ds_verify_tri_source(&vt, vt.used0 ? l0.addr : nullptr, l0.size_bytes,
+                                     tmemSpan0 != 0 ? mRdp->tmem + tmemOff : nullptr, tmemSpan0);
             /* LoadedTextureAt materializes a lazy span view (bookkeeping side effects): only touch the
              * unit-1 slot when the combiner actually samples it, exactly like the import loop. */
             if (vt.used1) {
                 const auto& t1 = mRdp->texture_tile[effective_tile[1]];
                 const auto& l1 = mRdp->LoadedTextureAt(t1.tmem_index);
                 const uint32_t tmemOff1 = static_cast<uint32_t>(t1.tmem_index) * 8u;
-                gdx3ds_verify_tri_source1(&vt, l1.addr, l1.size_bytes, tmemOff1 + 64u <= sizeof(mRdp->tmem) ? mRdp->tmem + tmemOff1 : nullptr);
+                const unsigned tmemSpan1 =
+                    tmemOff1 < sizeof(mRdp->tmem)
+                        ? (unsigned)std::min<size_t>(sizeof(mRdp->tmem) - tmemOff1, std::max<uint32_t>(l1.size_bytes, 8u))
+                        : 0u;
+                gdx3ds_verify_tri_source1(&vt, l1.addr, l1.size_bytes,
+                                          tmemSpan1 != 0 ? mRdp->tmem + tmemOff1 : nullptr, tmemSpan1);
                 vt.tmem1 = t1.tmem_index; vt.line1 = l1.line_size_bytes; vt.size1 = l1.size_bytes; vt.full1 = l1.full_image_line_size_bytes;
                 vt.orig1 = l1.orig_size_bytes;
             }
@@ -9967,7 +10022,7 @@ static void gfx_step() {
     auto& cmd = g_exec_stack.currCmd();
     int8_t opcode = (int8_t)(cmd->words.w0 >> 24);
 #ifdef __3DS__
-    if (gdx3ds_verify_active()) { /* [nverify] temporary diagnostic (interp track) */
+    if (gdx3ds_verify_mode != 0) { /* [nverify] diagnostic, inline-gated: see gdx3ds_verify.h */
         gdx3ds_verify_note_cmd((unsigned)cmd->words.w0, (unsigned)cmd->words.w1);
     }
 #endif

@@ -148,6 +148,11 @@ static void GpuProfLog(const char* fmt, ...) {
 #define GPUPROF_STORM_DRAWS 90
 
 int gdx3ds_prof_active = 0;
+/* MAINPROF: draws/frame of the last emitted [prof] window. The [mprof] receipt carries it
+ * as nD= so `gdx-dev prof --main` can bucket main-thread windows on exactly the load proxy
+ * `--by-vtxn` already uses for the render side. Written on the render thread, read racily
+ * on main; it is a scene descriptor, never a control input. */
+unsigned gdx3ds_prof_last_nd = 0;
 uint64_t gdx3ds_prof_sec_ticks[GDX3DS_PROF_SEC_COUNT];
 uint32_t gdx3ds_prof_sec_calls[GDX3DS_PROF_SEC_COUNT];
 uint32_t gdx3ds_prof_vtx_loaded = 0;
@@ -228,6 +233,7 @@ static void ProfEmitWindow(void) {
         allTicks[s] = sProfWinTicks[0][s] + sProfWinTicks[1][s];
         allCalls[s] = sProfWinCalls[0][s] + sProfWinCalls[1][s];
     }
+    gdx3ds_prof_last_nd = (unsigned)(allCalls[GDX3DS_PROF_DRW] / n);
     ProfEmitLine("", allTicks, allCalls, sProfWinVtx[0] + sProfWinVtx[1],
                  sProfWinProc[0] + sProfWinProc[1], n);
     if (sProfWinFrames[1] > 0) {

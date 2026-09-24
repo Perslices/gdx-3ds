@@ -54,6 +54,10 @@ uintptr_t DlSrc::ResolveTimg(const Cmd& c, size_t requiredBytes) const {
     return gdx_gfx_job_resolve_data(mJob, c.w1, 0, 0, requiredBytes, 0, 0);
 }
 
+uint32_t DlSrc::TimgClassEpoch() const {
+    return gdx_gfx_timg_class_epoch();
+}
+
 uintptr_t DlSrc::SetSegment(unsigned segment, const Cmd& c) const {
     const bool host = IsHostPtr(c);
     return gdx_gfx_job_set_segment(mJob, segment, c.w1, host ? 1 : 0, host ? c.w1 : 0);

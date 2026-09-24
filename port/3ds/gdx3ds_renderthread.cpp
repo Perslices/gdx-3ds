@@ -25,6 +25,8 @@
  * render thread runs the whole gdx_gfx_run, byte-identical to before. */
 #include "gdx3ds_renderthread.h"
 
+#include "gdx3ds_mainprof.h" /* MAINPROF: brm / sub buckets around the submit path */
+
 #include <3ds.h>
 #include <atomic>
 #include <stdarg.h>
@@ -89,6 +91,7 @@ uint32_t sBridgeMainTasks = 0; /* main: tasks whose bridge ran on the submitter 
 uint32_t sBridgeReleaseWaits = 0; /* main: release-before-walk waits (native-RGBA16 retirements) */
 uint64_t sWaitRenderTicks = 0; /* render: idle inside an open frame */
 uint64_t sBeginTicks = 0, sTaskTicks = 0, sEndTicks = 0, sQueueLatTicks = 0; /* render exec */
+uint32_t sQueueLatSkips = 0; /* render: ql samples dropped because the two cores' clocks crossed */
 uint32_t sTasksWindow = 0;
 uint32_t sFencesWindow = 0;
 uint32_t sDmaFencesWindow = 0;
@@ -128,18 +131,84 @@ bool OnMainThread() {
     return gdx_sched_on_host_thread() != 0;
 }
 
-/* Wait until sDone >= target. Single waiter (main). Returns the ticks spent waiting. */
-uint64_t WaitDone(uint32_t target) {
+/* ---- THE WAIT (HOMEFIX2: docs/research/native/homefix2-progress.md) ---------------------
+ *
+ * WHO SIGNALS sDoneEvent: RenderThreadMain, and nothing else -- once per command, right
+ * after the release-store of sDone (the `sDone.store(...); LightEvent_Signal(...)` pair at
+ * the bottom of its switch). There is no second signaler and no timer.
+ *
+ * CAN THE SIGNALER BE PARKED? The render thread is never parked by a flag -- it blocks on
+ * sCmdSem and wakes for every command -- but it CAN block for an unbounded time INSIDE a
+ * command, because a command runs citro3d/GX: kCmdEnd -> EndFrame -> C3D_FrameEnd and the
+ * oracle's C3D_FrameSync, plus gdx_vi_present_fallback, all of which wait on GSP events
+ * (vblank / PSC / PPF). GSP stops delivering those to us the moment GSPGPU_ReleaseRight()
+ * runs, and the shell-closed / screens-off states reach the same place. So:
+ *
+ *   INVARIANT AT EVERY WAIT SITE BELOW: a wait on sDoneEvent that runs INSIDE an APT
+ *   transition (aptHook ONSUSPEND/ONSLEEP, or the pre-pump join that precedes aptMainLoop
+ *   when HOME/close is already visible) MUST carry a deadline. If it does not, and the
+ *   render thread is inside a GSP wait that will never complete, the main thread never
+ *   returns to libctru, APT_JumpToHomeMenu / APT_ReplySleepNotificationComplete are never
+ *   sent, and NS force-terminates the title after ~10 s with no exception and no Luma dump.
+ *   That silent death is the HOME-hang class this file's deadline argument exists to stop.
+ *
+ * deadlineNs <= 0 selects FRAME-LOOP semantics: never give up (proceeding would let main
+ * overwrite buffers the render thread is still reading), but emit a flushed stall receipt
+ * every second so a wedged frame loop names its wait instead of going silent.
+ * Single waiter (main, game fibers included -- they are the same logical thread). */
+constexpr uint64_t kStallReportMs = 1000u;
+
+bool WaitDoneDeadline(uint32_t target, s64 deadlineNs, const char* who, uint64_t* outTicks) {
     const uint64_t t0 = svcGetSystemTick();
+    const uint64_t stallTicks = (uint64_t)(CPU_TICKS_PER_MSEC * (double)kStallReportMs);
+    uint64_t nextStall = t0 + stallTicks;
+    bool done = false;
     for (;;) {
         LightEvent_Clear(&sDoneEvent); /* clear FIRST, then check: a signal after the clear is kept */
         if ((int32_t)(sDone.load(std::memory_order_acquire) - target) >= 0) {
+            done = true;
             break;
         }
-        LightEvent_Wait(&sDoneEvent);
+        const uint64_t spent = svcGetSystemTick() - t0;
+        s64 slice = (s64)(kStallReportMs * 1000000ull); /* wake to report, then re-check */
+        if (deadlineNs > 0) {
+            const s64 spentNs = (s64)((double)spent / CPU_TICKS_PER_MSEC) * 1000000LL;
+            const s64 left = deadlineNs - spentNs;
+            if (left <= 0) {
+                /* Deadline reached. Re-check ONCE before giving up: a completion that landed
+                 * inside the last slice must not be reported as a timeout. A false
+                 * "park TIMEOUT" receipt would send the next hardware investigation at the
+                 * wrong step, which is the one thing these receipts exist to prevent. */
+                done = (int32_t)(sDone.load(std::memory_order_acquire) - target) >= 0;
+                break;
+            }
+            if (left < slice) {
+                slice = left;
+            }
+        }
+        LightEvent_WaitTimeout(&sDoneEvent, slice); /* non-zero = timed out; re-check regardless */
+        if ((int64_t)(svcGetSystemTick() - nextStall) >= 0) {
+            nextStall += stallTicks;
+            RtLogf("[rt] STALL: %s waiting done=%u target=%u for %lums (rtIdle=%d) -- the render "
+                   "thread has not signalled; if this is an APT path it is the HOME-hang shape",
+                   who != nullptr ? who : "?",
+                   (unsigned)sDone.load(std::memory_order_acquire), (unsigned)target,
+                   (unsigned long)((svcGetSystemTick() - t0) / (uint64_t)CPU_TICKS_PER_MSEC));
+            gdx3ds_filelog_flush();
+        }
     }
     const uint64_t dt = svcGetSystemTick() - t0;
     sWaitMainTicks += dt;
+    if (outTicks != nullptr) {
+        *outTicks = dt;
+    }
+    return done;
+}
+
+/* Frame-loop wait: no deadline (see the invariant above), stall receipts only. */
+uint64_t WaitDone(uint32_t target) {
+    uint64_t dt = 0;
+    WaitDoneDeadline(target, 0, "frame", &dt);
     return dt;
 }
 
@@ -194,7 +263,22 @@ void RenderThreadMain(void*) {
                 sBeginTicks += svcGetSystemTick() - x0;
                 break;
             case kCmdTask: {
-                sQueueLatTicks += x0 - s.submitTick;
+                /* `submitTick` is stamped on the SUBMITTING core and `x0` on core 2. On real
+                 * hardware svcGetSystemTick is the same counter and this is a real queue
+                 * latency (hardware logs read ql=2-3 ms). Under Azahar the emulated cores are
+                 * time-sliced onto one host thread and their tick reads can cross, so
+                 * `x0 - s.submitTick` underflows an unsigned 64-bit subtraction and the
+                 * accumulator lands near 2^64, and one crossed sample buries the whole window:
+                 * 401 of 804 [rt] windows across this track's Azahar runs print exactly
+                 * `ql=1075037798400.00` (rtparity-progress.md), while the 2026-09-20 hardware
+                 * slices never once overflow. Drop the crossed samples and count them, so the
+                 * emulator prints a usable number and says how many it dropped, and hardware is
+                 * unaffected. */
+                if (x0 >= s.submitTick) {
+                    sQueueLatTicks += x0 - s.submitTick;
+                } else {
+                    sQueueLatSkips++;
+                }
                 if (s.job != nullptr) {
                     /* bridgemain: already converted on the submitter; interpreter + draws only.
                        The job's segment view (walk-time claims included) is the run's table and
@@ -338,11 +422,38 @@ extern "C" int gdx3ds_rt_idle(void) {
     return sDone.load(std::memory_order_acquire) == sHead.load(std::memory_order_relaxed);
 }
 
+/* "A TASK is queued or executing on the render thread right now." Used by owners of
+ * process-global containers that both threads touch (port/3ds/gfx/gdx3ds_mesh.cpp) to
+ * MEASURE the bridgemain overlap window: a mutation from the submitting thread while this
+ * returns 1 is one the render thread's replay could have been reading. */
+extern "C" int gdx3ds_rt_task_rendering(void) {
+    if (sMode == kOff) {
+        return 0;
+    }
+    return TaskRendering() ? 1 : 0;
+}
+
 extern "C" void gdx3ds_rt_join_idle(void) {
     if (sMode == kOff || tOnRenderThread) {
         return;
     }
     sWaitTopTicks += WaitDone(sHead.load(std::memory_order_relaxed));
+}
+
+/* HOMEFIX2: the APT/suspend-path join. Same drain, with a deadline and a boolean answer.
+ * See "THE WAIT" above for who signals sDoneEvent and why an APT-path wait must be bounded:
+ * the render thread can be stuck in a GSP wait that no longer completes, and a hook that
+ * never returns is a silent NS kill. 0 = timed out; the caller logs a receipt and proceeds
+ * (citro3d's ONSUSPEND gxCmdQueueClear may then svcBreak, which at least leaves a dump). */
+extern "C" int gdx3ds_rt_join_idle_deadline(unsigned timeoutMs) {
+    if (sMode == kOff || tOnRenderThread) {
+        return 1;
+    }
+    uint64_t dt = 0;
+    const bool ok = WaitDoneDeadline(sHead.load(std::memory_order_relaxed),
+                                     (s64)timeoutMs * 1000000LL, "apt-join", &dt);
+    sWaitTopTicks += dt;
+    return ok ? 1 : 0;
 }
 
 extern "C" void gdx3ds_rt_pace_vblank(void) {
@@ -397,10 +508,14 @@ extern "C" int gdx3ds_rt_submit_task(void* dl, size_t dlSize, int ucode) {
             if (TaskRendering()) {
                 sBridgeReleaseWaits++;
             }
+            const int mpRel = gdx3ds_mprof_enter(GDX3DS_MPROF_SUB);
             WaitTaskDone(&sWaitDpTicks); /* merges + releases sJob */
+            gdx3ds_mprof_leave(mpRel);
         }
         const uint64_t b0 = svcGetSystemTick();
+        const int mpPrep = gdx3ds_mprof_enter(GDX3DS_MPROF_BRM);
         job = gdx_gfx_job_prepare(dl, dlSize, (GdxTaskUcode)ucode);
+        gdx3ds_mprof_leave(mpPrep);
         sBridgeMainTicks += svcGetSystemTick() - b0;
         sBridgeMainTasks++;
     }
@@ -409,7 +524,12 @@ extern "C" int gdx3ds_rt_submit_task(void* dl, size_t dlSize, int ucode) {
      * is THE backpressure -- the game is about to write the pool half the previous task reads
      * (audit section 8), so wait for it here; its DP-done was acknowledged early. */
     if (gdx3ds_rt_task_pending() || TaskRendering()) {
+        /* MAINPROF `sub`: main blocked because render(N) is still going. Under the A8
+         * finding (waitMain 14-16 ms, waitRender < 1 ms) this must read ~0 -- if it ever
+         * grows, the render thread has become the bottleneck again. */
+        const int mpSub = gdx3ds_mprof_enter(GDX3DS_MPROF_SUB);
         WaitTaskDone(&sWaitDpTicks);
+        gdx3ds_mprof_leave(mpSub);
         const uint32_t prev = sTaskSeq.load(std::memory_order_acquire);
         if (sTaskAcked != prev) {
             sTaskAcked = prev;
@@ -511,7 +631,7 @@ extern "C" void gdx3ds_rt_emit_receipt(unsigned long frame) {
     const double k = CPU_TICKS_PER_MSEC;
     RtLogf("[rt] mode=%s frame=%lu n=%u tasks=%u waitMain=%.2f waitRender=%.2f fence=%u/%u "
            "segMerge=%u pace=%u/%u latency=1 | ovl=%.2f jdp=%.2f jtop=%.2f brMain=%.2f bm=%u "
-           "relWait=%u | bg=%.2f tk=%.2f en=%.2f ql=%.2f tb=%u texcacheMainMut=%u",
+           "relWait=%u | bg=%.2f tk=%.2f en=%.2f ql=%.2f/%u tb=%u texcacheMainMut=%u",
            ModeName(sMode), frame, (unsigned)sFramesWindow, (unsigned)sTasksWindow,
            (float)((double)sWaitMainTicks / k) / n, (float)((double)sWaitRenderTicks / k) / n,
            (unsigned)sFencesWindow, (unsigned)sDmaFencesWindow, (unsigned)sSegMergeWindow,
@@ -521,11 +641,12 @@ extern "C" void gdx3ds_rt_emit_receipt(unsigned long frame) {
            (unsigned)sBridgeReleaseWaits,
            (float)((double)sBeginTicks / k) / n, (float)((double)sTaskTicks / k) / n,
            (float)((double)sEndTicks / k) / n, (float)((double)sQueueLatTicks / k) / n,
-           (unsigned)sTaskBeforeBegin, (unsigned)sTexCacheMainMut.load(std::memory_order_relaxed));
+           (unsigned)sQueueLatSkips, (unsigned)sTaskBeforeBegin, (unsigned)sTexCacheMainMut.load(std::memory_order_relaxed));
     sWaitMainTicks = sWaitRenderTicks = sWaitTopTicks = sWaitDpTicks = sOverlapTicks = 0;
     sBridgeMainTicks = 0;
     sBridgeMainTasks = sBridgeReleaseWaits = 0;
     sBeginTicks = sTaskTicks = sEndTicks = sQueueLatTicks = 0;
+    sQueueLatSkips = 0;
     sTasksWindow = sFencesWindow = sDmaFencesWindow = sSegMergeWindow = sFramesWindow = 0;
     sPaceWaits = sPaceSkips = sTaskBeforeBegin = 0;
 }
@@ -534,14 +655,51 @@ extern "C" void gdx3ds_rt_shutdown(void) {
     if (sMode == kOff || sThread == nullptr) {
         return;
     }
-    gdx3ds_rt_join_idle();
+    /* HOMEFIX2 / audit-2026-09-24 finding 6: this drain is on the SAME path the QUIT wait
+     * below is bounded for -- teardown after a close order from HOME runs with GSP rights
+     * already released -- and it runs FIRST, so an unbounded gdx3ds_rt_join_idle() here made
+     * the bounded wait at the bottom unreachable in the one scenario it was written for, and
+     * made the "shutdown TIMEOUT ... unjoined on purpose" receipt assert something untrue.
+     * Same shape as the APT join: honour [debug] apt_join_ms, 0 = the pre-HOMEFIX2 unbounded
+     * wait kept as a deliberate bisect lever, and proceed with a receipt on a timeout (the
+     * QUIT wait and threadJoin below are both bounded, and the receipt names what leaked). */
+    int joinMs = gdx3ds_config_get_int("debug", "apt_join_ms", 1200);
+    if (joinMs < 0) {
+        joinMs = 0;
+    }
+    if (joinMs > 0) {
+        if (!gdx3ds_rt_join_idle_deadline((unsigned)joinMs)) {
+            RtLogf("[rt] shutdown drain TIMEOUT after %dms: the render thread has not signalled; "
+                   "proceeding to QUIT without releasing the in-flight job",
+                   joinMs);
+            gdx3ds_filelog_flush();
+            /* sJob is still owned by a render that never completed: releasing it would hand
+             * the recycler a buffer the render thread may still be reading. Leak it, as the
+             * thread's stack is leaked below, and say so. */
+            sJob = nullptr;
+        }
+    } else {
+        gdx3ds_rt_join_idle(); /* [debug] apt_join_ms=0: pre-HOMEFIX2 unbounded wait */
+    }
     if (sJob != nullptr) {
         gdx_gfx_job_release(sJob); /* its render completed at the join above */
         sJob = nullptr;
     }
     const uint32_t t = Produce(kCmdQuit, nullptr, 0, 0);
-    WaitDone(t);
-    threadJoin(sThread, U64_MAX);
+    /* HOMEFIX2: teardown after a close order from the HOME menu runs with GSP rights already
+     * released, so a render thread still inside a GSP wait would never acknowledge QUIT.
+     * Bound both waits and leak deliberately with a receipt rather than wedge main() one
+     * step short of the final flush (the close-from-HOME hang of home-crash-audit.md). */
+    uint64_t dt = 0;
+    const bool acked = WaitDoneDeadline(t, 3000LL * 1000000LL, "rt-quit", &dt);
+    if (!acked || R_FAILED(threadJoin(sThread, 3000000000LL))) {
+        RtLogf("[rt] shutdown TIMEOUT (quitAcked=%d): leaving the render thread unjoined on "
+               "purpose; its stack is leaked so teardown can finish", acked ? 1 : 0);
+        gdx3ds_filelog_flush();
+        sThread = nullptr;
+        sMode = kOff;
+        return;
+    }
     threadFree(sThread);
     sThread = nullptr;
     sMode = kOff;

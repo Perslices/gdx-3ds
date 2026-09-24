@@ -93,6 +93,10 @@ if(NINTENDO_3DS)
     # DYNLOD (LOCKED-60 Task J): automatic rival-detail tier from the render task's wall
     # time ([perf] rival_detail_auto, DEFAULT ON; manual [perf] rival_detail is the floor).
     target_sources(G-Diffuser-3DS PRIVATE gdx3ds_dynlod.c)
+    # MAINPROF (NEXT.md A8): [mprof] main-thread section profiler, gdiffuser.ini
+    # [debug] mainprof (DEFAULT OFF). Diagnostic only; every hook site is one int
+    # load + branch when the gate is off.
+    target_sources(G-Diffuser-3DS PRIVATE gdx3ds_mainprof.c)
     # ORACLE: true frame capture + [fh] receipts (docs/research/native/03-oracle-plan.md).
     target_sources(G-Diffuser-3DS PRIVATE gdx3ds_oracle.c)
     set_source_files_properties(gdx3ds_oracle.c PROPERTIES COMPILE_DEFINITIONS

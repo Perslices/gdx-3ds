@@ -1,0 +1,102 @@
+# race-4p-vs: VS BATTLE 4 PLAYERS on Mute City, split screen, under [debug] pads=4.
+# Requires `--ini pads=4`: the 3DS has one pad and the decomp gates VS on the port count
+# (decomp/src/overlays/ovl_i6/main_menu.c:205 and :317-324). Ports 2-4 mirror port 1
+# (port/input_bridge.c), so the four machines drive together -- deterministic, and it is
+# the split-screen viewports that this replay exists to draw.
+# Modes: 7 MAIN_MENU -> 10 COURSE_SELECT -> 8 MACHINE_SELECT -> 9 MACHINE_SETTINGS -> 5 VS_4P.
+# SHOT PLACEMENT IS NOT AUTHORED HERE ANY MORE (NEXT.md B15/B43, coverage2-progress.md).
+# This file is the INPUT script: ticks, buttons, sticks. The schedule that decides which frames
+# the parity gate hashes is DERIVED from a `[debug] cov=1` coverage census of the replay and
+# written into the .gdxrec by tools/dev/covsched.py. Regenerating a .gdxrec from this file
+# therefore produces a recording with NO SHOTs; re-apply the schedule with
+#   tools/dev/covsched.py derive <cov-run>/log-*.txt --rewrite in.gdxrec out.gdxrec
+# The hand-placed schedules this file used to carry covered 49-80% of what their replay draws.
+build native/replays@dd936b2
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 rival_detail_auto=0 stereo=1 fh_every=0 pads=4
+at 400
+press START 15 0
+at 660
+press RIGHT 12 0
+at 760
+press RIGHT 12 0
+at 860
+press RIGHT 12 0
+at 960
+wait 1
+at 1060
+press A 12 0
+at 1180
+wait 1
+at 1240
+press DOWN 12 0
+at 1320
+press DOWN 12 0
+at 1420
+wait 1
+at 1480
+press A 12 0
+at 1600
+wait 1
+at 1660
+press A 15 0
+at 1790
+wait 1
+at 1910
+press A 15 0
+at 2040
+wait 1
+at 2160
+press A 15 0
+at 2290
+wait 1
+at 2410
+press A 15 0
+at 2540
+wait 1
+at 2660
+press A 15 0
+at 2790
+wait 1
+at 2910
+press A 15 0
+at 3040
+wait 1
+at 3160
+press A 15 0
+at 3290
+wait 1
+at 3300
+hold A 100
+hold A 80
+hold A 80
+hold A 80
+hold A 80
+hold A 80
+hold A 80
+hold A 80
+hold A 80
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+hold A 80 35 0
+len 5900

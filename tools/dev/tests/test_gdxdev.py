@@ -6,9 +6,11 @@ the manifest round-trips through the schema check, the ini merge provably preser
 foreign agent's key, and the log parser reproduces hand-computed numbers.
 """
 
+import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,7 +18,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from gdxdev import inifile, prof, replay, runs, util  # noqa: E402
+from gdxdev import hwrun, inifile, prof, replay, runs, util  # noqa: E402
+import hw  # noqa: E402
 from gdxdev.util import GdxError  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -30,6 +33,9 @@ class ManifestTest(unittest.TestCase):
             build={"id": "native/devcli@abcdef12", "dirty": False, "artifact": "x.3dsx",
                    "sha256": "0" * 64, "generator": "Ninja", "configure_s": 1.0,
                    "build_s": 2.0},
+            tree={"branch": "native/devcli", "head": "a" * 40, "base": "native/main",
+                  "base_head": "b" * 40, "branch_point": "b" * 40, "behind": 0,
+                  "ahead": 3, "dirty": False, "current": True},
             ini={"debug.filelog": "1"}, replay=None, gputrace=False, seconds=60,
             platform={"host": "darwin-arm64", "azahar": "2126.0", "retroarch": None,
                       "model": "emu-new3ds"},
@@ -54,6 +60,32 @@ class ManifestTest(unittest.TestCase):
         m = self._full()
         m["gputrace"] = "yes"
         self.assertTrue(any("gputrace" in p for p in runs.validate(m)))
+
+    def test_a_manifest_without_a_tree_is_refused(self):
+        """NEXT.md B46 / PROTOCOL.md: a parity cell is a claim about a tree. A manifest
+        that does not name its branch point cannot support a parity claim, so the schema
+        refuses it rather than letting the number be quoted bare."""
+        m = self._full()
+        m["tree"] = None
+        problems = runs.validate(m)
+        self.assertTrue(any("tree" in p for p in problems), problems)
+
+    def test_a_tree_without_a_branch_point_is_refused(self):
+        m = self._full()
+        m["tree"] = dict(m["tree"], branch_point=None)
+        self.assertTrue(any("branch_point" in p for p in runs.validate(m)))
+
+    def test_a_half_filled_tree_is_refused(self):
+        m = self._full()
+        m["tree"] = {"branch": "native/x", "branch_point": "c" * 40}
+        self.assertTrue(any("behind" in p for p in runs.validate(m)))
+
+    def test_timeout_is_a_legal_verdict(self):
+        """NEXT.md B45: a run cut short by --seconds is a different FACT from a crash,
+        so it gets its own word rather than borrowing FAIL's."""
+        m = self._full()
+        m["result"] = dict(m["result"], verdict="TIMEOUT")
+        self.assertEqual(runs.validate(m), [])
 
     def test_write_refuses_invalid(self):
         with tempfile.TemporaryDirectory() as d:
@@ -229,6 +261,46 @@ class ProfParseTest(unittest.TestCase):
         self.assertEqual(prof.percentile(v, 10), 1)
         self.assertEqual(prof.percentile(v, 50), 5)
         self.assertEqual(prof.percentile(v, 90), 9)
+
+
+class ShotBeatTest(unittest.TestCase):
+    """A10: a [watchdog] beat that carried a replay SHOT is measuring the harness.
+
+    The screenshot is a framebuffer readback plus a 230-288 KB BMP write, all on the main
+    thread -- about 2 s per image on an SD card. On the 2026-09-20 hardware logs EVERY beat
+    that dipped into the teens carried one, in every lever configuration, which is what made
+    the fps beat sequence look identical run to run and lever to lever.
+    """
+
+    def test_beats_are_tagged_by_log_position(self):
+        text = ("[watchdog] beat=1 frame=100(+100) stage=2\n"
+                "[autotest] SHOT captured -> autotest/race00_L.bmp bytes=288054 frame=150\n"
+                "[watchdog] beat=2 frame=160(+60) stage=2\n"
+                "[watchdog] beat=3 frame=460(+300) stage=2\n")
+        p = prof.parse_text(text)
+        self.assertEqual([b["shots"] for b in p.watchdog], [0, 1, 0])
+
+    def test_excluding_shot_beats_changes_the_summary(self):
+        p = prof.parse_file(os.path.join(FIXTURES, "hw-fps-all1-interp1.log"))
+        every = prof.fps_summary(p)
+        clean = prof.fps_summary(p, exclude_shots=True)
+        self.assertGreater(every["shot_beats"], 0)
+        self.assertEqual(clean["beats"], every["beats"] - every["shot_beats"])
+        # The dips into the teens are entirely SHOT beats: without them the floor is a
+        # real frame rate, not a screenshot.
+        self.assertLess(every["min"], 20.0)
+        self.assertGreater(clean["min"], 30.0)
+        self.assertGreater(clean["mean"], every["mean"])
+
+    def test_the_legacy_dump_receipts_count_too(self):
+        # Hardware takes the legacy path ("SHOT dumped" + "SHOT scanout dumped"), the
+        # emulator the oracle one ("SHOT captured"). Both must tag the beat.
+        text = ("[watchdog] beat=1 frame=100(+100)\n"
+                "[autotest] SHOT dumped -> autotest/race00.bmp\n"
+                "[autotest] SHOT scanout dumped -> autotest/race00_scan.bmp\n"
+                "[watchdog] beat=2 frame=160(+60)\n")
+        p = prof.parse_text(text)
+        self.assertEqual(p.watchdog[1]["shots"], 2)
 
 
 class VerdictTest(unittest.TestCase):
@@ -475,6 +547,497 @@ class RetroGfxTest(unittest.TestCase):
                       "the manifest must record the staged replay, not null")
 
 
+class _OnlyPopenExplodes(object):
+    """A stand-in for the `subprocess` module whose Popen detonates and whose everything
+    else is the real thing."""
+
+    def __init__(self, real, boom):
+        self._real = real
+        self.Popen = boom
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class RetroDryRunTest(unittest.TestCase):
+    """NEXT.md B45. `--dry-run` was parsed by `_common()`, documented in `--help`, and
+    read by NOBODY in `retro run`: the flag that exists to be safe booted a real
+    RetroArch instance on a real private SD. These tests detonate on every side effect a
+    real run has, so a dry run that reaches any of them fails here instead of on the host.
+    """
+
+    SIDE_EFFECTS = ("ensure_core", "ensure_core_3d", "acquire_instance", "seed_sd",
+                    "write_config", "_attempt", "suppress_restore_prompt",
+                    "wait_for_host", "send_command", "kill_group", "strip_run_control")
+
+    def setUp(self):
+        from gdxdev import retro
+        self.retro = retro
+        self.tmp = tempfile.mkdtemp(prefix="gdx-dry-")
+        self.dsx = os.path.join(self.tmp, "G-Diffuser-3DS.3dsx")
+        with open(self.dsx, "wb") as f:
+            f.write(b"3DSX\x00fake")
+        self.out = util.Out(quiet=True)
+        self.tripped = []
+        self._saved = {}
+        for name in self.SIDE_EFFECTS:
+            self._saved[name] = getattr(retro, name)
+            setattr(retro, name, self._detonator(name))
+        # and the launch itself, one level below everything above. Only `retro`'s own
+        # view of the module is swapped: patching subprocess.Popen globally would also
+        # detonate on the `git` calls the manifest's tree block makes.
+        self._popen = retro.subprocess
+        retro.subprocess = _OnlyPopenExplodes(retro.subprocess,
+                                              self._detonator("subprocess.Popen"))
+        # runs.create() would leave a directory behind: "change nothing" includes that
+        self._create = retro.runs.create
+        retro.runs.create = self._detonator("runs.create")
+
+    def _detonator(self, name):
+        def boom(*a, **kw):
+            self.tripped.append(name)
+            raise AssertionError("--dry-run called %s()" % name)
+        return boom
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(self.retro, name, fn)
+        self.retro.subprocess = self._popen
+        self.retro.runs.create = self._create
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _args(self, *extra):
+        from gdxdev import cli
+        return cli.build_parser().parse_args(
+            ["retro", "run", self.dsx, "--dry-run", "--quiet"] + list(extra))
+
+    def _ctx(self):
+        return {"root": util.repo_root(), "track": "dryrun-unit",
+                "run_root": os.path.join(self.tmp, "runs")}
+
+    def test_a_dry_run_launches_nothing(self):
+        code = self.retro.do_run(self._args(), self.out, self._ctx())
+        self.assertEqual(code, util.EXIT_OK)
+        self.assertEqual(self.tripped, [])
+
+    def test_a_dry_run_with_a_replay_launches_nothing(self):
+        code = self.retro.do_run(self._args("--replay", "race-mutecity-start"),
+                                 self.out, self._ctx())
+        self.assertEqual(code, util.EXIT_OK)
+        self.assertEqual(self.tripped, [])
+
+    def test_a_dry_run_writes_no_run_directory(self):
+        self.retro.do_run(self._args(), self.out, self._ctx())
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "runs")))
+
+    def test_a_dry_run_stages_no_replay_file(self):
+        """replay.stage(dry_run=True) still VALIDATES and reports; it must not copy."""
+        from gdxdev import replay as rp
+        inst = self.retro.Instance("dryrun-unit")
+        self.retro.do_run(self._args("--replay", "race-mutecity-start"),
+                          self.out, self._ctx())
+        self.assertFalse(os.path.exists(rp.rec_dir(inst.sdmc())))
+
+    def test_a_dry_run_reports_what_it_would_launch(self):
+        out = util.Out(quiet=False, as_json=True)
+        buf = io.StringIO()
+        saved, sys.stdout = sys.stdout, buf
+        try:
+            self.retro.do_run(self._args("--replay", "race-mutecity-start",
+                                         "--gfx", "vulkan"), out, self._ctx())
+        finally:
+            sys.stdout = saved
+        text = buf.getvalue()
+        emitted = json.loads(text[text.index("{"):])
+        self.assertTrue(emitted["dry_run"])
+        self.assertIn("retroarch", emitted["cmd"][0].lower())
+        self.assertIn(self.dsx, emitted["cmd"])
+        self.assertEqual(emitted["gfx"], ["Vulkan"])
+        self.assertEqual(emitted["replay"]["id"], "race-mutecity-start")
+        self.assertTrue(emitted["tree"]["branch_point"])
+
+    def test_a_real_run_is_not_short_circuited(self):
+        """The guard against 'fixed --dry-run by making every run a dry run'."""
+        from gdxdev import cli
+        args = cli.build_parser().parse_args(["retro", "run", self.dsx, "--quiet"])
+        with self.assertRaises(AssertionError):
+            self.retro.do_run(args, self.out, self._ctx())
+        self.assertTrue(self.tripped, "a real run must still reach the launch path")
+
+
+class RetroSecondsTest(unittest.TestCase):
+    """NEXT.md B45, second half: `--seconds 60` truncated every corpus replay."""
+
+    def _args(self, *extra):
+        from gdxdev import cli
+        return cli.build_parser().parse_args(["retro", "run", "x.3dsx"] + list(extra))
+
+    def test_the_parser_no_longer_hardcodes_sixty(self):
+        self.assertIsNone(self._args().seconds,
+                          "a fixed --seconds default hides which value a run chose")
+
+    def test_a_bare_boot_keeps_the_short_default(self):
+        from gdxdev import retro
+        self.assertEqual(retro.resolve_seconds(self._args(), None)[0],
+                         retro.DEFAULT_SECONDS)
+
+    def test_a_staged_replay_gets_the_long_default(self):
+        from gdxdev import retro
+        secs, why = retro.resolve_seconds(self._args(), {"id": "race-mutecity-start"})
+        self.assertEqual(secs, retro.REPLAY_SECONDS)
+        self.assertGreaterEqual(secs, 240)      # residuals2-progress.md measured 240-420 s
+        self.assertIn("B45", why)
+
+    def test_an_explicit_seconds_always_wins(self):
+        from gdxdev import retro
+        self.assertEqual(retro.resolve_seconds(self._args("--seconds", "5"),
+                                               {"id": "x"})[0], 5)
+
+
+class TimeoutVerdictTest(unittest.TestCase):
+    """NEXT.md B45: a run cut short by --seconds was reported exactly like a crash."""
+
+    LOG = ("[rec] replay armed\n"
+           "[watchdog] beat=1 frame=60(+60)\n"
+           "[watchdog] beat=2 frame=120(+60)\n")
+    BLOCK = {"kind": "gdxrec", "shots": [], "last_tick": 6000, "schedule": []}
+
+    def _judge(self, **kw):
+        from gdxdev import emu
+        return emu.judge("", self.LOG, util.Out(quiet=True), replay_kind="gdxrec",
+                         replay_block=self.BLOCK, **kw)
+
+    def test_the_clock_running_out_is_a_timeout_not_a_failure(self):
+        r = self._judge(emu_alive_at_end=True, deadline_hit=True, seconds=60)
+        self.assertEqual(r["verdict"], "TIMEOUT")
+        self.assertTrue(r["timed_out"])
+        self.assertIn("cut short", r["detail"])
+        self.assertIn("NOT crashed", r["detail"])
+        self.assertIn("6000", r["detail"])      # names the tick it was short of
+
+    def test_a_dead_core_is_still_a_failure(self):
+        r = self._judge(emu_alive_at_end=False, deadline_hit=False)
+        self.assertEqual(r["verdict"], "FAIL")
+        self.assertFalse(r["timed_out"])
+        self.assertIn("core died", r["detail"])
+
+    def test_a_fatal_outranks_the_clock(self):
+        """A run that crashed AND hit the deadline is a crash, not a timeout."""
+        from gdxdev import emu
+        r = emu.judge("", self.LOG + "[fatal] assert in gfx\n", util.Out(quiet=True),
+                      replay_kind="gdxrec", replay_block=self.BLOCK,
+                      emu_alive_at_end=True, deadline_hit=True, seconds=60)
+        self.assertEqual(r["verdict"], "FAIL")
+
+    def test_timeout_does_not_exit_zero(self):
+        import inspect
+        from gdxdev import retro
+        self.assertIn('result["verdict"] == "PASS"', inspect.getsource(retro.do_run))
+
+    def test_the_result_line_says_the_word(self):
+        from gdxdev import emu
+        r = self._judge(emu_alive_at_end=True, deadline_hit=True, seconds=60)
+        line = emu.result_line({"build": {}, "replay": {"id": "r", "kind": "gdxrec"},
+                                "wall_s": 60}, r)
+        self.assertTrue(line.startswith("RESULT TIMEOUT"), line)
+
+    def test_the_attempt_records_why_it_ended(self):
+        import inspect
+        from gdxdev import retro
+        src = inspect.getsource(retro._attempt)
+        self.assertIn('_LAST_ATTEMPT["deadline_hit"]', src)
+        self.assertIn("deadline_hit = rc is None and not guest_done", src)
+
+
+class ImpliedReplayQuitTest(unittest.TestCase):
+    """NEXT.md B19: `--replay` alone never ENDED a run — the guest played on, unscripted,
+    until --seconds expired."""
+
+    KEY = ("debug", "replay_quit")
+
+    def _args(self, *extra):
+        from gdxdev import cli
+        return cli.build_parser().parse_args(["retro", "run", "x.3dsx"] + list(extra))
+
+    def test_a_staged_replay_implies_replay_quit(self):
+        settings, explicit = {}, set()
+        replay.apply_implied(settings, explicit, kind="gdxrec")
+        self.assertEqual(settings[self.KEY], "1")
+
+    def test_an_explicit_ini_wins(self):
+        settings = {self.KEY: "0"}
+        replay.apply_implied(settings, {self.KEY}, kind="gdxrec")
+        self.assertEqual(settings[self.KEY], "0",
+                         "the wobble and dynlod runs need to play past the replay end")
+
+    def test_the_override_flag_exists_and_is_explicit(self):
+        from gdxdev import retro
+        settings, explicit = retro.build_settings(self._args("--no-replay-quit"))
+        self.assertEqual(settings[self.KEY], "0")
+        self.assertIn(self.KEY, explicit)
+        replay.apply_implied(settings, explicit, kind="gdxrec")
+        self.assertEqual(settings[self.KEY], "0")
+
+    def test_the_ini_spelling_of_the_override_also_wins(self):
+        from gdxdev import retro
+        settings, explicit = retro.build_settings(
+            self._args("--ini", "debug.replay_quit=0"))
+        replay.apply_implied(settings, explicit, kind="gdxrec")
+        self.assertEqual(settings[self.KEY], "0")
+
+    def test_both_lanes_imply_it(self):
+        import inspect
+        from gdxdev import emu, retro
+        for fn in (emu.do_run, retro.do_run):
+            self.assertIn("replay.apply_implied(", inspect.getsource(fn),
+                          "%s stages a replay without implying replay_quit" % fn)
+
+    def test_the_override_is_reachable_from_both_lanes(self):
+        from gdxdev import cli
+        ap = cli.build_parser()
+        self.assertTrue(ap.parse_args(["retro", "run", "x", "--no-replay-quit"])
+                        .no_replay_quit)
+        self.assertTrue(ap.parse_args(["emu", "run", "x", "--no-replay-quit"])
+                        .no_replay_quit)
+
+    def test_the_clean_exit_it_causes_is_not_a_fatal(self):
+        """replay_quit leaves through exit(), which logs `[fatal-trace] atexit:`. If that
+        counted as a fatal, implying replay_quit would fail every run that obeyed it
+        (residuals-progress.md, STATUS.md item 7)."""
+        census = prof.error_census("[fatal-trace] atexit: process exiting via exit()\n")
+        self.assertEqual(census["fatals"], 0)
+
+
+class TreeClaimTest(unittest.TestCase):
+    """NEXT.md B46 / PROTOCOL.md: a parity cell is a claim about a tree. A long-lived
+    branch that does not name its branch point cannot be checked against main from where
+    it stands — which cost one agent a full bisect of B42, a bug already fixed on main."""
+
+    def _repo(self, d):
+        def g(*a):
+            import subprocess
+            return subprocess.run(["git"] + list(a), cwd=d, text=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL).stdout
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        open(os.path.join(d, "f"), "w").write("1")
+        g("add", "f"); g("commit", "-qm", "one")
+        return g
+
+    def test_a_current_branch_reports_no_drift(self):
+        from gdxdev import build as buildmod
+        with tempfile.TemporaryDirectory() as d:
+            g = self._repo(d)
+            g("checkout", "-qb", "work")
+            t = buildmod.tree_info(d, base="main")
+            self.assertEqual(t["behind"], 0)
+            self.assertTrue(t["current"])
+            self.assertIsNone(buildmod.tree_warning(t))
+
+    def test_a_branch_behind_main_is_named_as_such(self):
+        from gdxdev import build as buildmod
+        with tempfile.TemporaryDirectory() as d:
+            g = self._repo(d)
+            point = g("rev-parse", "HEAD").strip()
+            g("checkout", "-qb", "work")
+            open(os.path.join(d, "w"), "w").write("w")
+            g("add", "w"); g("commit", "-qm", "work")
+            g("checkout", "-q", "main")
+            open(os.path.join(d, "m"), "w").write("m")
+            g("add", "m"); g("commit", "-qm", "main moves on")
+            g("checkout", "-q", "work")
+            t = buildmod.tree_info(d, base="main")
+            self.assertEqual(t["branch"], "work")
+            self.assertEqual(t["branch_point"], point)
+            self.assertEqual(t["behind"], 1)
+            self.assertEqual(t["ahead"], 1)
+            self.assertFalse(t["current"])
+            warn = buildmod.tree_warning(t)
+            self.assertIn("behind", warn)
+            self.assertIn("pre-existing", warn)
+
+    def test_the_receipt_carries_the_branch_point(self):
+        from gdxdev import build as buildmod
+        line = buildmod.tree_receipt({"branch": "native/x", "head": "a" * 40,
+                                      "base": "native/main", "base_head": "b" * 40,
+                                      "branch_point": "c" * 40, "behind": 2, "ahead": 5,
+                                      "dirty": True, "current": False})
+        self.assertIn("native/x@aaaaaaaa", line)
+        self.assertIn("branch point cccccccc", line)
+        self.assertIn("native/main@bbbbbbbb", line)
+        self.assertIn("DIRTY", line)
+
+    def test_every_lane_writes_one(self):
+        import inspect
+        from gdxdev import emu, hwrun, retro
+        for fn in (emu.do_run, retro.do_run, hwrun._run_slice,
+                   hwrun._write_matrix_manifest):
+            self.assertIn("tree=buildmod.tree_info(", inspect.getsource(fn),
+                          "%s writes a manifest with no branch point" % fn)
+
+    def test_this_very_worktree_resolves(self):
+        from gdxdev import build as buildmod
+        t = buildmod.tree_info(util.repo_root())
+        self.assertTrue(t["branch_point"], "the live worktree must name its branch point")
+        self.assertEqual(runs._tree_problems(t), [])
+
+
+class Stereo3dTest(unittest.TestCase):
+    """`--3d`: the host knob that makes the guest's right-eye pass run at all.
+
+    The invariant most of these guard is "nothing changes when off" — the whole parity
+    corpus was recorded without this flag.
+    """
+
+    def test_qt_enum_is_azahars_not_citras(self):
+        """Azahar inserted SideBySideFull at 2, pushing Anaglyph to 3 (settings.h:86).
+
+        An enum carried over from a Citra-era note would select the wrong mode, which
+        looks like "3D did not work" rather than like a bug."""
+        from gdxdev import stereo3d
+        self.assertEqual(stereo3d.MODES["off"][0], 0)
+        self.assertEqual(stereo3d.MODES["side-by-side"][0], 1)
+        self.assertEqual(stereo3d.MODES["side-by-side-full"][0], 2)
+        self.assertEqual(stereo3d.MODES["anaglyph"][0], 3)
+        self.assertEqual(stereo3d.MODES["interlaced"][0], 4)
+        self.assertEqual(stereo3d.MODES["reverse-interlaced"][0], 5)
+
+    def test_depth_zero_is_refused(self):
+        """factor_3d 0 leaves the slider at 0, i.e. exactly the state --3d exists to fix."""
+        from gdxdev import stereo3d
+        for bad in (0, -1, 101, "x"):
+            with self.assertRaises(GdxError):
+                stereo3d.depth_or_die(bad)
+        self.assertEqual(stereo3d.depth_or_die(100), 100)
+
+    def test_unknown_mode_is_a_usage_error(self):
+        from gdxdev import stereo3d
+        with self.assertRaises(GdxError) as cm:
+            stereo3d.mode_or_die("sidebyside")
+        self.assertEqual(cm.exception.code, util.EXIT_USAGE)
+
+    def test_3d_implies_stereo_and_both_eyes(self):
+        from gdxdev import stereo3d
+        s = stereo3d.guest_settings()
+        self.assertEqual(s[("stereo", "enabled")], "1")
+        self.assertEqual(s[("debug", "fh_eye")], "both",
+                         "without fh_eye=both there is no eye=R stream to compare")
+
+    def test_qt_config_patch_writes_the_default_sibling_and_restores(self):
+        """QtConfig::ReadBasicSetting throws the stored value away when <key>\\default is
+        true, so render_3d=1 on its own is inert. And qt-config.ini is the user's own
+        preference file: the run must hand it back byte for byte."""
+        from gdxdev import stereo3d
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "qt-config.ini")
+            original = ("[UI]\ntheme=dark\n\n[Layout]\nfactor_3d=100\n"
+                        "factor_3d\\default=false\nrender_3d=0\nrender_3d\\default=true\n"
+                        "swap_eyes_3d=false\n\n[Renderer]\nrenderer_debug=false\n")
+            with open(path, "w") as f:
+                f.write(original)
+
+            class _Out:
+                def say(self, *a, **k):
+                    pass
+
+            with stereo3d.QtStereo("anaglyph", 40, _Out(), path=path):
+                got = util.read_text(path)
+                self.assertIn("render_3d=3", got)
+                self.assertIn("render_3d\\default=false", got)
+                self.assertIn("factor_3d=40", got)
+                self.assertIn("factor_3d\\default=false", got)
+                self.assertIn("[Renderer]", got)
+                self.assertIn("swap_eyes_3d=false", got)
+            self.assertEqual(util.read_text(path), original)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_core_options_file_is_untouched_without_3d(self):
+        """Not one byte differs for a run that did not ask for 3D."""
+        from gdxdev import retro
+        d = tempfile.mkdtemp()
+        try:
+            inst = retro.Instance("t3d")
+            inst.dir = d
+            retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib")
+            self.assertEqual(util.read_text(inst.core_options),
+                             retro.CORE_OPTIONS_TEMPLATE % {"gfx": "Vulkan"})
+            self.assertNotIn("rgui_config_directory", util.read_text(inst.cfg))
+            self.assertFalse(os.path.exists(os.path.join(d, "config", "Azahar",
+                                                         "Azahar.opt")))
+
+            retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib",
+                               three_d=("side-by-side", 100))
+            # The file RetroArch actually reads (core_options_path is inert; see
+            # CFG_3D_EXTRA). Both halves have to be there or the option never lands.
+            opt = util.read_text(os.path.join(d, "config", "Azahar", "Azahar.opt"))
+            self.assertIn('citra_render_3d = "side-by-side"', opt)
+            self.assertIn('citra_factor_3d = "100"', opt)
+            self.assertIn('citra_is_new_3ds = "New 3DS"', opt,
+                          "under --3d the file IS read, so the value must be a legal one")
+            self.assertIn("rgui_config_directory", util.read_text(inst.cfg))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class FhDiffEyeTest(unittest.TestCase):
+    """`fhdiff --eye both`: one capture writes an eye=L and an eye=R receipt sharing a
+    frame number, so the two streams must be compared separately, never against each
+    other."""
+
+    TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "fhdiff.py")
+
+    BOTH = ("[fh] frame=10 tick=9 eye=L w=400 h=240 hash=aaaa1111 tag=auto mode=1\n"
+            "[fh] frame=10 tick=9 eye=R w=400 h=240 hash=bbbb2222 tag=auto mode=1\n"
+            "[fh] frame=11 tick=10 eye=L w=400 h=240 hash=cccc3333 tag=auto mode=1\n"
+            "[fh] frame=11 tick=10 eye=R w=400 h=240 hash=dddd4444 tag=auto mode=1\n")
+
+    def _run(self, a_text, b_text, *extra):
+        import subprocess
+        d = tempfile.mkdtemp()
+        try:
+            pa, pb = os.path.join(d, "a.log"), os.path.join(d, "b.log")
+            for p, t in ((pa, a_text), (pb, b_text)):
+                with open(p, "w") as f:
+                    f.write(t)
+            p = subprocess.run([sys.executable, self.TOOL, pa, pb] + list(extra),
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return p.returncode, p.stdout
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_identical_two_eye_logs_pass(self):
+        rc, outp = self._run(self.BOTH, self.BOTH, "--eye", "both")
+        self.assertEqual(rc, 0, outp)
+        self.assertIn("eyes=L,R status=PASS", outp)
+        self.assertIn("[eye=L] compared=2 divergent=0", outp)
+        self.assertIn("[eye=R] compared=2 divergent=0", outp)
+
+    def test_a_right_eye_only_divergence_fails(self):
+        """The whole point: a lever that breaks only the right eye is invisible in mono."""
+        rc, outp = self._run(self.BOTH, self.BOTH.replace("dddd4444", "dddd9999"),
+                             "--eye", "both")
+        self.assertEqual(rc, 1, outp)
+        self.assertIn("[eye=L] compared=2 divergent=0", outp)
+        self.assertIn("[eye=R] compared=2 divergent=1", outp)
+        self.assertIn("status=FAIL", outp)
+
+    def test_missing_right_eye_says_the_pass_did_not_run(self):
+        mono = "".join(l for l in self.BOTH.splitlines(True) if "eye=R" not in l)
+        rc, outp = self._run(self.BOTH, mono, "--eye", "both")
+        self.assertEqual(rc, 2, outp)
+        self.assertIn("right-eye pass did not run", outp)
+
+    def test_eyes_are_never_matched_against_each_other(self):
+        """L-vs-R would report divergence on a perfectly good stereo pair."""
+        rc, outp = self._run(self.BOTH, self.BOTH, "--eye", "both")
+        self.assertEqual(rc, 0, outp)
+        self.assertNotIn("DIFF", outp)
+
+
 class RetroInstanceLockTest(unittest.TestCase):
     """Orphan RetroArch processes shared private SDs with live runs (reported by the
     coordinator, 2026-09-13: 9 orphans, ppid 1, several on instance names a live run was
@@ -672,9 +1235,26 @@ class SeedIniHygieneTest(unittest.TestCase):
         """Nothing is inherited any more, so the retro lane must set what it relies on."""
         import inspect
         from gdxdev import emu, retro
-        self.assertIn("MEASUREMENT_INI", inspect.getsource(retro.do_run))
+        self.assertIn("MEASUREMENT_INI", inspect.getsource(retro.build_settings))
         for key in (("debug", "filelog"), ("debug", "verbose")):
             self.assertIn(key, emu.MEASUREMENT_INI)
+
+    def test_the_render_thread_is_on_by_default_on_both_lanes(self):
+        """rtparity: the gate measures the configuration that SHIPS.
+
+        The Qt lane merges into the shared virtual SD, which carried `renderthread = 0` for
+        six days and thereby defined the render-thread state of every Qt-lane parity run the
+        fork scored — silently, because `emu run` merged and never set the key. Pinning it in
+        MEASUREMENT_INI makes `renderthread=1` (kPipe + bridgemain=1, the guest default at
+        gdx3ds_renderthread.cpp:296) the default, and `--ini debug.renderthread=0` an explicit
+        bisect lever. An --ini flag must still win, or the lever would be unreachable.
+        """
+        from gdxdev import emu, inifile
+        self.assertEqual(emu.MEASUREMENT_INI.get(("debug", "renderthread")), "1")
+        settings = dict(emu.MEASUREMENT_INI)
+        section, key, value = inifile.parse_spec("debug.renderthread=0")
+        settings[(section, key)] = value
+        self.assertEqual(settings[("debug", "renderthread")], "0")
 
     def test_apt_signal_lines_are_not_crashes(self):
         """Azahar logs "with signal 00000001" on every healthy boot."""
@@ -790,8 +1370,10 @@ class ReplayCompletionTest(unittest.TestCase):
         gd = os.path.join(util.repo_root(), "replays", "race-mutecity-start.gdxrec")
         if os.path.exists(gd):
             labels = replay.shot_labels(gd, "gdxrec")
-            self.assertIn("title", labels)
+            self.assertTrue(labels)
             self.assertNotIn("label", labels)      # the header comment is not a SHOT
+            # derived, not frozen: the schedule belongs to the coverage track
+            self.assertEqual(labels, [l for _, l in replay.shot_schedule(gd, "gdxrec")])
             self.assertEqual(replay.last_tick(gd, "gdxrec"), 6000)
         ai = os.path.join(replay.replays_dir(), "storm2.txt")
         self.assertEqual(replay.shot_labels(ai, "autoinput"),
@@ -1025,6 +1607,170 @@ class ReapPruneTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "old")))
 
 
+class HwIniDeleteTest(unittest.TestCase):
+    """Host side of `hw.py ini --delete` / `replay --off`.
+
+    `ini <section> <key> ""` could not clear a key: the control protocol sent
+    "INI debug input_replay " and the guest kept the old value, so a replay stayed armed
+    across reloads (coordinator, 2026-09-20). These tests stub the transport — nothing
+    here may touch the console, which is mid-manual-test.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(util.tools_dev()))
+        import hw
+        self.hw = hw
+        self.sent = []
+        test = self
+
+        class FakeControl(object):
+            def __init__(self, ip, port=None, timeout=None):
+                test.sent.append(("connect", ip))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def command(self, line):
+                test.sent.append(line)
+                return "OK"
+
+            def put_file(self, line, path):
+                test.sent.append((line, path))
+                return "OK"
+
+        self._real_control = hw.Control
+        self._real_load_ip = hw.load_ip
+        hw.Control = FakeControl
+        hw.load_ip = lambda explicit: explicit or "10.0.0.1"
+        # hw.py prints each reply; keep it out of the test report.
+        self._stdout = sys.stdout
+        sys.stdout = io.StringIO()
+
+    def tearDown(self):
+        sys.stdout = self._stdout
+        self.hw.Control = self._real_control
+        self.hw.load_ip = self._real_load_ip
+
+    def _args(self, **kw):
+        base = {"ip": None, "section": "debug", "key": "input_replay", "value": None,
+                "delete": False, "save": False, "file": None, "off": False, "dest": None}
+        base.update(kw)
+        return type("A", (), base)()
+
+    def _lines(self):
+        return [x for x in self.sent if isinstance(x, str)]
+
+    def test_delete_sends_ini_del(self):
+        self.assertEqual(self.hw.cmd_ini(self._args(delete=True)), 0)
+        self.assertEqual(self._lines(), ["INI DEL debug input_replay"])
+
+    def test_delete_with_save_also_saves(self):
+        self.hw.cmd_ini(self._args(delete=True, save=True))
+        self.assertEqual(self._lines(), ["INI DEL debug input_replay", "INI SAVE"])
+
+    def test_the_set_path_is_unchanged(self):
+        self.hw.cmd_ini(self._args(value="1", key="tmemfast"))
+        self.assertEqual(self._lines(), ["INI debug tmemfast 1"])
+
+    def test_set_with_save_is_unchanged(self):
+        self.hw.cmd_ini(self._args(value="1", key="tmemfast", save=True))
+        self.assertEqual(self._lines(), ["INI debug tmemfast 1", "INI SAVE"])
+
+    def test_delete_refuses_a_value(self):
+        with self.assertRaises(SystemExit):
+            self.hw.cmd_ini(self._args(delete=True, value="x"))
+        self.assertEqual(self._lines(), [], "must not send anything before dying")
+
+    def test_set_without_a_value_is_refused(self):
+        """The old failure mode: `ini debug input_replay ""` looked like it worked."""
+        with self.assertRaises(SystemExit):
+            self.hw.cmd_ini(self._args(value=None))
+        self.assertEqual(self._lines(), [])
+
+    def test_replay_off_deletes_and_saves(self):
+        self.assertEqual(self.hw.cmd_replay(self._args(off=True)), 0)
+        self.assertEqual(self._lines(),
+                         ["INI DEL debug input_replay", "INI SAVE"])
+
+    def test_replay_off_never_pushes_a_file(self):
+        self.hw.cmd_replay(self._args(off=True))
+        self.assertEqual([x for x in self.sent if isinstance(x, tuple)
+                          and x[0] != "connect"], [])
+
+    def test_replay_without_a_file_or_off_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.hw.cmd_replay(self._args())
+
+    def test_replay_still_pushes_and_arms(self):
+        with tempfile.NamedTemporaryFile(suffix=".gdxrec", delete=False) as f:
+            f.write(b"gdxrec 1\n")
+            path = f.name
+        try:
+            self.hw.cmd_replay(self._args(file=path))
+        finally:
+            os.unlink(path)
+        base = os.path.basename(path)
+        self.assertIn(("PUT /3ds/gdiffuser/rec/" + base, path), self.sent)
+        self.assertIn("REPLAY /3ds/gdiffuser/rec/" + base, self._lines())
+
+    # ---- end to end through hw.main(), so the parser itself is covered ----------
+    def test_main_ini_delete(self):
+        self.assertEqual(self.hw.main(["ini", "--delete", "debug", "input_replay"]), 0)
+        self.assertEqual(self._lines(), ["INI DEL debug input_replay"])
+
+    def test_main_ini_delete_save(self):
+        self.hw.main(["ini", "--delete", "--save", "debug", "input_replay"])
+        self.assertEqual(self._lines(), ["INI DEL debug input_replay", "INI SAVE"])
+
+    def test_main_ini_set_still_works(self):
+        self.hw.main(["ini", "debug", "tmemfast", "1"])
+        self.assertEqual(self._lines(), ["INI debug tmemfast 1"])
+
+    def test_main_replay_off(self):
+        self.assertEqual(self.hw.main(["replay", "--off"]), 0)
+        self.assertEqual(self._lines(), ["INI DEL debug input_replay", "INI SAVE"])
+
+    def test_main_ini_set_with_no_value_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.hw.main(["ini", "debug", "input_replay"])
+        self.assertEqual(self._lines(), [])
+
+
+class GuestIniDelProtocolTest(unittest.TestCase):
+    """The guest half, checked at the source so host and console cannot drift."""
+
+    def _src(self, rel):
+        p = os.path.join(util.repo_root(), rel)
+        if not os.path.exists(p):
+            self.skipTest("%s not present" % rel)
+        return util.read_text(p)
+
+    def test_net_handles_ini_del(self):
+        net = self._src("port/3ds/net/gdx3ds_net.c")
+        self.assertIn("REQ_INI_DEL", net)
+        self.assertIn('strcmp(tok[1], "DEL")', net)
+        self.assertIn("gdx3ds_config_unset(sReqA, sReqB)", net)
+        self.assertIn('netLog("[net] ini del', net)
+
+    def test_del_is_checked_before_the_set_form(self):
+        """Otherwise `INI DEL debug input_replay` sets a section literally named DEL."""
+        net = self._src("port/3ds/net/gdx3ds_net.c")
+        i = net.index('strcmp(tok[1], "DEL")')
+        j = net.index("netPostRequest(REQ_INI_SET")
+        self.assertLess(i, j)
+
+    def test_config_exposes_unset(self):
+        self.assertIn("int gdx3ds_config_unset(", self._src("port/3ds/os/gdx3ds_config.h"))
+        self.assertIn("int gdx3ds_config_unset(", self._src("port/3ds/os/gdx3ds_config.c"))
+
+    def test_the_host_test_is_wired_into_ci(self):
+        ci = self._src("tools/ci-3ds.sh")
+        self.assertIn("gdx3ds_config_host_tests", ci)
+
+
 class DelegateTest(unittest.TestCase):
     def test_missing_peer_exits_7(self):
         from gdxdev import delegate
@@ -1049,5 +1795,784 @@ class StdlibOnlyTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout)
 
 
+# =====================================================================================
+# hw-run: the unattended hardware config matrix (NEXT.md A9)
+#
+# The console is not on. Everything below runs against the committed slices of the real
+# 2026-09-20 session (tests/fixtures/hw-*.log) and a mocked control link, so the whole
+# flow — ini application, reload between configs, marker-delimited slicing, completion
+# checking, manifests — is provable with the hardware powered off.
+# =====================================================================================
+from gdxdev import hwrun  # noqa: E402
+
+# The SHOTs the committed hardware fixtures actually contain — i.e. the canonical
+# replay's schedule AS IT STOOD when those logs were captured on the console. It is NOT
+# the replay's current schedule: the coverage track rederived that file with
+# `covsched derive --rewrite` and it now schedules 49 SHOTs. These tests feed the
+# fixtures, so they must expect the fixtures' own set; the test that checks the live file
+# derives from the live file (test_the_canonical_replays_schedule_is_read_off_the_file).
+FIXTURE_SHOTS = ["title", "mainmenu", "machsel", "race00", "race01", "race02",
+                 "race04", "race03"]
+
+
+def canon_schedule():
+    """[(tick, label), ...] the canonical replay schedules TODAY, read from the file."""
+    path, kind = replay.resolve("race-mutecity-start")
+    return replay.shot_schedule(path, kind)
+
+
+def _fix(name):
+    return util.read_text(os.path.join(FIXTURES, name))
+
+
+class HwRunConfigSpecTest(unittest.TestCase):
+    def test_a_config_is_a_comma_separated_list_of_section_dot_key(self):
+        self.assertEqual(hwrun.parse_config("native.all=0,native.interp=1"),
+                         [("native", "all", "0"), ("native", "interp", "1")])
+
+    def test_a_bare_key_defaults_to_debug(self):
+        self.assertEqual(hwrun.parse_config("gputrace=1"), [("debug", "gputrace", "1")])
+
+    def test_an_empty_value_means_DELETE_not_set_to_empty(self):
+        """`INI <k> ""` leaves an entry behind that survives INI SAVE — that is how a
+        replay stayed armed across reloads (hw.py:cmd_ini)."""
+        self.assertEqual(hwrun.parse_config("debug.input_replay="),
+                         [("debug", "input_replay", None)])
+
+    def test_label_names_the_delete(self):
+        self.assertEqual(hwrun.config_label(hwrun.parse_config("a=1,b=")), "a=1,b=DEL")
+
+    def test_an_empty_config_is_a_usage_error(self):
+        with self.assertRaises(GdxError) as cm:
+            hwrun.parse_config("  ,  ")
+        self.assertEqual(cm.exception.code, util.EXIT_USAGE)
+
+
+class HwRunMarkerTest(unittest.TestCase):
+    """Slicing by a marker the GUEST emits, against a stream holding two slices."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _fix("hw-markers.log")
+
+    def test_the_marker_needle_matches_the_guest_receipt_format(self):
+        """port/3ds/net/gdx3ds_net.c:476 logs `[net] cmd INI [<sec>] <key>=<val> rc=<n>`."""
+        needle = hwrun.mark_needle("abc123-c00r01-b")
+        self.assertIn(needle, self.text)
+        line = [l for l in self.text.splitlines() if needle in l][0]
+        self.assertIn("[net] cmd INI [debug] hwrun_mark=", line)
+
+    def test_a_slice_excludes_both_marker_lines(self):
+        body, status = hwrun.slice_marked(self.text, "abc123-c00r01-b", "abc123-c00r01-e")
+        self.assertEqual(status, "ok")
+        self.assertNotIn("hwrun_mark", body)
+
+    def test_a_slice_is_exactly_its_own_config_and_nothing_else(self):
+        """The byte-offset version DID leak: artifacts/hwfps3-r1-all1-interp1.log opens
+        with the PREVIOUS run's race03/race04 SHOTs, because the offset was taken before
+        the earlier config had finished flushing."""
+        for token, source in (("c00r01", "hw-fps-all0-interp0.log"),
+                              ("c01r01", "hw-fps-all1-interp1.log")):
+            body, status = hwrun.slice_marked(self.text, "abc123-%s-b" % token,
+                                              "abc123-%s-e" % token)
+            self.assertEqual(status, "ok")
+            want = "\n".join(l for l in _fix(source).splitlines()
+                              if not l.startswith("#"))
+            self.assertEqual(body, want)
+            self.assertEqual(body.count("[rec] replay armed"), 1)
+            self.assertEqual(body.count("[rec] end tick="), 1)
+
+    def test_slicing_is_stable_when_another_writer_appends(self):
+        a1, _ = hwrun.slice_marked(self.text, "abc123-c00r01-b", "abc123-c00r01-e")
+        grown = self.text + "\n19:40:00 [net] ctl accept from 10.0.0.1\n" * 50
+        a2, _ = hwrun.slice_marked(grown, "abc123-c00r01-b", "abc123-c00r01-e")
+        self.assertEqual(a1, a2)
+
+    def test_a_missing_end_marker_gives_everything_after_the_begin(self):
+        body, status = hwrun.slice_marked(self.text, "abc123-c01r01-b", "never-sent")
+        self.assertEqual(status, "open")
+        self.assertIn("[rec] end tick=", body)
+
+    def test_a_missing_begin_marker_yields_nothing_rather_than_the_whole_log(self):
+        body, status = hwrun.slice_marked(self.text, "never-sent", "abc123-c01r01-e")
+        self.assertEqual((body, status), ("", "missing"))
+
+    def test_tokens_are_unique_per_config_and_repeat(self):
+        seen = set()
+        for cfg in range(3):
+            for rep in range(1, 4):
+                seen.update(hwrun.mark_tokens("20260923-010203-hw-run", cfg, rep))
+        self.assertEqual(len(seen), 18)
+
+    def test_a_token_fits_the_guest_log_buffer(self):
+        """netLog writes into msg[224] and netReadCtl reads into buf[256]."""
+        beg, _ = hwrun.mark_tokens("20260923-010203-hw-run", 9, 9)
+        line = "[net] cmd INI [debug] hwrun_mark=%s rc=0" % beg
+        self.assertLess(len(line), 200)
+        self.assertNotIn(" ", beg)
+
+
+class HwRunFpsWindowTest(unittest.TestCase):
+    """The in-race fps window, against the two trace-off slices of the real session.
+
+    The fixtures are console logs from the HAND-PLACED schedules, whose first in-race SHOT
+    is the literal `race00`. `IN_RACE_ANCHOR` is now `mode:01` because coverage2 rederived
+    the corpus and mints `m<mode>_<frame>` labels instead, so these tests name the anchor
+    their own fixtures carry rather than riding the default — the default is about today's
+    recordings, the fixtures are about that session.
+    """
+
+    FIXTURE_ANCHOR = "race00"
+
+    def test_the_window_reproduces_the_published_beat_sequence(self):
+        """docs/research/native/integration-verify-2026-09-17.md records
+        `21 51 59 30 46 60 55 39 15 43 43 43` for all=0 interp=0."""
+        vals, anchor = hwrun.fps_window(_fix("hw-fps-all0-interp0.log"),
+                                        anchor=self.FIXTURE_ANCHOR)
+        self.assertIsNotNone(anchor)
+        self.assertEqual([round(v) for v in vals],
+                         [21, 51, 59, 30, 46, 60, 55, 39, 15, 43, 43, 43])
+
+    def test_sixty_seconds_is_twelve_five_second_beats(self):
+        vals, _ = hwrun.fps_window(_fix("hw-fps-all1-interp1.log"),
+                                   anchor=self.FIXTURE_ANCHOR)
+        self.assertEqual(len(vals), 12)
+        self.assertEqual(prof.WATCHDOG_PERIOD_S, 5.0)
+
+    def test_the_window_is_counted_in_beats_not_host_timestamps(self):
+        """The link flushes in bursts — beats 30/31/32 of the session all carry the same
+        host second — so a wall-clock window would cut wherever the network hiccuped."""
+        text = _fix("hw-fps-all0-interp0.log")
+        stamps = [l.split()[0] for l in text.splitlines() if "[watchdog]" in l]
+        self.assertLess(len(set(stamps)), len(stamps), "the fixture must contain a burst")
+        vals, _ = hwrun.fps_window(text, anchor=self.FIXTURE_ANCHOR)
+        self.assertEqual(len(vals), 12)
+
+    def test_no_anchor_means_no_window_rather_than_the_whole_run(self):
+        vals, anchor = hwrun.fps_window(_fix("hw-fps-all0-interp0.log"), anchor="nosuch")
+        self.assertEqual((vals, anchor), ([], None))
+
+    def test_a_shorter_window_takes_fewer_beats(self):
+        vals, _ = hwrun.fps_window(_fix("hw-fps-all0-interp0.log"), seconds=30,
+                                   anchor=self.FIXTURE_ANCHOR)
+        self.assertEqual([round(v) for v in vals], [21, 51, 59, 30, 46, 60])
+
+    def test_pooled_stats_match_the_published_table(self):
+        """Published: all=0 min 15.0 mean 42.0 8% at cap; all=1 min 12.8 mean 42.8 17%.
+        Those were pooled over three repeats; one repeat reproduces min and the cap
+        fraction, and the mean to a tenth."""
+        a, _ = hwrun.fps_window(_fix("hw-fps-all0-interp0.log"),
+                                anchor=self.FIXTURE_ANCHOR)
+        b, _ = hwrun.fps_window(_fix("hw-fps-all1-interp1.log"),
+                                anchor=self.FIXTURE_ANCHOR)
+        sa, sb = hwrun.fps_stats(a), hwrun.fps_stats(b)
+        self.assertEqual((sa["n"], sb["n"]), (12, 12))
+        self.assertAlmostEqual(sa["min"], 15.4, places=1)
+        self.assertAlmostEqual(sb["min"], 13.6, places=1)
+        self.assertAlmostEqual(sa["mean"], 42.0, places=0)
+        self.assertAlmostEqual(sb["mean"], 42.8, places=0)
+        self.assertAlmostEqual(sa["at_cap"], 1 / 12.0, places=3)
+        self.assertAlmostEqual(sb["at_cap"], 2 / 12.0, places=3)
+
+    def test_percentiles_are_nearest_rank_like_the_rest_of_the_cli(self):
+        st = hwrun.fps_stats([1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(st["p50"], 2.0)
+        self.assertIn(st["p50"], [1.0, 2.0, 3.0, 4.0])
+
+    def test_empty_is_none_not_a_crash(self):
+        self.assertIsNone(hwrun.fps_stats([]))
+
+    def test_the_default_anchor_resolves_against_the_live_corpus(self):
+        """The bug 075f214 fixed, pinned: the default anchor silently resolved to nothing
+        after the corpus was rederived, and an empty fps series is the same shape as a
+        slice that never reached the race."""
+        labels = [l for _, l in canon_schedule()]
+        fake = "\n".join("[rec] SHOT '%s' at tick %d" % (l, t)
+                          for t, l in canon_schedule())
+        self.assertIsNotNone(
+            hwrun.find_anchor(fake.splitlines(), hwrun.IN_RACE_ANCHOR),
+            "IN_RACE_ANCHOR %r matches nothing in the canonical replay's %d labels: %s"
+            % (hwrun.IN_RACE_ANCHOR, len(labels), labels[:6]))
+
+
+class HwRunCompletionTest(unittest.TestCase):
+    """`sleep 150` truncated two of the three configs in the published [prof] A/B. The
+    completion check is what makes that visible instead of silent."""
+
+    def test_the_published_all1_interp1_prof_slice_is_complete(self):
+        c = hwrun.completion(_fix("hw-prof-all1-interp1.log"), FIXTURE_SHOTS)
+        self.assertTrue(c["replay_complete"], c["detail"])
+        self.assertEqual(c["shots_seen"], 8)
+        self.assertTrue(c["end_receipt"])
+
+    def test_the_published_all0_interp0_prof_slice_was_cut_short(self):
+        c = hwrun.completion(_fix("hw-prof-all0-interp0.log"), FIXTURE_SHOTS)
+        self.assertFalse(c["replay_complete"])
+        self.assertFalse(c["end_receipt"])
+        self.assertEqual(c["missing_shots"], ["race04", "race03"])
+        self.assertIn("[rec] end", c["detail"])
+
+    def test_both_trace_off_slices_are_complete(self):
+        for name in ("hw-fps-all0-interp0.log", "hw-fps-all1-interp1.log"):
+            c = hwrun.completion(_fix(name), FIXTURE_SHOTS)
+            self.assertTrue(c["replay_complete"], "%s: %s" % (name, c["detail"]))
+
+    def test_the_hardware_shot_wording_is_recognised(self):
+        """gdx3ds_oracle.c says 'SHOT captured'; the 3DS bridge says 'SHOT dumped', and
+        `[fh] tag=` needs fh=1, which perf runs turn off. All three must count."""
+        self.assertEqual(hwrun.shots_seen("[rec] SHOT 'race00' at tick 3300"), {"race00"})
+        self.assertEqual(hwrun.shots_seen("[autotest] SHOT dumped -> autotest/race01.bmp"),
+                         {"race01"})
+        self.assertEqual(
+            hwrun.shots_seen("[autotest] SHOT scanout dumped -> autotest/race02_scan.bmp"),
+            {"race02"})
+        self.assertIn("race03", hwrun.shots_seen("[fh] frame=1 tag=race03"))
+
+    def test_a_replay_that_never_loaded_is_not_complete(self):
+        c = hwrun.completion("[watchdog] beat=1 frame=60(+60)", FIXTURE_SHOTS)
+        self.assertFalse(c["replay_complete"])
+        self.assertIn("never loaded", c["detail"])
+
+    def test_the_canonical_replays_schedule_is_read_off_the_file(self):
+        """Derived, never frozen: the schedule is the coverage track's to rewrite
+        (NEXT.md B47/B48), and a hardcoded copy of it here goes stale silently — it did,
+        and this test failed on main for exactly that reason."""
+        path, kind = replay.resolve("race-mutecity-start")
+        sched = replay.shot_schedule(path, kind)
+        self.assertTrue(sched, "the canonical replay schedules no SHOTs at all")
+        self.assertEqual(replay.shot_labels(path, kind), [l for _, l in sched])
+        self.assertEqual(len(set(l for _, l in sched)), len(sched), "duplicate labels")
+        self.assertLessEqual(max(t for t, _ in sched), replay.last_tick(path, kind))
+
+
+class HwRunProfTableTest(unittest.TestCase):
+    """The summary tables, against the slices the published table was computed from."""
+
+    def _buckets(self, name):
+        p = prof.parse_text(_fix(name))
+        return {n.split()[0]: prof.section_summary(sel)
+                for n, sel in prof.bucket_by_nd(p.prof)}
+
+    def test_the_crowd_bucket_reproduces_the_published_milliseconds(self):
+        a = self._buckets("hw-prof-all0-interp0.log")["crowd"]
+        b = self._buckets("hw-prof-all1-interp1.log")["crowd"]
+        self.assertAlmostEqual(a["total"]["mean"], 33.97, places=2)
+        self.assertAlmostEqual(b["total"]["mean"], 24.54, places=2)
+        self.assertAlmostEqual(a["vtx"]["mean"], 4.21, places=2)
+        self.assertAlmostEqual(b["vtx"]["mean"], 0.10, places=2)
+        self.assertAlmostEqual(a["tri"]["mean"], 11.66, places=2)
+        self.assertAlmostEqual(b["tri"]["mean"], 1.30, places=2)
+        self.assertAlmostEqual(a["dsp"]["mean"], 11.08, places=2)
+        self.assertAlmostEqual(b["dsp"]["mean"], 15.62, places=2)
+
+    def test_the_menu_and_mid_buckets_match_too(self):
+        a, b = (self._buckets("hw-prof-all0-interp0.log"),
+                self._buckets("hw-prof-all1-interp1.log"))
+        self.assertAlmostEqual(a["menu"]["total"]["mean"], 13.24, places=2)
+        self.assertAlmostEqual(b["menu"]["total"]["mean"], 12.63, places=2)
+        self.assertAlmostEqual(a["mid"]["total"]["mean"], 19.21, places=2)
+        self.assertAlmostEqual(b["mid"]["total"]["mean"], 17.69, places=2)
+
+    def test_gputrace_is_visible_in_the_trace_on_slices_only(self):
+        self.assertTrue(prof.parse_text(_fix("hw-prof-all1-interp1.log")).gputrace)
+        self.assertIsNone(prof.parse_text(_fix("hw-fps-all1-interp1.log")).gputrace)
+
+    def test_no_error_receipts_in_any_slice(self):
+        for name in ("hw-prof-all0-interp0.log", "hw-prof-all1-interp1.log",
+                     "hw-fps-all0-interp0.log", "hw-fps-all1-interp1.log"):
+            c = prof.error_census(_fix(name))
+            self.assertEqual(c["fatals"], 0, name)
+
+    def test_repeats_pool_into_one_bucket_set(self):
+        r = [{"cfg": 0, "label": "a=0", "parsed": prof.parse_text(_fix("hw-prof-all0-interp0.log")),
+              "fps": [10.0]},
+             {"cfg": 0, "label": "a=0", "parsed": prof.parse_text(_fix("hw-prof-all0-interp0.log")),
+              "fps": [20.0]},
+             {"cfg": 1, "label": "a=1", "parsed": prof.parse_text(_fix("hw-prof-all1-interp1.log")),
+              "fps": [30.0]}]
+        groups = hwrun.pool_by_config(r)
+        self.assertEqual([g[0] for g in groups], [0, 1])
+        self.assertEqual(len(hwrun.pooled_windows(groups[0][2])), 180)
+        self.assertEqual(hwrun.pooled_fps(groups[0][2]), [10.0, 20.0])
+
+
+class HwRunPongTest(unittest.TestCase):
+    def test_pong_is_parsed_for_the_manifest_uptime(self):
+        d = hwrun.parse_pong("OK PONG native/main@8b3ecfab 1156 43210")
+        self.assertEqual(d, {"build": "native/main@8b3ecfab", "frame": 1156,
+                             "uptime_ms": 43210})
+
+    def test_a_non_pong_reply_is_none(self):
+        self.assertIsNone(hwrun.parse_pong("ERR unknown command FOO"))
+        self.assertIsNone(hwrun.parse_pong(""))
+        self.assertIsNone(hwrun.parse_pong("OK PONG short"))
+
+
+# ---------------------------------------------------------------- mocked console ----
+class _FakeSink(hwrun.LogSink):
+    """A log stream the fake console writes into, so the real waiting, slicing and
+    completion code runs unchanged with no hardware and no sockets."""
+
+    mode = "fake"
+
+    def __init__(self):
+        self.lines = []
+        self.rotations = []
+
+    def text(self):
+        return "\n".join(self.lines)
+
+    def rotate(self, path):
+        self.rotations.append(path)
+
+    def write(self, text):
+        self.lines.extend(text.splitlines())
+
+
+class HwRunSequenceTest(unittest.TestCase):
+    """Drives do_hw_run end to end against a mocked transport: the console is off."""
+
+    def setUp(self):
+        sys.path.insert(0, util.tools_dev())
+        import hw
+        self.hw = hw
+        self.sink = _FakeSink()
+        self.sent = []
+        test = self
+        # The fixtures are real console logs from when the canonical replay scheduled 8
+        # SHOTs; it now schedules 49. Append the receipts for whatever it schedules today
+        # so a mocked "complete" slice stays complete when that file is rewritten again.
+        tail = "\n".join("[rec] SHOT '%s' at tick %d" % (label, tick)
+                          for tick, label in canon_schedule())
+        self.bodies = [_fix("hw-fps-all0-interp0.log") + "\n" + tail,
+                       _fix("hw-fps-all1-interp1.log") + "\n" + tail]
+        self.body_at = 0
+
+        class FakeControl(object):
+            def __init__(self, ip, port=None, timeout=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def command(self, line):
+                test.sent.append(line)
+                if line == "PING":
+                    return "OK PONG native/main@deadbeef 1200 45000"
+                if line.startswith("INI debug hwrun_mark "):
+                    # The guest logs the receipt itself (gdx3ds_net.c:476) — that is the
+                    # whole point of using an ini set as the marker.
+                    token = line.split()[-1]
+                    test.sink.write("[net] cmd INI [debug] hwrun_mark=%s rc=0" % token)
+                    if token.endswith("-b"):
+                        # The replay runs AFTER the begin marker, which is the ordering
+                        # the runner depends on: reload, relaunch, mark, then the run.
+                        test.sink.write(test.bodies[test.body_at % len(test.bodies)])
+                        test.body_at += 1
+                    return "OK INI"
+                return "OK"
+
+            def put_file(self, header, path, progress=True):
+                test.sent.append(("PUT" if header.startswith("PUT") else "RELOAD", header))
+                if header == "RELOAD":
+                    test.sink.write("[net] link up build=native/main@deadbeef")
+                return "OK"
+
+        self._saved = (hw.Control, hw.load_ip, hwrun.open_sink,
+                       hw.wait_for_relaunch_via_ping)
+        hw.Control = FakeControl
+        hw.load_ip = lambda explicit: explicit or "10.0.0.1"
+        hw.wait_for_relaunch_via_ping = lambda ip, t, old: ("[net] link up", [])
+        hwrun.open_sink = lambda *a, **k: self.sink
+        hwrun._import_hw = lambda: hw
+
+        self.tmp = tempfile.mkdtemp(prefix="gdx-hwrun-test-")
+        self.dsx = os.path.join(self.tmp, "G-Diffuser-3DS.3dsx")
+        with open(self.dsx, "wb") as f:
+            f.write(b"3DSX\x00fake")
+        self.out = util.Out(quiet=True)
+
+    def tearDown(self):
+        (self.hw.Control, self.hw.load_ip, hwrun.open_sink,
+         self.hw.wait_for_relaunch_via_ping) = self._saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _args(self, **kw):
+        base = {"config": ["native.all=0,native.interp=0", "native.all=1,native.interp=1"],
+                "replay": "race-mutecity-start", "repeats": 1, "seconds": 5, "settle": 0,
+                "poll": 0, "wait": 1, "gputrace": False, "base_ini": None,
+                "restore": None, "no_restore": False,
+                "fps_window": hwrun.DEFAULT_FPS_WINDOW_S,
+                "fps_anchor": hwrun.IN_RACE_ANCHOR, "threedsx": self.dsx, "ip": "10.0.0.1",
+                "name": "unit", "dry_run": False, "json": False, "quiet": True}
+        base.update(kw)
+        return type("A", (), base)()
+
+    def _ctx(self):
+        return {"root": util.repo_root(), "track": "hwrun-unit",
+                "run_root": os.path.join(self.tmp, "runs")}
+
+    def _lines(self):
+        return [x for x in self.sent if isinstance(x, str)]
+
+    def _run(self, **kw):
+        ctx = self._ctx()
+        code = hwrun.do_hw_run(self._args(**kw), self.out, ctx)
+        root = runs.track_root(ctx["run_root"], ctx["track"])
+        rd = runs.RunDir(os.path.join(root, sorted(os.listdir(root))[-1]))
+        return code, rd
+
+    # ---- sequencing
+    def test_every_config_gets_its_levers_saved_then_a_reload(self):
+        code, _ = self._run()
+        self.assertEqual(code, util.EXIT_OK)
+        lines = self._lines()
+        first = lines.index("INI native all 0")
+        self.assertEqual(lines[first:first + 3],
+                         ["INI native all 0", "INI native interp 0", "INI SAVE"])
+        # the RELOAD comes after the SAVE, never before it
+        reloads = [i for i, x in enumerate(self.sent)
+                   if isinstance(x, tuple) and x[0] == "RELOAD"]
+        saves = [i for i, x in enumerate(self.sent) if x == "INI SAVE"]
+        self.assertTrue(saves[1] < reloads[0] < saves[2])
+
+    def test_one_reload_per_slice_plus_one_for_the_restore(self):
+        self._run(repeats=2)
+        reloads = [x for x in self.sent if isinstance(x, tuple) and x[0] == "RELOAD"]
+        self.assertEqual(len(reloads), 2 * 2 + 1)
+
+    def test_repeats_are_the_outer_loop_so_drift_hits_every_config(self):
+        self._run(repeats=2)
+        order = [l for l in self._lines() if l.startswith("INI native all ")]
+        self.assertEqual(order, ["INI native all 0", "INI native all 1",
+                                 "INI native all 0", "INI native all 1"])
+
+    def test_the_replay_is_pushed_once_and_armed_through_the_ini(self):
+        self._run()
+        puts = [x for x in self.sent if isinstance(x, tuple) and x[0] == "PUT"]
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][1],
+                         "PUT /3ds/gdiffuser/rec/race-mutecity-start.gdxrec")
+        self.assertEqual(puts[0][1].count(".gdxrec"), 1, "no doubled extension")
+        self.assertIn("INI debug input_replay race-mutecity-start", self._lines())
+
+    def test_the_marker_is_set_then_deleted_so_ini_save_can_never_persist_it(self):
+        self._run()
+        marks = [l for l in self._lines() if "hwrun_mark" in l]
+        self.assertEqual(len(marks), 8)          # 2 slices x (begin,end) x (set,del)
+        for i in range(0, len(marks), 2):
+            self.assertTrue(marks[i].startswith("INI debug hwrun_mark "))
+            self.assertEqual(marks[i + 1], "INI DEL debug hwrun_mark")
+        # and no INI SAVE ever happens between a set and its delete
+        seq = self._lines()
+        for i, l in enumerate(seq):
+            if l.startswith("INI debug hwrun_mark "):
+                self.assertEqual(seq[i + 1], "INI DEL debug hwrun_mark")
+
+    def test_the_marker_is_emitted_after_the_reload_not_before(self):
+        self._run()
+        first_mark = next(i for i, x in enumerate(self.sent)
+                          if isinstance(x, str) and x.startswith("INI debug hwrun_mark"))
+        first_reload = next(i for i, x in enumerate(self.sent)
+                            if isinstance(x, tuple) and x[0] == "RELOAD")
+        self.assertLess(first_reload, first_mark)
+
+    def test_gputrace_is_applied_and_recorded(self):
+        _, rd = self._run(gputrace=True)
+        self.assertIn("INI debug gputrace 1", self._lines())
+        self.assertTrue(rd.read_manifest()["gputrace"])
+
+    def test_the_default_base_ini_pins_determinism_and_turns_hashing_off(self):
+        self._run()
+        lines = self._lines()
+        self.assertIn("INI debug det 1", lines)
+        self.assertIn("INI debug fh 0", lines)
+        self.assertIn("INI debug gputrace 0", lines)
+
+    # ---- restore
+    def test_the_restore_deletes_the_replay_rather_than_emptying_it(self):
+        self._run()
+        self.assertIn("INI DEL debug input_replay", self._lines())
+        self.assertNotIn("INI debug input_replay ", self._lines()[-6:])
+
+    def test_no_restore_leaves_the_console_armed(self):
+        self._run(no_restore=True)
+        tail = self._lines()[-4:]
+        self.assertNotIn("INI DEL debug input_replay", tail)
+
+    def test_the_restore_still_runs_when_a_slice_blows_up(self):
+        original = hwrun._run_slice
+        hwrun._run_slice = lambda *a, **k: (_ for _ in ()).throw(GdxError("boom"))
+        try:
+            with self.assertRaises(GdxError):
+                self._run()
+        finally:
+            hwrun._run_slice = original
+        self.assertIn("INI DEL debug input_replay", self._lines())
+
+    # ---- artifacts
+    def test_each_slice_gets_a_schema_valid_manifest(self):
+        _, rd = self._run()
+        for slug in ("cfg00-rep01", "cfg01-rep01"):
+            m = runs.RunDir(rd.sub(slug)).read_manifest()
+            self.assertEqual(runs.validate(m), [])
+            self.assertEqual(m["lane"], "hw")
+            self.assertEqual(m["replay"]["id"], "race-mutecity-start")
+            self.assertEqual(m["build"]["sha256"], util.sha256_file(self.dsx))
+            self.assertIsNotNone(m["platform"]["guest_uptime_ms_end"])
+            self.assertEqual(m["result"]["marker_status"], "ok")
+
+    def test_the_manifest_records_the_per_config_levers(self):
+        _, rd = self._run()
+        a = runs.RunDir(rd.sub("cfg00-rep01")).read_manifest()["ini"]
+        b = runs.RunDir(rd.sub("cfg01-rep01")).read_manifest()["ini"]
+        self.assertEqual(a["native.all"], "0")
+        self.assertEqual(b["native.all"], "1")
+        self.assertEqual(a["debug.input_replay"], "race-mutecity-start")
+
+    def test_the_matrix_manifest_lists_the_slices(self):
+        _, rd = self._run()
+        m = rd.read_manifest()
+        self.assertEqual(runs.validate(m), [])
+        self.assertEqual(m["result"]["slices"], ["cfg00-rep01", "cfg01-rep01"])
+        self.assertEqual(m["result"]["verdict"], "PASS")
+
+    def test_each_slice_log_holds_only_its_own_config(self):
+        _, rd = self._run()
+        a = util.read_text(rd.sub("cfg00-rep01", "log.txt"))
+        self.assertNotIn("hwrun_mark", a)
+        self.assertEqual(a.count("[rec] end tick="), 1)
+
+    def test_the_sink_is_rotated_once_per_slice(self):
+        self._run(repeats=2)
+        self.assertEqual(len(self.sink.rotations), 4)
+
+    # ---- verdicts
+    def test_an_incomplete_replay_fails_the_run(self):
+        self.bodies = ["\n".join(_fix("hw-fps-all0-interp0.log").splitlines()[:20])] * 2
+        code, rd = self._run(seconds=1)
+        self.assertEqual(code, util.EXIT_FAIL)
+        self.assertEqual(rd.read_manifest()["result"]["verdict"], "FAIL")
+        self.assertFalse(runs.RunDir(rd.sub("cfg00-rep01"))
+                         .read_manifest()["result"]["replay_complete"])
+
+    def test_a_fatal_receipt_fails_the_run(self):
+        self.bodies = [_fix("hw-fps-all0-interp0.log") + "\n[fatal] assert in gfx\n"] * 2
+        code, _ = self._run()
+        self.assertEqual(code, util.EXIT_FAIL)
+
+    def test_an_autoinput_replay_is_refused_on_hardware(self):
+        with self.assertRaises(GdxError) as cm:
+            self._run(replay="boot")
+        self.assertEqual(cm.exception.code, util.EXIT_STAGING)
+
+    def test_no_config_is_a_usage_error(self):
+        with self.assertRaises(GdxError) as cm:
+            self._run(config=[])
+        self.assertEqual(cm.exception.code, util.EXIT_USAGE)
+
+    # ---- dry run
+    def test_dry_run_opens_no_connection_and_writes_nothing(self):
+        ctx = self._ctx()
+        code = hwrun.do_hw_run(self._args(dry_run=True), self.out, ctx)
+        self.assertEqual(code, util.EXIT_OK)
+        self.assertEqual(self.sent, [], "a dry run must not talk to the console")
+        self.assertFalse(os.path.exists(ctx["run_root"]),
+                         "a dry run must not create a run directory")
+
+    def test_dry_run_names_every_step_it_would_take(self):
+        buf = io.StringIO()
+        saved, sys.stdout = sys.stdout, buf
+        try:
+            hwrun.do_hw_run(self._args(dry_run=True), util.Out(), self._ctx())
+        finally:
+            sys.stdout = saved
+        text = buf.getvalue()
+        for needle in ("PUT /3ds/gdiffuser/rec/race-mutecity-start.gdxrec",
+                       "INI native all 0", "INI native all 1", "INI SAVE",
+                       "RELOAD", "hwrun_mark", "INI DEL debug hwrun_mark",
+                       "rotate log sink", "[rec] end", "INI DEL debug input_replay"):
+            self.assertIn(needle, text, needle)
+
+
+class HwRunCliTest(unittest.TestCase):
+    def test_the_subcommand_is_wired_into_gdx_dev(self):
+        from gdxdev import cli
+        args = cli.build_parser().parse_args(
+            ["hw-run", "--config", "native.all=1", "--repeats", "3", "--gputrace"])
+        self.assertIs(args.func, hwrun.do_hw_run)
+        self.assertEqual(args.config, ["native.all=1"])
+        self.assertEqual(args.repeats, 3)
+        self.assertTrue(args.gputrace)
+        self.assertEqual(args.replay, "race-mutecity-start")
+
+    def test_hw_run_does_not_reimplement_the_control_protocol(self):
+        """It goes through delegate.require('hw.py') so a branch without the hwlink
+        track gets exit 7 naming the track, not an ImportError."""
+        src = util.read_text(os.path.join(util.tools_dev(), "gdxdev", "hwrun.py"))
+        self.assertIn('delegate.require("hw.py")', src)
+        for forbidden in ("socket.create_connection", "3dslink", "sendall"):
+            self.assertNotIn(forbidden, src)
+
+
+class FhDiffShiftTest(unittest.TestCase):
+    """`--shift` vanished once already: a merge pasted a whole main() INSIDE another
+    function's docstring, so the file still parsed, CI still passed, and the flag simply
+    stopped existing — taking every `--shift` result in the rtparity evidence with it.
+    Assert the flag is reachable AND that it actually realigns, not merely that it parses."""
+
+    def _run(self, *args):
+        import subprocess
+        fh = os.path.join(util.repo_root(), "tools", "dev", "fhdiff.py")
+        return subprocess.run([sys.executable, fh] + list(args),
+                              capture_output=True, text=True)
+
+    def test_shift_is_reachable(self):
+        self.assertIn("--shift", self._run("--help").stdout)
+
+    def test_shift_realigns_an_offset_stream(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.log")
+            b = os.path.join(d, "b.log")
+            with open(a, "w") as f:
+                f.write("[fh] frame=10 tick=9 eye=L hash=aaaa\n"
+                        "[fh] frame=11 tick=10 eye=L hash=bbbb\n")
+            with open(b, "w") as f:   # same content, one frame later
+                f.write("[fh] frame=11 tick=10 eye=L hash=aaaa\n"
+                        "[fh] frame=12 tick=11 eye=L hash=bbbb\n")
+            self.assertIn("divergent=1", self._run(a, b).stdout)
+            aligned = self._run(a, b, "--shift", "-1").stdout
+            self.assertIn("compared=2", aligned)
+            self.assertIn("divergent=0", aligned)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class HwRunRelaunchSeamTest(unittest.TestCase):
+    """The three faults the first real matrix run after the WiFi link came back hit.
+
+    All three live in the seam between RELOAD and the first control command, and all
+    three were found on hardware rather than here, which is why they are pinned now.
+    """
+
+    def test_arming_receipt_is_read_from_the_boot_log(self):
+        # The guest prints `[rec] replay armed` while it boots, which is strictly before
+        # hw-run can set its begin marker -- setting it needs a control connection that
+        # does not exist yet. A slice with 49/49 SHOTs and a `[rec] end` was scored
+        # "the replay never loaded" because the receipt was sought in the marker window.
+        sliced = "\n".join(["[rec] SHOT 'm00_119' at tick 119",
+                            "[rec] SHOT 'm01_3225' at tick 3225",
+                            "[rec] end"])
+        boot = "22:26:37 [rec] replay armed sdmc:/3ds/gdiffuser/rec/x.gdxrec frames=6001"
+        expected = ["m00_119", "m01_3225"]
+        without = hwrun.completion(sliced, expected)
+        self.assertFalse(without["replay_complete"])
+        self.assertIn("never loaded", without["detail"])
+        with_boot = hwrun.completion(sliced, expected, boot_text=boot)
+        self.assertTrue(with_boot["replay_complete"], with_boot["detail"])
+        self.assertEqual(with_boot["shots_seen"], 2)
+
+    def test_transport_errors_are_retried(self):
+        # `[net] link up` says the log link is dialling out, not that the control port
+        # can serve: the relaunched guest accepts and then RSTs the first command. An
+        # unretried error aborted a whole six-slice matrix twice, losing the remaining
+        # slices AND the restore.
+        attempts = {"n": 0}
+
+        class FlakyControl:
+            def __init__(self, ip, timeout=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def command(self, line):
+                attempts["n"] += 1
+                if attempts["n"] < 3:
+                    raise ConnectionResetError(54, "Connection reset by peer")
+                return "OK PONG native/main@abc 1 2"
+
+        class HW:
+            Control = FlakyControl
+
+        console = hwrun.Console(HW(), "1.2.3.4", out=None)
+        console.TRANSPORT_BACKOFF_S = 0.0
+        self.assertTrue(console.command("PING").startswith("OK"))
+        self.assertEqual(attempts["n"], 3)
+
+    def test_a_protocol_refusal_is_not_retried(self):
+        # An ERR reply is the console answering, not the link failing. Retrying it would
+        # turn one refusal into six.
+        attempts = {"n": 0}
+
+        class ErrControl:
+            def __init__(self, ip, timeout=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def command(self, line):
+                attempts["n"] += 1
+                return "ERR nope"
+
+        class HW:
+            Control = ErrControl
+
+        console = hwrun.Console(HW(), "1.2.3.4", out=None)
+        console.TRANSPORT_BACKOFF_S = 0.0
+        with self.assertRaises(GdxError):
+            console.command("INI a b c")
+        self.assertEqual(attempts["n"], 1)
+
+    def test_mode_anchor_survives_a_schedule_rederive(self):
+        # coverage2 renamed every SHOT to m<mode>_<frame>; the literal `race00` the fps
+        # window anchored on stopped existing and resolved to an empty series, which is
+        # the same shape as a slice that never raced.
+        lines = ["[rec] SHOT 'm00_119' at tick 119",
+                 "[rec] SHOT 'm09_3208' at tick 3208",
+                 "[rec] SHOT 'm01_3225' at tick 3225"]
+        self.assertEqual(hwrun.find_anchor(lines, "mode:01"), 2)
+        self.assertEqual(hwrun.find_anchor(lines, "mode:1"), 2)
+        self.assertEqual(hwrun.find_anchor(lines, "m01_3225"), 2)
+        self.assertIsNone(hwrun.find_anchor(lines, "race00"))
+        self.assertEqual(hwrun.anchor_candidates({"m00_119", "m01_3225"}), ["m00", "m01"])
+
+
+class HwPushVerifyTest(unittest.TestCase):
+    """3dslink exits 0 on a partial transfer, and its last progress line is unterminated."""
+
+    def test_final_unterminated_progress_line_is_counted(self):
+        # Scanning only the completed pieces dropped the final line, so a 100% push was
+        # twice reported as TRUNCATED at 46.18% -- at the same byte count both times,
+        # which is what a flaky link does not do.
+        script = ("import sys;"
+                  "sys.stdout.write('Sending G-Diffuser-3DS.3dsx, 3265100 bytes\\r');"
+                  "sys.stdout.write('1507717 sent (46.18%), 130 blocks\\r');"
+                  "sys.stdout.write('3265100 sent (100.00%), 282 blocks');"
+                  "sys.stdout.flush()")
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            return real_popen([sys.executable, "-c", script], **kw)
+
+        subprocess.Popen = fake_popen
+        try:
+            rc, sent, total = hw._run_3dslink("1.2.3.4", "x.3dsx")
+        finally:
+            subprocess.Popen = real_popen
+        self.assertEqual(rc, 0)
+        self.assertEqual(total, 3265100)
+        self.assertEqual(sent, 3265100)

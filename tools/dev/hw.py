@@ -38,6 +38,7 @@ import argparse
 import binascii
 import configparser
 import os
+import re
 
 import socket
 import struct
@@ -287,6 +288,53 @@ def build_3dsx():
         ["cmake", "--build", bdir, "--target", "G-Diffuser-3DS_3dsx", "-j8"], env=env)
 
 
+
+_LINK_TOTAL_RE = re.compile(r"Sending\s+\S+,\s*(\d+)\s+bytes")
+_LINK_SENT_RE = re.compile(r"(\d+)\s+sent\s*\(")
+
+
+def _run_3dslink(ip, path):
+    """Run 3dslink, echoing its output, and return (rc, bytes_sent, announced_total).
+
+    3dslink writes progress with carriage returns, so the stream is read in chunks and
+    split on both \r and \n rather than by line. bytes_sent is the largest count it
+    reported, which is what the caller checks against the file size -- see cmd_push.
+    """
+    proc = subprocess.Popen([LINK3DS, "-a", ip, path],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    state = {"sent": None, "total": None}
+
+    def scan(piece):
+        m = _LINK_TOTAL_RE.search(piece)
+        if m:
+            state["total"] = int(m.group(1))
+        m = _LINK_SENT_RE.search(piece)
+        if m:
+            n = int(m.group(1))
+            state["sent"] = n if state["sent"] is None else max(state["sent"], n)
+
+    buf = ""
+    while True:
+        chunk = proc.stdout.read(256)
+        if not chunk:
+            break
+        text = chunk.decode("utf-8", "replace")
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        buf += text
+        pieces = re.split(r"[\r\n]+", buf)
+        for piece in pieces[:-1]:
+            scan(piece)
+        buf = pieces[-1]
+    # The FINAL progress line usually arrives with no trailing \r or \n, so it sits in
+    # `buf` when the pipe closes. Scanning only the completed pieces above dropped it and
+    # made a completed transfer look like it stopped at whatever the previous line said --
+    # which is how a 100% push was twice reported as truncated at 46.18%.
+    scan(buf)
+    proc.wait()
+    return proc.returncode, state["sent"], state["total"]
+
+
 def cmd_push(args):
     if not os.path.exists(LINK3DS):
         die("3dslink not found at %s.\n"
@@ -314,10 +362,25 @@ def cmd_push(args):
         print("log server on 0.0.0.0:%d -> %s" % (LOG_PORT, srv.out_path))
 
     print("3dslink -a %s %s" % (ip, path))
-    rc = subprocess.call([LINK3DS, "-a", ip, path])
+    rc, sent, total = _run_3dslink(ip, path)
     if rc != 0:
         die("3dslink failed (rc=%d). Is hbmenu on the netloader screen? Press Y." % rc)
-    print("pushed. hbmenu should be launching it now.")
+    # 3dslink can exit 0 having sent only part of the file -- a mid-transfer close looks
+    # like a clean one from its side. The console then tries to launch a truncated .3dsx
+    # and throws an error that reads like a bad build. Verify the byte count it reported
+    # against the file we handed it, and against the announced total.
+    want = os.path.getsize(path)
+    if total is not None and total != want:
+        die("3dslink announced %d bytes but %s is %d bytes on disk." % (total, path, want))
+    if sent is None:
+        die("3dslink printed no progress line, so the transfer cannot be confirmed. "
+            "Re-arm the netloader screen (press Y) and push again.")
+    if sent != want:
+        die("TRUNCATED PUSH: 3dslink exited 0 after sending %d of %d bytes (%.2f%%).\n"
+            "The console now holds a partial .3dsx and will error on launch.\n"
+            "Re-arm hbmenu's netloader screen (press Y) and push again."
+            % (sent, want, 100.0 * sent / want if want else 0.0))
+    print("pushed %d bytes (verified). hbmenu should be launching it now." % sent)
     if srv:
         line = srv.wait_for("[net] link up", args.wait)
         if line:
@@ -440,6 +503,16 @@ def cmd_replay(args):
     IN-APP tick-exact injector. The oracle track owns both the format and the injector;
     hw.py is transport + arm only. UDP InputRedirection (`hw.py input`) is explicitly NOT
     this: it has no frame clock and cannot be a parity oracle."""
+    if args.off:
+        # Disarming has to DELETE the key: an empty input_replay is still an entry, and
+        # main_3ds.cpp:772 only treats a missing/empty string as off while INI SAVE would
+        # keep writing it back — so the replay survived reloads.
+        with Control(load_ip(args.ip)) as c:
+            print(c.command("INI DEL debug input_replay"))
+            print(c.command("INI SAVE"))
+        return 0
+    if not args.file:
+        die("replay needs a .gdxrec file (or --off to disarm)")
     if not os.path.exists(args.file):
         die("no such file: %s" % args.file)
     dest = args.dest or ("/3ds/gdiffuser/rec/" + os.path.basename(args.file))
@@ -452,6 +525,23 @@ def cmd_replay(args):
 
 
 def cmd_ini(args):
+    """Set or DELETE one ini key at runtime.
+
+    Deleting is not "set it to the empty string": an empty value is still an entry, so
+    the getters return "" instead of the key's DEFAULT and `INI SAVE` writes the key
+    straight back out. That is why `ini debug input_replay ""` left a replay armed across
+    reloads. `INI DEL` removes the entry, and the guest then falls back to the default.
+    """
+    if args.delete:
+        if args.value is not None:
+            die("ini --delete takes <section> <key> and no value")
+        with Control(load_ip(args.ip)) as c:
+            print(c.command("INI DEL %s %s" % (args.section, args.key)))
+            if args.save:
+                print(c.command("INI SAVE"))
+        return 0
+    if args.value is None:
+        die("ini needs a <value> (or --delete to remove the key)")
     with Control(load_ip(args.ip)) as c:
         print(c.command("INI %s %s %s" % (args.section, args.key, args.value)))
         if args.save:
@@ -606,13 +696,20 @@ def run_input_script(drv, path):
                 secs = float(parts[0])
             except ValueError:
                 die("%s:%d: first token must be a duration in seconds" % (path, lineno))
-            btns = []
+            btns, spec = [], []
             if len(parts) > 1 and parts[1] not in ("-", "NONE"):
-                btns = [b for b in parts[1].split(",") if b]
+                # HOME/POWER are not HID buttons: they ride the special word and NS acts on
+                # them, which is the only way to drive a suspend from here.
+                for b in parts[1].split(","):
+                    if not b:
+                        continue
+                    (spec if b in SPECIAL_BITS else btns).append(b)
             cx = float(parts[2]) if len(parts) > 2 else 0.0
             cy = float(parts[3]) if len(parts) > 3 else 0.0
-            print("  %5.2fs %-14s circle=(%.2f,%.2f)" % (secs, ",".join(btns) or "-", cx, cy))
-            drv.hold(ir_packet(buttons=btns, circle=(cx, cy)), secs)
+            print("  %5.2fs %-14s circle=(%.2f,%.2f)%s"
+                  % (secs, ",".join(btns) or "-", cx, cy,
+                     (" special=" + ",".join(spec)) if spec else ""))
+            drv.hold(ir_packet(buttons=btns, circle=(cx, cy), special=spec), secs)
 
 
 # --------------------------------------------------------------------------------------
@@ -699,16 +796,22 @@ def main(argv):
 
     p = sub.add_parser("replay", help="push a .gdxrec and start the in-app tick-exact replay")
     ip_arg(p)
-    p.add_argument("file")
+    p.add_argument("file", nargs="?", default=None)
+    p.add_argument("--off", action="store_true",
+                   help="disarm: delete [debug] input_replay and save, so the replay does "
+                        "not survive the next reload")
     p.add_argument("--dest", help="sdmc-relative destination "
                                   "(default /3ds/gdiffuser/rec/<basename>)")
     p.set_defaults(fn=cmd_replay)
 
-    p = sub.add_parser("ini", help="set an ini key at runtime")
+    p = sub.add_parser("ini", help="set or delete an ini key at runtime")
     ip_arg(p)
     p.add_argument("section")
     p.add_argument("key")
-    p.add_argument("value")
+    p.add_argument("value", nargs="?", default=None)
+    p.add_argument("--delete", action="store_true",
+                   help="remove the key so the guest falls back to its DEFAULT "
+                        "(setting an empty value does NOT do this)")
     p.add_argument("--save", action="store_true", help="also write gdiffuser.ini back")
     p.set_defaults(fn=cmd_ini)
 

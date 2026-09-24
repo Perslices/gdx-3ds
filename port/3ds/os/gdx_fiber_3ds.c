@@ -78,6 +78,11 @@ static void gdx_fiber_3ds_trampoline(void* param) {
     /* Entry is not expected to return (decomp threads exit via __osCleanupThread, which
      * reschedules). There is no context to fall back to -- abort loudly (ucontext parity)
      * rather than let threadExit silently strand whoever was supposed to run next. */
+    {
+        extern void gdx_dbg_logf(const char* fmt, ...);
+        gdx_dbg_logf("[fiber] FATAL: entry returned for fiber %p (entry=%p)\n",
+                     (void*)f, (void*)(unsigned long)f->entry);
+    }
     abort();
 }
 

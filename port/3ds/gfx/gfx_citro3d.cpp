@@ -27,6 +27,7 @@ extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__(
 #include "gdx3ds_stereo.h" // stream S: stereo foundation (dual targets + per-eye loop)
 #include "gdx3ds_nativebatch.h" // Gdx_NativeBatch: shared native draw primitive ([native] track/machines)
 #include "gdx3ds_texclamp.h" // the pow2-pad / atlas-view UV clamp contract (host-tested)
+#include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
 
 #include <cmath>
 #include <cstdarg>
@@ -643,6 +644,56 @@ static bool GdxTriloopEnabled() {
     return sEnabled;
 }
 
+/* GEOMLOSS test knob: [debug] vbopoolkib shrinks the USABLE part of the 1 MiB linear VBO
+ * pool so the exhaustion paths (packed-begin refusal, machines poolTrunc) can be forced in
+ * a normal build. Default 0 = the whole pool, i.e. exactly the shipped behaviour. The
+ * allocation itself is unchanged; only the cursor limit moves, so nothing can overrun. */
+static size_t GdxVboPoolUsableFloats(size_t poolFloats) {
+    static const int sKib = [] {
+        if (&gdx3ds_config_get_int != nullptr) {
+            return gdx3ds_config_get_int("debug", "vbopoolkib", 0);
+        }
+        return 0;
+    }();
+    if (sKib <= 0) {
+        return poolFloats;
+    }
+    size_t want = (size_t)sKib * 1024u / sizeof(float);
+    if (want < 4096u) {
+        want = 4096u; /* floor: 16 KiB, still room for a few hundred vertices */
+    }
+    return want < poolFloats ? want : poolFloats;
+}
+
+/* GEOMLOSS killswitch: [debug] vbosplit=0 restores the pre-fix all-or-nothing packed begin
+ * (refuse unless a whole 256-tri batch fits) for the owned interpreter too. That is the
+ * behaviour that DROPS triangles under pool pressure; it exists only so the two behaviours
+ * can be A/B'd from one binary. Default 1 = split the batch, never drop what still fits. */
+/* GEOMLOSS test knob: [debug] vbopackcap=N caps every packed batch at N triangles regardless
+ * of pool pressure, so "splitting a batch changes no pixels" can be proved on a full pool
+ * instead of only in the narrow band where the pool happens to be nearly exhausted.
+ * 0 = off = the pool decides. */
+static uint32_t GdxVboPackCap() {
+    static const uint32_t sCap = [] {
+        if (&gdx3ds_config_get_int != nullptr) {
+            const int n = gdx3ds_config_get_int("debug", "vbopackcap", 0);
+            return n > 0 ? (uint32_t)n : (uint32_t)0;
+        }
+        return (uint32_t)0;
+    }();
+    return sCap;
+}
+
+static bool GdxVboSplitEnabled() {
+    static const bool sOn = [] {
+        if (&gdx3ds_config_get_int != nullptr) {
+            return gdx3ds_config_get_int("debug", "vbosplit", 1) != 0;
+        }
+        return true;
+    }();
+    return sOn;
+}
+
 /* [trectbatch] killswitch (LOCKED-60 Task A): [debug] trectbatch=0 or env GDX_TRECTBATCH_OFF
  * keeps every rect on the legacy path (no atlas arming, no same-page merge); read weakly by
  * the patched interpreter at every task boundary. */
@@ -670,6 +721,20 @@ extern "C" void gdx_texclr_dump(const char* line) {
     GFX_C3D_LOG("%s\n", line);
 }
 
+/* GEOMLOSS telemetry for the [c3d] line: packed begins refused (geometry dropped) and
+ * packed begins that had to split the batch at the pool cap (geometry preserved). */
+static unsigned long sVboPackRefused = 0;
+static unsigned long sVboPackSplit = 0;
+/* Draws dropped outright by the pool-exhaustion early-out in DrawTriangles — the frame-wide
+ * geometry loss that every path (LUS legacy, machines, track, fx) funnels into. It had a
+ * one-shot log and no counter at all, so a run that lost half a frame every frame looked
+ * identical to a clean one on the receipt. */
+static unsigned long sVboDrawDropped = 0;
+/* Gdx_NativeBatchCommit refusals: the cursor could not advance, so the caller's appended
+ * vertices are outside the flushed range. Unreachable while the begin reservation holds,
+ * checked because the failure is silent corruption rather than loss. */
+static unsigned long sNbCommitRefused = 0;
+
 /* [triloop] packed-draw telemetry for the [c3d] line (dPk). */
 static unsigned long sPackedDrawCalls = 0;
 /* [native] indexed mesh draws this session (dNat on the [c3d] line). */
@@ -682,10 +747,20 @@ static unsigned long sPrevNativeDraws = 0;
 
 /* ---- [nverify] per-batch record/compare (gdx3ds_verify.h) --------------------------------- */
 #include "gdx3ds_verify.h"
+/* The mode lives at file scope with external linkage so the interpreters read it inline; see
+ * the gdx3ds_verify_mode block in gdx3ds_verify.h. 0 off, 1 record, 2 compare. */
+extern "C" { int gdx3ds_verify_mode = 0; }
 namespace {
-int sVfyMode = 0;                       /* 0 off, 1 record, 2 compare */
 std::vector<uint32_t> sVfyRing;         /* 4 words per record: kind, state, vbo, fieldsig */
 std::vector<uint32_t> sVfyTexHash;      /* per texture id: FNV of the last upload payload */
+/* Per texture id: the global upload serial at which that id was last filled, and the serial
+ * itself. A field=3 mismatch is ambiguous between "the two sides decoded different bytes" and
+ * "one side served a cache entry minted several frames ago"; the serial separates them. */
+std::vector<uint32_t> sVfyTexSeq;
+uint32_t sVfyUploadSeq = 0;
+/* Per texture id: the first and last 4 bytes of the payload that filled it. An upload-hash
+ * mismatch says the two decodes differ; these say where. */
+std::vector<uint32_t> sVfyTexEnds;   /* 2 words per id: first, last */
 std::vector<uint32_t> sVfyFields;       /* mode-1 per-record state field hashes (16 per record) */
 size_t sVfyIdx = 0;
 uint32_t sVfyFirst = 0xFFFFFFFFu, sVfyClass = 0, sVfyDetail = 0;
@@ -696,7 +771,7 @@ struct VfyBatchInfo {
     float v0[12];
     uint32_t tris;
     uint64_t id0, id1;
-    uint32_t texUsed[2], texId[2], texHash[2], texW[2], texH[2];
+    uint32_t texUsed[2], texId[2], texHash[2], texW[2], texH[2], texSeq[2], seqNow, texEnds[2], texEnds0[2];
     float vpf[5];
     int vis[4];
     Gdx3dsVerifyTri tri;
@@ -737,7 +812,7 @@ inline bool VfyCmdCounts(uint32_t w0) {
 }
 
 void VfyRecord(uint32_t kind, uint32_t state, uint32_t vbo, const uint32_t* fields, const VfyBatchInfo* info = nullptr) {
-    if (sVfyMode == 1) {
+    if (gdx3ds_verify_mode == 1) {
         sVfyInfo.push_back(info != nullptr ? *info : VfyBatchInfo{});
         sVfyRing.push_back(kind);
         sVfyRing.push_back(state);
@@ -746,7 +821,7 @@ void VfyRecord(uint32_t kind, uint32_t state, uint32_t vbo, const uint32_t* fiel
         for (int i = 0; i < kVfyFields; i++) {
             sVfyFields.push_back(fields != nullptr ? fields[i] : 0);
         }
-    } else if (sVfyMode == 2) {
+    } else if (gdx3ds_verify_mode == 2) {
         if (sVfySeqOwnedN < kVfySeq) {
             sVfySeqOwned[sVfySeqOwnedN][0] = kind;
             sVfySeqOwned[sVfySeqOwnedN][1] = info != nullptr ? static_cast<uint32_t>(info->id0) : state;
@@ -789,7 +864,7 @@ void VfyRecord(uint32_t kind, uint32_t state, uint32_t vbo, const uint32_t* fiel
 } // namespace
 
 extern "C" void gdx3ds_verify_begin(int mode) {
-    sVfyMode = mode;
+    gdx3ds_verify_mode = mode;
     if (mode == 1) {
         sVfyRing.clear();
         sVfyFields.clear();
@@ -817,26 +892,55 @@ extern "C" void gdx3ds_verify_note_tri(const Gdx3dsVerifyTri* t) {
 }
 
 extern "C" unsigned gdx_gfx_classify_host_ptr(unsigned long p) __attribute__((weak));
-extern "C" void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem64) {
+extern "C" int gdx_gfx_rawcopy_origin(unsigned long p, unsigned long* s, unsigned* n) __attribute__((weak));
+/* [nverify] the TMEM identity covers the load extent up to kVfyTmemHashCap rather than a
+ * 64-byte prefix: a prefix agrees on every texture whose first rows are static and hides a real
+ * content divergence further in. TMEM is a fixed 4 KiB mirror, so the span is always in bounds.
+ * The SOURCE hash stays at 64 bytes on purpose -- a loaded record's size_bytes is the requested
+ * extent, not the readable one. */
+static constexpr unsigned kVfySrcHashCap = 4096u;
+/* These run on every TRIANGLE while verify is armed, not once per import: hashing the whole
+ * 4 KiB TMEM span here stalled the render thread hard enough that the guest stopped advancing
+ * at frame ~150 on every renderer. 256 bytes is four RGBA16 rows -- enough to separate two
+ * decodes of the same source, cheap enough to keep the frame moving. */
+static constexpr unsigned kVfyTmemHashCap = 4096u; /* TEMP diag: full span */
+/* The first 8 bytes verbatim: a hash says the two sides differ, these say how. */
+static inline void VfyBytes8(unsigned* out, const void* p, unsigned n) {
+    out[0] = out[1] = 0u;
+    if (p == nullptr) return;
+    const unsigned take = n < 8u ? n : 8u;
+    unsigned char b[8] = {};
+    memcpy(b, p, take);
+    memcpy(out, b, 8);
+}
+extern "C" void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem,
+                                         unsigned tmemBytes) {
     t->addr0 = reinterpret_cast<unsigned long>(addr);
     t->cls0 = (addr && gdx_gfx_classify_host_ptr) ? gdx_gfx_classify_host_ptr(t->addr0) : 0u;
     t->srcHash0 = addr ? VfyFnv(2166136261u, addr, sizeBytes < 64u ? sizeBytes : 64u) : 0u;
-    t->tmemHash0 = tmem64 ? VfyFnv(2166136261u, tmem64, 64) : 0u;
+    t->tmemHash0 = tmem ? VfyFnv(2166136261u, tmem, tmemBytes < kVfyTmemHashCap ? tmemBytes : kVfyTmemHashCap) : 0u;
+    VfyBytes8(t->srcB0, addr, sizeBytes);
+    VfyBytes8(t->tmemB0, tmem, tmemBytes);
+    t->copyOrigin0 = 0; t->copyRemain0 = 0;
+    if (addr && gdx_gfx_rawcopy_origin) gdx_gfx_rawcopy_origin(t->addr0, &t->copyOrigin0, &t->copyRemain0);
+    VfyBytes8(t->srcB0 + 2, addr && sizeBytes >= 8u ? static_cast<const uint8_t*>(addr) + (sizeBytes - 8u) : nullptr, 8u);
+    VfyBytes8(t->tmemB0 + 2, tmem && tmemBytes >= 8u ? static_cast<const uint8_t*>(tmem) + (tmemBytes - 8u) : nullptr, 8u);
 }
 
-extern "C" void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem64) {
+extern "C" void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem,
+                                          unsigned tmemBytes) {
     t->addr1 = reinterpret_cast<unsigned long>(addr);
     t->cls1 = (addr && gdx_gfx_classify_host_ptr) ? gdx_gfx_classify_host_ptr(t->addr1) : 0u;
     t->srcHash1 = addr ? VfyFnv(2166136261u, addr, sizeBytes < 64u ? sizeBytes : 64u) : 0u;
-    t->tmemHash1 = tmem64 ? VfyFnv(2166136261u, tmem64, 64) : 0u;
+    t->tmemHash1 = tmem ? VfyFnv(2166136261u, tmem, tmemBytes < kVfyTmemHashCap ? tmemBytes : kVfyTmemHashCap) : 0u;
 }
 
 extern "C" void gdx3ds_verify_note_cmd(unsigned w0, unsigned w1) {
     if (!VfyCmdCounts(w0)) return;
-    if (sVfyMode == 1) {
+    if (gdx3ds_verify_mode == 1) {
         sVfyCmd.push_back(w0);
         sVfyCmd.push_back(w1);
-    } else if (sVfyMode == 2) {
+    } else if (gdx3ds_verify_mode == 2) {
         const size_t n = sVfyCmd.size() / 2;
         if (sVfyCmdFirst == 0xFFFFFFFFu) {
             const bool same = sVfyCmdIdx < n && sVfyCmd[sVfyCmdIdx * 2] == w0 && sVfyCmd[sVfyCmdIdx * 2 + 1] == w1;
@@ -878,7 +982,7 @@ extern "C" void gdx3ds_verify_cmd_detail(char* buf, unsigned bufSize) {
              sVfyCmdOwned[4], sVfyCmdOwned[5], sVfyKindState[0], sVfyKindState[1], sVfyKindState[2], sVfyKindState[3]);
 }
 extern "C" int gdx3ds_verify_active(void) {
-    return sVfyMode != 0;
+    return gdx3ds_verify_mode != 0;
 }
 
 extern "C" void gdx3ds_verify_tri_detail(char* buf, unsigned bufSize) {
@@ -916,14 +1020,39 @@ extern "C" void gdx3ds_verify_src_detail(char* buf, unsigned bufSize) {
              "[nverify]   src lus=%08lX cls=%X h=%08X tm=%08X bA=%u | owned=%08lX cls=%X h=%08X tm=%08X bA=%u | "
              "src1 lus=%08lX cls=%X h=%08X tm=%08X @%u ld=%u/%u/%u/%u | owned=%08lX cls=%X h=%08X tm=%08X @%u ld=%u/%u/%u/%u | "
              "vp lus=%.0f %.4f %.4f %.4f %.4f vis=%d,%d %dx%d | owned=%.0f %.4f %.4f %.4f %.4f vis=%d,%d %dx%d | "
-             "span0 lus u=%u/%u @%u base=%u %08lX/%u/%u | owned u=%u/%u @%u base=%u %08lX/%u/%u",
+             "span0 lus u=%u/%u @%u base=%u %08lX/%u/%u | owned u=%u/%u @%u base=%u %08lX/%u/%u | "
+             "fmtsiz lus=%08X pal=%08X | owned=%08X pal=%08X",
              a.addr0, a.cls0, a.srcHash0, a.tmemHash0, a.blendA, b.addr0, b.cls0, b.srcHash0, b.tmemHash0, b.blendA,
              a.addr1, a.cls1, a.srcHash1, a.tmemHash1, a.tmem1, a.line1, a.size1, a.full1, a.orig1,
              b.addr1, b.cls1, b.srcHash1, b.tmemHash1, b.tmem1, b.line1, b.size1, b.full1, b.orig1,
              ia.vpf[0], ia.vpf[1], ia.vpf[2], ia.vpf[3], ia.vpf[4], ia.vis[0], ia.vis[1], ia.vis[2], ia.vis[3],
              ib.vpf[0], ib.vpf[1], ib.vpf[2], ib.vpf[3], ib.vpf[4], ib.vis[0], ib.vis[1], ib.vis[2], ib.vis[3],
              a.used0, a.used1, a.tmem0, a.base0, a.baseAddr0, a.baseSize0, a.baseOrig0,
-             b.used0, b.used1, b.tmem0, b.base0, b.baseAddr0, b.baseSize0, b.baseOrig0);
+             b.used0, b.used1, b.tmem0, b.base0, b.baseAddr0, b.baseSize0, b.baseOrig0,
+             a.tc1, a.tc0, b.tc1, b.tc0);
+}
+
+/* The first 8 bytes of each side's unit-0 source and TMEM window, verbatim. A hash says the two
+ * sides differ; these say HOW: a byte-swapped pair is a byte-order difference (the bridge hands
+ * LUS a persistent copy that is 16-bit-swapped for a native-RGBA16 source), anything else is
+ * different content. Its own line because the src line is already at its buffer. */
+extern "C" void gdx3ds_verify_bytes_detail(char* buf, unsigned bufSize) {
+    if (!sVfyMismatchInfoValid || bufSize == 0) {
+        if (bufSize) buf[0] = 0;
+        return;
+    }
+    const VfyBatchInfo& ia = sVfyMismatchLus;
+    const VfyBatchInfo& ib = sVfyMismatchOwned;
+    const Gdx3dsVerifyTri& a = ia.tri;
+    const Gdx3dsVerifyTri& b = ib.tri;
+    snprintf(buf, bufSize,
+             "[nverify]   b8 lus src=%08X%08X..%08X%08X tmem=%08X%08X..%08X%08X | "
+             "owned src=%08X%08X..%08X%08X tmem=%08X%08X..%08X%08X | "
+             "copy lus=%08lX/%u owned=%08lX/%u | upl lus=%08X..%08X owned=%08X..%08X | rtline lus=%u owned=%u",
+             a.srcB0[0], a.srcB0[1], a.srcB0[2], a.srcB0[3], a.tmemB0[0], a.tmemB0[1], a.tmemB0[2], a.tmemB0[3],
+             b.srcB0[0], b.srcB0[1], b.srcB0[2], b.srcB0[3], b.tmemB0[0], b.tmemB0[1], b.tmemB0[2], b.tmemB0[3],
+             a.copyOrigin0, a.copyRemain0, b.copyOrigin0, b.copyRemain0, ia.texEnds0[0], ia.texEnds[0],
+             ib.texEnds0[0], ib.texEnds[0], a.rtLine0, b.rtLine0);
 }
 
 extern "C" void gdx3ds_verify_seq_detail(char* buf, unsigned bufSize) {
@@ -953,13 +1082,15 @@ extern "C" void gdx3ds_verify_first_detail(char* buf, unsigned bufSize) {
     snprintf(buf, bufSize,
              "[nverify]   lus tris=%u id=%08X%08X/%08X%08X v0=%.4f %.4f %.4f %.4f uv=%.4f %.4f c=%.3f %.3f %.3f %.3f | "
              "owned tris=%u id=%08X%08X/%08X%08X v0=%.4f %.4f %.4f %.4f uv=%.4f %.4f c=%.3f %.3f %.3f %.3f | "
-             "tex lus u0=%u/%u/%08X/%ux%u u1=%u/%u/%08X/%ux%u owned u0=%u/%u/%08X/%ux%u u1=%u/%u/%08X/%ux%u",
+             "tex lus u0=%u/%u/%08X/%ux%u@%u u1=%u/%u/%08X/%ux%u owned u0=%u/%u/%08X/%ux%u@%u u1=%u/%u/%08X/%ux%u "
+             "| upl lus=%u owned=%u",
              a.tris, (unsigned)(a.id0 >> 32), (unsigned)a.id0, (unsigned)(a.id1 >> 32), (unsigned)a.id1, a.v0[0], a.v0[1],
              a.v0[2], a.v0[3], a.v0[4], a.v0[5], a.v0[6], a.v0[7], a.v0[8], a.v0[9], b.tris, (unsigned)(b.id0 >> 32),
              (unsigned)b.id0, (unsigned)(b.id1 >> 32), (unsigned)b.id1, b.v0[0], b.v0[1], b.v0[2], b.v0[3], b.v0[4],
              b.v0[5], b.v0[6], b.v0[7], b.v0[8], b.v0[9], a.texUsed[0], a.texId[0], a.texHash[0], a.texW[0], a.texH[0],
-             a.texUsed[1], a.texId[1], a.texHash[1], a.texW[1], a.texH[1], b.texUsed[0], b.texId[0], b.texHash[0],
-             b.texW[0], b.texH[0], b.texUsed[1], b.texId[1], b.texHash[1], b.texW[1], b.texH[1]);
+             a.texSeq[0], a.texUsed[1], a.texId[1], a.texHash[1], a.texW[1], a.texH[1], b.texUsed[0], b.texId[0],
+             b.texHash[0], b.texW[0], b.texH[0], b.texSeq[0], b.texUsed[1], b.texId[1], b.texHash[1], b.texW[1],
+             b.texH[1], a.seqNow, b.seqNow);
 }
 
 extern "C" void gdx3ds_verify_result(unsigned* recorded, unsigned* compared, unsigned* first, unsigned* cls,
@@ -980,6 +1111,19 @@ extern "C" void gdx3ds_verify_result(unsigned* recorded, unsigned* compared, uns
 static unsigned long sAtlasEvictions = 0;     /* pages reclaimed */
 static unsigned long sAtlasEvictedViews = 0;  /* views copied out to standalone */
 static unsigned long sAtlasEvictCopyFail = 0; /* copy-outs that failed C3D_TexInit (view dropped) */
+/* DROPSITES site 4. texUpFail= lumped three unrelated causes into one number; split them so a
+ * non-zero value says WHICH refusal happened. All three are drops with no recovery pre-fix:
+ * the id keeps whatever it held, and the draw that follows does not rebind the PICA texunit
+ * at all (DrawTriangles' bind-miss branch), so it samples an unrelated texture. */
+static unsigned long sTexUpFailId = 0;    /* invalid texture id / zero extent */
+static unsigned long sTexUpFailDim = 0;   /* padded extent above the PICA 1024 limit */
+static unsigned long sTexUpFailInit = 0;  /* C3D_TexInit refused (linear heap) */
+static unsigned long sTexInitReclaimed = 0; /* TexInit retries that SUCCEEDED after a reclaim */
+static unsigned long sTexMissingBinds = 0;  /* draws that bound the fallback instead of nothing */
+/* [debug] texinitfail=N: fail every Nth C3D_TexInit in UploadTexture so the recovery path is
+ * reachable in a normal build. 0 = shipped behaviour (geomloss's vbopoolkib, for this site). */
+static unsigned long sTexInitFailEvery = 0;
+static unsigned long sTexInitCalls = 0;
 /* [anchor] stereo-anchored draw telemetry for the [c3d] line (anchor=n/dmin/dmax per window). */
 static unsigned long sAnchorDraws = 0;
 static float sAnchorDMin = 2.0f;
@@ -1465,8 +1609,12 @@ void GfxRenderingAPIC3D::Init() {
         GFX_C3D_LOG("FATAL: linearAlloc(%zu) for the VBO pool failed\n", kVboPoolBytes);
         return;
     }
-    mVboPoolFloats = kVboPoolBytes / sizeof(float);
+    mVboPoolFloats = GdxVboPoolUsableFloats(kVboPoolBytes / sizeof(float));
     mVboOffsetFloats = 0;
+    if (mVboPoolFloats != kVboPoolBytes / sizeof(float)) {
+        GFX_C3D_LOG("[debug] vbopoolkib: VBO pool capped to %zu KiB of %zu KiB (test knob)\n",
+                    mVboPoolFloats * sizeof(float) / 1024, kVboPoolBytes / 1024);
+    }
 
     mTextures.reserve(512);
     mShaderPool.reserve(64); // census-predicted variant population (~40/session observed)
@@ -1587,7 +1735,7 @@ void GfxRenderingAPIC3D::StartFrame() {
     if (!mInitialized) {
         return;
     }
-    if (sVfyMode == 2) {
+    if (gdx3ds_verify_mode == 2) {
         return; /* [nverify] compare pass rides the recorded pass's open frame */
     }
     if (!mFrameActive) {
@@ -1660,6 +1808,20 @@ void GfxRenderingAPIC3D::EndFrame() {
     // above queued the display transfer + swap for THIS frame's draws.
     mFrameIndex++;
     sAtlasDiagFrame = (unsigned long)mFrameIndex; /* [atlasdiag] window mirror for the texcache hook */
+    /* GEOMLOSS: an ALWAYS-ON receipt, because "the renderer is silently dropping geometry"
+     * must not be a fact you only learn by having remembered to set [debug] verbose=1 before
+     * the run. Silent while every counter is zero (the normal case, zero log cost), loud from
+     * the first non-zero one onward. vboHW is the pool high-water mark, which is what says
+     * how close a scene is to the cliff BEFORE it goes over. */
+    if ((mFrameIndex & 63) == 1 &&
+        (sVboPackRefused | sVboPackSplit | sVboDrawDropped | sNbCommitRefused) != 0) {
+        GFX_C3D_LOG("[geomloss] frame=%lu vboHW=%luK/%luK vboRef=%lu vboSplit=%lu vboDrop=%lu "
+                    "nbCommitRef=%lu\n",
+                    (unsigned long)mFrameIndex,
+                    (unsigned long)(mVboHighWaterFloats * sizeof(float) / 1024),
+                    (unsigned long)(mVboPoolFloats * sizeof(float) / 1024), sVboPackRefused,
+                    sVboPackSplit, sVboDrawDropped, sNbCommitRefused);
+    }
     if ((mFrameIndex & 63) == 1 && GdxVerboseTelemetry()) {
         // texUp/texImp/texMiss/texDel are CUMULATIVE since boot (they always were);
         // dUp/dImp/dMiss/dDel are the deltas since the previous [c3d] emit (64 frames),
@@ -1694,17 +1856,31 @@ void GfxRenderingAPIC3D::EndFrame() {
         sPrevSettimgLoads = sSettimgLoads;
         sPrevSettimgMemoHits = sSettimgMemoHits;
         sTexMissWindowBudget = 6; // refill the non-race [texmiss] sampling budget
-        char msg[288];
+        char msg[448];
         int n = std::snprintf(msg, sizeof(msg),
                               "[c3d] frame=%lu draws=%lu (scr=%lu tex=%lu) tris=%lu fbBinds=%lu "
                               "bindMiss=%lu texUp=%lu texUpFail=%lu texImp=%lu texMiss=%lu texDel=%lu "
-                              "dUp=%lu dImp=%lu dMiss=%lu dDel=%lu dRl=%lu dRm=%lu dPk=%lu dNat=%lu",
+                              "dUp=%lu dImp=%lu dMiss=%lu dDel=%lu dRl=%lu dRm=%lu dPk=%lu dNat=%lu "
+                              "vboHW=%luK/%luK vboRef=%lu vboSplit=%lu vboDrop=%lu nbCommitRef=%lu",
                               (unsigned long)mFrameIndex, (unsigned long)mFrameDrawCalls,
                               (unsigned long)mFrameDrawsScreenFb, (unsigned long)mFrameDrawsTexFb,
                               (unsigned long)mFrameTris, (unsigned long)mFrameFbBinds,
                               (unsigned long)mFrameBindMisses, (unsigned long)mTexUploads,
                               (unsigned long)mTexUploadFails, sTexCacheImports, sTexCacheMisses,
-                              sTexCacheDeletes, dUp, dImp, dMiss, dDel, dRl, dRm, dPk, dNat);
+                              sTexCacheDeletes, dUp, dImp, dMiss, dDel, dRl, dRm, dPk, dNat,
+                              (unsigned long)(mVboHighWaterFloats * sizeof(float) / 1024),
+                              (unsigned long)(mVboPoolFloats * sizeof(float) / 1024),
+                              sVboPackRefused, sVboPackSplit, sVboDrawDropped, sNbCommitRefused);
+        if (mTexUploadFails > 0 && n > 0 && n < (int)sizeof(msg)) {
+            /* DROPSITES site 4: which refusal, and whether the recovery caught it. Emitted only
+             * when something actually failed, so the all-zero [c3d] line stays byte-identical to
+             * every receipt other tracks compare against. */
+            n += std::snprintf(msg + n, sizeof(msg) - n, " texUpWhy=%lu/%lu/%lu texReclaim=%lu",
+                               sTexUpFailId, sTexUpFailDim, sTexUpFailInit, sTexInitReclaimed);
+        }
+        if (sTexMissingBinds > 0 && n > 0 && n < (int)sizeof(msg)) {
+            n += std::snprintf(msg + n, sizeof(msg) - n, " texFallbackBind=%lu", sTexMissingBinds);
+        }
         if (mAtlasPlaced > 0 && n > 0 && n < (int)sizeof(msg)) {
             // [trectbatch] atlas-only suffix (never emitted with trectbatch=0): page evictions /
             // views copied out to standalone / copy-out failures / no-safe-candidate fallbacks.
@@ -1733,6 +1909,24 @@ void GfxRenderingAPIC3D::EndFrame() {
         }
         if (n > 0) {
             svcOutputDebugString(msg, n);
+            /* [c3d_filelog] killswitch [debug] c3d_filelog (default 0 = off, so every
+             * existing log stays byte-identical). svcOutputDebugString reaches Azahar Qt's
+             * azahar_log.txt (with log_filter=*:Debug) and NOTHING else: on the RetroArch
+             * lane, on hardware and over hwlink the only readable sink is the SD filelog,
+             * which every other tracer ([prof], [gpu], [vp], [rt], [fh]) already writes to.
+             * Without this the stereo receipts this line carries — `eyeR=<n> stereo=<0|1>`
+             * and `anchor=<draws>/<dmin>/<dmax>` — are unreadable on the one lane where the
+             * right-eye pass can now be made to run. `gdx-dev --3d` turns it on. */
+            static int sC3dFileLog = -1;
+            if (sC3dFileLog < 0) {
+                /* Weak, like every other config read here: the DL harness links the backend
+                 * without the config library. */
+                sC3dFileLog = (&gdx3ds_config_get_int != nullptr &&
+                               gdx3ds_config_get_int("debug", "c3d_filelog", 0) != 0) ? 1 : 0;
+            }
+            if (sC3dFileLog != 0 && &gdx3ds_filelog_write != nullptr) {
+                gdx3ds_filelog_write(msg, (size_t)n);
+            }
         }
     }
 }
@@ -2471,17 +2665,93 @@ void GfxRenderingAPIC3D::VboPackRefreshTextures(Gdx3dsVboPackParams* params) {
     }
 }
 
+/* DROPSITES site 4 helpers. */
+
+/* C3D_TexInit with the [debug] texinitfail=N forcing knob folded in, so the recovery path is
+ * reachable from a shipped build without exhausting the linear heap for real. */
+bool GfxRenderingAPIC3D::TexInitChecked(C3D_Tex* tex, uint32_t padW, uint32_t padH) {
+    static const unsigned long sEvery = [] {
+        if (&gdx3ds_config_get_int != nullptr) {
+            const int n = gdx3ds_config_get_int("debug", "texinitfail", 0);
+            return n > 0 ? (unsigned long)n : 0ul;
+        }
+        return 0ul;
+    }();
+    sTexInitFailEvery = sEvery;
+    sTexInitCalls++;
+    if (sTexInitFailEvery != 0 && (sTexInitCalls % sTexInitFailEvery) == 0) {
+        return false; /* forced: nothing is allocated, so nothing needs undoing */
+    }
+    return C3D_TexInit(tex, (u16)padW, (u16)padH, GPU_RGBA8) != false;
+}
+
+/* Free the linear heap a failed texture allocation needs, without destroying anything a live
+ * view still references. An atlas page at refs == 0 has already had all of its cells orphaned
+ * (AtlasRelease resets such a page's shelf cursor), and AtlasTryPlace re-inits a page on demand,
+ * so deleting one is self-healing. Returns true if anything was actually freed. */
+bool GfxRenderingAPIC3D::ReclaimLinearForTexture() {
+    bool freed = false;
+    for (size_t p = 0; p < mAtlasPages.size(); p++) {
+        AtlasPageC3D& pg = mAtlasPages[p];
+        if (pg.inited && pg.refs == 0) {
+            C3D_TexDelete(&pg.tex);
+            pg.inited = false;
+            pg.shelfY = 0;
+            pg.shelfH = 0;
+            pg.cursorX = 0;
+            freed = true;
+        }
+    }
+    return freed;
+}
+
+/* The shared "this id has no content" texture: 8x8 opaque white, so a draw that would otherwise
+ * not rebind the texunit at all samples the SHADE colour (TEXEL0 * SHADE with TEXEL0 = white)
+ * instead of whichever unrelated texture the unit happened to hold. Allocated once from a
+ * healthy heap (the first successful upload), never from the failure path. */
+void GfxRenderingAPIC3D::EnsureMissingTexture() {
+    if (mMissingTexInited) {
+        return;
+    }
+    if (!C3D_TexInit(&mMissingTex, 8, 8, GPU_RGBA8)) {
+        return; /* 256 bytes refused: the heap is far past saving, leave the bind-miss as-is */
+    }
+    std::memset(mMissingTex.data, 0xFF, mMissingTex.size);
+    C3D_TexSetFilter(&mMissingTex, GPU_NEAREST, GPU_NEAREST);
+    C3D_TexSetWrap(&mMissingTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    mMissingTexInited = true;
+}
+
 void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
     const uint32_t id = mBoundTextureIds[mLastSelectedTile];
     if (id >= mTextures.size() || width == 0 || height == 0) {
         mTexUploadFails++;
-        GFX_C3D_LOG("UploadTexture: invalid texture id %u (%ux%u)\n", id, width, height);
+        sTexUpFailId++;
+        GFX_C3D_LOG("DROPSITE: UploadTexture invalid texture id %u (%ux%u) -- nothing uploaded\n", id, width,
+                    height);
         return;
     }
     TextureC3D& t = mTextures[id];
-    if (sVfyMode != 0) { /* [nverify] content identity of what this id holds */
+    if (gdx3ds_verify_mode != 0) { /* [nverify] content identity of what this id holds */
         if (sVfyTexHash.size() <= id) {
             sVfyTexHash.resize(id + 1, 0);
+        }
+        if (sVfyTexSeq.size() <= id) {
+            sVfyTexSeq.resize(id + 1, 0);
+        }
+        sVfyTexSeq[id] = ++sVfyUploadSeq;
+        if (sVfyTexEnds.size() <= id * 2u + 1u) {
+            sVfyTexEnds.resize(id * 2u + 2u, 0);
+        }
+        {
+            const size_t payload = static_cast<size_t>(width) * height * 4u;
+            uint32_t w0v = 0, wNv = 0;
+            if (payload >= 4u) {
+                memcpy(&w0v, rgba32Buf, 4);
+                memcpy(&wNv, rgba32Buf + payload - 4u, 4);
+            }
+            sVfyTexEnds[id * 2u] = w0v;
+            sVfyTexEnds[id * 2u + 1u] = wNv;
         }
         uint32_t h = 2166136261u;
         h = VfyFnv(h, &width, 4);
@@ -2502,7 +2772,10 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
     const uint32_t padH = NextPow2(height < 8 ? 8 : height);
     if (padW > 1024 || padH > 1024) {
         mTexUploadFails++;
-        GFX_C3D_LOG("UploadTexture: %ux%u exceeds the PICA 1024 limit\n", width, height);
+        sTexUpFailDim++;
+        GFX_C3D_LOG("DROPSITE: UploadTexture %ux%u (padded %ux%u) exceeds the PICA 1024 limit -- this "
+                    "texture can never be uploaded; the draw binds the fallback\n",
+                    width, height, padW, padH);
         return;
     }
 
@@ -2511,9 +2784,27 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
         t.inited = false;
     }
     if (!t.inited) {
-        if (!C3D_TexInit(&t.tex, (u16)padW, (u16)padH, GPU_RGBA8)) {
+        /* DROPSITES site 4: this used to be a bare drop. The id kept the previous texture and
+         * the next draw did not rebind the texunit at all, so it sampled something unrelated.
+         * Now: reclaim what is safely reclaimable and retry once, then fall back to a defined
+         * sample rather than an arbitrary one. */
+        bool texInitOk = TexInitChecked(&t.tex, padW, padH);
+        if (!texInitOk && ReclaimLinearForTexture()) {
+            texInitOk = TexInitChecked(&t.tex, padW, padH);
+            if (texInitOk) {
+                sTexInitReclaimed++;
+                GFX_C3D_LOG("DROPSITE: C3D_TexInit(%ux%u) failed and SUCCEEDED after reclaiming "
+                            "orphaned atlas pages (linear free now %u KiB)\n",
+                            padW, padH, (unsigned)(linearSpaceFree() / 1024u));
+            }
+        }
+        if (!texInitOk) {
             mTexUploadFails++;
-            GFX_C3D_LOG("UploadTexture: C3D_TexInit(%ux%u) failed (linear heap exhausted?)\n", padW, padH);
+            sTexUpFailInit++;
+            GFX_C3D_LOG("DROPSITE: C3D_TexInit(%ux%u) failed with %u KiB linear free and no orphaned "
+                        "atlas page to reclaim (or the retry failed too) -- the draw binds the "
+                        "fallback, not the id's old contents\n",
+                        padW, padH, (unsigned)(linearSpaceFree() / 1024u));
             return;
         }
         std::memset(t.tex.data, 0, t.tex.size); // padding must not bleed under linear filtering
@@ -2578,6 +2869,7 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
     t.uScale = (float)width / (float)padW;
     t.vScale = (float)height / (float)padH;
     mTexUploads++;
+    EnsureMissingTexture(); /* DROPSITES site 4: allocate the fallback while the heap is healthy */
     // S12 asset-cost: the swizzled PICA payload just flushed (post pow2-pad) is the
     // real upload/bandwidth cost the ETC1 shift would cut.
     gdx3ds_gpuprof_note_tex_upload((unsigned)t.tex.size);
@@ -2714,6 +3006,23 @@ static int VpFixEnabled() {
 
 void GfxRenderingAPIC3D::SetViewport(int x, int y, int width, int height) {
     const int fbH = (int)CurrentTargetFbHeight();
+    /* COVERAGE: a distinct viewport rect is a distinct thing the frame draws into — 4P split
+     * screen is four of them, and the number of distinct VP keys in a frame IS its viewport
+     * count.
+     *
+     * Quantised to 32 px, and that number is load-bearing. Finer quantisations make a SLIDING
+     * viewport mint a new feature on every frame of its animation, and the set cover then has
+     * to sample animation frames one at a time: at 4 px it picked frame 1702 of the canonical
+     * replay, which is the one frame with a DOCUMENTED non-deterministic render transient (the
+     * course-name glyph; fhdiff --known 1702), and at 16 px it picked 30 CONSECUTIVE frames of
+     * race-4p-vs's split-screen wipe (97 of that replay's 321 features were viewport rects
+     * living 3 frames or fewer). A schedule is only useful if it is small and reproduces, so
+     * the feature is "a viewport of roughly this shape here", not "exactly these pixels".
+     * 32 px still separates all four 200x120 quadrants of the 4P split and the machine-select
+     * grid's 100-px columns, which are what the family exists to catch. */
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_VP,
+                                   ((uint32_t)((x >> 5) & 0x1F) << 15) | ((uint32_t)((y >> 5) & 0x1F) << 10) |
+                                       ((uint32_t)((width >> 5) & 0x1F) << 5) | (uint32_t)((height >> 5) & 0x1F)));
     const bool texBacked = mCurrentFramebuffer >= 0 && mCurrentFramebuffer < (int)mFramebuffers.size() &&
                            mFramebuffers[mCurrentFramebuffer].texBacked;
     const bool inside = (x >= 0 && y >= 0 && x + width <= 400 && y + height <= 240);
@@ -2722,15 +3031,26 @@ void GfxRenderingAPIC3D::SetViewport(int x, int y, int width, int height) {
     {
         static int sVpLogs = 0;
         static u64 sVpT0 = 0;
+        /* [debug] verbose, LATCHED. gdx3ds_config_get_int linear-scans the whole ini table with
+           two strcmp per entry; with verbose=0 sVpLogs never advances, so the unlatched form
+           paid that scan on EVERY non-full-window SetViewport for the rest of the run (menus and
+           split-screen: several per frame). Same class as audit 2026-09-23 finding 5. The latch
+           is only ever taken past the 45 s mark, by which time the ini is long loaded. */
+        static int sVpVerbose = -1;
         if (sVpT0 == 0) { sVpT0 = osGetTime(); }
         const bool full = (x == 0 && y == 0 && width == 400 && height == 240);
-        if (!full && sVpLogs < 400 && (osGetTime() - sVpT0) > 45000 && gdx3ds_config_get_int("debug", "verbose", 0) != 0) {
-            ++sVpLogs;
-            char line[160];
-            const int n = snprintf(line, sizeof(line), "[vp] f=%lu viewport x=%d y=%d w=%d h=%d inside=%d\n",
-                                   (unsigned long)mFrameIndex, x, y, width, height, (int)inside);
-            if (n > 0 && &gdx3ds_filelog_write != nullptr) {
-                gdx3ds_filelog_write(line, (size_t)n);
+        if (!full && sVpLogs < 400 && (osGetTime() - sVpT0) > 45000) {
+            if (sVpVerbose < 0) {
+                sVpVerbose = gdx3ds_config_get_int("debug", "verbose", 0) != 0 ? 1 : 0;
+            }
+            if (sVpVerbose != 0) {
+                ++sVpLogs;
+                char line[160];
+                const int n = snprintf(line, sizeof(line), "[vp] f=%lu viewport x=%d y=%d w=%d h=%d inside=%d\n",
+                                       (unsigned long)mFrameIndex, x, y, width, height, (int)inside);
+                if (n > 0 && &gdx3ds_filelog_write != nullptr) {
+                    gdx3ds_filelog_write(line, (size_t)n);
+                }
             }
         }
     }
@@ -2908,10 +3228,12 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         return;
     }
     if (mVboOffsetFloats + numVerts * kOutStrideFloats + nativeIdxFloats > mVboPoolFloats) {
+        sVboDrawDropped++; /* GEOMLOSS: was logged once and counted nowhere */
         if (!mVboExhaustionLogged) {
             mVboExhaustionLogged = true;
-            GFX_C3D_LOG("VBO pool exhausted (%zu KiB) — dropping the rest of the frame's geometry\n",
-                        kVboPoolBytes / 1024);
+            GFX_C3D_LOG("GEOMLOSS: VBO pool exhausted (%zu of %zu KiB usable) — DROPPING the rest of "
+                        "this frame's geometry (%zu tris here); vboDrop on the [c3d] line counts them\n",
+                        mVboPoolFloats * sizeof(float) / 1024, kVboPoolBytes / 1024, bufVboNumTris);
         }
         return;
     }
@@ -3047,9 +3369,19 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
             C3D_TexBind(tile, bindTex);
             gdx3ds_gpuprof_note_tex_bind(texId); // S12: distinct textures touched/frame
         } else {
+            /* DROPSITES site 4. Pre-fix this branch bound NOTHING, so the PICA texunit kept the
+             * last texture bound to it and the draw sampled an unrelated image -- the same
+             * stale-content failure as the texture cache's, one layer down. Bind the shared
+             * white fallback instead: the primitive draws untextured, which is wrong but
+             * DEFINED, and bindMiss= still counts every occurrence. */
             mFrameBindMisses++;
-            GFX_C3D_LOG("DrawTriangles: shader wants texel%d but texture %u is not uploaded\n", tile,
-                        mBoundTextureIds[tile]);
+            if (mMissingTexInited) {
+                C3D_TexBind(tile, &mMissingTex);
+                sTexMissingBinds++;
+            }
+            GFX_C3D_LOG("DROPSITE: shader wants texel%d but texture %u is not uploaded (bound the "
+                        "white fallback: %d)\n",
+                        tile, mBoundTextureIds[tile], mMissingTexInited ? 1 : 0);
         }
     }
 
@@ -3348,7 +3680,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         }
     };
 
-    if (sVfyMode != 0) { /* [nverify] one record per submitted batch; compare pass never draws */
+    if (gdx3ds_verify_mode != 0) { /* [nverify] one record per submitted batch; compare pass never draws */
         uint32_t f[kVfyFields] = {};
         uint32_t h = 2166136261u;
         f[0] = VfyFnv(h, &prg.id0, 8);
@@ -3402,11 +3734,15 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
             info.texHash[tile] = texId < sVfyTexHash.size() ? sVfyTexHash[texId] : 0u;
             info.texW[tile] = texId < mTextures.size() ? mTextures[texId].width : 0u;
             info.texH[tile] = texId < mTextures.size() ? mTextures[texId].height : 0u;
+            info.texSeq[tile] = texId < sVfyTexSeq.size() ? sVfyTexSeq[texId] : 0u;
+            info.texEnds[tile] = (texId * 2u + 1u) < sVfyTexEnds.size() ? sVfyTexEnds[texId * 2u + 1u] : 0u;
+            info.texEnds0[tile] = (texId * 2u) < sVfyTexEnds.size() ? sVfyTexEnds[texId * 2u] : 0u;
         }
+        info.seqNow = sVfyUploadSeq;
         memcpy(info.vpf, vp, sizeof(info.vpf));
         memcpy(info.vis, vis, sizeof(info.vis));
         VfyRecord(1, state, vboHash, f, &info);
-        if (sVfyMode == 2) {
+        if (gdx3ds_verify_mode == 2) {
             return;
         }
     }
@@ -3506,7 +3842,16 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
     }
 
     mVboOffsetFloats += numVerts * kOutStrideFloats + nativeIdxFloats;
+    if (mVboOffsetFloats > mVboHighWaterFloats) {
+        mVboHighWaterFloats = mVboOffsetFloats; /* GEOMLOSS: peak pool use, [c3d] vboHW */
+    }
     mFrameDrawCalls++;
+    /* COVERAGE (NEXT.md B15/B43): the one place every draw of every path funnels through, so
+     * this is where a frame's combiner / render-mode / texture-format vocabulary is recorded.
+     * One branch on gdx3ds_cov_on when the census is off, which is every shipped run. */
+    if (gdx3ds_cov_on) {
+        CovNoteDraw(prg, texBacked, anchoredDraw);
+    }
     if (packed) {
         sPackedDrawCalls++; // [triloop] receipt: dPk on the [c3d] line
     }
@@ -3522,22 +3867,173 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
 }
 
 /* ------------------------------------------------------------------------------- */
+/* COVERAGE ([debug] cov) — what this draw exercises                                 */
+/* ------------------------------------------------------------------------------- */
+
+static inline uint32_t CovLog2u(uint32_t v) {
+    uint32_t n = 0;
+    while (v > 1u && n < 15u) {
+        v >>= 1;
+        n++;
+    }
+    return n;
+}
+
+void GfxRenderingAPIC3D::CovNoteTexture(int unit, uint32_t texId) {
+    /* value: unit | class | PICA format | pow2 extents | filter | wrap. This is the texture
+     * VOCABULARY the frame binds, not the texture identity: two different course textures of
+     * the same format and extent are the same coverage feature, because a SHOT that samples
+     * one samples the decode/bind path of the other. Identity is the texture cache's business
+     * (family TC), not the schedule's. */
+    uint32_t cls = 2; /* not ready: a draw wanting a texel whose texture never uploaded */
+    uint32_t fmt = 0xFu;
+    uint32_t w = 0, h = 0, filt = 0, cms = 0, cmt = 0;
+    if (texId < mTextures.size()) {
+        const TextureC3D& t = mTextures[texId];
+        if (t.page >= 0) {
+            cls = 1; /* [trectbatch] view into a shared atlas page */
+            w = t.padWidth;
+            h = t.padHeight;
+        } else if (t.inited) {
+            cls = 0;
+            fmt = (uint32_t)t.tex.fmt & 0xFu;
+            w = t.padWidth;
+            h = t.padHeight;
+        }
+        filt = t.linearFilter ? 1u : 0u;
+        cms = t.cms & 3u;
+        cmt = t.cmt & 3u;
+    }
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_TEX,
+                                   ((uint32_t)(unit & 1) << 23) | (cls << 21) | (fmt << 17) |
+                                       (CovLog2u(w) << 13) | (CovLog2u(h) << 9) | (filt << 8) |
+                                       (cms << 6) | (cmt << 4)));
+}
+
+void GfxRenderingAPIC3D::CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw) {
+    /* Combiner: the two 64-bit shader ids folded to 24 bits. A fold, not an identity — a
+     * collision would merge two combiners into one coverage feature, which costs a sample, and
+     * the alternative (a dense side table) costs a per-draw map probe in the hot path. */
+    const uint64_t mix = prg.id0 * 0x9E3779B97F4A7C15ull ^ (prg.id1 + 0x165667B19E3779F9ull);
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_CC, (uint32_t)((mix >> 24) ^ mix)));
+
+    uint32_t rm = 0;
+    rm |= mDepthTest ? GDX3DS_COV_RM_ZTEST : 0u;
+    rm |= mDepthMask ? GDX3DS_COV_RM_ZWRITE : 0u;
+    rm |= mZmodeDecal ? GDX3DS_COV_RM_DECAL : 0u;
+    rm |= mUseAlpha ? GDX3DS_COV_RM_ALPHA : 0u;
+    rm |= prg.cc.opt_fog ? GDX3DS_COV_RM_FOG : 0u;
+    rm |= prg.cc.opt_prim_depth ? GDX3DS_COV_RM_PDEPTH : 0u;
+    rm |= prg.cc.opt_texture_edge ? GDX3DS_COV_RM_TEDGE : 0u;
+    rm |= prg.cc.opt_alpha_threshold ? GDX3DS_COV_RM_ATHR : 0u;
+    rm |= prg.cc.opt_2cyc ? 0x100u : 0u;
+    rm |= prg.cc.opt_noise ? 0x200u : 0u;
+    rm |= prg.cc.opt_grayscale ? 0x400u : 0u;
+    rm |= prg.fogBlendStage ? 0x800u : 0u;
+    rm |= (uint32_t)(prg.cc.numInputs & 7) << 12;
+    rm |= mNativeActive ? 0x8000u : 0u;   /* indexed native mesh draw vs arrays */
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_RM, rm));
+
+    /* Prim-depth-anchored draws get their own family: a stereo anchor is a distinct visual
+     * behaviour, and B15's whole point is that a feature nothing samples is a feature nothing
+     * checks. */
+    if (anchoredDraw) {
+        gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_RM, rm | 0x10000u));
+    }
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_FB, texBacked ? 1u : 0u));
+
+    for (int tile = 0; tile < 2; tile++) {
+        if (prg.cc.usedTextures[tile]) {
+            CovNoteTexture(tile, mBoundTextureIds[tile]);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------------- */
 /* [triloop] direct PICA-layout emission (gdx3ds_vbopack.h)                          */
 /* ------------------------------------------------------------------------------- */
 
-float* GfxRenderingAPIC3D::VboPackBegin(Gdx3dsVboPackParams* params) {
+float* GfxRenderingAPIC3D::VboPackBegin(Gdx3dsVboPackParams* params, uint32_t* capTris) {
+    if (capTris != nullptr) {
+        *capTris = 0;
+    }
     if (!GdxTriloopEnabled()) {
+        /* GEOMLOSS: LOUD. The LUS path has a legacy loop to fall back to; the owned
+         * interpreter does not, so under [native] interp=1 this killswitch is a
+         * draw-nothing switch. Say so once rather than quietly rendering black. */
+        if (capTris != nullptr && !mVboPackRefuseLogged) {
+            mVboPackRefuseLogged = true;
+            GFX_C3D_LOG("GEOMLOSS: packed begin refused — [debug] triloop=0 with no legacy path "
+                        "on this interpreter; geometry WILL be dropped\n");
+        }
         return nullptr;
     }
     if (!mInitialized || !mFrameActive || mCurrentShader == nullptr) {
+        if (capTris != nullptr && !mVboPackRefuseLogged) {
+            mVboPackRefuseLogged = true;
+            GFX_C3D_LOG("GEOMLOSS: packed begin refused — init=%d frame=%d shader=%d; "
+                        "this batch is dropped\n",
+                        mInitialized ? 1 : 0, mFrameActive ? 1 : 0, mCurrentShader != nullptr ? 1 : 0);
+        }
         return nullptr;
     }
-    // Reserve room for a full interpreter batch (MAX_TRI_BUFFER = 256 tris);
-    // refusing near exhaustion falls back to the legacy path, which drops at
-    // draw time exactly as before.
+    // A full interpreter batch is MAX_TRI_BUFFER = 256 tris.
     constexpr size_t kBatchReserveFloats = 256 * 3 * kOutStrideFloats;
-    if (mVboOffsetFloats + kBatchReserveFloats > mVboPoolFloats) {
-        return nullptr;
+    const bool splitOn = GdxVboSplitEnabled();
+    const size_t freeFloats = mVboPoolFloats > mVboOffsetFloats ? mVboPoolFloats - mVboOffsetFloats : 0;
+    if (capTris == nullptr || !splitOn) {
+        // Historic all-or-nothing contract: the caller (LUS) answers a refusal by
+        // running its legacy variable-stride loop, which reserves what it actually
+        // needs at DrawTriangles time. [debug] vbosplit=0 puts the owned caller back
+        // on it too (the A/B arm that drops geometry).
+        if (freeFloats < kBatchReserveFloats) {
+            if (capTris != nullptr) {
+                sVboPackRefused++;
+                if (!mVboPackRefuseLogged) {
+                    mVboPackRefuseLogged = true;
+                    GFX_C3D_LOG("GEOMLOSS: [debug] vbosplit=0 — packed begin refused at %zu/%zu KiB with "
+                                "%zu tris still fitting; that geometry is DROPPED\n",
+                                mVboOffsetFloats * sizeof(float) / 1024, mVboPoolFloats * sizeof(float) / 1024,
+                                freeFloats / (3 * kOutStrideFloats));
+                }
+            }
+            return nullptr;
+        }
+        if (capTris != nullptr) {
+            *capTris = 256; /* pre-fix: always a whole batch */
+        }
+    } else {
+        // GEOMLOSS: the owned interpreter has no legacy loop. Tell it how many
+        // triangles still fit so it can split the batch there; refuse only when not
+        // even one triangle fits, which is exactly where DrawTriangles — and so the
+        // LUS path too — drops the geometry.
+        size_t fitTris = freeFloats / (3 * kOutStrideFloats);
+        if (fitTris == 0) {
+            sVboPackRefused++;
+            if (!mVboPackRefuseLogged) {
+                mVboPackRefuseLogged = true;
+                GFX_C3D_LOG("GEOMLOSS: VBO pool exhausted at %zu/%zu KiB — packed begin refused, "
+                            "the rest of this frame's owned-interpreter geometry is DROPPED\n",
+                            mVboOffsetFloats * sizeof(float) / 1024,
+                            mVboPoolFloats * sizeof(float) / 1024);
+            }
+            return nullptr;
+        }
+        const uint32_t forced = GdxVboPackCap();
+        if (forced != 0 && forced < fitTris) {
+            fitTris = forced;
+        }
+        *capTris = (uint32_t)fitTris;
+        if (fitTris < 256) {
+            sVboPackSplit++;
+        }
+        if (fitTris < 256 && !mVboPackSplitLogged) {
+            mVboPackSplitLogged = true;
+            GFX_C3D_LOG("GEOMLOSS: VBO pool low at %zu/%zu KiB — packed batches now split at %zu tris "
+                        "(geometry preserved, draw count rises)\n",
+                        mVboOffsetFloats * sizeof(float) / 1024, mVboPoolFloats * sizeof(float) / 1024,
+                        fitTris);
+        }
     }
     const ShaderProgramC3D& prg = *mCurrentShader;
     const bool skyClampFix = GdxSkyClampFixEnabled();
@@ -3926,9 +4422,9 @@ void GfxRenderingAPIC3D::StartDrawToFramebuffer(int fbId, float noiseScale) {
         return;
     }
     mCurrentFramebuffer = fbId;
-    if (sVfyMode != 0) {
+    if (gdx3ds_verify_mode != 0) {
         VfyRecord(3, static_cast<uint32_t>(fbId), 0, nullptr);
-        if (sVfyMode == 2) {
+        if (gdx3ds_verify_mode == 2) {
             return;
         }
     }
@@ -4024,9 +4520,9 @@ void GfxRenderingAPIC3D::ClearFramebuffer(bool color, bool depth) {
     if (mCurrentFramebuffer >= (int)mFramebuffers.size()) {
         return;
     }
-    if (sVfyMode != 0) {
+    if (gdx3ds_verify_mode != 0) {
         VfyRecord(2, (color ? 1u : 0u) | (depth ? 2u : 0u) | (static_cast<uint32_t>(mCurrentFramebuffer) << 8), 0, nullptr);
-        if (sVfyMode == 2) {
+        if (gdx3ds_verify_mode == 2) {
             return;
         }
     }
@@ -4281,7 +4777,8 @@ extern "C" int gdx3ds_gfx_frame_active(void) {
  * in gdx3ds_vbopack.h; the interpreter only ever calls them from its own DL
  * walk, where the renderer singleton exists by construction). */
 extern "C" float* gdx3ds_vbopack_begin(Gdx3dsVboPackParams* params) {
-    return GdxCitro3dRendererSingleton().VboPackBegin(params);
+    /* LUS: legacy all-or-nothing contract — a refusal is answered by its legacy loop. */
+    return GdxCitro3dRendererSingleton().VboPackBegin(params, nullptr);
 }
 
 extern "C" void gdx3ds_vbopack_refresh(Gdx3dsVboPackParams* params) {
@@ -4408,6 +4905,21 @@ extern "C" void Gdx_NativeBatchCommit(uint32_t nVerts) {
     const size_t floats = (size_t)nVerts * kOutStrideFloats;
     if (r.mVboOffsetFloats + floats <= r.mVboPoolFloats) {
         r.mVboOffsetFloats += floats;
+        return;
+    }
+    /* GEOMLOSS: the cursor could not advance, but the caller has already written nVerts
+     * through the batch cursor and popped them from the interpreter. Those vertices are now
+     * outside the range Gdx_NativeBatchFlush will draw AND will be overwritten by the next
+     * append. The begin reservation makes this unreachable; count and name it rather than
+     * let it be the one pool failure with no trace at all. */
+    sNbCommitRefused++;
+    static bool sLogged = false;
+    if (!sLogged) {
+        sLogged = true;
+        GFX_C3D_LOG("GEOMLOSS: Gdx_NativeBatchCommit refused %u verts at %zu/%zu KiB — the appended "
+                    "vertices fall outside the flushed range\n",
+                    nVerts, r.mVboOffsetFloats * sizeof(float) / 1024,
+                    r.mVboPoolFloats * sizeof(float) / 1024);
     }
 }
 

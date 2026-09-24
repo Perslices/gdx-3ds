@@ -17,6 +17,9 @@
     {                                                                                   \
         Gfx* _gdxG = (Gfx*)(pkt);                                                       \
         const void* _gdxD = (const void*)(dl);                                          \
+        if (gdx3ds_cov_on) {                                                            \
+            gdxfx_cov_setup(_gdxD);                                                     \
+        }                                                                               \
         if (gdxfx_active && gdxfx_setup(_gdxG, _gdxD) == 2) {                           \
             _gdxG = gfx++;                                                              \
         }                                                                               \
@@ -33,6 +36,9 @@
         int _gdxV0 = (int)(v0);                                                         \
         int _gdxAdv = (_gdxB != gfx);                                                   \
         int _gdxR = gdxfx_active ? gdxfx_vertex(_gdxG, _gdxV, _gdxN, _gdxV0, _gdxAdv) : 0; \
+        if (gdx3ds_cov_on) {                                                            \
+            gdxfx_cov_vertex();                                                         \
+        }                                                                               \
         if (_gdxR == 1) {                                                               \
             if (_gdxAdv) {                                                              \
                 gfx = _gdxG;                                                            \
@@ -170,7 +176,7 @@
 #define gDPSetTextureImage(pkt, f, s, w, i)                                             \
     {                                                                                   \
         Gfx* _gdxG = (Gfx*)(pkt);                                                       \
-        if (gdxfx_active && gdxfx_texload(_gdxG) == 2) {                                \
+        if (gdxfx_active && gdxfx_texload(_gdxG, (const void*)(i)) == 2) {                                \
             _gdxG = gfx++;                                                              \
         }                                                                               \
         gdxfx_gbi_settimg(_gdxG, (int)(f), (int)(s), (int)(w), (const void*)(i));       \

@@ -126,6 +126,10 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     uint32_t NewTexture() override;
     void SelectTexture(int tile, uint32_t textureId) override;
     void UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) override;
+    /* DROPSITES site 4 (gfx_citro3d.cpp). */
+    bool TexInitChecked(C3D_Tex* tex, uint32_t padW, uint32_t padH);
+    bool ReclaimLinearForTexture();
+    void EnsureMissingTexture();
     void SetSamplerParameters(int sampler, bool linearFilter, uint32_t cms, uint32_t cmt) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
@@ -177,12 +181,23 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
      * hands the interpreter the batch's pack parameters + a linear-pool write
      * cursor (NULL = refuse, legacy path); DrawPackedBatch submits the packed
      * range through DrawTriangles with the repack skipped. */
-    float* VboPackBegin(Gdx3dsVboPackParams* params);
+    /* capTris: GEOMLOSS. NULL keeps the historic all-or-nothing contract (refuse unless a
+     * whole 256-tri batch fits) used by the LUS path, which falls back to its legacy
+     * variable-stride append on refusal. Non-NULL asks instead for "how many triangles
+     * still fit" and refuses only at genuine exhaustion (0) — the owned interpreter has no
+     * legacy path to fall back to, so it splits the batch at the cap instead of dropping it. */
+    float* VboPackBegin(Gdx3dsVboPackParams* params, uint32_t* capTris = nullptr);
     void DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux);
     /* [native] machines (gdx3ds_mesh.h): reserve packed vertices + u16 indices in the
      * linear pool for the CURRENT shader/texture state, then submit ONE indexed draw
      * through DrawTriangles' shared tail (C3D_DrawElements in place of DrawArrays). */
     float* NativeMeshBegin(Gdx3dsVboPackParams* params, uint32_t minVerts, uint32_t maxIndices, uint32_t* capVerts);
+
+    /* COVERAGE ([debug] cov, NEXT.md B15/B43): record this draw's combiner, render mode,
+     * render target and both bound textures as per-frame features. Diagnostic only; never
+     * called unless gdx3ds_cov_on. */
+    void CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw);
+    void CovNoteTexture(int unit, uint32_t texId);
     void NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux);
 
   private:
@@ -313,6 +328,9 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     size_t mVboOffsetFloats = 0;
     size_t mVboFlushedFloats = 0; // flushed-to-GPU watermark (FlushPendingVbo)
     bool mVboExhaustionLogged = false;
+    size_t mVboHighWaterFloats = 0;   // GEOMLOSS: peak pool bytes any frame reached ([c3d] vboHW)
+    bool mVboPackRefuseLogged = false; // GEOMLOSS: one-shot "a packed begin was refused"
+    bool mVboPackSplitLogged = false;  // GEOMLOSS: one-shot "a packed batch was split at the cap"
 
     std::vector<TextureC3D> mTextures;
     std::vector<FramebufferC3D> mFramebuffers;
@@ -390,6 +408,10 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     uint32_t mFrameBindMisses = 0; // draws wanting a texel whose texture never uploaded
     uint32_t mTexUploads = 0;      // cumulative successful UploadTexture calls
     uint32_t mTexUploadFails = 0;  // cumulative UploadTexture early-outs
+    /* DROPSITES site 4: the shared 8x8 opaque-white sample a draw binds when its texture id
+     * holds nothing, so the texunit is never left pointing at an unrelated texture. */
+    C3D_Tex mMissingTex = {};
+    bool mMissingTexInited = false;
 
     /* [triloop] batch aux record of the packed draw currently threading through
      * DrawTriangles (non-null exactly inside DrawPackedBatch). */

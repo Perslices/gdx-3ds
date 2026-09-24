@@ -1,9 +1,10 @@
-"""Log parsing: [prof]/[prof!]/[profop]/[gpu]/[fill]/[rt]/[watchdog] + error census.
+"""Log parsing: [prof]/[prof!]/[profop]/[gpu]/[fill]/[mprof]/[rt]/[watchdog] + error census.
 
 The receipt formats are FIXED in the source and must not be re-guessed
 (port/3ds/gfx/gdx3ds_gpu_prof.c:211,428,432; port/3ds/gdx3ds_renderthread.cpp:512;
-port/3ds/main_3ds.cpp:208). Everything here is a tolerant key=value scan rather than a
-positional regex, so a build that adds a column at the end does not break the parser.
+port/3ds/gdx3ds_mainprof.c:154,165; port/3ds/main_3ds.cpp:208). Everything here is a
+tolerant key=value scan rather than a positional regex, so a build that adds a column at
+the end does not break the parser.
 """
 
 import math
@@ -28,6 +29,24 @@ BENIGN_RECEIPTS = (
 
 PROF_SECTIONS = ["br", "dsp", "vtx", "tri", "imp", "drw", "mtx", "oth"]
 PROF_COUNTS = ["vtxN", "nV", "nT", "nI", "nD", "nM", "nRun"]
+
+# [mprof] MAIN-THREAD sections (port/3ds/gdx3ds_mainprof.h). The order here is the order
+# the columns print in; it is grouped, not ranked — `--main` ranks by value.
+# Game-fiber (the submitting side) first, then the host loop, then the residual.
+MPROF_FIB = ["logic", "dlb", "brm", "aud", "lseg", "sla", "seg", "dma", "stask", "sub"]
+MPROF_HOST = ["apt", "pace", "inp", "beg", "vi", "disp", "jdp", "jtop", "end", "tail"]
+MPROF_SECTIONS = MPROF_FIB + MPROF_HOST + ["oth"]
+# Buckets in which main is BLOCKED rather than working. `sub` and `jdp` are waits for the
+# render thread, `jtop` is the APT frame-boundary join, `pace` is the deliberate vblank
+# alignment. Separated because they answer a different question from the work buckets: the
+# work columns say what main would have to get faster, the wait columns say whether main is
+# the bottleneck at all. In the emulator the wait columns are inflated by host contention
+# (core 2 is time-sliced onto the same host thread), so a lever decision reads the work
+# columns and the hardware [rt] receipt, never the emulator's waits.
+MPROF_WAIT = ["sub", "jdp", "jtop", "pace"]
+MPROF_WORK = [s for s in MPROF_SECTIONS if s not in MPROF_WAIT]
+# Emitted over two lines sharing one frame= (each stays inside the 224-byte log line cap).
+MPROF_PARTS = 2
 
 # `key=value` where value is a number, optionally a/b, optionally %-suffixed.
 _KV = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(-?[0-9]+(?:\.[0-9]+)?)")
@@ -104,7 +123,8 @@ class Parsed:
         self.gpu = []
         self.fill = []
         self.rt = []
-        self.watchdog = []   # dict(beat,frame,delta,stage,...)
+        self.mprof = []      # [mprof] windows: dict(frame,n,nD,dl,tot,<sections>)
+        self.watchdog = []   # dict(beat,frame,delta,stage,shot,...)
         self.errors = {t: 0 for t in ERROR_TAGS}
         self.benign = 0
         self.error_lines = []
@@ -116,11 +136,19 @@ class Parsed:
         return sum(self.errors[t] for t in FATAL_TAGS)
 
     def is_empty(self):
-        return not (self.prof or self.gpu or self.watchdog or self.rt or self.fill)
+        return not (self.prof or self.gpu or self.watchdog or self.rt or self.fill
+                    or self.mprof)
 
 
 def parse_text(text):
     p = Parsed()
+    # A10: a SHOT is a screenshot the REPLAY asked for -- a readback plus a 230-288 KB BMP
+    # write, all on the main thread. On hardware that cost ~2 s per image, so every beat that
+    # carried one collapsed into the teens in EVERY lever configuration and the fps table was
+    # measuring the harness. Beats are tagged with whether a SHOT landed inside them (by log
+    # position: a SHOT line after beat k-1 and before beat k belongs to beat k) so a caller
+    # can price the run without them.
+    shots_pending = 0
     for raw in text.splitlines():
         p.lines += 1
         line = raw.rstrip()
@@ -134,6 +162,8 @@ def parse_text(text):
                     p.errors[tag] += 1
                     if len(p.error_lines) < 200:
                         p.error_lines.append(line.strip())
+        if "SHOT captured" in line or "SHOT dumped" in line or "SHOT scanout dumped" in line:
+            shots_pending += 1
         tag = _tag_of(line)
         if tag is None:
             continue
@@ -164,6 +194,29 @@ def parse_text(text):
             d = _kv(line)
             if "frame" in d:
                 p.fill.append(d)
+        elif tag == "[mprof]":
+            d = _kv(line)
+            if "frame" not in d or "n" not in d or "part" not in d:
+                continue  # the arming ack ("[mprof] main-thread profiling enabled ...")
+            frame, n = int(d["frame"]), int(d["n"])
+            # Merge the two parts of one window. They are emitted back to back from the
+            # same MProfEmit call, so "the open record with this frame" is unambiguous;
+            # a truncated log that lost one part simply leaves those columns at 0.
+            rec = None
+            if p.mprof and p.mprof[-1]["frame"] == frame:
+                rec = p.mprof[-1]
+            else:
+                rec = {"frame": frame, "n": n, "parts": 0}
+                for k in MPROF_SECTIONS:
+                    rec[k] = 0.0
+                for k in ("nD", "dl", "tot", "fib", "host", "tasks"):
+                    rec[k] = 0.0
+                p.mprof.append(rec)
+            rec["parts"] += 1
+            for k in MPROF_SECTIONS + ["nD", "dl", "tot", "fib", "host", "tasks"]:
+                if k in d:
+                    rec[k] = d[k]
+            rec["nD"] = int(rec["nD"])
         elif tag == "[rt]":
             d = _kv(line)
             if "frame" in d and "n" in d:
@@ -181,7 +234,9 @@ def parse_text(text):
                 "delta": int(m.group(2)),
                 "stage": int(d.get("stage", -1)),
                 "heapUsed": int(d.get("heapUsed", 0)),
+                "shots": shots_pending,
             })
+            shots_pending = 0
     return p
 
 
@@ -211,21 +266,29 @@ def mean(values):
     return (sum(values) / float(len(values))) if values else None
 
 
-def fps_series(parsed, skip_first=1):
+def fps_series(parsed, skip_first=1, exclude_shots=False):
     """fps from [watchdog] frame deltas / 5 s (docs/3DS-HARDWARE.md:177-180).
 
     The first beat's delta counts everything since process start (boot + asset load), so
     it is dropped by default — it is not a frame rate.
+
+    exclude_shots drops every beat a replay SHOT landed in, for the same reason: the
+    screenshot's readback and BMP write are harness cost on the main thread, not the
+    game's frame rate.
     """
     beats = parsed.watchdog[skip_first:]
+    if exclude_shots:
+        beats = [b for b in beats if not b.get("shots")]
     return [b["delta"] / WATCHDOG_PERIOD_S for b in beats]
 
 
-def fps_summary(parsed, skip_first=1):
-    series = fps_series(parsed, skip_first)
+def fps_summary(parsed, skip_first=1, exclude_shots=False):
+    series = fps_series(parsed, skip_first, exclude_shots)
     if not series:
         return None
+    shot_beats = sum(1 for b in parsed.watchdog[skip_first:] if b.get("shots"))
     return {
+        "shot_beats": shot_beats,
         "beats": len(series),
         "p10": percentile(series, 10),
         "p50": percentile(series, 50),
@@ -268,6 +331,44 @@ def bucket_by_nd(windows):
             label = "%s (nD %d-%s)" % (name, lo, "inf" if hi > 10 ** 8 else str(hi - 1))
             groups.append((label, sel))
     return groups
+
+
+def mprof_summary(windows):
+    """Mean/p50 per [mprof] section over a set of windows. `total` is the SUM of the
+    sections, which by construction is the main thread's wall ms/frame — the buckets
+    partition the frame rather than sampling it (gdx3ds_mainprof.h, "THE MODEL"), so a
+    total that drifts from the emitted tot= column would mean a lost part= line."""
+    if not windows:
+        return None
+    out = {"windows": len(windows), "frames": sum(w["n"] for w in windows)}
+    for s in MPROF_SECTIONS:
+        vals = [w[s] for w in windows]
+        out[s] = {"mean": mean(vals), "p50": percentile(vals, 50),
+                  "min": min(vals), "max": max(vals)}
+    totals = [sum(w[s] for s in MPROF_SECTIONS) for w in windows]
+    out["total"] = {"mean": mean(totals), "p50": percentile(totals, 50),
+                    "min": min(totals), "max": max(totals)}
+    out["wait"] = mean([sum(w[s] for s in MPROF_WAIT) for w in windows])
+    out["work"] = mean([sum(w[s] for s in MPROF_WORK) for w in windows])
+    out["fib"] = mean([sum(w[s] for s in MPROF_FIB) for w in windows])
+    out["host"] = mean([sum(w[s] for s in MPROF_HOST) for w in windows])
+    out["emitted_tot"] = mean([w["tot"] for w in windows])
+    out["nD"] = mean([w["nD"] for w in windows])
+    out["dl"] = mean([w["dl"] for w in windows])
+    return out
+
+
+def mprof_ranked(summary, top=None, sections=None, denom=None):
+    """(section, ms, pct-of-denominator) rows, biggest first — the A8 deliverable.
+
+    `sections=MPROF_WORK, denom="work"` gives the ranking that transfers off the
+    emulator: what main actually SPENDS, with the host-contention-inflated waits out."""
+    sections = sections or MPROF_SECTIONS
+    total = summary[denom] if denom else summary["total"]["mean"]
+    total = total or 1.0
+    rows = [(s, summary[s]["mean"], 100.0 * summary[s]["mean"] / total) for s in sections]
+    rows.sort(key=lambda r: -(r[1] or 0))
+    return rows[:top] if top else rows
 
 
 def op_summary(parsed, top=8):

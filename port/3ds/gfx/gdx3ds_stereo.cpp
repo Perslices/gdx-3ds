@@ -19,6 +19,8 @@
 // Render-thread identity + menu echo gate (both weak: harness builds link neither).
 extern "C" int gdx3ds_rt_on_render_thread(void) __attribute__((weak));
 extern "C" int gdx3ds_console_echo_enabled __attribute__((weak));
+/* StereoLog's SD-filelog sink (weak, like the rest: the DL harness links neither). */
+extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__((weak));
 
 /* Config comes from stream B's OS library; the DL harness links the backend
  * without it, so resolve the getters weakly (same pattern as gGdxRaceActive in
@@ -69,7 +71,15 @@ void StereoLog(const char* msg) {
             std::fprintf(stderr, "[gdx3ds_stereo] %s\n", msg);
         }
     }
-    svcOutputDebugString(msg, std::strlen(msg));
+    const size_t len = std::strlen(msg);
+    svcOutputDebugString(msg, len);
+    /* The comment above has always promised the filelog; the call was missing, so the
+     * "[stereo] right-eye pass ACTIVE" receipt — the one line that says the pass ran at all
+     * — never reached the SD log, i.e. never reached the RetroArch lane, hardware, or
+     * hwlink. Three lines per boot at most (init, activation, an allocation failure). */
+    if (&gdx3ds_filelog_write != nullptr) {
+        gdx3ds_filelog_write(msg, len);
+    }
 }
 
 float ClampF(float v, float lo, float hi) {

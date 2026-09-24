@@ -1,0 +1,111 @@
+diff --git a/src/sys/sys_gfx.c b/src/sys/sys_gfx.c
+--- a/src/sys/sys_gfx.c
++++ b/src/sys/sys_gfx.c
+@@ -6,8 +6,26 @@
+ #ifdef PORT
+ extern void gdx_ck(const char* s);
+ #define GDX_CK(n) do { if (gdx_diag_verbose()) gdx_ck("[game] ck" #n); } while (0)
++/* MAINPROF (port/3ds/gdx3ds_mainprof.h, NEXT.md A8): the per-VI frame function below IS
++ * the game thread's frame, and on the 3DS it runs inline on main inside gdx_vi_tick. These
++ * checkpoints hand the [mprof] timeline the phase boundaries so main's milliseconds can be
++ * attributed to audio / logic / DL build / asset loads / submit instead of one opaque
++ * total. Ids must match the GDX3DS_MPROF_CK_* defines in that header. Diagnostic only:
++ * gdx_mprof_ck reads a clock and nothing else, and is a no-op unless [debug] mainprof=1. */
++extern void gdx_mprof_ck(int step);
++#define GDX_MP_IDLE    0
++#define GDX_MP_AUDIO   1
++#define GDX_MP_LOGIC   2
++#define GDX_MP_LSEG    3
++#define GDX_MP_DLBUILD 4
++#define GDX_MP_DPWAIT  5
++#define GDX_MP_SEGLOAD 6
++#define GDX_MP_FBSPIN  7
++#define GDX_MP_SETTASK 8
++#define GDX_MP(n) gdx_mprof_ck(GDX_MP_##n)
+ #else
+ #define GDX_CK(n)
++#define GDX_MP(n)
+ #endif
+ 
+ GfxPool* gGfxPool;
+@@ -198,19 +216,25 @@
+     GDX_CK(H1_67D64_wait_vi);
+     osRecvMesg(&D_800DCAB0, &D_800DCD10, OS_MESG_BLOCK);
+     GDX_CK(H2_67D64_got_vi);
++    GDX_MP(AUDIO);
+     Audio_Update();
++    GDX_MP(LOGIC);
+     Gfx_InitBuffer();
+     GDX_CK(H3_67D64_pre_gamemode);
+     func_800690FC();
+     GDX_CK(H4_67D64_post_gamemode);
++    GDX_MP(LSEG);
+     Gfx_LoadSegments();
+     GDX_CK(H5_67D64_pre_draw);
++    GDX_MP(DLBUILD);
+     gMasterDisp = func_80069698(gMasterDisp);
+     GDX_CK(H6_67D64_post_draw);
++    GDX_MP(DPWAIT);
+     Gfx_FullSync();
+     GDX_CK(H7_67D64_wait_dp);
+     osRecvMesg(&D_800DCAC8, &D_800DCD10, OS_MESG_BLOCK);
+     GDX_CK(H8_67D64_got_dp);
++    GDX_MP(SEGLOAD);
+ 
+     while (osDpGetStatus() &
+            (DPC_STATUS_DMA_BUSY | DPC_STATUS_CMD_BUSY | DPC_STATUS_PIPE_BUSY | DPC_STATUS_TMEM_BUSY)) {}
+@@ -219,29 +243,44 @@
+     Transition_SetBackgroundBuffer();
+     osViSwapBuffer(gFrameBuffers[D_800DCD00]);
+     GDX_CK(H9_67D64_wait_fb);
++    GDX_MP(FBSPIN);
+ 
+     while (osViGetCurrentFramebuffer() != gFrameBuffers[D_800DCD00]) {}
+ 
+     GDX_CK(HA_67D64_set_task);
++    GDX_MP(SETTASK);
+     Gfx_SetTask(sGfxTask);
+     GDX_CK(HB_67D64_done);
++    GDX_MP(IDLE);
+ }
+ 
+ void func_80067E98(void) {
+     s32 retries = 100000;
+ 
+     osRecvMesg(&D_800DCAB0, &D_800DCD10, OS_MESG_BLOCK);
++    /* MAINPROF: this is the OTHER game main loop (D_800CCFE4 == 3, the triple-buffered
++     * path the game runs in for most of a session -- see the switch at the bottom of this
++     * file). Same phases as func_80067D64 in a different order, so it carries the same
++     * GDX_MP markers; without them every steady-state [mprof] window reads logic=0. */
++    GDX_MP(LOGIC);
+     Gfx_InitBuffer();
+     func_800690FC();
+     func_80067AE0();
++    GDX_MP(LSEG);
+     Gfx_LoadSegments();
++    GDX_MP(DLBUILD);
+     gMasterDisp = func_80069698(gMasterDisp);
++    GDX_MP(DPWAIT);
+     Gfx_FullSync();
++    GDX_MP(AUDIO);
+     Audio_Update();
++    GDX_MP(DPWAIT);
+     osRecvMesg(&D_800DCAC8, &D_800DCD10, OS_MESG_BLOCK);
++    GDX_MP(SEGLOAD);
+     Transition_SetBackgroundBuffer();
+     osViSwapBuffer(gFrameBuffers[D_800DCD08]);
+     Segment_LoadAssets();
++    GDX_MP(FBSPIN);
+ 
+     while ((osViGetCurrentFramebuffer() == gFrameBuffers[D_800DCD04] ||
+             osViGetNextFramebuffer() == gFrameBuffers[D_800DCD04]) &&
+@@ -249,7 +288,9 @@
+         retries--;
+     }
+ 
++    GDX_MP(SETTASK);
+     Gfx_SetTask(sGfxTask);
++    GDX_MP(IDLE);
+ }
+ 
+ u32 gGameFrameCount = 0;

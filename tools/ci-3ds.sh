@@ -9,7 +9,9 @@
 #      even when patches share overlapping context; a stack that neither applies
 #      nor reverses cleanly fails LOUDLY, or warns under SKIP_PATCH_GATE=1);
 #   3. builds the host-side unit tests that run on this machine and runs them
-#      (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests, gdx3ds_fs_host_smoke,
+#      (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests,
+#       gdx3ds_config_host_tests, gdx3ds_native_cfg_host_tests, gdx3ds_dynlod_host_tests,
+#       gdx3ds_fs_host_smoke,
 #      gdx_machines_harness —
 #      compiled directly with the host compiler; no desktop configure needed);
 #   4. configures + builds the 3DS target (G-Diffuser-3DS.3dsx) and the DL
@@ -200,6 +202,9 @@ PATCH_LIST=(
     "decomp:decomp-native-machines-rebuilt.patch"
     "decomp:decomp-port-title-demo-audio-pin.patch"
     "decomp:decomp-native-fx-shim.patch"
+    "decomp:decomp-3ds-mainprof-checkpoints.patch"
+    "decomp:decomp-3ds-disk-audio-ilp32.patch"
+    "decomp:decomp-3ds-disk-audio-heap-ilp32.patch"
 )
 
 banner "submodule patches (decomp)"
@@ -331,6 +336,123 @@ if [ "$PATCHES_OK" -ne 1 ]; then
 fi
 record "submodule patches" PASS "${ALREADY} already applied, ${APPLIED_NOW} newly applied"
 
+# ------------------------------------------------- bridge memo ownership --
+# [factsrace] The bridge's per-list facts memo (N64DisplayListAdapter::ListFacts) must stay a
+# PER-ADAPTER member. As a process-wide `static` table it is reachable from BOTH threads under
+# `[native] interp=1` (the owned walker resolves lists on the render thread through
+# gdx_gfx_job_resolve_list) while `[debug] bridgemain=1` has main constructing the NEXT task's
+# adapter at the same time — the constructor's per-task wipe then nulls a slot the render thread
+# holds a reference to. That is the 2026-09-23 New 3DS data abort (far=0x00000003 inside
+# FactsScan); see docs/research/native/factsrace-progress.md. This check is a regression fence,
+# not a test: the race cannot be reproduced under Azahar, which time-slices both cores onto one
+# host thread.
+banner "bridge memo ownership"
+BRIDGE_SRC="${ROOT}/port/n64_gfx_bridge.cpp"
+if grep -nE '(static|thread_local|__thread)[[:space:]]+ListFacts' "${BRIDGE_SRC}" >&2; then
+    record "bridge memo ownership" FAIL "ListFacts memo is static/thread-local again — it must be a N64DisplayListAdapter member"
+elif grep -q 'mutable ListFacts mFacts\[kListFactsSlots\];' "${BRIDGE_SRC}"; then
+    record "bridge memo ownership" PASS "ListFacts memo is a per-adapter member (8 KiB/adapter on ARM32, one task = one walker)"
+else
+    record "bridge memo ownership" FAIL "per-adapter ListFacts member (mFacts) not found in port/n64_gfx_bridge.cpp"
+fi
+
+# ------------------------------------------ bridge cross-thread invariants --
+# [resolverace] Three fences over the process-wide bridge state that `[native] interp=1` put on
+# two threads (docs/research/native/resolverace-progress.md). None of these can be caught by a
+# test: Azahar time-slices both emulated cores onto one host thread, so the races are not
+# reproducible in either emulator lane. They are regression fences on the SHAPE of the code.
+#
+#  1. gGdxResolveTablesVersion / gConvertEpoch / gNativeRgba16Generation are std::atomic and
+#     every mutation goes through the bump helpers. Measured: the [resolverace] census reports
+#     ver mask=3 under `[native] interp=1` -- both threads read-modify-write that word -- and it
+#     is the sole freshness key of four process-wide memos, so a lost `++` serves a stale host
+#     pointer.
+#     [stubmemo] gNativeRgba16Generation is the sibling resolverace left uncovered: a game-thread
+#     writer (gdx_set_native_rgba16_texture_range) and a walking-thread writer (GdxGfxJobRelease's
+#     nativeClears retirement, on the render thread under `[native] interp=1`). It is the
+#     freshness key of MakePersistentRawTextureCopy's per-frame compare skip AND of loadblock's
+#     SETTIMG classification memo, so a lost bump is a persistent texture copy holding the
+#     previous transition's screen -- silent, no fault.
+#  2. EnsureAssetSegmentImageImpl does not push_back into gHostRanges / gRawN64Ranges /
+#     gLoadedAssetSegments from the render thread; a walk-time first load defers to
+#     gPendingSegmentPublishes and the game thread drains it. GdxRtFence() above those appends
+#     is a JOIN, not a barrier, and returns immediately on the render thread.
+#  3. The three tables stay reserved, because the deferral's correctness argument and the walk
+#     scans both assume the storage is pinned.
+banner "bridge cross-thread invariants"
+BRIDGE_SRC="${ROOT}/port/n64_gfx_bridge.cpp"
+rr_fail=""
+if grep -qE '^static std::atomic<uint32_t> gGdxResolveTablesVersion' "${BRIDGE_SRC}" &&
+   grep -qE '^std::atomic<uint32_t> gConvertEpoch' "${BRIDGE_SRC}" &&
+   grep -qE '^std::atomic<uint64_t> gNativeRgba16Generation' "${BRIDGE_SRC}"; then
+    :
+else
+    rr_fail="${rr_fail} tables-version/convert-epoch/native-rgba16-generation are not std::atomic;"
+fi
+# Statement form only (the identifier immediately followed by `;`), so prose that names the
+# old `++gConvertEpoch` in a comment does not trip the fence.
+rr_ctr='gGdxResolveTablesVersion|gConvertEpoch|gNativeRgba16Generation'
+if grep -qE "(\+\+[[:space:]]*(${rr_ctr})[[:space:]]*;)|((${rr_ctr})[[:space:]]*\+\+[[:space:]]*;)" "${BRIDGE_SRC}"; then
+    rr_fail="${rr_fail} a plain ++ on a cross-thread counter is back;"
+fi
+# ... and that each one still has its bump helper, so a new mutation site has somewhere correct
+# to go instead of reaching for the raw name.
+for rr_bump in GdxBumpResolveTablesVersion GdxBumpConvertEpoch GdxBumpNativeRgba16Generation; do
+    if ! grep -qE "^static inline void ${rr_bump}\(\)" "${BRIDGE_SRC}"; then
+        rr_fail="${rr_fail} the ${rr_bump} helper is gone;"
+    fi
+done
+if grep -q 'if (GdxOnRenderThread()) {' "${BRIDGE_SRC}" &&
+   grep -q 'gPendingSegmentPublishes.emplace_back(std::move(loaded));' "${BRIDGE_SRC}" &&
+   grep -q 'static void GdxDrainPendingSegmentPublishes()' "${BRIDGE_SRC}"; then
+    :
+else
+    rr_fail="${rr_fail} the render-thread segment-publish deferral is gone;"
+fi
+#  4. The six process-wide [brfast] memos keep ONE owner thread: every entry is behind
+#     GdxMemoOwnedHere(), which latches the first thread to reach a memo and sends any other
+#     thread down the uncached path the memo memoises. Measured: with the latch, the memo masks
+#     under `[native] interp=1 interp_verify=1` drop from 3 (both threads) to 1.
+rr_owned=$(grep -c 'GdxMemoOwnedHere()' "${BRIDGE_SRC}" || true)
+# 1 definition (3DS) + 1 desktop stub + 6 call sites.
+if [ "${rr_owned}" -lt 8 ]; then
+    rr_fail="${rr_fail} the [brfast] memo owner latch is gone from some call site (GdxMemoOwnedHere x${rr_owned}, expected >= 8);"
+fi
+for rr_tbl in gHostRanges gRawN64Ranges gLoadedAssetSegments; do
+    if ! grep -qE "^[[:space:]]*${rr_tbl}\.reserve\(" "${BRIDGE_SRC}"; then
+        rr_fail="${rr_fail} ${rr_tbl} is no longer reserved;"
+    fi
+done
+if [ -n "${rr_fail}" ]; then
+    record "bridge cross-thread invariants" FAIL "${rr_fail# }"
+else
+    record "bridge cross-thread invariants" PASS "atomic version+epoch+rgba16-generation via bump helpers, render-thread segment publish deferred, 3 walk-scanned tables reserved, 6 brfast memos owner-latched"
+fi
+
+# ------------------------------------------------------- schedule invariants --
+# [covfinish, NEXT.md B48] The parity gate samples the frames a replay's `SHOT` schedule names,
+# and what a SHOT does not sample the gate cannot see. Those schedules are DERIVED from a
+# `[debug] cov=1` coverage census (coverage2-progress.md), which makes each one a claim about
+# the replay CONTENT it was derived from — a claim that goes stale silently, while the gate
+# keeps printing `divergent=0` over a shrinking sample.
+#
+# The full drift check re-runs the census and compares against the committed schedule; it needs
+# an emulator, a libretro core and fzerox.o2r, takes ~10 minutes for the corpus, and therefore
+# lives in tools/dev/covdrift.sh as a per-release check, NOT here. This is the half that costs
+# nothing: static invariants over replays/, no guest run at all. It is not a weaker version of
+# the same check — it catches a different failure. B47 was precisely this shape
+# (explosion-pileup.gdxs carried the "placement is derived elsewhere" banner while the .gdxrec
+# still held 39 hand-placed shots covering 51.9%), and this lint flags that file in 30 ms.
+banner "schedule invariants"
+SCHED_LOG="${HOST_TEST_DIR}/covsched-lint.log"
+mkdir -p "${HOST_TEST_DIR}"
+if python3 "${ROOT}/tools/dev/covsched.py" lint "${ROOT}/replays" >"${SCHED_LOG}" 2>&1; then
+    record "schedule invariants" PASS "$(grep -c 'SHOTs' "${SCHED_LOG}") replay schedule(s): carried, ascending, on-stream, no gap over 300 ticks"
+else
+    cat "${SCHED_LOG}" >&2
+    record "schedule invariants" FAIL "$(grep -m1 'schedule invariants:' "${SCHED_LOG}" | sed 's/^schedule invariants: //') — see tools/dev/covsched.py lint"
+fi
+
 # --------------------------------------------------------------- host tests --
 # These are the desktop console tests that matter for the 3DS port (pointer
 # packing + DL conversion) plus stream D's fs/zipshim smoke test. They are
@@ -392,7 +514,9 @@ fi
 if c++ -std=c++20 -O1 \
       "${ROOT}/port/tests/gdx_interp_host_tests.cpp" \
       "${ROOT}"/port/3ds/gfx/n64/gdx_{dlsrc,dl,interp,cc,tmem,texcache,rsp,tri,rect}.cpp \
-      -I"${ROOT}/port/3ds/gfx/n64" -I"${ROOT}/port/3ds/gfx" -I"${ROOT}/port" -I"${ROOT}/port/tests" \
+      "${ROOT}/port/3ds/gfx/gdx3ds_cov.c" \
+      -I"${ROOT}/port/3ds/gfx/n64" -I"${ROOT}/port/3ds/gfx" -I"${ROOT}/port/3ds/include" \
+      -I"${ROOT}/port" -I"${ROOT}/port/tests" \
       -o "${HOST_TEST_DIR}/gdx_interp_host_tests"; then
     run_host_test "gdx_interp_host_tests" "${HOST_TEST_DIR}/gdx_interp_host_tests" "${HOST_TEST_DIR}"
 else
@@ -410,6 +534,55 @@ if c++ -std=c++20 -O1 -ffp-contract=off \
     run_host_test "gdx_gfx_atlas_uv_tests" "${HOST_TEST_DIR}/gfx_atlas_uv_tests" "${HOST_TEST_DIR}"
 else
     record "test: gdx_gfx_atlas_uv_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_config_host_tests — the ini table (set / unset / save). gdx3ds_config.c is
+# plain C over stdio, so the guest-side behaviour of the net `INI` / `INI DEL` commands
+# can be verified on the build machine instead of only on hardware. Needs a scratch CWD:
+# the test writes its fixture ini next to itself.
+if cc -O1 -Wall \
+      "${ROOT}/port/3ds/os/test/gdx3ds_config_host_tests.c" \
+      "${ROOT}/port/3ds/os/gdx3ds_config.c" \
+      -I"${ROOT}/port/3ds/os" \
+      -o "${HOST_TEST_DIR}/config_host_tests"; then
+    rm -rf "${HOST_TEST_DIR}/config-cwd"
+    mkdir -p "${HOST_TEST_DIR}/config-cwd"
+    run_host_test "gdx3ds_config_host_tests" "${HOST_TEST_DIR}/config_host_tests" "${HOST_TEST_DIR}/config-cwd"
+else
+    record "test: gdx3ds_config_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_native_cfg_host_tests — the [native] lever resolver (port/3ds/gfx/gdx3ds_native_cfg.c).
+# Three rules, each of which has cost a session: `all` covers the Tier-2 set only (interp is
+# read as written), `all=1` only ever raises a lever, and interp_verify=1 with interp=1 forces
+# fx_hud to 0 because the batch-for-batch oracle cannot compare a folded 2D batch against an
+# unfolded one (docs/research/native/verifymatrix-progress.md).
+if cc -O1 -Wall \
+      "${ROOT}/port/3ds/gfx/test/gdx3ds_native_cfg_host_tests.c" \
+      "${ROOT}/port/3ds/gfx/gdx3ds_native_cfg.c" \
+      -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/native_cfg_host_tests"; then
+    run_host_test "gdx3ds_native_cfg_host_tests" "${HOST_TEST_DIR}/native_cfg_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_native_cfg_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_dynlod_host_tests — the DYNLOD rival-detail controller (port/3ds/gdx3ds_dynlod.c)
+# driven by synthetic render-task frame times through a stub <3ds.h> whose tick source the
+# test owns (port/3ds/test/host/). Each case carries a PLANT — raising the tier makes the
+# very frame the controller measures cheaper — because that feedback is what the hysteresis
+# has to survive; the gate is tier transitions per 1000 frames, and a transition re-tiers
+# every distant rival at once (decomp-port-rival-detail.patch), which is what the hardware
+# report saw as wobble and pop-in. See docs/research/native/dynlod-progress-native.md.
+if cc -O1 -Wall -Wextra -Wno-unused-parameter -DGDX3DS_DYNLOD_HOST_TEST \
+      "${ROOT}/port/3ds/test/gdx3ds_dynlod_host_tests.c" \
+      "${ROOT}/port/3ds/gdx3ds_dynlod.c" \
+      -I"${ROOT}/port/3ds/test/host" -I"${ROOT}/port/3ds" -I"${ROOT}/port/3ds/os" \
+      -I"${ROOT}/port/3ds/include" -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/dynlod_host_tests"; then
+    run_host_test "gdx3ds_dynlod_host_tests" "${HOST_TEST_DIR}/dynlod_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_dynlod_host_tests" FAIL "compile failed"
 fi
 
 # gdx3ds_fs_host_smoke — stream D's SD/O2R/zipshim smoke test; needs a scratch
@@ -451,6 +624,22 @@ else
         tail -8 "${MH_LOG}" >&2
         record "test: gdx_machines_harness" FAIL "see ${MH_LOG#${ROOT}/}"
     fi
+fi
+
+# gdxdev_harness_tests — the DEV HARNESS's own unit tests (tools/dev/tests/test_gdxdev.py,
+# stdlib unittest only). These were never wired into CI, and that is precisely how
+# `gdx-dev retro run --dry-run` shipped not dry-running and how four assertions about the
+# replay corpus sat red on main unnoticed (NEXT.md B45). The harness decides what every
+# run MEANS — its verdicts, its manifests, its parity claims — so a broken harness is a
+# broken measurement, and it is gated here like any other code.
+GDXDEV_LOG="${HOST_TEST_DIR}/gdxdev_harness_tests.log"
+if python3 "${ROOT}/tools/dev/tests/test_gdxdev.py" > "${GDXDEV_LOG}" 2>&1; then
+    echo "PASS: gdxdev_harness_tests  ($(tail -1 "${GDXDEV_LOG}"))"
+    record "test: gdxdev_harness_tests" PASS "$(tail -1 "${GDXDEV_LOG}")"
+else
+    echo "FAIL: gdxdev_harness_tests — last lines:" >&2
+    tail -20 "${GDXDEV_LOG}" >&2
+    record "test: gdxdev_harness_tests" FAIL "see ${GDXDEV_LOG#${ROOT}/}"
 fi
 
 # ---------------------------------------------------------------- 3DS build --

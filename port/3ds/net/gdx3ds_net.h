@@ -80,7 +80,8 @@ void gdx3ds_net_log_write(const char* msg, size_t len);
 /* APT lifecycle. SOC sockets do not survive a suspend cleanly, so the hook drops both
  * connections on ONSUSPEND/ONSLEEP and re-runs the connect path on ONRESTORE/ONWAKEUP.
  * Both are main-thread calls from aptLifecycleHook and are no-ops when disabled. */
-void gdx3ds_net_suspend(void);
+/* HOMEFIX2: 1 = the net thread parked inside the 240 ms window, 0 = it did not. */
+int gdx3ds_net_suspend(void);
 void gdx3ds_net_resume(void);
 
 /* Exit chain, AFTER gdx3ds_fs_shutdown(): final ring drain + send, close both sockets,

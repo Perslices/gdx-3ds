@@ -29,6 +29,7 @@ git -C decomp apply ../port/3ds/patches/decomp-port-determinism-pins.patch
 git -C decomp apply ../port/3ds/patches/decomp-native-machines-rebuilt.patch
 git -C decomp apply ../port/3ds/patches/decomp-port-title-demo-audio-pin.patch
 git -C decomp apply ../port/3ds/patches/decomp-native-fx-shim.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-mainprof-checkpoints.patch
 ```
 
 `tools/ci-3ds.sh` applies exactly this list, idempotently, and FAILS if a `*.patch` turns up
@@ -327,8 +328,10 @@ registry re-bakes at the next G_DL. Applied last of the decomp series.
 ## lus-nverify-diag.patch (native/interp — per-batch verify side channels)
 
 **Folded into the vendored carve** (`port/3ds/vendor/lus/`, see its PROVENANCE.md); the patch file lives in `port/3ds/vendor/lus/patches/` for provenance only.
-3DS only, pure delta on the full stack. Two hooks gated on `gdx3ds_verify_active()` (false
-unless `[native] interp_verify=1`): `gdx3ds_verify_note_cmd(w0,w1)` at the top of gfx_step
+3DS only, pure delta on the full stack. Two hooks gated on an inline `gdx3ds_verify_mode != 0`
+test (false unless `[native] interp_verify=1`; the gate was a `gdx3ds_verify_active()` CALL
+until 2026-09-23 -- with no LTO in the tree that was a real per-command and per-triangle cost
+on the default `interp=0` path, audit finding 5): `gdx3ds_verify_note_cmd(w0,w1)` at the top of gfx_step
 (command-stream differential against the owned walker) and `gdx3ds_verify_note_tri(&vt)` in
 GfxSpTri1 just before packed emission (tile window / extents / tm / loaded sizes / othermode /
 viewport for the mismatching batch). Zero behavior change; one predictable branch per command
@@ -375,3 +378,78 @@ gated (it is audio-internal and does not touch game state).
 a fixed tick. That would be the more faithful pin, but it changes what every existing
 parity replay records (all of them assume the demo does not fire), so it belongs to a
 separate change with its own re-recorded replays.
+
+## decomp-3ds-mainprof-checkpoints.patch (MAINPROF, NEXT.md A8)
+
+`GDX_MP(...)` phase markers inside BOTH of `src/sys/sys_gfx.c`'s per-VI frame functions —
+`func_80067D64` (`D_800CCFE4 == 2`) and `func_80067E98` (`== 3`, the triple-buffered path the
+game runs in for most of a session; the switch is at the bottom of that file) — plus the macro
+block that defines them (`#ifdef PORT` only; off
+PORT `GDX_MP` expands to nothing, exactly like the `GDX_CK` block it sits beside).
+
+**Why the decomp and not the port.** `func_80067D64` IS the game thread's frame, and on the
+3DS it runs inline on the main thread inside `gdx_vi_tick` (the VI `osSendMesg` dispatches
+the fibers from host context — `docs/research/renderthread-audit.md` §8). The phases the
+A8 main-thread profile has to separate — `Audio_Update`, `func_800690FC` (the game-mode
+update), `Gfx_LoadSegments`, `func_80069698` (the DL build), `Segment_LoadAssets` + the
+transition capture, and `Gfx_SetTask` — are plain sequential calls inside that one
+function with no port-side boundary between them. There is nowhere else to stand.
+
+**Cost and blast radius.** `GDX_MP(n)` is one call to `gdx_mprof_ck` (`port/n64_sched.c`,
+defined for every platform; a no-op off 3DS), whose first statement tests the single int
+`gdx3ds_mprof_active`. That int is 0 unless `gdiffuser.ini [debug] mainprof = 1`, which
+defaults to 0. Nine calls per game frame, in family with the `gdx_diag_verbose()` call the
+adjacent `GDX_CK` lines already make. No game state is read or written: the profiler only
+reads `svcGetSystemTick`. Armed, the receipt is emitted from the HOST loop at a window
+boundary, never from inside a game fiber, so the replay's tick order is untouched —
+verified by `[fh]` parity, `docs/research/native/mainprof-progress.md`.
+
+## decomp-3ds-disk-audio-ilp32.patch (B11 — Expansion Kit build, ILP32 argument passing)
+
+`src/audio/disk/lib/load.c` declares two port shims with 64-bit parameter types:
+
+```c
+extern void* gdx_host_calloc(unsigned long long count, unsigned long long size);
+extern void* gdx_rdram_persist_alloc_raw(unsigned long long size, unsigned long long align);
+```
+
+Both real definitions take `size_t` (`port/shims.c`, `port/decomp_port.c`). On LP64 desktop
+`size_t` and `unsigned long long` are both 64 bits, so the spelling was harmless and nobody
+noticed. On the ILP32 3DS build `size_t` is 32 bits, and ARM32 AAPCS passes each `u64`
+argument in a **register pair** — so the callee reads its *second* parameter out of the high
+half of the first. `gdx_rdram_persist_alloc_raw` therefore saw `align == 0`, computed
+`base = (top - size) & ~(0u - 1u) == 0`, decided the arena was exhausted and called
+`abort()`. That is the first hard stop of an `GDX_EXPANSION_KIT=ON` 3DS build: it dies at
+the first soundfont conversion, around guest frame 180, with
+`[rdram] FATAL: arena exhausted (persist)`.
+
+This patch respells both externs as `unsigned int`, exactly as the ROM twin
+`src/audio/rom/lib/load.c` already does (that file carries the same fix and the same
+comment, applied when the ROM audio driver was ported in
+`decomp-3ds-rom-audio-port.patch` — the disk twin was skipped because the 3DS has never
+built it).
+
+**Affects only `GDX_EXPANSION_KIT=ON`.** `audio/disk/` is excluded from the shipped
+(EK=OFF) source list by `port/cmake/GdxGameSources.cmake`, so the patch changes no byte of
+the default build.
+
+## decomp-3ds-disk-audio-heap-ilp32.patch (B11 — Expansion Kit build, static audio heap)
+
+`src/audio/disk/lib/audio_heap.c` sizes the disk audio library's static heap at
+`0x2ECA00 * 4` (**12.2 MB**) under `PORT`, and says why:
+
+> The pools are carved by N64-tuned spec sizes, but several cached structs carry 64-bit
+> pointers on the host and outgrow their N64 footprints.
+
+That is a **64-bit-host** headroom figure. The overflow it pays for is pointers doubling
+from 4 bytes to 8, which does not happen on an ILP32 target. On the 3DS the `x4` takes
+12.2 MB of BSS out of a ~49 MB application heap before a single allocation — by itself the
+largest single reason an `GDX_EXPANSION_KIT=ON` 3DS build runs out of memory at boot. (For
+scale: the ROM audio library's `gAudioHeap` is `0x3B000`, 236 KB.)
+
+This patch makes the multiplier `x2` when `__SIZEOF_POINTER__ == 4`, leaving 2.9 MB of
+headroom over the retail carve, and keeps `x4` on every 64-bit host so no desktop build
+changes. Total EK BSS: 21.59 MB → 15.45 MB.
+
+**Affects only `GDX_EXPANSION_KIT=ON`.** `audio/disk/` is excluded from the shipped (EK=OFF)
+source list, so the patch changes no byte of the default build.

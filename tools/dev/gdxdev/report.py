@@ -68,9 +68,22 @@ def _fps_table(out, label, parsed):
     out.say("")
     out.say("fps from [watchdog] frame deltas / %.0fs — %s (first beat dropped: it "
             "covers boot)" % (prof.WATCHDOG_PERIOD_S, label))
-    out.table(["beats", "p10", "p50", "p90", "min", "max", "mean", "max frame"],
-              [[f["beats"], _fmt(f["p10"], 1), _fmt(f["p50"], 1), _fmt(f["p90"], 1),
-                _fmt(f["min"], 1), _fmt(f["max"], 1), _fmt(f["mean"], 1), f["max_frame"]]])
+    rows = [["all", f["beats"], _fmt(f["p10"], 1), _fmt(f["p50"], 1), _fmt(f["p90"], 1),
+             _fmt(f["min"], 1), _fmt(f["max"], 1), _fmt(f["mean"], 1), f["max_frame"]]]
+    # A10: a beat that carried a replay SHOT is measuring the harness, not the game -- the
+    # screenshot's readback and 230-288 KB BMP write are main-thread work, ~2 s per image on
+    # an SD card. On hardware those beats alone produced every teens-fps dip, in every lever
+    # configuration, which is why the row is printed rather than left to be discovered again.
+    if f.get("shot_beats"):
+        g = prof.fps_summary(parsed, exclude_shots=True)
+        if g:
+            rows.append(["no SHOT", g["beats"], _fmt(g["p10"], 1), _fmt(g["p50"], 1),
+                         _fmt(g["p90"], 1), _fmt(g["min"], 1), _fmt(g["max"], 1),
+                         _fmt(g["mean"], 1), g["max_frame"]])
+    out.table(["beats", "n", "p10", "p50", "p90", "min", "max", "mean", "max frame"], rows)
+    if f.get("shot_beats"):
+        out.say("  %d beat(s) carried a replay SHOT (screenshot readback + BMP write on the "
+                "main thread) and are excluded from the second row." % f["shot_beats"])
     return f
 
 
@@ -108,7 +121,8 @@ def do_prof(args, out, ctx):
         out.warn("gputrace was ON — these millisecond values are inflated and are not "
                  "comparable with a gputrace=0 run")
 
-    show_all = not (args.sections or args.ops or args.fps or args.by_vtxn)
+    show_all = not (args.sections or args.ops or args.fps or args.by_vtxn
+                    or getattr(args, "main", False))
     fps = None
     if args.fps or show_all:
         fps = _fps_table(out, label, parsed)
@@ -125,6 +139,8 @@ def do_prof(args, out, ctx):
                         + [_fmt(s[k]["mean"]) for k in prof.PROF_SECTIONS]
                         + [_fmt(s["total"]["mean"]), _fmt(s["vtxN"], 0)])
         out.table(header, rows)
+    if getattr(args, "main", False) or (show_all and parsed.mprof):
+        _main_tables(out, label, parsed, args)
     if args.ops or show_all:
         rows = prof.op_summary(parsed)
         if rows:
@@ -149,6 +165,59 @@ def do_prof(args, out, ctx):
     return util.EXIT_OK
 
 
+def _main_tables(out, label, parsed, args):
+    """[mprof] MAIN-thread breakdown (NEXT.md A8). The render-side [prof] table answers
+    "what does the render thread spend the frame on"; this one answers the same question
+    for the thread that was actually the bottleneck on hardware ([rt] waitMain 14-16 ms vs
+    waitRender < 1 ms). Sections partition main's frame, so the percentages sum to 100."""
+    windows = parsed.mprof[-args.window:] if args.window else parsed.mprof
+    if not windows:
+        out.warn("no [mprof] receipts in %s — was [debug] mainprof=1 set?" % label)
+        return
+    s = prof.mprof_summary(windows)
+    out.say("")
+    out.say("[mprof] MAIN-thread sections, ranked, mean ms/frame — %s "
+            "(%d window(s), %d frames)" % (label, s["windows"], s["frames"]))
+    rows = [[name, _fmt(ms), "%.1f%%" % pct,
+             "WAIT" if name in prof.MPROF_WAIT else "work",
+             "fiber" if name in prof.MPROF_FIB else
+             ("host" if name in prof.MPROF_HOST else "residual")]
+            for name, ms, pct in prof.mprof_ranked(s)]
+    out.table(["section", "ms", "%frame", "kind", "side"], rows)
+    out.say("  total %s ms/frame  (game-fiber %s + host-loop %s + residual %s)"
+            % (_fmt(s["total"]["mean"]), _fmt(s["fib"]), _fmt(s["host"]),
+               _fmt(s["oth"]["mean"])))
+    out.say("  of which WORK %s ms/frame, BLOCKED %s ms/frame (%s)"
+            % (_fmt(s["work"]), _fmt(s["wait"]), " ".join(prof.MPROF_WAIT)))
+    # The ranking that survives leaving the emulator: host contention inflates the wait
+    # columns (core 2 is time-sliced onto the same host thread), the work columns hold.
+    out.say("")
+    out.say("[mprof] main-thread WORK only (waits excluded), mean ms/frame — %s" % label)
+    out.table(["section", "ms", "%work", "side"],
+              [[n, _fmt(ms), "%.1f%%" % pct,
+                "fiber" if n in prof.MPROF_FIB else
+                ("host" if n in prof.MPROF_HOST else "residual")]
+               for n, ms, pct in prof.mprof_ranked(s, sections=prof.MPROF_WORK,
+                                                   denom="work") if ms > 0.004])
+    # The emitted tot= is computed in the firmware from the same accumulators; a drift
+    # means a part= line was lost in the log, not that the model is wrong.
+    if s["emitted_tot"] and abs(s["emitted_tot"] - s["total"]["mean"]) > 0.05:
+        out.warn("summed sections %.2f != emitted tot= %.2f — a part= line is missing "
+                 "from the log" % (s["total"]["mean"], s["emitted_tot"]))
+    if args.by_vtxn:
+        out.say("")
+        out.say("[mprof] main-thread sections bucketed by nD (draw count) — %s" % label)
+        cols = prof.MPROF_SECTIONS
+        header = ["bucket", "wins", "frames"] + cols + ["total"]
+        rows = []
+        for name, sel in prof.bucket_by_nd(windows):
+            b = prof.mprof_summary(sel)
+            rows.append([name, b["windows"], b["frames"]]
+                        + [_fmt(b[k]["mean"]) for k in cols]
+                        + [_fmt(b["total"]["mean"])])
+        out.table(header, rows)
+
+
 def _do_ab(args, out, ctx):
     a_id, b_id = args.ab
     pa, la, ma = _load(a_id, ctx["run_root"], ctx["track"])
@@ -160,6 +229,20 @@ def _do_ab(args, out, ctx):
             raise GdxError("refusing to A/B: gputrace differs (%s vs %s) — gputrace "
                            "inflates profiles (PROTOCOL.md line 22)"
                            % (ma.get("gputrace"), mb.get("gputrace")), util.EXIT_USAGE)
+        ga = (ma.get("platform") or {}).get("gfx")
+        gb = (mb.get("platform") or {}).get("gfx")
+        if ga and gb and ga != gb and not args.force:
+            raise GdxError("refusing to A/B: renderer differs (%s vs %s). `retro run` falls "
+                           "back Vulkan->OpenGL->Software on a boot crash, and both frame "
+                           "hashes and timings are renderer-specific, so this would compare "
+                           "two renderers. Re-run with --gfx pinned, or --force"
+                           % (ga, gb), util.EXIT_USAGE)
+        # Contended runs measure the host, not the guest (see tools/dev/README.md).
+        for tag, m in (("A", ma), ("B", mb)):
+            load = (m.get("host") or {}).get("loadavg_at_launch")
+            if load is not None and load > (m.get("host") or {}).get("max_loadavg", 40):
+                out.warn("%s launched at load %.1f — treat these ms as host contention"
+                         % (tag, load))
         ida = (ma.get("build") or {}).get("id")
         idb = (mb.get("build") or {}).get("id")
         if ida != idb and not args.force:
@@ -187,7 +270,33 @@ def _do_ab(args, out, ctx):
 
     out.say("A = %s (%d windows)   B = %s (%d windows)" % (la, len(wa), lb, len(wb)))
     compare(wa, wb, "[prof] mean ms/frame, all windows")
+    if getattr(args, "main", False):
+        ma = pa.mprof[-args.window:] if args.window else pa.mprof
+        mb = pb.mprof[-args.window:] if args.window else pb.mprof
+        sa, sb = prof.mprof_summary(ma), prof.mprof_summary(mb)
+        if sa and sb:
+            out.say("")
+            out.say("[mprof] MAIN-thread mean ms/frame, all windows")
+            rows = []
+            for k in prof.MPROF_SECTIONS:
+                va, vb = sa[k]["mean"], sb[k]["mean"]
+                d = vb - va
+                rows.append([k, _fmt(va), _fmt(vb), "%+.2f" % d])
+            rows.append(["TOTAL", _fmt(sa["total"]["mean"]), _fmt(sb["total"]["mean"]),
+                         "%+.2f" % (sb["total"]["mean"] - sa["total"]["mean"])])
+            out.table(["section", "A %s" % la, "B %s" % lb, "delta"], rows)
     if args.by_vtxn:
+        # Selection bias: the buckets ARE nD, so a lever that changes the draw count moves
+        # windows between buckets and each bucket then compares different scenes. A batch
+        # fold measured -22% draws was reported as +5.9% SLOWER in every bucket while the
+        # whole-run total was flat. Say so rather than printing a plausible wrong number.
+        nda = sum(w["nD"] for w in wa) / max(1, len(wa))
+        ndb = sum(w["nD"] for w in wb) / max(1, len(wb))
+        if nda and abs(ndb - nda) / nda > 0.05:
+            out.warn("--by-vtxn is UNSAFE for this pair: mean nD %.1f vs %.1f (%.0f%%). The "
+                     "buckets are nD, so windows migrate between them and each bucket compares "
+                     "different scenes. Cut the band by scene tag instead, or read the all-windows "
+                     "table above." % (nda, ndb, 100.0 * (ndb - nda) / nda))
         ba = dict(prof.bucket_by_nd(wa))
         bb = dict(prof.bucket_by_nd(wb))
         for name in [n for n, _ in prof.bucket_by_nd(wa)]:

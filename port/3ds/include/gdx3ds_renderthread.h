@@ -39,7 +39,14 @@ int gdx3ds_rt_init(const GdxRtCallbacks* cb);
 int gdx3ds_rt_mode(void);
 
 /* ---- per-iteration protocol (main thread) ---- */
-void gdx3ds_rt_join_idle(void);    /* loop top / APT / teardown: wait until the ring is drained */
+void gdx3ds_rt_join_idle(void);    /* loop top / teardown: wait until the ring is drained */
+/* HOMEFIX2 (docs/research/native/homefix2-progress.md): the SAME drain with a deadline, for
+ * every caller that runs inside an APT transition (the ONSUSPEND/ONSLEEP hook and the
+ * pre-pump join). Returns 1 when the ring drained, 0 on timeout. The render thread is the
+ * only signaller of the completion event and it can sit in a GSP wait that no longer
+ * completes once GSPGPU_ReleaseRight has run or the shell is closed; a hook that never
+ * returns is force-terminated by NS with no exception and no crash dump. */
+int gdx3ds_rt_join_idle_deadline(unsigned timeoutMs);
 int gdx3ds_rt_idle(void);          /* 1 when no command is queued or running */
 void gdx3ds_rt_pace_vblank(void);  /* adaptive vblank wait (same policy as gpuprof's SYNCDRAW skip) */
 void gdx3ds_rt_frame_begin(void);  /* BEGIN: StartFrame on the render thread */
@@ -51,6 +58,7 @@ void gdx3ds_rt_frame_end(void);    /* END: presentFallback + EndFrame on the ren
  * loop posts DP-done through gdx3ds_rt_post_dp_done after gdx3ds_rt_wait_task). */
 int gdx3ds_rt_submit_task(void* dl, size_t dlSize, int ucode);
 int gdx3ds_rt_task_pending(void);  /* a TASK is queued or running (pipe mode) */
+int gdx3ds_rt_task_rendering(void); /* a TASK is queued or executing RIGHT NOW (overlap probe) */
 void gdx3ds_rt_wait_task(void);    /* block until the in-flight TASK completed (no DP post) */
 void gdx3ds_rt_post_dp_done(void); /* defined in n64_sched.c: osSendMesg(&D_800DCAC8, 0x2A) */
 

@@ -5,7 +5,13 @@
  * the legacy decode from the source bytes; raw RGBA16 decodes from the TMEM mirror. */
 #include "gdx_interp.h"
 
+#include <new>
 #include <string.h>
+
+#include "gdx_log.h"
+#include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
+
+extern "C" int gdx_ninterp_palhash(void);
 
 namespace gdxn {
 
@@ -20,6 +26,7 @@ static inline uint32_t KeyHash(const TexKey& k) {
     const uintptr_t addr = reinterpret_cast<uintptr_t>(k.addr);
     uint32_t h = static_cast<uint32_t>(addr ^ (addr >> 5));
     h ^= k.content_hash * 0x9E3779B1u;
+    h ^= k.palette_content_hash * 0x85EBCA6Bu;
     h ^= (static_cast<uint32_t>(k.fmt) << 24) ^ (static_cast<uint32_t>(k.siz) << 20) ^ k.size_bytes;
     h ^= h >> 15;
     return h & (kTexCacheHash - 1);
@@ -89,26 +96,18 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
         }
     }
     mStats.texMisses++;
+    /* COVERAGE: a miss frame is a frame that runs the decode+upload path; an evict frame is
+     * one that runs the LRU retire path. Both were invisible to the old hand-placed SHOT
+     * schedules, and `dropsites` had to FORCE all four of its sites because none had ever
+     * executed in a normal run (dropsites-progress.md). */
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_TC, GDX3DS_COV_TC_MISS));
     int16_t slot = -1;
     if (mTexCount >= kTexCacheSize) {
         /* Evict the least recently used; nulling a live binding re-arms the import pipeline. */
         slot = mTexLruHead;
-        TexEntry& v = mTex[slot];
-        mTexFreeIds[mTexFreeIdCount++] = v.texture_id;
-        for (int j = 0; j < 2; j++) {
-            if (mRs.textures[j] == slot) {
-                mRs.textures[j] = -1;
-                ArmTexturesChanged();
-            }
-        }
-        const uint32_t vh = KeyHash(v.key);
-        int16_t* pp = &mTexHash[vh];
-        while (*pp >= 0 && *pp != slot) pp = &mTex[*pp].hashNext;
-        if (*pp == slot) *pp = v.hashNext;
-        LruUnlink(mTex, mTexLruHead, mTexLruTail, slot);
-        v.used = false;
-        mTexCount--;
+        TexCacheRetireSlot(slot);
         mStats.texEvicts++;
+        gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_TC, GDX3DS_COV_TC_EVICT));
     } else {
         for (unsigned i = 0; i < kTexCacheSize; i++) {
             if (!mTex[i].used) {
@@ -133,6 +132,9 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
     e.lruPrev = e.lruNext = -1;
     LruPushBack(mTex, mTexLruHead, mTexLruTail, slot);
     mTexCount++;
+    if (mTexCount > mTexCountHw) {
+        mTexCountHw = mTexCount; /* B23: how close content-keyed CI textures push the 1024 LRU */
+    }
     mBackend->SelectTexture(unit, texture_id);
     mBackend->SetSamplerParameters(unit, false, 0, 0);
     mRs.sampler_valid[unit] = true;
@@ -143,16 +145,156 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
     return false;
 }
 
+/* == TexCacheRetireSlot: unbind, unhash, unlink, hand the backend texture id back to the
+ * free list. The one place an entry leaves the cache (LRU eviction, clear, address delete),
+ * so every exit re-arms the import pipeline the same way. */
+void Interp::TexCacheRetireSlot(int16_t slot) {
+    if (slot < 0) return;
+    TexEntry& v = mTex[slot];
+    if (!v.used) return;
+    if (mTexFreeIdCount < kTexCacheSize) {
+        mTexFreeIds[mTexFreeIdCount++] = v.texture_id;
+    }
+    for (int j = 0; j < 2; j++) {
+        if (mRs.textures[j] == slot) {
+            mRs.textures[j] = -1;
+            ArmTexturesChanged();
+        }
+    }
+    const uint32_t vh = KeyHash(v.key);
+    int16_t* pp = &mTexHash[vh];
+    while (*pp >= 0 && *pp != slot) pp = &mTex[*pp].hashNext;
+    if (*pp == slot) *pp = v.hashNext;
+    LruUnlink(mTex, mTexLruHead, mTexLruTail, slot);
+    v.used = false;
+    v.uploaded = false;
+    v.hashNext = -1;
+    mTexCount--;
+}
+
+/* == TexCacheClear: LUS Interpreter::TextureCacheClear's counterpart. Raised by
+ * gdx_rdram_mode_reset (decomp_port.c) at every mode transition, because the bump arena
+ * rewinds and re-hands the same host addresses to the next mode's content. */
+void Interp::TexCacheClear() {
+    mStats.texClears++;
+    for (unsigned i = 0; i < kTexCacheSize; i++) {
+        TexCacheRetireSlot(static_cast<int16_t>(i));
+    }
+}
+
+/* == TexCacheDeleteAddress: LUS Interpreter::TextureCacheDelete's counterpart. Exact-address
+ * match, the same semantic minimap.c:196-206 was written against (it invalidates each CI8
+ * half separately because an exact match will not cover the second one). */
+void Interp::TexCacheDeleteAddress(const uint8_t* addr) {
+    mStats.texInvalidates++;
+    if (addr == nullptr) return;
+    for (unsigned i = 0; i < kTexCacheSize; i++) {
+        if (mTex[i].used && mTex[i].key.addr == addr) {
+            TexCacheRetireSlot(static_cast<int16_t>(i));
+            mStats.texInvalidated++;
+        }
+    }
+}
+
+/* == UploadPrepare -- DROPSITE 1.
+ *
+ * Pre-fix this was a hard 256 KiB ceiling: a decode that needed more bytes was refused, the
+ * decoder returned, and ImportTexture then marked the cache entry `uploaded` regardless. The
+ * backend texture id had just been handed out of the free list, so it still held the PREVIOUS
+ * texture's pixels -- and because the entry was marked uploaded, every later lookup of that
+ * key was a cache HIT serving those pixels. Not lost geometry: wrong pixels, permanently, and
+ * `texDecodeOverflow` was printed by nothing.
+ *
+ * The scratch now GROWS on demand, up to the largest upload the backend could accept anyway
+ * (kTexUploadMaxBytes == 1024*1024 RGBA8; GfxRenderingAPIC3D::UploadTexture refuses padW or
+ * padH > 1024). Steady-state footprint is unchanged -- nothing grows unless a texture actually
+ * needs it -- and a decode that used to be dropped now simply decodes. Only a request above
+ * that ceiling, which no upload could ever have displayed, still refuses; ImportTexture then
+ * takes the neutral fallback rather than leaving a stale sample behind.
+ *
+ * mTexDecodeHwBytes is the session high-water: the number that says how much margin a scene
+ * really has, the way geomloss's vboHW does for the VBO pool. */
 bool Interp::UploadPrepare(uint32_t w, uint32_t h) {
-    if (static_cast<uint64_t>(w) * h * 4u > kTexUploadBytes) {
+    const uint64_t need64 = static_cast<uint64_t>(w) * h * 4u;
+    if (need64 > 0xFFFFFFFFull) {
         mStats.texDecodeOverflow++;
         return false;
     }
+    const uint32_t need = static_cast<uint32_t>(need64);
+    if (need > mTexDecodeHwBytes) {
+        mTexDecodeHwBytes = need;
+    }
+    if (need <= mTexUploadCap) {
+        return true;
+    }
+    const uint32_t ceiling = (mTexUploadMax != 0 && mTexUploadMax < kTexUploadMaxBytes) ? mTexUploadMax
+                                                                                       : kTexUploadMaxBytes;
+    if (need > ceiling) {
+        mStats.texDecodeOverflow++;
+        if (mDropsiteTexLogged == 0) { /* one-shot; ses tex= on [ndrops] is the recurring signal */
+            mDropsiteTexLogged = 1;
+            GDXN_LOG("DROPSITE: texture decode %ux%u needs %u B, above the %u B ceiling -- this "
+                     "texture CANNOT be uploaded (PICA caps a side at 1024); the import takes the "
+                     "neutral fallback instead of the id's previous contents",
+                     w, h, need, ceiling);
+        }
+        return false;
+    }
+    /* Grow to the next power of two at or above `need`, never past the ceiling. */
+    uint32_t cap = mTexUploadCap != 0 ? mTexUploadCap : kTexUploadBytes;
+    while (cap < need) {
+        cap = (cap > ceiling / 2u) ? ceiling : cap * 2u;
+    }
+    uint8_t* grown = new (std::nothrow) uint8_t[cap];
+    if (grown == nullptr) {
+        mStats.texDecodeOverflow++;
+        if (mDropsiteTexLogged == 0) {
+            mDropsiteTexLogged = 1;
+            GDXN_LOG("DROPSITE: texture decode %ux%u needs %u B and the scratch could not grow "
+                     "from %u B (out of memory); the import takes the neutral fallback",
+                     w, h, need, mTexUploadCap);
+        }
+        return false;
+    }
+    delete[] mTexUpload;
+    mTexUpload = grown;
+    mTexUploadCap = cap;
+    mStats.texDecodeGrow++;
+    GDXN_LOG("DROPSITE: texture decode scratch grown to %u B for a %ux%u decode (%u B) -- pre-fix "
+             "this texture was SKIPPED and its cache id kept the previous texture's pixels",
+             cap, w, h, need);
     return true;
 }
 
 void Interp::Upload(uint32_t w, uint32_t h) {
+    mUploadDone = true;
     mBackend->UploadTexture(mTexUpload, w, h);
+}
+
+/* == UploadNeutralFallback -- DROPSITE 1's only remaining arm.
+ *
+ * Reached when a decode genuinely cannot happen: above the PICA ceiling, out of memory, a null
+ * source, or an fmt/siz pair no decoder handles. Uploading a small opaque-white block makes the
+ * primitive draw UNTEXTURED (TEXEL0 * SHADE with TEXEL0 = white is the shade colour) instead of
+ * sampling whatever the recycled backend id last held. The entry is deliberately left
+ * `uploaded == false`, so the next lookup misses and retries the decode: the fallback is one
+ * frame's worth of defined pixels, not a cached answer.
+ *
+ * Alternatives considered and rejected:
+ *  - evict the id: mRs.textures[unit] is already selected and this draw is still going, so
+ *    retiring the slot here leaves the draw with no binding at all (a bindMiss, which does not
+ *    rebind the PICA texunit either -- the same stale sample by a longer road) and churns the
+ *    LRU once per frame for as long as the condition holds.
+ *  - decode in tiles: the backend uploads one whole texture per id, so a tiled decode would
+ *    need UV surgery the reference path does not do, and would diverge from LUS by construction.
+ *  - do nothing but count it: that is the bug. */
+void Interp::UploadNeutralFallback(int unit) {
+    (void)unit;
+    /* Its own buffer, not the decode scratch: the fallback must still work in exactly the case
+     * where the scratch is the thing that could not be made big enough. */
+    memset(mFallbackTexels, 0xFF, sizeof(mFallbackTexels));
+    mStats.texFallback++;
+    mBackend->UploadTexture(mFallbackTexels, kFallbackTexDim, kFallbackTexDim);
 }
 
 static inline uint16_t Texel16(const uint8_t* p, bool native) {
@@ -507,6 +649,45 @@ void Interp::DecodeCi8(int tile, const LoadedTexture& lt) {
     Upload(width, height);
 }
 
+/* FNV-1a, 4 bytes at a time then the tail -- the spelling every other hash in this file uses. */
+static inline uint32_t FoldBytes(uint32_t h, const uint8_t* p, uint32_t n) {
+    uint32_t b = 0;
+    for (; b + 4 <= n; b += 4) {
+        uint32_t word;
+        memcpy(&word, p + b, 4);
+        h = (h ^ word) * 16777619u;
+    }
+    for (; b < n; b++) {
+        h = (h ^ p[b]) * 16777619u;
+    }
+    return h;
+}
+
+/* True when `p` points INSIDE palette_staging, i.e. at bytes the [native] palhash fold below
+ * already covers (palhash folds the whole staging half, a superset of any 32-byte sub-palette
+ * inside it). Used to keep texhash_ci from folding the same palette bytes into the same key a
+ * second time -- audit-2026-09-24 finding 7. The other DpLoadTlut outcome (tmem < 256:
+ * palettes[1] = the raw resolved source, staging NOT updated) is NOT covered by palhash, so
+ * texhash_ci must still fold it there or that TLUT is invisible to the key. */
+static bool PaletteIsStaged(const Rdp& rdp, const uint8_t* p) {
+    const uint8_t* stageBegin = &rdp.palette_staging[0][0];
+    return p >= stageBegin && p < stageBegin + sizeof(rdp.palette_staging);
+}
+
+/* How many of `want` palette bytes are safe to read at `p`. DpLoadTlut leaves palettes[] either
+ * inside palette_staging (the tmem>=256 path) or pointing straight at the resolved source (the
+ * tmem<256 path), and a raw source need not carry a full 256-byte half. */
+static uint32_t PaletteReadable(const Rdp& rdp, const uint8_t* p, uint32_t want) {
+    const uint8_t* stageBegin = &rdp.palette_staging[0][0];
+    const uint8_t* stageEnd = stageBegin + sizeof(rdp.palette_staging);
+    if (p >= stageBegin && p < stageEnd) {
+        const uint32_t room = static_cast<uint32_t>(stageEnd - p);
+        return want < room ? want : room;
+    }
+    const size_t readable = DlSrc::ReadableBytes(reinterpret_cast<uintptr_t>(p));
+    return static_cast<uint32_t>(want < readable ? want : readable);
+}
+
 /* == ImportTexture: key derivation (content hash over exactly the decoded span for the
  * hashed formats; source-byte hash for the immutable class where LUS keyed on the resource
  * identity), lookup, dispatch. */
@@ -560,9 +741,47 @@ void Interp::ImportTexture(int unit, int tile) {
     key.masks = tt.masks;
     key.maskt = tt.maskt;
 
+    /* [native] palhash: a CI entry is keyed on the palette's DRAM address, which cannot see a
+     * TLUT rewritten IN PLACE at that address. The RDP re-reads the TLUT for every primitive, so
+     * the palette's CONTENT is part of the texture's identity; without it an animated palette
+     * serves whatever decode the cache entry was born with. Hashes the fixed 256-byte staging
+     * halves, never raw DRAM, so it cannot fault. CI4 folds the whole 256-byte staging half its
+     * paletteIndex selects and CI8 folds both, which is wider than either decode strictly reads
+     * -- deliberately, because it is exactly what the vendored LUS folds
+     * (interpreter.cpp:3056-3074): THIS FIELD, key.palette_content_hash, has to agree bit for
+     * bit with LUS's or interp=1 stops being comparable with the stock path on CI. The claim is
+     * about the palette fold only -- key.content_hash is the owned twin of LUS's
+     * tmem_content_hash and is deliberately NOT bit-identical for the classes [native]
+     * texhash_ci covers, which is what that lever is for. */
+    if (fmt == IM_FMT_CI && (siz == IM_SIZ_4b || siz == IM_SIZ_8b) && gdx_ninterp_palhash()) {
+        uint32_t palHash = 2166136261u;
+        const auto foldPalette = [&palHash](const uint8_t* pal, uint32_t n) {
+            for (uint32_t b = 0; b < n; b++) {
+                palHash = (palHash ^ pal[b]) * 16777619u;
+            }
+        };
+        if (siz == IM_SIZ_4b) {
+            foldPalette(mRdp.palette_staging[(tt.palette / 8) & 1], 256u);
+        } else {
+            foldPalette(mRdp.palette_staging[0], 256u);
+            foldPalette(mRdp.palette_staging[1], 256u);
+        }
+        key.palette_content_hash = palHash;
+    }
+
     const bool isRgba16 = (fmt == IM_FMT_RGBA && siz == IM_SIZ_16b);
     const bool isFontFmt = (fmt == IM_FMT_I && (siz == IM_SIZ_4b || siz == IM_SIZ_8b)) ||
                            (fmt == IM_FMT_IA && (siz == IM_SIZ_4b || siz == IM_SIZ_8b || siz == IM_SIZ_16b));
+    const bool isCi = (fmt == IM_FMT_CI && (siz == IM_SIZ_4b || siz == IM_SIZ_8b));
+    const bool isRgba32 = (fmt == IM_FMT_RGBA && siz == IM_SIZ_32b);
+    /* CI and RGBA32 decode from the SOURCE bytes, not from the TMEM mirror (DecodeCi4/DecodeCi8/
+     * DecodeRgba32 below all read lt.addr), so the TMEM hash above is not their content identity
+     * -- the source span is, plus the live palette for CI. Without it their key is pure identity
+     * and a recycled address serves the previous occupant's decode: the bridge covers that for
+     * the LUS path with MakePersistentRawTextureCopy's per-source memcmp + TextureCacheDelete
+     * (n64_gfx_bridge.cpp:2884-2925), which the owned walk never runs. Plan 06 §3.7 asked for
+     * this key ("plus the palette bytes for CI") and invariant (11); it was not carried. */
+    const bool hashSource = lt.immutable || (mHashCiRgba32 && (isCi || isRgba32));
     if (!lt.immutable && (isRgba16 || isFontFmt)) {
         const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIdx) * 8u;
         const uint32_t lineBytes = tt.line_size_bytes;
@@ -599,21 +818,45 @@ void Interp::ImportTexture(int unit, int tile) {
             }
             key.content_hash = contentHash;
         }
-    } else if (lt.immutable) {
+    } else if (hashSource) {
         /* LUS keyed resource-backed textures on the archive path; the source bytes are that
-         * identity here (append-only images, but mode-owned carves reuse addresses). */
+         * identity here (append-only images, but mode-owned carves reuse addresses). The same
+         * span is the content identity of the CI/RGBA32 classes, which decode from it. */
         uint32_t n = lt.size_bytes;
         const size_t readable = DlSrc::ReadableBytes(reinterpret_cast<uintptr_t>(origAddr));
         if (n > readable) n = static_cast<uint32_t>(readable);
-        uint32_t h = 2166136261u;
-        uint32_t b = 0;
-        for (; b + 4 <= n; b += 4) {
-            uint32_t word;
-            memcpy(&word, origAddr + b, 4);
-            h = (h ^ word) * 16777619u;
-        }
-        for (; b < n; b++) {
-            h = (h ^ origAddr[b]) * 16777619u;
+        uint32_t h = FoldBytes(2166136261u, origAddr, n);
+        if (isCi && mHashCiRgba32) {
+            /* The palette is half the decoded pixel: the same index bytes under a different TLUT
+             * are a different texture. Night-course CI4 TLUTs are staged into the GfxPool and
+             * bound through the segment-1 alias with slot indices assigned from 0 per course
+             * (n64_gfx_bridge.cpp:2769-2779), so palette_dram_addr alone cannot separate them. */
+            /* ...but only where palhash has not already put them in this same key. palhash
+             * folds the whole staging half into key.palette_content_hash, a superset of every
+             * sub-palette inside it, so folding a staged palette again here separates nothing
+             * and costs 32-512 byte-wise FNV rounds per CI import -- per draw in a
+             * palette-animated scene, with both levers on by default (audit-2026-09-24
+             * finding 7). A palette that is NOT staged (DpLoadTlut's tmem<256 path leaves
+             * palettes[1] pointing at the raw resolved source) is invisible to palhash, so it
+             * is still folded here whatever palhash says. */
+            const bool palStagedCovered = gdx_ninterp_palhash() != 0;
+            if (siz == IM_SIZ_4b) {
+                const uint32_t palSlot = tt.palette / 8u;
+                const uint8_t* pal = mRdp.palettes[palSlot];
+                if (pal != nullptr) {
+                    pal += (tt.palette % 8u) * 32u;
+                    if (!(palStagedCovered && PaletteIsStaged(mRdp, pal))) {
+                        h = FoldBytes(h, pal, PaletteReadable(mRdp, pal, 32u));
+                    }
+                }
+            } else {
+                for (int pi = 0; pi < 2; pi++) {
+                    const uint8_t* pal = mRdp.palettes[pi];
+                    if (pal != nullptr && !(palStagedCovered && PaletteIsStaged(mRdp, pal))) {
+                        h = FoldBytes(h, pal, PaletteReadable(mRdp, pal, 256u));
+                    }
+                }
+            }
         }
         key.content_hash = h != 0 ? h : 1u;
     }
@@ -623,6 +866,7 @@ void Interp::ImportTexture(int unit, int tile) {
     if (TexCacheLookup(unit, key)) {
         return;
     }
+    mUploadDone = false; /* DROPSITE 1: did any decoder below actually reach Upload()? */
     mBackend->TexCacheNoteMiss(origAddr, fmt, siz, tmemIdx, key.line_size_bytes, lt.size_bytes, key.tile_width,
                                key.tile_height, key.content_hash);
     switch (fmt) {
@@ -648,8 +892,30 @@ void Interp::ImportTexture(int unit, int tile) {
         default:
             break;
     }
+    /* DROPSITE 1. Pre-fix this marked the entry uploaded unconditionally. Every decoder above
+     * has early-outs -- a null source, a zero extent, a decode above the scratch ceiling, and
+     * an fmt/siz pair with no case in the switch at all (G_IM_FMT_RGBA at 4b/8b falls straight
+     * through) -- and each of them left the entry marked uploaded over a backend id that had
+     * just come off the free list still holding the last texture that used it. Later lookups
+     * of the key then HIT and served those pixels for the life of the entry.
+     *
+     * Now an import that uploaded nothing gets a neutral fallback and stays un-uploaded, so the
+     * next lookup misses and retries. [native] texstalefix=0 restores the pre-fix arm. */
     if (mRs.textures[unit] >= 0) {
-        mTex[mRs.textures[unit]].uploaded = true;
+        if (mUploadDone || !mTexStaleFix) {
+            mTex[mRs.textures[unit]].uploaded = true;
+        } else {
+            mStats.texNoUpload++;
+            if (mDropsiteStaleLogged == 0) {
+                mDropsiteStaleLogged = 1;
+                GDXN_LOG("DROPSITE: texture import fmt=%u siz=%u %ux%u decoded NOTHING -- pre-fix "
+                         "this entry was marked uploaded and the cache id kept the previous "
+                         "texture's pixels; it now draws untextured and retries next frame",
+                         static_cast<unsigned>(fmt), static_cast<unsigned>(siz),
+                         static_cast<unsigned>(key.tile_width), static_cast<unsigned>(key.tile_height));
+            }
+            UploadNeutralFallback(unit);
+        }
     }
 }
 

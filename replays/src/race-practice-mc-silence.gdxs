@@ -1,0 +1,102 @@
+# race-practice-mc-silence: two races on DIFFERENT courses in one run.
+#
+# Why PRACTICE and not GP: GP never exposes the track cursor (course_select.c:731-747), and its
+# retire card restarts course 1, so a GP replay can only ever race one course (measured:
+# docs/research/native/texcacheinterp-progress.md, run R0). PRACTICE's retire overlay carries a
+# "Change Course" entry that returns to SELECT COURSE with the track cursor live, so one replay
+# can race JACK 1 (MUTE CITY) and then JACK 2 (SILENCE).
+#
+# What it is for: every per-race buffer that is rewritten in place for the second course --
+# `sCourseMinimapTex` above all, a plain u8[0x1000] uploaded as two CI8 blocks and explicitly
+# invalidated at minimap.c:201-205 -- is an address the texture cache has already keyed. The
+# SHOTs in each race window sample the in-race HUD, where the minimap is drawn.
+# SHOT PLACEMENT IS NOT AUTHORED HERE ANY MORE (NEXT.md B15/B43, coverage2-progress.md).
+# This file is the INPUT script: ticks, buttons, sticks. The schedule that decides which frames
+# the parity gate hashes is DERIVED from a `[debug] cov=1` coverage census of the replay and
+# written into the .gdxrec by tools/dev/covsched.py. Regenerating a .gdxrec from this file
+# therefore produces a recording with NO SHOTs; re-apply the schedule with
+#   tools/dev/covsched.py derive <cov-run>/log-*.txt --rewrite in.gdxrec out.gdxrec
+# The hand-placed schedules this file used to carry covered 49-80% of what their replay draws.
+build native/texcacheinterp@9f06edc
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 rival_detail_auto=0 stereo=1 fh_every=0
+at 400
+press START 15 0
+at 700
+press RIGHT 12 0
+at 800
+press DOWN 12 0
+at 1000
+press A 15 0
+at 1300
+press A 15 0
+at 1600
+press A 15 0
+at 1900
+press A 15 0
+at 2100
+wait 1
+at 2200
+press A 15 0
+at 2500
+press A 15 0
+at 2800
+press A 15 0
+at 3100
+press A 15 0
+at 3400
+press A 15 0
+at 3700
+press A 15 0
+# --- race 1: MUTE CITY (JACK 1) ---
+at 3900
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+wait 200
+# --- retire overlay: Retry / Settings / Change Machine / Change Course / Quit ---
+at 5600
+press DOWN 12 0
+at 5750
+press DOWN 12 0
+at 5900
+press DOWN 12 0
+at 6000
+at 6050
+press A 15 0
+at 6200
+at 6350
+press A 15 0
+at 6500
+press RIGHT 12 0
+at 6600
+at 6700
+press A 15 0
+at 7000
+press A 15 0
+at 7300
+press A 15 0
+at 7600
+press A 15 0
+at 7900
+press A 15 0
+at 8200
+press A 15 0
+at 8500
+press A 15 0
+# --- race 2: SILENCE (JACK 2) ---
+at 8700
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+hold A 200
+wait 200
+len 10500

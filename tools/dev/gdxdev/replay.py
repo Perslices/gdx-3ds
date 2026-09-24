@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 
-from . import util
+from . import inifile, util
 from .util import GdxError
 
 INPUT_TOKENS = {"START", "A", "B", "UP", "DOWN", "LEFT", "RIGHT",
@@ -155,6 +155,51 @@ def rec_dir(sdmc_root=None):
     test_rec_path_matches_the_guest_source.
     """
     return os.path.join(sdmc_root or util.AZAHAR_SDMC, "3ds", "gdiffuser", "rec")
+
+
+# ------------------------------------------------------------ implied settings --
+# NEXT.md B19: `--replay` alone never ENDS a run. The guest reaches the replay's last tick
+# and then keeps playing — unscripted, unrecorded — until `--seconds` expires. On the
+# canonical replay that is ~150 s of garbage appended to every run, and it is also what
+# made `--seconds 60` look like a crash (B45): the run can only ever be cut short.
+# `[debug] replay_quit=1` leaves the frame loop at `[rec] end` (main_3ds.cpp:1051), which
+# is the natural end of a staged replay, so staging one implies it.
+#
+# It is IMPLIED, not forced. Some diagnostic runs deliberately play past the replay's end:
+# the wobble investigation watches post-replay drift and the dynlod one watches LOD
+# settling after the scripted inputs stop. Both need the guest to keep running, and both
+# get it with `--no-replay-quit` (or the equivalent `--ini debug.replay_quit=0`), which
+# this never overrides.
+REPLAY_QUIT_KEY = ("debug", "replay_quit")
+
+
+def implied_settings(kind=None):
+    """Ini keys a staged replay implies but does not force. -> {(section, key): value}.
+
+    The caller must apply these with setdefault semantics against anything the user typed,
+    so `--ini debug.replay_quit=0` and `--no-replay-quit` still win.
+    """
+    return {REPLAY_QUIT_KEY: "1"}
+
+
+def apply_implied(settings, explicit, kind=None, out=None):
+    """Merge implied_settings() into `settings`, never over a key in `explicit`.
+
+    `explicit` is the set of (section, key) the invocation named itself.
+    """
+    for key, value in implied_settings(kind).items():
+        if key in explicit:
+            if out and key == REPLAY_QUIT_KEY and not inifile.truthy(settings.get(key, "0")):
+                out.say("[%s] %s=%s as asked: this run plays PAST the replay's last tick "
+                        "and ends on --seconds (wobble/dynlod-style diagnostics)"
+                        % (key[0], key[1], settings.get(key)))
+            continue
+        settings[key] = value
+        if out and key == REPLAY_QUIT_KEY:
+            out.say("[debug] replay_quit=1 implied by --replay: the run ends at the "
+                    "replay's last tick ('[rec] end'), not on --seconds. "
+                    "Pass --no-replay-quit to play past it.")
+    return settings
 
 
 def stage(ident, sdmc_root=None, gdx_dir=None, dry_run=False, out=None):

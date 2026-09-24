@@ -36,7 +36,9 @@
 #include "gdx3ds_config.h"
 #include "gdx3ds_filelog.h" // H-HARDWARE: SD sink for the tracers (svc goes nowhere on hardware)
 #include "gdx3ds_fps_hud.h" // FPS-HUD: bottom-screen counter (debug.fps, default ON)
+#include "gdx3ds_mainprof.h" // MAINPROF: [mprof] main-thread section profiler ([debug] mainprof)
 #include "gdx3ds_menu.h"    // MENU: v1 bottom-screen touch menu ([menu] enabled, default ON)
+#include "gdx3ds_cov.h"     // COVERAGE: [cov] per-frame feature census ([debug] cov)
 #include "gdx3ds_oracle.h"  // ORACLE: true frame capture + [fh] receipts (after EndFrame)
 #include "gdx3ds_dynlod.h"  // ORACLE: dynlod tier pin under .gdxrec replay
 #include "gdx_input_rec.h"  // ORACLE: .gdxrec record/replay ([debug] input_record / input_replay)
@@ -88,6 +90,9 @@ int  GdxSegmentSourcePayload(uint32_t romBase, void** outPayload, uint32_t* outS
 int  GdxSegmentSourcePreallocPayload(uint32_t romBase, void** outPayload, uint32_t* outCap);
 double gdx_host_ms_now(void);
 void gdx_boot_warm_asset_segments(void);
+// A10 LOAD-STALL census (port/gdx_stall.c) — `[debug] stall = 1`. Every entry point is a
+// no-op when the key is absent, so the shipped configuration is unchanged.
+#include "gdx_stall.h"
 // [audioprime2] (port/3ds/audio/gdx3ds_audio_ndsp.c diagnostic exports): preload ladder
 // off core 2 + the boot-phase / preload thread map the under-edge receipt prints.
 int  gdx3ds_audio_prime2_enabled(void);
@@ -201,6 +206,13 @@ static volatile int sAptState = 0;
 static volatile uint64_t sAptStateTick = 0;
 static int sAptWatch = 1;     // [debug] apt_watch (default 1): suspended-mode watchdog poll
 static int sAptHookFirst = 1; // [debug] apt_hook_first (default 1): re-arm our hook ahead of citro3d's
+// HOMEFIX2 (docs/research/native/homefix2-progress.md): deadlines for the waits that run
+// INSIDE an APT transition. An APT hook that never returns is not a hang the user sees as a
+// hang: NS force-terminates the title ~10 s after the jump was prepared, with no exception
+// and no Luma dump — the log simply stops, which is exactly what hw run E left behind.
+static int sAptJoinMs = 1200;  // [debug] apt_join_ms (0 = unbounded, pre-HOMEFIX2 behaviour)
+static int sAptDspHook = 1;    // [debug] apt_dsp_hook (default 1): receipt around ndspFinalize
+static int sAptDspPark = 0;    // [debug] apt_dsp_park (default 0): also park audio in that hook
 
 static unsigned long aptMsSince(uint64_t tick) {
     return (unsigned long)((svcGetSystemTick() - tick) / (uint64_t)CPU_TICKS_PER_MSEC);
@@ -437,13 +449,27 @@ static void aptStateSet(int state) {
     }
 }
 
+// HOMEFIX2: gdx3ds_audio_suspend's wait is already bounded (~50 ms) and proceeds either way;
+// what was missing was a receipt that says it gave up. WHO SIGNALS the acks: the drain thread
+// (gdx3ds_audio_ndsp.c ParkDrainWhileSuspended) and the HLE producer
+// (gdx3ds_audio_producer_park_if_suspended), each on its OWN sticky park event — never a
+// shared one (home-crash-audit.md "Close-from-HOME hang fix"). Both can miss the window while
+// inside one pass of their loop; libctru then runs aptDspSleep -> ndspFinalize under them.
 static void aptAudioSuspend(void) {
     int drainParked = 0;
     int producerParked = 0;
-    gdx3ds_audio_suspend(&drainParked, &producerParked); // waits (<= ~50 ms) for both parks
-    char msg[96];
-    std::snprintf(msg, sizeof(msg), "[apt] audio parked (drain=%d hle=%d)", drainParked,
-                  producerParked);
+    const int all = gdx3ds_audio_suspend(&drainParked, &producerParked); // bounded, ~50 ms
+    char msg[224];
+    if (!all) {
+        std::snprintf(msg, sizeof(msg),
+                      "[apt] audio park TIMEOUT (drain=%d hle=%d) — a 0 means that thread was still "
+                      "inside a loop pass; libctru's aptDspSleep -> ndspFinalize runs next and its "
+                      "DSP handshake is an unbounded poll",
+                      drainParked, producerParked);
+    } else {
+        std::snprintf(msg, sizeof(msg), "[apt] audio parked (drain=%d hle=%d)", drainParked,
+                      producerParked);
+    }
     aptLogReceipt(msg);
 }
 
@@ -457,18 +483,41 @@ static void aptAudioSuspend(void) {
 // run BEFORE citro3d's (see the re-arm after InitWindow): citro3d's ONSUSPEND does
 // gxCmdQueueWait + gxCmdQueueStop + gxCmdQueueClear on the queue the render thread is
 // still filling, and gxCmdQueueClear svcBreak(USERBREAK_PANIC)s if the queue is running.
-static void aptRenderThreadPark(void) {
+//
+// HOMEFIX2 — THE WAIT AND ITS INVARIANT (the one unbounded wait the 2026-09-23 audit named,
+// finding 7). gdx3ds_rt_join_idle() waits on gdx3ds_renderthread.cpp's sDoneEvent.
+//   WHO SIGNALS IT: RenderThreadMain, and nothing else, once per command.
+//   CAN THE SIGNALLER BE PARKED? Not by a flag — but it can block for an unbounded time
+//   inside a command, because kCmdEnd runs EndFrame -> C3D_FrameEnd / C3D_FrameSync and
+//   gdx_vi_present_fallback, which wait on GSP vblank/PSC/PPF events. GSP stops delivering
+//   those once GSPGPU_ReleaseRight() has run or the shell is closed.
+//   THEREFORE: this join is bounded (debug.apt_join_ms, default 1200 ms) and prints a
+//   receipt when it gives up. Returning late to libctru is survivable; not returning is not.
+static void aptRenderThreadPark(const char* phase) {
     if (gdx3ds_rt_mode() == 0) {
         return;
     }
     const int idle = gdx3ds_rt_idle();
     const uint64_t t0 = svcGetSystemTick();
+    int joined = 1;
     if (!idle) {
-        gdx3ds_rt_join_idle();
+        if (sAptJoinMs > 0) {
+            joined = gdx3ds_rt_join_idle_deadline((unsigned)sAptJoinMs);
+        } else {
+            gdx3ds_rt_join_idle(); // debug.apt_join_ms=0: the pre-HOMEFIX2 unbounded wait
+        }
     }
-    char msg[96];
-    std::snprintf(msg, sizeof(msg), "[apt] render thread parked (idle=%d join=%lums frameOpen=%d)", idle,
-                  aptMsSince(t0), gdx3ds_gfx_frame_active());
+    char msg[224];
+    if (!joined) {
+        std::snprintf(msg, sizeof(msg),
+                      "[apt] %s render thread park TIMEOUT after %lums (idle=0 rtIdle=%d frameOpen=%d) "
+                      "— proceeding into citro3d's gxCmdQueueWait/Clear; a USERBREAK_PANIC dump from "
+                      "here means the render thread still owns the GX queue",
+                      phase, aptMsSince(t0), gdx3ds_rt_idle(), gdx3ds_gfx_frame_active());
+    } else {
+        std::snprintf(msg, sizeof(msg), "[apt] render thread parked (idle=%d join=%lums frameOpen=%d)", idle,
+                      aptMsSince(t0), gdx3ds_gfx_frame_active());
+    }
     aptLogReceipt(msg);
 }
 
@@ -515,11 +564,20 @@ static void aptRestoreCpuState(void) {
 // Suspend side (HOME/POWER and lid sleep share it; only HOME lights the bottom panel).
 static void aptSuspendSteps(const char* phase, bool forHomeMenu) {
     aptStepReceipt(phase, 1, "render thread park");
-    aptRenderThreadPark();
+    aptRenderThreadPark(phase);
     aptStepReceipt(phase, 2, "audio park");
     aptAudioSuspend();
     aptStepReceipt(phase, 3, "net suspend");
-    gdx3ds_net_suspend(); // SOC sockets do not survive a suspend: drop them first
+    // HOMEFIX2: gdx3ds_net_suspend waits at most 240 ms for the net thread to drop its fds
+    // and proceeds either way. WHO SIGNALS the ack: the net thread, at the TOP of its loop
+    // only — a thread inside netRecvFileTo misses the window entirely. ack=0 is the receipt.
+    {
+        const int ack = gdx3ds_net_suspend(); // SOC sockets do not survive a suspend: drop them first
+        if (ack == 0) {
+            aptLogReceipt("[apt] net suspend TIMEOUT (ack=0) — the net thread did not park in 240 ms; "
+                          "SOC IPC may still be in flight across ReleaseRight/JumpToHomeMenu");
+        }
+    }
     if (forHomeMenu) {
         aptStepReceipt(phase, 4, "backlight for HOME menu");
         aptBacklightForHome();
@@ -580,6 +638,65 @@ static void aptLifecycleHook(APT_HookType hook, void* param) {
     }
 }
 static aptHookCookie sAptHookCookie;
+
+// ---------------------------------------------------------------------------------------------
+// HOMEFIX2 — the DSP hook: the receipt that covers the one blocking call our APT receipts
+// could never bracket.
+//
+// hw run E's log ends immediately after `[apt] audio parked` with the rest of our hook being
+// no-ops, i.e. main was already inside libctru when it stopped. The next blocking call in
+// that window is aptDspSleep() (libctru apt.c:826 for HOME, apt.c:583 on the APT EVENT
+// THREAD for a lid sleep) -> dsp.c:86 dspCallHook(DSPHOOK_ONSLEEP) -> ndsp.c:341
+// ndspFinalize(true), whose DSP handshake is an UNBOUNDED `for(;;)` poll of DSP_RecvData
+// (ndsp.c:301-330, 4.888 ms per iteration, no deadline, no escape). If the DSP never answers
+// 1, main never returns, APT_JumpToHomeMenu is never sent, and NS kills the title with no
+// dump — the exact shape of run E.
+//
+// dspHook is LIFO like aptHook (dsp.c:63-71: the newest cookie becomes dspFirstHook), so
+// registering ours AFTER gdx3ds_audio_init() (which runs ndspInit -> ndsp's own dspHook) puts
+// this callback AHEAD of ndsp's. The receipt below is therefore written immediately BEFORE
+// ndspFinalize runs: a log that ends on it names the step that no previous build could name.
+//
+// `[debug] apt_dsp_park = 1` additionally parks our audio threads here. That matters on a LID
+// SLEEP, where libctru calls aptDspSleep() from its own event thread long before our ONSLEEP
+// aptHook runs on main — i.e. ndsp is finalised while our drain thread is still issuing
+// ndspChnWaveBufAdd / DSP_FlushDataCache on the shared dsp handle. Default 0: it parks audio
+// from a non-main thread, which is a behaviour change, and the receipt alone is what the next
+// hardware run needs.
+static dspHookCookie sDspHookCookie;
+
+static void dspLifecycleHook(DSP_HookType hook) {
+    switch (hook) {
+        case DSPHOOK_ONSLEEP: {
+            if (sAptDspPark) {
+                int drainParked = 0;
+                int producerParked = 0;
+                gdx3ds_audio_suspend(&drainParked, &producerParked);
+                char pm[160];
+                std::snprintf(pm, sizeof(pm),
+                              "[apt] dsp sleep: audio parked early (drain=%d hle=%d, debug.apt_dsp_park=1)",
+                              drainParked, producerParked);
+                aptLogReceipt(pm);
+            }
+            char msg[224];
+            std::snprintf(msg, sizeof(msg),
+                          "[apt] dsp sleep hook (aptState=%d t=+%lums) — ndspFinalize(true) NEXT: its "
+                          "DSP_RecvData handshake is an unbounded poll. A log that ends HERE is that "
+                          "poll, not our hook.",
+                          sAptState, aptMsSince(sAptStateTick));
+            aptLogReceipt(msg);
+            break;
+        }
+        case DSPHOOK_ONWAKEUP:
+            aptLogReceipt("[apt] dsp wakeup hook (ndspInitialize(true) done)");
+            break;
+        case DSPHOOK_ONCANCEL:
+            aptLogReceipt("[apt] dsp cancel hook (close order while the DSP slept; [exit] chain expected)");
+            break;
+        default:
+            break;
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // M1-RACE-FREEZE fatal-exit tracers. The race-time "freeze" soak proved the guest EXITS —
@@ -923,6 +1040,13 @@ static void emitMemCensus(Ship::Context* ctx, unsigned long frameNum, const char
 //   input_replay=X   replay rec/X.gdxrec from tick 0 (wins over gdx-autoinput.txt)
 //   replay_quit=1    leave the frame loop at "[rec] end" (self-terminating parity runs)
 // Receipts: "[det] ..." and "[rec] ..." lines.
+// COVERAGE: the [cov] census's log sink — the same two channels every other receipt uses.
+static void covLogSink(const char* line) {
+    const size_t n = strlen(line);
+    svcOutputDebugString(line, n);
+    gdx3ds_filelog_write(line, n);
+}
+
 static void oracleReplayEnded() {
     gdx3ds_oracle_request_quit("[rec] end with replay_quit=1");
 }
@@ -983,9 +1107,19 @@ static void oracleInitDeterminismAndRec() {
         char path[192];
         std::snprintf(path, sizeof(path), "%srec/%s.gdxrec", gdx3ds_fs_base_path(), replayName);
         if (gdx_replay_start(path) == 0) {
-            // DYNLOD tier depends on svcGetSystemTick() deltas (plan §3 item 3): pinned under replay.
-            gdx3ds_dynlod_set_auto(0);
-            logStep("[rec] replay: [perf] rival_detail_auto pinned to 0 for this run");
+            // DYNLOD tier depends on svcGetSystemTick() deltas (plan §3 item 3): pinned under
+            // replay, because a host-speed-dependent tier is not reproducible and would make
+            // [fh] parity meaningless. [debug] replay_dynlod=1 keeps the controller LIVE for
+            // the one thing a replay can still measure honestly: how often the controller
+            // changes tier under a fixed input stream (the A/B in
+            // docs/research/native/dynlod-progress-native.md). Such a run is explicitly NOT a
+            // parity run -- the receipt says so.
+            if (gdx3ds_config_get_bool("debug", "replay_dynlod", 0)) {
+                logStep("[rec] replay: [debug] replay_dynlod=1 -- DYNLOD live, this run is NOT parity-valid");
+            } else {
+                gdx3ds_dynlod_set_auto(0);
+                logStep("[rec] replay: [perf] rival_detail_auto pinned to 0 for this run");
+            }
             if (gdx3ds_config_get_bool("debug", "replay_quit", 0)) {
                 gdx_input_rec_set_end_callback(oracleReplayEnded);
             }
@@ -1039,6 +1173,12 @@ int main(int argc, char** argv) {
     // HOMEFIX killswitches (receipt below, after the window is up).
     sAptWatch = gdx3ds_config_get_bool("debug", "apt_watch", 1) ? 1 : 0;
     sAptHookFirst = gdx3ds_config_get_bool("debug", "apt_hook_first", 1) ? 1 : 0;
+    sAptJoinMs = gdx3ds_config_get_int("debug", "apt_join_ms", 1200);
+    if (sAptJoinMs < 0) {
+        sAptJoinMs = 0;
+    }
+    sAptDspHook = gdx3ds_config_get_bool("debug", "apt_dsp_hook", 1) ? 1 : 0;
+    sAptDspPark = gdx3ds_config_get_bool("debug", "apt_dsp_park", 0) ? 1 : 0;
     if (R_FAILED(svcCreateEvent(&sWatchdogWake, RESET_ONESHOT))) {
         sWatchdogWake = 0; // watchdog falls back to plain sleeps (no early wake)
     }
@@ -1058,6 +1198,10 @@ int main(int argc, char** argv) {
     // ORACLE: capture oracle, determinism pins and the .gdxrec recorder/replayer — all before the
     // first controller poll (line 0 of a recording == tick 0) and before the game seeds its RNGs.
     gdx3ds_oracle_init();
+    // COVERAGE: armed next to the oracle because the two share a frame number by construction
+    // (gdx3ds_oracle_after_endframe calls gdx3ds_cov_frame with the tuple it stamps [fh] with).
+    gdx3ds_cov_arm(gdx3ds_config_get_bool("debug", "cov", 0),
+                   gdx3ds_config_get_bool("debug", "cov_verbose", 0), covLogSink);
     oracleInitDeterminismAndRec();
     logStep("window up; gdx_dev_gates_init_env");
 
@@ -1111,11 +1255,12 @@ int main(int argc, char** argv) {
         aptHook(&sAptHookCookie, aptLifecycleHook, nullptr);
     }
     {
-        char msg[160];
+        char msg[240]; // HOMEFIX2: 160 truncated the line at apt_dsp_hook= and ate park=
         std::snprintf(msg, sizeof(msg),
                       "[apt] hooks: ours %s citro3d's (debug.apt_hook_first=%d), suspended-mode watchdog poll=%d "
-                      "(debug.apt_watch), wake event=%d",
-                      sAptHookFirst ? "ahead of" : "behind", sAptHookFirst, sAptWatch, sWatchdogWake != 0 ? 1 : 0);
+                      "(debug.apt_watch), wake event=%d, apt_join_ms=%d, apt_dsp_hook=%d park=%d",
+                      sAptHookFirst ? "ahead of" : "behind", sAptHookFirst, sAptWatch, sWatchdogWake != 0 ? 1 : 0,
+                      sAptJoinMs, sAptDspHook, sAptDspPark);
         logStep(msg);
     }
 
@@ -1123,6 +1268,13 @@ int main(int argc, char** argv) {
     //    audio thread (it waits for the decomp's gAudioContextInitialized internally).
     logStep("gdx3ds_audio_init");
     gdx3ds_audio_init(0);
+    // HOMEFIX2: AFTER ndspInit (inside gdx3ds_audio_init) so dspHook's LIFO order puts our
+    // callback ahead of ndsp's — i.e. our receipt lands BEFORE ndspFinalize's unbounded DSP
+    // handshake. See dspLifecycleHook above.
+    if (sAptDspHook) {
+        dspHook(&sDspHookCookie, dspLifecycleHook);
+        logStep("[apt] dsp hook armed ahead of ndsp's (debug.apt_dsp_hook=1)");
+    }
     {
         // AUDIOFIX: the null-sink degrade used to be invisible outside the (default-off)
         // bottom-screen console, so "runs fine but silent" never left a trace in log.txt
@@ -1153,6 +1305,12 @@ int main(int argc, char** argv) {
         romArgv.push_back(const_cast<char*>(romPath.c_str()));
         gdx_init_rom(static_cast<int>(romArgv.size()), romArgv.data(), archivesValidated ? 1 : 0);
     }
+
+    // A10: arm the load-stall census before the boot preloads, so the boot-window spans
+    // (which run on this very thread, i.e. the future main thread) are measured too.
+    gdx_stall_configure(gdx3ds_config_get_int("debug", "stall", 0),
+                        gdx3ds_config_get_int("debug", "stall_ms", 8),
+                        gdx3ds_config_get_int("debug", "stall_frame_ms", 50));
 
     logStep("gdx_rdram_init");
     gdx_rdram_init();
@@ -1343,27 +1501,54 @@ int main(int argc, char** argv) {
     // also arm it so measurement runs get it for free.
     const bool cadenceCfg = gdx3ds_config_get_int("debug", "cadence", 0) != 0;
 #define cadenceTelemetry (verboseTelemetry || cadenceCfg)
+    // A10: everything from here runs on THE main thread (the game fibers included: a fiber
+    // shares its host thread), so spans opened past this point are frame stalls and spans on
+    // the preload worker / audio producer are not. The table separates them on this identity.
+    gdx_stall_set_main_thread();
     while (w != nullptr && w->IsRunning() && gdx3ds_quit_requested() == 0) {
+        // A10 frame boundary: closes the previous iteration (unattributed remainder -> `other`,
+        // one `[stall] frame=` line when it overran) and opens this one.
+        gdx_stall_frame((unsigned long)frameNum);
         // APT pump — FIRST statement of the iteration, outside every conditional and
         // frame-skip path. HOME/POWER suspends and lid-close sleeps happen INSIDE this
         // call (the aptLifecycleHook receipts bracket them); a false return is the OS
         // close order (power-off menu, HOME-menu X, cart eject) and must break the loop
         // so main() unwinds through the ordinary teardown below — that path logs
         // "exiting" and fires the atexit tracer, which is the proof of a clean exit.
+        // MAINPROF: open this iteration's timeline. Everything from here to
+        // gdx3ds_mprof_frame_end below is partitioned into [mprof] buckets; the window
+        // emit itself happens inside frame_end, i.e. outside every bucket.
+        gdx3ds_mprof_frame_begin();
         if (rtMode != 0 && (rtMode != 3 || aptShouldJumpToHome() || aptShouldClose())) {
             // Frame boundary: the previous iteration's END (present) must have completed so
             // the APT pump runs with no C3D frame open and nothing queued (audit section 6).
             // ahead mode (3) lets the previous frame's render/present overlap this iteration
             // and joins only when an APT transition is about to run (the hook joins too).
             sWatchStage = 9;
-            gdx3ds_rt_join_idle();
+            const int mpPrev = gdx3ds_mprof_enter(GDX3DS_MPROF_JTOP);
+            // HOMEFIX2: this join is ALSO on the suspend path — it only runs when a HOME or
+            // close request is already visible, i.e. aptMainLoop() below is about to enter
+            // the transition. Same invariant as the hook's join (see aptRenderThreadPark):
+            // the render thread is the only signaller and it can be inside a GSP wait, so
+            // bound it and say so rather than never reach aptMainLoop at all.
+            if (sAptJoinMs > 0) {
+                if (!gdx3ds_rt_join_idle_deadline((unsigned)sAptJoinMs)) {
+                    aptLogReceipt("[apt] pre-pump render join TIMEOUT — entering aptMainLoop with the "
+                                  "render thread still busy (the hook's own join retries)");
+                }
+            } else {
+                gdx3ds_rt_join_idle();
+            }
+            gdx3ds_mprof_leave(mpPrev);
         }
+        gdx3ds_mprof_enter(GDX3DS_MPROF_APT);
         if (!aptMainLoop() || gdx3ds_oracle_quit_requested()) {
             logStep("[apt] shutdown requested — leaving frame loop");
             gdx3ds_filelog_flush(); // receipt must survive even if teardown wedges
             break;
         }
         if (rtMode != 0) {
+            gdx3ds_mprof_enter(GDX3DS_MPROF_PACE);
             gdx3ds_rt_pace_vblank(); // main owns the vblank alignment (render thread: FrameBegin(0))
         }
         if (GDX3DS_BOOT_TRACE || frameNum < 8 || (verboseTelemetry && (frameNum & 63) == 0)) {
@@ -1378,6 +1563,7 @@ int main(int argc, char** argv) {
 #else
 #define GDX_HB(tag, stage) (sWatchStage = (stage))
 #endif
+        gdx3ds_mprof_enter(GDX3DS_MPROF_INP);
         gdx_dev_gates_refresh();
         GDX_HB("hb:events", 1);
         w->HandleEvents();
@@ -1390,17 +1576,26 @@ int main(int argc, char** argv) {
             // logic tick run INSIDE gdx_vi_tick -- the TASK must find the frame already opened
             // by Interpreter::StartFrame (dimension/fixed-aspect latches precede Run).
             GDX_HB("hb:start_frame", 4);
+            gdx3ds_mprof_enter(GDX3DS_MPROF_BEG);
             gdx3ds_rt_frame_begin(); // BEGIN: StartFrame on the render thread
         }
         GDX_HB("hb:vi_tick", 2);
+        // MAINPROF: gdx_vi_tick's osSendMesg dispatches the game fibers from host context
+        // (renderthread-audit.md section 8), so the game's whole frame function runs INSIDE
+        // this call and re-buckets itself at its own checkpoints. What stays in `vi` is the
+        // host side plus the few instructions a resumed fiber runs before its next one.
+        gdx3ds_mprof_enter(GDX3DS_MPROF_VI);
         gdx_vi_tick();   // runs the Main game fiber inline (posts VI retrace)
         GDX_HB("hb:audio_notify", 3);
+        gdx3ds_mprof_enter(GDX3DS_MPROF_AUD);
         gdx_audio_thread_notify_frame();
 
         if (rtMode == 0) {
             GDX_HB("hb:start_frame", 4);
+            gdx3ds_mprof_enter(GDX3DS_MPROF_BEG);
             w->StartFrame();
         }
+        gdx3ds_mprof_enter(GDX3DS_MPROF_DISP);
         gdx_sched_drain_deferred_wakes();
         GDX_HB("hb:dispatch", 5);
         gdx_dispatch();
@@ -1411,24 +1606,32 @@ int main(int argc, char** argv) {
         // the DP-done at once (the next submit is the backpressure) and dispatch again.
         while (rtMode != 0 && gdx3ds_rt_task_pending()) {
             GDX_HB("hb:rt_join", 9);
+            gdx3ds_mprof_enter(GDX3DS_MPROF_JDP);
+            gdx_stall_begin(GDX_STALL_GPU_WAIT); // A10: main blocked on the render thread
             gdx3ds_rt_wait_task(); // waits, merges segment claims, posts the DP-done once
+            gdx_stall_end();
+            gdx3ds_mprof_enter(GDX3DS_MPROF_DISP);
             gdx_sched_drain_deferred_wakes();
             GDX_HB("hb:dispatch", 5);
             gdx_dispatch();
         }
         GDX_HB("hb:save_tick", 6);
+        gdx3ds_mprof_enter(GDX3DS_MPROF_TAIL);
         gdx_disk_save_tick();
         // ORACLE: stamp this frame's (frame, tick, mode) before its EndFrame is issued.
         gdx3ds_oracle_frame_mark((unsigned long)frameNum, (unsigned long)gdx_input_tick() - 1u, gdx_input_game_mode());
         if (rtMode != 0) {
             GDX_HB("hb:end_frame", 7);
+            gdx3ds_mprof_enter(GDX3DS_MPROF_END);
             gdx3ds_rt_frame_end(); // END: present fallback + EndFrame on the render thread
         } else {
+            gdx3ds_mprof_enter(GDX3DS_MPROF_END);
             gdx_vi_present_fallback();
             GDX_HB("hb:end_frame", 7);
             w->EndFrame();
             gdx3ds_oracle_after_endframe(); // ORACLE (rtMode 0 twin of the render-thread hook)
         }
+        gdx3ds_mprof_enter(GDX3DS_MPROF_TAIL);
 
         // Present-path oracle (m1-boot-debug): the top-screen framebuffers live on the
         // linear heap (gfxInitDefault), so the CPU can inspect what actually reaches
@@ -1516,6 +1719,15 @@ int main(int argc, char** argv) {
         // gfxrun can exceed task (several tasks in one present during
         // transitions). dtMs is the window wall time, so hostFps = 64000/dtMs
         // and gameFps = game * 1000/dtMs.
+        // A10: a windowed `[stall-table]` every 256 frames, reset each time, so the table can
+        // be read per phase (boot / menu / race) instead of as one run-long total that hides
+        // where the blocked milliseconds actually landed.
+        if (frameNum > 8 && (frameNum & 255) == 4) {
+            char stallTag[32];
+            std::snprintf(stallTag, sizeof(stallTag), "frames<=%lu", (unsigned long)frameNum);
+            gdx_stall_report(stallTag, 1);
+        }
+
         if (cadenceTelemetry && frameNum > 8 && (frameNum & 63) == 3) {
             static uint64_t sCadPrevTick = 0;
             static unsigned long sCadPrevTasks = 0;
@@ -1571,6 +1783,12 @@ int main(int argc, char** argv) {
 
         GDX_HB("hb:pacer", 8);
         gdx_frame_pacer_tick();
+        // MAINPROF: close the frame, fold it into the window, and (on a window boundary)
+        // emit the [mprof] receipt. Deliberately the last statement of the iteration: the
+        // emit's own svc/filelog cost then lands in no bucket and cannot inflate the table,
+        // and it can only ever happen at a window boundary on the host thread — never
+        // inside a game fiber, so the replay's tick order is untouched.
+        gdx3ds_mprof_frame_end((unsigned long)frameNum);
 #undef GDX_HB
     }
 #undef verboseTelemetry
@@ -1602,6 +1820,8 @@ int main(int argc, char** argv) {
     gdx3ds_audio_shutdown(); // joins the drain, then ndspExit (cancel-aware when suspended)
     aptLogReceipt("[exit] audio_shutdown done");
     aptLogReceipt("[exit] render_thread_join enter");
+    gdx3ds_cov_finish();  // COVERAGE: the per-key summary, before anything can wedge the join
+    gdx3ds_filelog_flush();
     gdx_input_rec_stop(); // ORACLE: close a .gdxrec recording (flush) before teardown
     gdx3ds_rt_shutdown(); // QUIT + threadJoin on its own event (no shared-event spin)
     aptLogReceipt("[exit] render_thread_join done");

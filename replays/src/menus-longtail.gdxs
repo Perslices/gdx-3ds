@@ -1,0 +1,115 @@
+# menus-longtail: every front-end screen the race replays never draw.
+# SELECT MODE grid cursor -> OPTIONS (rows, value change, erase-data box, EXIT)
+# -> TIME ATTACK sub-popup -> RECORDS cup select -> records course list -> RECORDS screen.
+# Modes visited: 0 TITLE, 7 MAIN_MENU, 20 OPTIONS_MENU, 19 RECORDS_COURSE_SELECT, 6 RECORDS.
+# SHOT PLACEMENT IS NOT AUTHORED HERE ANY MORE (NEXT.md B15/B43, coverage2-progress.md).
+# This file is the INPUT script: ticks, buttons, sticks. The schedule that decides which frames
+# the parity gate hashes is DERIVED from a `[debug] cov=1` coverage census of the replay and
+# written into the .gdxrec by tools/dev/covsched.py. Regenerating a .gdxrec from this file
+# therefore produces a recording with NO SHOTs; re-apply the schedule with
+#   tools/dev/covsched.py derive <cov-run>/log-*.txt --rewrite in.gdxrec out.gdxrec
+# The hand-placed schedules this file used to carry covered 49-80% of what their replay draws.
+build native/replays@d45fe63
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 rival_detail_auto=0 stereo=1 fh_every=0
+note SELECT MODE grid is 4x2; non-EK redirects idx3->2, idx4->5, idx7->6.
+at 350
+wait 1
+at 400
+press START 15 0
+at 600
+wait 1
+at 660
+press RIGHT 12 0
+at 740
+wait 1
+at 800
+press RIGHT 12 0
+at 880
+wait 1
+at 940
+press DOWN 12 0
+at 1020
+wait 1
+at 1080
+press A 12 0
+at 1180
+wait 1
+at 1240
+press DOWN 12 0
+at 1320
+wait 1
+at 1380
+press RIGHT 12 0
+at 1460
+wait 1
+at 1520
+press LEFT 12 0
+at 1600
+wait 1
+at 1660
+press DOWN 12 0
+at 1720
+press DOWN 12 0
+at 1780
+press DOWN 12 0
+at 1860
+wait 1
+at 1920
+press A 12 0
+at 2020
+wait 1
+at 2080
+press B 12 0
+at 2180
+wait 1
+at 2240
+press DOWN 12 0
+at 2320
+wait 1
+at 2380
+press A 12 0
+at 2500
+wait 1
+at 2560
+press UP 12 0
+at 2620
+press LEFT 12 0
+at 2700
+wait 1
+at 2760
+press A 12 0
+at 2860
+wait 1
+at 2920
+press DOWN 12 0
+at 3000
+wait 1
+at 3060
+press A 12 0
+at 3180
+wait 1
+at 3240
+press A 12 0
+at 3380
+wait 1
+at 3440
+press RIGHT 12 0
+at 3560
+wait 1
+at 3620
+press A 12 0
+at 3740
+wait 1
+at 3800
+press A 12 0
+at 3940
+wait 1
+at 4080
+wait 1
+at 4140
+press B 12 0
+at 4260
+wait 1
+len 4400

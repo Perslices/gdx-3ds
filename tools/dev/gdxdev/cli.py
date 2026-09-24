@@ -10,7 +10,7 @@ import os
 import sys
 
 from . import build as buildmod
-from . import capture, delegate, emu, report, sd, util
+from . import capture, delegate, emu, hwrun, report, sd, util
 from .util import GdxError
 
 EPILOG = """\
@@ -26,7 +26,34 @@ def _common(p):
     p.add_argument("--json", action="store_true", help="machine-readable result on stdout")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--dry-run", action="store_true",
-                   help="print the legacy shell this would run, change nothing")
+                   help="print exactly what this invocation would do and do NONE of it: "
+                        "nothing launched, written, downloaded or locked")
+
+
+def _add_3d(p):
+    """`--3d` / `--depth-3d`, shared by both lanes (gdxdev/stereo3d.py).
+
+    `--3d` with no value means side-by-side, the one mode where a single captured host
+    frame visibly contains both eyes. `dest` is spelled out because an option starting
+    with a digit gets no usable automatic attribute name.
+    """
+    from . import stereo3d
+    p.add_argument("--3d", dest="three_d", nargs="?", const=stereo3d.DEFAULT_MODE,
+                   default=None, metavar="MODE",
+                   help="render the emulator in stereoscopic 3D so the guest's right-eye "
+                        "pass actually runs (the emulated 3D slider is 0 otherwise, and "
+                        "[stereo] enabled=1 alone does nothing). MODE: %s (default %s). "
+                        "Implies [stereo] enabled=1 and [debug] fh_eye=both"
+                        % (", ".join(sorted(stereo3d.MODES)), stereo3d.DEFAULT_MODE))
+    p.add_argument("--depth-3d", dest="depth_3d", type=int, default=None, metavar="PCT",
+                   help="3D depth/separation percentage for --3d, 1..100 (default %d)"
+                        % stereo3d.DEFAULT_DEPTH)
+
+
+def retro_defaults():
+    """(no-replay default, staged-replay default) seconds, from the lane itself."""
+    from . import retro
+    return retro.DEFAULT_SECONDS, retro.REPLAY_SECONDS
 
 
 def build_parser():
@@ -60,6 +87,10 @@ def build_parser():
     _common(r)
     r.add_argument("threedsx", help="absolute or relative path to the .3dsx")
     r.add_argument("--replay", help="replay id under tools/dev/replays/, or a path")
+    r.add_argument("--no-replay-quit", dest="no_replay_quit", action="store_true",
+                   help="play PAST the replay's last tick and end on --seconds instead "
+                        "([debug] replay_quit=0). For diagnostics that watch post-replay "
+                        "behaviour (wobble, dynlod). Same as --ini debug.replay_quit=0")
     r.add_argument("--ini", action="append", metavar="K=V",
                    help="merge an ini key ([debug] by default; `section.k=v` to target one)")
     r.add_argument("--seconds", type=int, default=None,
@@ -70,6 +101,7 @@ def build_parser():
     r.add_argument("--shots", action="store_true",
                    help="collect autotest/*.bmp written by SHOT events")
     r.add_argument("--capture", action="store_true", help="host window capture at the end")
+    _add_3d(r)
     r.add_argument("--lane", choices=["azahar", "retro"], default="azahar")
     r.add_argument("--lock-wait", type=int, default=900, help="seconds to wait for the lock")
     r.add_argument("--launch", choices=["open", "direct"], default="open",
@@ -115,6 +147,9 @@ def build_parser():
     p.add_argument("--fps", action="store_true", help="p10/p50/p90 from [watchdog] deltas")
     p.add_argument("--by-vtxn", action="store_true",
                    help="bucket [prof] windows by nD (crowd nD>=100 vs menu)")
+    p.add_argument("--main", action="store_true",
+                   help="[mprof] MAIN-thread section table, ranked (NEXT.md A8); "
+                        "add --by-vtxn to bucket it by nD as well")
     p.add_argument("--ab", nargs=2, metavar=("RUN_A", "RUN_B"))
     p.add_argument("--window", type=int, default=0, help="use only the last N windows")
     p.add_argument("--force", action="store_true", help="A/B across different build ids")
@@ -168,6 +203,43 @@ def build_parser():
     h.add_argument("rest", nargs=argparse.REMAINDER)
     h.set_defaults(func=delegate.do_hw)
 
+    # ---- hw-run: the unattended hardware config matrix (NEXT.md A9)
+    hr = sub.add_parser("hw-run", help="unattended hardware A/B: a config matrix x a "
+                                       "replay over the WiFi link, with a summary table")
+    _common(hr)
+    hr.add_argument("--config", action="append", metavar="SPEC",
+                    help="one config, repeatable: 'native.all=0,native.interp=0'. "
+                         "An EMPTY value deletes the key (`k=`), which is what clearing "
+                         "a lever on the guest requires")
+    hr.add_argument("--replay", default="race-mutecity-start",
+                    help="replay id or path; must be a .gdxrec (tick-exact injector)")
+    hr.add_argument("--repeats", type=int, default=1,
+                    help="repeats per config; the OUTER loop, so drift hits every config")
+    hr.add_argument("--seconds", type=int, default=240,
+                    help="ceiling per slice; the slice ends at the replay's `[rec] end`")
+    hr.add_argument("--settle", type=int, default=6,
+                    help="seconds after the end receipt, so the last [prof] window lands")
+    hr.add_argument("--poll", type=int, default=3, help="seconds between completion polls")
+    hr.add_argument("--wait", type=int, default=60, help="seconds to wait for a relaunch")
+    hr.add_argument("--gputrace", action="store_true",
+                    help="[debug] gputrace=1 — inflates every millisecond; recorded in "
+                         "each manifest and printed in the header")
+    hr.add_argument("--base-ini", default=None, metavar="SPEC",
+                    help="ini applied to every config (default %r, plus the replay and "
+                         "gputrace state)" % hwrun.DEFAULT_BASE_INI)
+    hr.add_argument("--restore", default=None, metavar="SPEC",
+                    help="ini applied once at the end (default %r)" % hwrun.DEFAULT_RESTORE)
+    hr.add_argument("--no-restore", action="store_true",
+                    help="leave the last config armed on the console")
+    hr.add_argument("--fps-window", type=float, default=hwrun.DEFAULT_FPS_WINDOW_S,
+                    help="seconds of racing to pool fps over (default 60)")
+    hr.add_argument("--fps-anchor", default=hwrun.IN_RACE_ANCHOR,
+                    help="SHOT label the fps window starts after (default race00)")
+    hr.add_argument("--3dsx", dest="threedsx", default=None)
+    hr.add_argument("--ip", default=None, help="console IPv4 (default: tools/dev/hw.ini)")
+    hr.add_argument("--name", default=None, help="slug for the run id")
+    hr.set_defaults(func=hwrun.do_hw_run)
+
     # ---- retro (spike)
     rt = sub.add_parser("retro", help="RetroArch/libretro lane (spike)")
     rtsub = rt.add_subparsers(dest="sub")
@@ -178,7 +250,12 @@ def build_parser():
                     help="instance name -> its own config, private SD and UDP port "
                          "(default: the run id, which is unique — two agents that both "
                          "omit this can never collide)")
-    rr.add_argument("--seconds", type=int, default=60)
+    rr.add_argument("--seconds", type=int, default=None,
+                    help="run CEILING in seconds. Default: %d with a staged --replay "
+                         "(60 truncated every corpus replay — NEXT.md B45), %d without. "
+                         "With replay_quit the run ends at the replay's last tick and "
+                         "never reaches the ceiling"
+                         % (retro_defaults()[1], retro_defaults()[0]))
     rr.add_argument("--frames", type=int, default=None, help="--max-frames N (bounded run)")
     rr.add_argument("--gfx", default=None, metavar="vulkan|opengl|software",
                     help="pin the renderer (case-insensitive). Default: try Vulkan, then "
@@ -187,7 +264,17 @@ def build_parser():
     rr.add_argument("--name")
     rr.add_argument("--ini", action="append", metavar="K=V")
     rr.add_argument("--replay")
+    # NEXT.md B19. A staged replay implies [debug] replay_quit=1 so the run ENDS at the
+    # replay's last tick instead of playing on, unscripted, until --seconds expires.
+    # The override is a real flag rather than folklore because runs that need it exist:
+    # the wobble and dynlod investigations watch what the guest does AFTER the scripted
+    # inputs stop, and a hardcoded flip would have silently ended those runs early.
+    rr.add_argument("--no-replay-quit", dest="no_replay_quit", action="store_true",
+                    help="play PAST the replay's last tick and end on --seconds instead "
+                         "([debug] replay_quit=0). For diagnostics that watch post-replay "
+                         "behaviour (wobble, dynlod). Same as --ini debug.replay_quit=0")
     rr.add_argument("--build-dir", default=buildmod.DEFAULT_BUILD_DIR)
+    _add_3d(rr)
     rr.set_defaults(func=_retro_dispatch)
     rs = rtsub.add_parser("setup", help="install/verify the core and write per-instance configs")
     _common(rs)

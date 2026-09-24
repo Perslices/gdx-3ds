@@ -12,6 +12,14 @@
 
 namespace gdxn {
 
+/* [native] levers latched by gdx_rt_glue.cpp (weak-free: the host harness supplies stubs). */
+extern "C" int gdx_ninterp_census(void);
+extern "C" int gdx_ninterp_ownfold(void);
+extern "C" int gdx_ninterp_dspcensus(void);
+extern "C" int gdx_ninterp_timgmemo(void);
+extern "C" int gdx_ninterp_tmemskip(void);
+extern "C" int gdx_ninterp_tmemcls(void);
+
 Interp::Interp(Backend* backend) : mBackend(backend) {
     memset(&mRsp, 0, sizeof(mRsp));
     memset(&mRdp, 0, sizeof(mRdp));
@@ -36,7 +44,15 @@ Interp::Interp(Backend* backend) : mBackend(backend) {
         mByteToUnit[k] = k / 255.0f; /* == (int)b / 255.0f, the LUS table */
     }
     mTexUpload = new uint8_t[kTexUploadBytes];
+    mTexUploadCap = kTexUploadBytes; /* DROPSITES: the INITIAL size; UploadPrepare grows it */
     mTrectBatchOn = mBackend->TrectBatchEnabled();
+    mCensus = gdx_ninterp_census();
+    mOwnFold = gdx_ninterp_ownfold();
+    mDspCensus = gdx_ninterp_dspcensus();
+    mTimgMemo = gdx_ninterp_timgmemo();
+    mTmemSkip = gdx_ninterp_tmemskip();
+    mTmemCls = gdx_ninterp_tmemcls();
+    memset(mTimgClassMemo, 0, sizeof(mTimgClassMemo));
 }
 
 Interp::~Interp() {
@@ -44,6 +60,14 @@ Interp::~Interp() {
 }
 
 void Interp::ResetStats() {
+    /* DROPSITES: roll the drop counters into the session totals before the window is cleared. */
+    mSesDrops.texOvf += mStats.texDecodeOverflow;
+    mSesDrops.texGrow += mStats.texDecodeGrow;
+    mSesDrops.texNoUp += mStats.texNoUpload;
+    mSesDrops.texFb += mStats.texFallback;
+    mSesDrops.vtxOver += mStats.vtxOver;
+    mSesDrops.vtxDropped += mStats.vtxOverDropped;
+    mSesDrops.clipTrunc += mStats.clipTrunc;
     memset(&mStats, 0, sizeof(mStats));
 }
 
@@ -157,13 +181,20 @@ void Interp::SpReset() {
     mBufNumTris = 0;
     mPackBatch = false;
     mPackDst = nullptr;
+    mPackComb = nullptr;
+    mPackFolded = false;
 }
 
 void Interp::RunFrame(GdxGfxJob* job, const GdxFrameConfig& cfg, int variant) {
     mSrc.Begin(job);
     mCfg = cfg;
     mVariant = variant;
+    /* [nverify] latch the mode for the whole task: the glue calls gdx3ds_verify_begin(2)
+     * immediately before RunFrame and gdx3ds_verify_begin(0) immediately after, so this is
+     * exact, and it keeps the hot sites free of a cross-TU / virtual call. */
+    mVerifyActive = mBackend->VerifyActive();
     mStats.tasks++;
+    mBatchesAtTaskStart = mStats.batches;
     SpReset();
 
     /* == Interpreter::Run prologue (interpreter.cpp:10016-10060): the fresh canvas. Run()
@@ -189,6 +220,12 @@ void Interp::RunFrame(GdxGfxJob* job, const GdxFrameConfig& cfg, int variant) {
         mStats.rootRejects++;
     }
     Flush(FLUSH_TASK_END);
+    if (mCensus) {
+        const uint32_t n = mStats.batches - mBatchesAtTaskStart;
+        if (n > mStats.maxBatchesPerTask) {
+            mStats.maxBatchesPerTask = n;
+        }
+    }
 
     /* == Run epilogue: publish the offscreen target when the game renders to it. */
     uintptr_t gfxFrameBuffer = 0;
@@ -271,21 +308,21 @@ static inline bool RgbaDiffers(const Rgba& a, const Rgba& b) {
  * backend binds them as stage constants from vertex 0 of the flushed batch. */
 void Interp::DpSetEnvColor(Rgba c) {
     if (RgbaDiffers(mRdp.env_color, c)) {
-        Flush(FLUSH_CONST);
+        NoteRegChange(false, FLUSH_ENV);
     }
     mRdp.env_color = c;
 }
 void Interp::DpSetPrimColor(uint8_t m, uint8_t l, Rgba c) {
     (void)m;
     if (RgbaDiffers(mRdp.prim_color, c) || mRdp.prim_lod_fraction != l) {
-        Flush(FLUSH_CONST);
+        NoteRegChange(true, FLUSH_PRIM);
     }
     mRdp.prim_lod_fraction = l;
     mRdp.prim_color = c;
 }
 void Interp::DpSetFogColor(Rgba c) {
     if (RgbaDiffers(mRdp.fog_color, c)) {
-        Flush(FLUSH_CONST);
+        Flush(FLUSH_FOGCOLOR);
     }
     mRdp.fog_color = c;
 }
@@ -296,7 +333,7 @@ void Interp::DpSetBlendColor(Rgba c) {
      * ride the per-vertex fog/blend path). Mirrors the LUS handler; without it a batch drawn under
      * the OLD blend alpha is submitted with the NEW threshold -- the [nverify] field-7 class. */
     if (c.a != mRdp.blend_color.a && gdx_ninterp_blendflush()) {
-        Flush(FLUSH_CONST);
+        Flush(FLUSH_BLENDA);
     }
     mRdp.blend_color = c;
 }
@@ -311,7 +348,7 @@ void Interp::DpSetPrimDepth(uint16_t z) {
     /* [prim-depth-flush] Flush samples prim_depth at drain time: drain before the register
      * moves (gfx_set_prim_depth_handler_rdp). */
     if (z != mRdp.prim_depth) {
-        Flush(FLUSH_CONST);
+        Flush(FLUSH_PRIMDEPTH);
     }
     mRdp.prim_depth = z;
 }

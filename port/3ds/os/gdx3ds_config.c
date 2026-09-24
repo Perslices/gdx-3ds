@@ -186,6 +186,35 @@ int gdx3ds_config_set_string(const char* section, const char* key, const char* v
     return 0;
 }
 
+int gdx3ds_config_unset(const char* section, const char* key) {
+    char wantSection[GDX3DS_CFG_SECTION_LEN];
+    char wantKey[GDX3DS_CFG_KEY_LEN];
+    int i;
+
+    if (key == NULL) {
+        return 1;
+    }
+    gdx3ds_cfg_copy_lower(wantSection, sizeof(wantSection), (section != NULL) ? section : "");
+    gdx3ds_cfg_copy_lower(wantKey, sizeof(wantKey), key);
+    if (wantKey[0] == '\0') {
+        return 1;
+    }
+
+    for (i = 0; i < sEntryCount; i++) {
+        if (strcmp(sEntries[i].section, wantSection) == 0 && strcmp(sEntries[i].key, wantKey) == 0) {
+            /* Shift the tail down rather than swapping with the last entry: gdx3ds_config_save
+             * writes the table in order, so swapping would silently reshuffle the user's ini. */
+            for (; i + 1 < sEntryCount; i++) {
+                sEntries[i] = sEntries[i + 1];
+            }
+            sEntryCount--;
+            memset(&sEntries[sEntryCount], 0, sizeof(sEntries[sEntryCount]));
+            return 0;
+        }
+    }
+    return 3; /* nothing to remove — the key is absent either way */
+}
+
 int gdx3ds_config_set_int(const char* section, const char* key, int value) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", value);

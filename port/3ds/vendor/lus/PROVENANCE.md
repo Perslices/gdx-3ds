@@ -90,5 +90,9 @@ into this tree at merge time (`git apply --directory=port/3ds/vendor/lus`) and k
 - `lus-native-machines-dl-hook.patch` (native/machines, 2026-09-13): weak `gdx3ds_mesh_dl_hook`
   call-out in `gfx_dl_handler_common` (`src/fast/interpreter.cpp`), `__3DS__` only.
 - `lus-nverify-diag.patch` (native/interp, 2026-09-13): `gdx3ds_verify_note_cmd/_tri` side channels
-  in `src/fast/interpreter.cpp`, gated on `gdx3ds_verify_active()`; folded by 3-way file merge
-  (base = carve at 9b8f332). Temporary until native M5.
+  in `src/fast/interpreter.cpp`; folded by 3-way file merge (base = carve at 9b8f332).
+  Temporary until native M5. **Edited in the vendored tree 2026-09-23 (native/nverifygate,
+  audit finding 5):** the gate is now an inline `gdx3ds_verify_mode != 0` test on the global
+  exported from `port/3ds/gfx/gfx_citro3d.cpp`, not a `gdx3ds_verify_active()` call -- there
+  is no LTO in the tree, so the call was a real per-command and per-triangle cost on the
+  DEFAULT `interp=0` path. The `.patch` file keeps the original text for provenance.

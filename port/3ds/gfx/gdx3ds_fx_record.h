@@ -77,6 +77,15 @@ typedef struct GdxFxRecord {
     uint32_t magic;
     uint32_t mode;  /* 1 native, 2 verify */
     uint32_t fold;  /* [native] fx_sprites: fold prim/env into the vertex colour where expressible */
+    uint32_t census; /* [native] fxcensus: the replay logs the class's combiner routing once */
+    /* [native] fxceiling — CENSUS ONLY, deliberately renders WRONG pixels. It measures the
+     * draw-count ceiling of the two candidate B5 optimisations instead of arguing it:
+     *   bit0  every prim/env value change folds (a perfect per-vertex carry of both registers)
+     *   bit1  the explosion class does not break its run at the per-sprite frame load
+     * Never a shippable path: with bit0 the stage constants are stale and with bit1 every
+     * sprite samples the last frame loaded. `[fh]` MUST differ from the baseline — if it does
+     * not, the lever did nothing. */
+    uint32_t ceiling;
     uint32_t frame; /* gGameFrameCount the record belongs to */
     uint32_t nOps;
     uint32_t nRuns;

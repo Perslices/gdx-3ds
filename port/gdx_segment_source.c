@@ -19,7 +19,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gdx_stall.h" /* A10: attribute the first-touch archive read as a load stall */
 #include "port_log.h"
+#if defined(GDX_PLATFORM_3DS)
+#include "3ds/gdx3ds_mainprof.h" /* MAINPROF: the [mprof] dma bucket */
+#endif
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -247,6 +251,11 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
 
     /* -- off the lock for the long read: other families keep loading/serving -- */
     seg_unlock();
+    /* A10 census: a first touch on the GAME thread is a frame stall; the same read on the
+       boot preload worker is not, and gdx_stall keeps the two apart by thread. The archive
+       read itself nests a GDX_STALL_FS span (AssetLoader.cpp), so this span's SELF time is
+       the framing/validation and the FS span is the SD read + inflate. */
+    gdx_stall_begin(GDX_STALL_SEG_BLOB);
     t0 = gdx_host_ms_now();
     copied = 0;
     ok = GDiffuser_LoadArchiveFileBytes(e->o2r_key, buf, cap, &copied) &&
@@ -267,6 +276,7 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
             ok = 0;
         }
     }
+    gdx_stall_end();
     seg_lock();
 
     if (!ok) {
@@ -291,7 +301,24 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
     return 1;
 }
 
+static int GdxSegmentSourceReadImpl(uint32_t romBase, uint32_t size, void* dst);
+
+/* MAINPROF: the single ROM/archive read funnel -- Dma_RomCopy, MIO0 staging, asset byte
+ * loads all land here. Charged to the [mprof] `dma` bucket for main-context callers only
+ * (the render thread's SETTIMG resolves and the preload thread also come through here).
+ * The body is unchanged below. */
 int GdxSegmentSourceRead(uint32_t romBase, uint32_t size, void* dst) {
+#if defined(GDX_PLATFORM_3DS)
+    const int mpDma = gdx3ds_mprof_enter_safe(GDX3DS_MPROF_DMA);
+    const int r = GdxSegmentSourceReadImpl(romBase, size, dst);
+    gdx3ds_mprof_leave(mpDma);
+    return r;
+#else
+    return GdxSegmentSourceReadImpl(romBase, size, dst);
+#endif
+}
+
+static int GdxSegmentSourceReadImpl(uint32_t romBase, uint32_t size, void* dst) {
 #if defined(GDX_PLATFORM_3DS)
     /* RENDER THREAD (ahead mode): the destination may be read by the in-flight walk. */
     {

@@ -12,6 +12,7 @@
 #define GDX_INTERP_H
 
 #include <stddef.h>
+#include <new>
 #include <stdint.h>
 
 #include "gdx_backend.h"
@@ -32,7 +33,21 @@ constexpr int kCallStack = 32;
 constexpr int kMaxTriBuffer = 256;
 constexpr unsigned kTexCacheSize = 1024;
 constexpr unsigned kTexCacheHash = 2048;
-constexpr uint32_t kTexUploadBytes = 256u * 1024u; /* decode scratch (plan deviation: LUS has 4 MiB) */
+/* Decode scratch. kTexUploadBytes is the INITIAL size (the historic fixed 256 KiB, a plan
+ * deviation: LUS has a flat 4 MiB). DROPSITES: it used to be a hard ceiling -- a texture whose
+ * decode needed more was skipped, and because ImportTexture marked the entry uploaded anyway,
+ * the cache id kept whatever the previous owner of that backend id had drawn. The scratch now
+ * grows on demand up to kTexUploadMaxBytes, which is the largest upload the PICA backend can
+ * accept at all (GfxRenderingAPIC3D::UploadTexture refuses padW/padH > 1024, so 1024*1024
+ * RGBA8 is the true ceiling). Above that no decode could ever have been displayed, so the
+ * import takes the neutral fallback instead of a stale sample. */
+constexpr uint32_t kTexUploadBytes = 256u * 1024u;
+constexpr uint32_t kTexUploadMaxBytes = 1024u * 1024u * 4u;
+/* The neutral fallback an undecodable import uploads in place of a stale sample: opaque white,
+ * 8x8 because 8 is the PICA minimum side (UploadTexture pads below it and the padding would
+ * otherwise be transparent black wherever the UVs ran past the single texel). */
+constexpr uint32_t kFallbackTexDim = 8u;
+constexpr uint32_t kFallbackTexBytes = kFallbackTexDim * kFallbackTexDim * 4u;
 
 /* N64 Light_t / lookat / point light, host-endian 16 bytes (LUS F3DLight union). */
 struct Light {
@@ -165,6 +180,14 @@ struct Rdp {
     uint16_t tmem_span_base[512];  /* 0 = none, else base + 1 */
     uint16_t tmem_span_words[512]; /* valid at a base */
     uint8_t tmem_span_load_kind[512];
+    /* [tmemblock] the SOURCE-STABILITY stamp of the last mirror written at this base:
+     * [0] gNativeRgba16Generation, [1] gDmaGeneration -- sampled BEFORE the copy -- and the
+     * source class they were sampled under. Read only at a base whose span is still live and
+     * whose descriptor still matches; every path that retires a span already zeroes
+     * tmem_span_words[base], which SameContentDescriptor tests before the stamp is consulted.
+     * 8.5 KiB on the one heap-allocated Interp (gdx_rt_glue.cpp:684). tmemblock-progress.md S2. */
+    uint64_t tmem_span_src_stamp[512][2];
+    uint8_t tmem_span_src_cls[512];
     uint16_t tmem_span_list[64];
     uint16_t tmem_span_list_n; /* 0xFFFF = invalid (rebuild) */
     alignas(8) uint8_t tmem[4096];
@@ -200,6 +223,7 @@ struct TexKey {
     uint16_t tile_width, tile_height;
     uint8_t cms, cmt, masks, maskt;
     uint32_t content_hash;
+    uint32_t palette_content_hash; /* [native] palhash; 0 when the lever is off or fmt is not CI */
 };
 
 struct TexEntry {
@@ -225,6 +249,9 @@ struct RenderState {
     uint8_t sampler_cmt[2];
 };
 
+/* Why an open batch was cut. One class per cause so the [ncensus] table ranks them:
+ * the five ex-FLUSH_CONST register classes are split apart because only some of them can
+ * ride per vertex (the prim/env fold), and lumping them hid that. */
 enum FlushReason : uint8_t {
     FLUSH_NONE = 0,
     FLUSH_SHADER,
@@ -234,15 +261,62 @@ enum FlushReason : uint8_t {
     FLUSH_VIEWPORT,
     FLUSH_SCISSOR,
     FLUSH_ALPHA,
-    FLUSH_CONST,
+    FLUSH_PRIM,      /* SETPRIMCOLOR value change (incl. prim_lod_fraction) */
+    FLUSH_ENV,       /* SETENVCOLOR value change */
+    FLUSH_FOGCOLOR,  /* SETFOGCOLOR value change */
+    FLUSH_BLENDA,    /* SETBLENDCOLOR alpha change ([native] blendflush) */
+    FLUSH_PRIMDEPTH, /* SETPRIMDEPTH value change */
     FLUSH_FBOP,
     FLUSH_FULL,
     FLUSH_TASK_END,
-    FLUSH_FOG,
+    FLUSH_FOG,      /* G_MW_FOG line change */
     FLUSH_COMBINER,
     FLUSH_SAMPLER,
     FLUSH_HOOK, /* a native replay hook (track/fx marker, machines G_DL) drained the batch */
     FLUSH_COUNT
+};
+
+/* [native] ncensus: batch-size buckets, by triangles in the drained batch. */
+enum { kBatchHistBuckets = 8 };
+
+/* [native] dspcensus: where a dispatched command's microseconds go. The walker is ITERATIVE
+ * (G_DL pushes a frame and returns), so Exec() never re-enters Walk and per-opcode time is
+ * SELF time by construction -- unlike LUS's [profop], whose 06 bucket is inclusive. The
+ * already-attributed [prof] child sections (vtx/tri/imp/drw/mtx) are subtracted so the census
+ * sums to `dsp`, the dispatch remainder, and not to the whole frame.
+ *   DSP_PH_FETCH     ReadCmd + the readable-bound test + the op/cmds bookkeeping + RemapF3d
+ *   DSP_PH_DLRESOLVE DlSrc::ResolveList inside G_DL (the bridge seam: segment epoch, source
+ *                    translation, KnownCommandLimit, LooksLikeDisplayList, list facts)
+ *   DSP_PH_DLHOOK    the registered machines G_DL hook -- **THIS IS NOT DISPATCH.** It is
+ *                    DrawMesh: the [native] machines feature doing real drawing work, billed
+ *                    to G_DL because the hook is called from the G_DL handler. Its own [prof]
+ *                    child sections are subtracted from DE's SELF time but NOT from this
+ *                    bucket, so it is inclusive where every other phase here is self, and it
+ *                    tracks machine count (16 us/call in the thinnest window, 94 us/call in a
+ *                    30-machine storm). The dispatch part of G_DL is DLRESOLVE. Anyone reading
+ *                    this census for a dispatch win must skip this line -- dispatch-progress.md
+ *                    and loadblock-progress.md both say so, and it is still the biggest number
+ *                    in the G_DL row.
+ *   DSP_PH_DLPUSH    call-stack push / tail-call bookkeeping
+ * Loop overhead is `dsp` minus the sum; it is not a bucket. */
+enum DspPhase {
+    DSP_PH_FETCH = 0,
+    DSP_PH_DLRESOLVE,
+    DSP_PH_DLHOOK,
+    DSP_PH_DLPUSH,
+    /* F3 (G_LOADBLOCK), the census's #1: the per-load source classification and the mirror.
+     *   DSP_PH_TIMGRES   DlSrc::ResolveTimg (the bridge's SETTIMG resolution)
+     *   DSP_PH_TIMGCLASS TexelsAreNativeRgba16 + TimgIsResource -- the native-RGBA16 range
+     *                    scan and the o2r asset lookup, re-run on EVERY load
+     *   DSP_PH_TMEMSAME  the same-content skip test
+     *   DSP_PH_TMEMCOPY  MirrorToTmem
+     *   DSP_PH_TMEMSTORE StoreLoadedTexture + NoteTmemLoadKind (the span store) */
+    DSP_PH_TIMGRES,
+    DSP_PH_TIMGCLASS,
+    DSP_PH_TMEMSAME,
+    DSP_PH_TMEMCOPY,
+    DSP_PH_TMEMSTORE,
+    DSP_PH_COUNT
 };
 
 /* GfxSpTri1's resolved draw state: what SpTri's state block leaves behind after binding the
@@ -273,7 +347,16 @@ struct Counters {
     uint32_t vtx;
     uint32_t batches;
     uint32_t packRefused;
+    uint32_t packSplit; /* GEOMLOSS: begins capped below kMaxTriBuffer by pool pressure */
     uint32_t flush[FLUSH_COUNT];
+    /* --- [native] ncensus (inert when the lever is off) --- */
+    uint32_t flushDrain[FLUSH_COUNT]; /* the subset of flush[] that actually drained tris */
+    uint64_t flushTicks[FLUSH_COUNT]; /* svcGetSystemTick spent inside those drains */
+    uint32_t batchHist[kBatchHistBuckets];
+    uint32_t batchTris;               /* sum of tris over drained batches */
+    uint32_t maxBatchesPerTask;
+    uint32_t foldable[2];             /* prim / env splits the const-input rule would absorb */
+    uint32_t folded[2];               /* prim / env splits actually absorbed ([native] ownfold) */
     uint32_t unknownOps;
     uint32_t droppedOps;
     uint32_t stackOverflow;
@@ -283,9 +366,50 @@ struct Counters {
     uint32_t tasks;
     uint32_t rootRejects;
     uint32_t texImports, texHits, texMisses, texEvicts, texDecodeOverflow;
+    uint32_t texClears, texInvalidates, texInvalidated;
+    /* --- DROPSITES: the texture-cache silent-loss site (gdx_texcache.cpp UploadPrepare). --- */
+    uint32_t texDecodeGrow;     /* scratch reallocations (a texture that used to be skipped) */
+    uint32_t texNoUpload;       /* imports that reached the end of the decode switch with no upload */
+    uint32_t texFallback;       /* neutral fallback uploads issued in place of a stale sample */
+    /* --- DROPSITES: G_VTX past kMaxVertices (gdx_rsp.cpp SpVertex). --- */
+    uint32_t vtxOver;           /* G_VTX loads whose [dest, dest+n) left the 64-slot window */
+    uint32_t vtxOverDropped;    /* vertices those loads did NOT transform */
+    /* --- DROPSITES: clip-polygon truncation (gdx_tri.cpp SpTri). --- */
+    uint32_t clipTrunc;         /* Sutherland-Hodgman planes that hit the 16-vertex output cap */
     uint32_t tmemLoads, tmemSkips, timgUnresolved;
+    /* [native] tmemskip receipt. `tmemDescSame` counts loads whose whole descriptor matched the
+       live span (everything SameContentLoad tests EXCEPT the immutable gate) -- i.e. the loads a
+       staleness test is even allowed to look at. `tmemStale` are those the test then rejected,
+       `tmemSkipImm`/`tmemSkipGen` split the skips by which gate fired, and tmemClsN/S/D/U count
+       every load by source class so the class the win actually rides on is visible rather than
+       assumed. All inert with the lever off except tmemDescSame/tmemCls*, which the census arms. */
+    uint32_t tmemDescSame, tmemStale, tmemSkipImm, tmemSkipGen;
+    uint32_t tmemClsN, tmemClsS, tmemClsD, tmemClsU;
+    /* WHY the descriptor did not match, first failing test wins. This is the column that says
+       whether a staleness test can ever pay: the gate is per TMEM BASE against the load that
+       last wrote it, not per texture, so if the game cycles several textures through one base
+       inside a task the descriptor never matches and no staleness term can help.
+         span   no live span starts at this base (retired by an overlapping load, or never set)
+         kind   a span is there, written by the OTHER load kind (LOADBLOCK vs LOADTILE)
+         words  a span is there, of a different length
+         addr   same span, same length -- a DIFFERENT SOURCE POINTER, i.e. another texture
+         other  same pointer, some other descriptor field moved (sizes, strides, swap, o2r) */
+    uint32_t tmemMissSpan, tmemMissKind, tmemMissWords, tmemMissAddr, tmemMissOther;
+    uint32_t timgMemoHit, timgMemoMiss, timgMemoInert; /* [native] timgmemo receipt */
+    /* Miss BREAKDOWN -- which part of the key failed. A memo that misses is useless in three
+       different ways and they have three different fixes, so the receipt says which:
+         Empty  the slot was never filled (cold, or thrashed by collisions)
+         Epoch  the key matched and the freshness term did not  -> invalidation churn
+         Key    the slot held a different operand                -> collision or genuine variety */
+    uint32_t timgMemoMissEmpty, timgMemoMissEpoch, timgMemoMissKey;
+    uint32_t timgEpochChanges; /* times the class epoch differed from the previous load's */
     uint32_t rects;
     uint32_t vtxUnresolved, mtxUnresolved;
+    /* --- [native] dspcensus (inert when the lever is off) --- */
+    uint64_t opTicks[256];              /* per-opcode SELF ticks, [prof] child sections removed */
+    uint64_t phTicks[DSP_PH_COUNT];     /* walk-phase ticks */
+    uint32_t phCalls[DSP_PH_COUNT];
+    uint64_t walkTicks;                 /* the whole Walk(), for the unattributed remainder */
 };
 
 /* RAII [prof] section; one int test when tracing is off. */
@@ -368,6 +492,108 @@ class Interp {
     /* [nverify] end-of-task state words, same layout as gdx_gfx_lus_state. */
     unsigned StateSnapshot(uint32_t* out, unsigned cap) const;
 
+    /* --- texture-cache invalidation (gdx_texcache.cpp) ---
+     * The owned cache is a second cache beside the LUS one, so the queued requests the game
+     * raises (gdx_rdram_mode_reset's arena-rewind clear, minimap.c's per-race address
+     * invalidate) must reach it too. Render thread only, like every other cache mutation. */
+    void TexCacheClear();
+    void TexCacheDeleteAddress(const uint8_t* addr);
+
+    /* [native] texhash_ci: fold the decoded source span (and, for CI, the live palette bytes)
+     * into the key for the CI/RGBA32 classes. 0 restores the identity-only key. */
+    void SetCiContentHash(bool on) {
+        mHashCiRgba32 = on;
+    }
+
+    /* Forcing knobs for DROPSITE 1, geomloss's vbopoolkib for this site. Both default to 0 =
+     * shipped behaviour.
+     *   [debug] texscratchkib=N    -- start the decode scratch at N KiB instead of 256, so an
+     *                                 ordinary texture exercises the GROWTH path.
+     *   [debug] texscratchmaxkib=N -- cap the growth ceiling at N KiB, so an ordinary texture
+     *                                 exercises the OVERFLOW + neutral-fallback path. Setting
+     *                                 both to the same N reproduces a pre-fix hard-ceiling
+     *                                 scratch of exactly that size (256 = the shipped pre-fix). */
+    void SetTexScratchKib(uint32_t startKib, uint32_t maxKib) {
+        SetTexScratchBytes(startKib * 1024u, maxKib * 1024u);
+    }
+    /* The same knob in bytes, so the host tests can straddle an 8x8 decode (256 B) without
+     * building a megabyte display list. */
+    void SetTexScratchBytes(uint32_t startBytes, uint32_t maxBytes) {
+        mTexUploadMax = maxBytes;
+        if (startBytes == 0) {
+            return;
+        }
+        const uint32_t want = startBytes;
+        if (want == mTexUploadCap) {
+            return;
+        }
+        uint8_t* p = new (std::nothrow) uint8_t[want];
+        if (p == nullptr) {
+            return;
+        }
+        delete[] mTexUpload;
+        mTexUpload = p;
+        mTexUploadCap = want;
+    }
+    /* [debug] vtxmax -- shrink the effective G_VTX window below kMaxVertices. Test knob only;
+     * the storage is unchanged, so nothing can overrun. 0 = shipped (kMaxVertices). */
+    void SetVtxSoftCap(uint32_t n) {
+        mVtxSoftCap = (n == 0 || n > static_cast<uint32_t>(kMaxVertices)) ? static_cast<uint32_t>(kMaxVertices) : n;
+    }
+    /* [native] vtxclamp -- 0 restores the pre-fix behaviour: an over-range G_VTX loads nothing
+     * at all. A/B only. */
+    void SetVtxClamp(bool on) {
+        mVtxClamp = on;
+    }
+    /* [debug] clippolymax -- shrink the clip-polygon cap below 16 to force the truncation arm.
+     * 0 = shipped. Never raised above 16: that is the buffer's real size. */
+    void SetClipPolyMax(uint32_t n) {
+        mClipPolyMax = (n < 3u || n > 16u) ? 16u : n;
+    }
+    /* [native] texstalefix -- 0 restores the pre-fix behaviour: an import that uploaded nothing
+     * is still marked uploaded, so the id keeps the previous texture's pixels. A/B only. */
+    void SetTexStaleFix(bool on) {
+        mTexStaleFix = on;
+    }
+
+    /* DROPSITES: session totals for the drop counters, which the windowed `Counters` cannot
+     * carry. Measured: a forced growth run put `texgrow>0` in 2 of 91 receipt windows -- a
+     * per-window counter that reads 0 in the other 89 is how `texDecodeOverflow` stayed
+     * invisible in the first place, so every drop also gets a number that never resets. */
+    struct SessionDrops {
+        uint32_t texOvf, texGrow, texNoUp, texFb, vtxOver, vtxDropped, clipTrunc;
+    };
+    SessionDrops Drops() const {
+        SessionDrops d = mSesDrops;
+        d.texOvf += mStats.texDecodeOverflow;
+        d.texGrow += mStats.texDecodeGrow;
+        d.texNoUp += mStats.texNoUpload;
+        d.texFb += mStats.texFallback;
+        d.vtxOver += mStats.vtxOver;
+        d.vtxDropped += mStats.vtxOverDropped;
+        d.clipTrunc += mStats.clipTrunc;
+        return d;
+    }
+
+    uint32_t TexDecodeHwBytes() const {
+        return mTexDecodeHwBytes;
+    }
+    uint32_t ClipPolyHw() const {
+        return mClipPolyHw;
+    }
+    uint32_t VtxHwEnd() const {
+        return mVtxHwEnd;
+    }
+    uint32_t TexScratchCap() const {
+        return mTexUploadCap;
+    }
+    unsigned TexLive() const {
+        return mTexCount;
+    }
+    unsigned TexLiveHw() const {
+        return mTexCountHw;
+    }
+
     /* Public for the emission helpers in gdx_tri.cpp. */
     void Flush(FlushReason why);
     LoadedTexture LoadedTexAt(uint16_t word) const;
@@ -380,6 +606,7 @@ class Interp {
 
     void SpReset();
     void Walk(const ListRef& root);
+    void WalkCensus(); /* [native] dspcensus: Walk with the per-opcode/per-phase clocks */
     bool RemapF3d(Cmd& c, const ListRef& list, size_t* f3dXferSize);
     int Exec(const Cmd& c, Frame& f, size_t f3dXferSize);
     bool PushList(const ListRef& list);
@@ -422,7 +649,19 @@ class Interp {
     bool ResolveTextureSource(size_t requiredBytes);
     void StoreLoadedTexture(uint16_t start, const LoadedTexture& t);
     void NoteTmemLoadKind(uint16_t base, uint8_t kind, uint32_t writeEndByte);
+    /* Everything SameContentLoad tests EXCEPT the source bytes: the live span's geometry and the
+       full LoadedTexture descriptor. Split out so the immutable gate and the [native] tmemskip
+       staleness gate are two different answers to "are the SOURCE BYTES the same", asked over
+       one shared, unchanged definition of "is everything else the same". */
+    bool SameContentDescriptor(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const;
     bool SameContentLoad(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const;
+    /* [native] tmemskip: decide the load, stamp it, and keep the receipt. Returns true when the
+       mirror + span store can be skipped outright; otherwise fills `outStamp`/`outCls` with the
+       stamp to record once the mirror has been written. */
+    bool TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTexture& fresh, uint32_t readBytes,
+                             uint64_t outStamp[2], unsigned* outCls);
+    void RecordTmemSrcStamp(uint16_t base, const uint64_t stamp[2], unsigned cls);
+    void NoteDescriptorMiss(uint16_t base, uint8_t kind, const LoadedTexture& fresh);
     void MirrorToTmem(uint8_t* dst, const uint8_t* src, uint32_t n, bool nativeRgba16);
     void ArmTexturesChanged();
 
@@ -439,10 +678,17 @@ class Interp {
     void DecodeCi4(int tile, const LoadedTexture& lt);
     void DecodeCi8(int tile, const LoadedTexture& lt);
     bool UploadPrepare(uint32_t w, uint32_t h);
+    void UploadNeutralFallback(int unit);
     void Upload(uint32_t w, uint32_t h);
+    void TexCacheRetireSlot(int16_t slot);
 
     /* --- gdx_tri.cpp --- */
     void* LookupOrCreateShader(uint64_t id0, uint64_t id1);
+    /* True when a VALUE change of prim (env) colour can ride per vertex in the OPEN packed
+     * batch, i.e. no TexEnv stage constant of its shader reads that register. Mirrors the LUS
+     * GdxHudRegFoldable ([native] fx_hud) over the same backend contract. */
+    bool RegFoldable(bool isPrim) const;
+    void NoteRegChange(bool isPrim, FlushReason why);
 
     /* --- gdx_rect.cpp --- */
     void DpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry);
@@ -462,6 +708,11 @@ class Interp {
     GdxFrameConfig mCfg;
     int mVariant = 0;
     bool mLineSection = false;
+    /* [nverify] latched once per task in RunFrame (the glue arms/disarms verify immediately
+     * around that call). The per-command and per-triangle diagnostics in gdx_dl.cpp /
+     * gdx_tri.cpp are gated on this bool, so they cost one predictable branch when
+     * [native] interp_verify=0. Audit 2026-09-23 finding 31. */
+    bool mVerifyActive = false;
 
     ListRef mBranchZTarget;
     bool mBranchZValid = false;
@@ -477,12 +728,30 @@ class Interp {
     unsigned mTexCount = 0;
     uint32_t mTexFreeIds[kTexCacheSize];
     unsigned mTexFreeIdCount = 0;
+    bool mHashCiRgba32 = true;
     uint8_t* mTexUpload = nullptr;
+    uint32_t mTexUploadCap = 0;   /* bytes mTexUpload can currently hold */
+    uint32_t mTexUploadMax = 0;   /* [debug] texscratchmaxkib; 0 = kTexUploadMaxBytes */
+    bool mUploadDone = false;     /* did this import actually reach Upload()? */
+    uint8_t mFallbackTexels[kFallbackTexBytes]; /* opaque white, DROPSITE 1's neutral upload */
+    uint8_t mDropsiteTexLogged = 0;  /* one-shot DROPSITE line for the decode ceiling */
+    uint8_t mDropsiteVtxLogged = 0;  /* one-shot DROPSITE line for an over-range G_VTX */
+    uint8_t mDropsiteClipLogged = 0; /* one-shot DROPSITE line for a truncated clip polygon */
+    uint8_t mDropsiteStaleLogged = 0;/* one-shot DROPSITE line for an import that uploaded nothing */
+    /* Session high-water marks -- deliberately NOT in Counters, which ResetStats() clears every
+     * receipt window. A drop site's margin is only meaningful over the whole run. */
+    uint32_t mTexDecodeHwBytes = 0; /* largest decode the run ever asked the scratch for */
+    uint32_t mClipPolyHw = 0;       /* largest clip-polygon vertex count the run ever produced */
+    uint32_t mVtxHwEnd = 0;         /* largest dest_index + n_vertices a G_VTX ever asked for */
 
     /* Batch emission state ([triloop] packed VBO). */
     size_t mBufNumTris = 0;
     float* mPackDst = nullptr;
     bool mPackBatch = false;
+    /* GEOMLOSS: triangles this batch may hold before it must be flushed. kMaxTriBuffer in
+     * the normal case; lower when the backend's pool cannot hold a whole batch, which is
+     * where the old code returned early and lost the geometry outright. */
+    size_t mPackCapTris = static_cast<size_t>(kMaxTriBuffer);
     Gdx3dsVboPackParams mPackParams;
     Gdx3dsVboPackAux mPackAux;
     uint32_t mClipFanDepth = 0;
@@ -493,6 +762,73 @@ class Interp {
     /* The tri memo: valid from a resolved state until the batch it belongs to is flushed. */
     DrawState mTriMemo;
     bool mTriMemoValid = false;
+    /* The combiner the OPEN packed batch was begun under: the fold key (== LUS sGdxPackComb). */
+    const Combiner* mPackComb = nullptr;
+    /* A batch that absorbed a prim/env fold must not take the [trectbatch] deferred import
+     * (== LUS sGdxPackFolded); see fx-progress.md "Frame 1418". */
+    bool mPackFolded = false;
+    int mCensus = 0;  /* [native] ncensus */
+    int mOwnFold = 0; /* [native] ownfold */
+    int mDspCensus = 0; /* [native] dspcensus: 0 off, 1 per-opcode self time, 2 + walk phases */
+    uint32_t mVtxSoftCap = static_cast<uint32_t>(kMaxVertices); /* [debug] vtxmax */
+    bool mVtxClamp = true;                                      /* [native] vtxclamp */
+    bool mTexStaleFix = true;                                   /* [native] texstalefix */
+    uint32_t mClipPolyMax = 16;                                 /* [debug] clippolymax */
+    unsigned mTexCountHw = 0;                                   /* B23: LRU occupancy high-water */
+    SessionDrops mSesDrops = {};                                /* never reset by ResetStats */
+    int mTimgMemo = 0;  /* [native] timgmemo: cross-frame SETTIMG classification memo (B4/F3) */
+    uint32_t mTimgEpochLast = 0; /* [native] timgmemo receipt: epoch-churn detector */
+    /* [native] tmemskip -- widen the same-content skip past the o2r resource class, using the
+     * generation/DMA staleness test the bridge already runs (gdx_dlsrc_bridge.h). 0 off,
+     * 1 the two classes that are stable WITHOUT a compare (native-RGBA16 by generation, and
+     * registered ROM-backed host ranges), 2 additionally the DMA-tracked class (RDRAM and
+     * framebuffer shadows), whose generation does NOT see a plain CPU store into RDRAM.
+     * Default 0. The invalidation argument is docs/research/native/tmemblock-progress.md S2. */
+    int mTmemSkip = 0;
+    int mTmemCls = 0; /* [native] tmemcls: class census only; changes no behaviour */
+    uint32_t mBatchesAtTaskStart = 0;
+
+    /* [native] timgmemo -- the cross-frame SETTIMG classification memo.
+     *
+     * WHAT: ResolveTextureSource derives three answers per G_LOADBLOCK/LOADTILE/LOADTLUT --
+     * the resolved pointer, TexelsAreNativeRgba16 (a linear scan of gNativeRgba16Ranges) and
+     * TimgIsResource (a binary search of the generated asset table) -- for a SETTIMG operand
+     * that usually did not change since the last frame. dispatch-progress.md measured that at
+     * timgres 1.43 + timgclass 0.93 = 2.36 ms/task, the largest removable block in the census.
+     *
+     * WHY IT IS AN Interp MEMBER, not a process-wide table next to the bridge's gResolveMemo:
+     * the owned interpreter is walked by ONE thread (sInterp is constructed once in
+     * gdx_ninterp_job_run and only ever entered from there), so this memo is single-owner BY
+     * CONSTRUCTION. That is the same conclusion resolverace reached for the bridge's memo
+     * family the expensive way -- and it means this table needs no GdxMemoOwnedHere() latch,
+     * no release/acquire pair, and cannot be the seventh member of that bug class.
+     *
+     * KEY: (resolved pointer, w1, w1hi, requiredBytes) + the bridge's classEpoch. The resolved
+     * pointer is an INPUT here, not a cached output -- the memo covers the classification only,
+     * and ResolveTimg still runs. That is what makes the key honest AND cross-frame: given p,
+     * both classifications are pure functions of the key plus exactly two counted tables
+     * (gNativeRgba16Generation and the venue base) and read no segment state at all.
+     *
+     * Memoising the POINTER too was tried first and measured: it has to be keyed on the
+     * adapter's mSegGen, and mSegGen folds gSegments[1], the double-buffered GfxPool the game
+     * rewrites every frame, so the epoch turned over once per task and the hit rate was 3.7 %
+     * (hit=256 miss=6592 per 64-task window). The bridge's own gWideStubMemo has the same key
+     * and the same result -- 0 hits, 6592 misses. See loadblock-progress.md S2.
+     *
+     * Direct-mapped, no eviction policy: a collision is a miss, which is correct, just slower.
+     * ~128 distinct operands per crowd task against 256 slots. */
+    struct TimgClassEntry {
+        uint32_t w1;
+        uint32_t w1hi;
+        uint32_t required;
+        uint32_t epoch;
+        uintptr_t addr;
+        uint8_t native_rgba16;
+        uint8_t immutable;
+        uint8_t filled;
+    };
+    static constexpr unsigned kTimgMemoSlots = 256; /* power of two: the index is a mask */
+    TimgClassEntry mTimgClassMemo[kTimgMemoSlots];
 
     DlHook mDlHook = nullptr;
     void* mDlHookUser = nullptr;
