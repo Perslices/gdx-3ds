@@ -120,8 +120,17 @@ heap_watch = 8     ; MB above the 60 s heap baseline that triggers a [heap-watch
 heap_watch_step = 4 ; MB between further triggers
 heap_watch_arm = 0 ; 1 = first trigger also arms the live allocation histogram
                    ;     (for long stress sessions; costs a little per frame once armed)
+pads = 1           ; DEV ONLY. Number of controller ports to report (1-4). The 3DS has one
+                   ;     pad, so 2-4 spoof the extra ports and mirror port 1 into them
+                   ;     (mirroring happens in port/input_bridge.c, after the scripted-input
+                   ;     injector, so a .gdxrec replay drives all of them). It exists because
+                   ;     the decomp gates VS Battle on the port count, which makes the
+                   ;     split-screen render paths unreachable — and untestable — with one
+                   ;     pad. 1 is the hardware behaviour, byte for byte. Receipt: [input] pads=
 
 [native]           ; the native renderer levers (read once at boot; 0 = the exact prior path)
+                   ; full reference, including the compatibility and census keys not listed
+                   ; here: docs/NATIVE-RENDERER.md §2
 all = 0            ; master for the TIER-2 levers only (machines, track, fx_sink, fx_sprites,
                    ;     fx_hud): 1 = each of those that is 0/absent reads as 1 (a lever set to
                    ;     2 keeps verify). Never touches interp.
@@ -145,6 +154,12 @@ cpuclip = 1        ; the owned interpreter clips triangles on the CPU the way LU
                    ;     0 = let the PICA clip (fewer draws, different pixels — the tunnel A/B)
 blendflush = 1     ; the owned interpreter flushes its batch before a blend-alpha change, so
                    ;     alpha compare uses the register in force at the primitive (LUS parity)
+texinval = 1       ; the owned interpreter honours the queued texture-cache invalidations
+                   ;     (gdx_rdram_mode_reset's arena-rewind clear, minimap.c's per-race
+                   ;     address delete). 0 = the pre-fix behaviour: they never reach it
+texhash_ci = 1     ; content-key the CI4/CI8/RGBA32 classes (decoded source span + the live
+                   ;     TLUT bytes). 0 = key them by address alone, so a recycled address
+                   ;     serves the previous course's decode
 machines_walk_only = 0 ; 1 = replay the baked mesh back through the interpreter's own
                    ;     vertex/triangle path. A stepping stone, kept as a bisect
 machines_verify = 0    ; 1 = per draw, walk pass drawn+captured vs native pass captured with
