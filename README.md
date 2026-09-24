@@ -84,7 +84,8 @@ The full story of the port — every step from research to a native-60 stereosco
 | `tools/prebake/` | Converts *your* ROM into the archives the console reads; `tools/ci-3ds.sh` applies the patches and builds |
 | `docs/3DS-HARDWARE.md` | Toolchain, SD layout, install, troubleshooting |
 | `docs/research/` | Working notes, briefs, measurements and verdicts written during development |
-| `docs/research/native/` | The native-renderer fork's plans, per-track progress docs and verification runs (`STATUS.md` is the one-page summary) |
+| `docs/NATIVE-RENDERER.md` | The native renderer: the two tiers, every `[native]` ini key, and how each lever is verified |
+| `docs/NATIVE-RELEASE-NOTES.md` | Beta release notes — what is measured, and what has not been run |
 | `docs/postmortem/` | The post-mortem site and its generator |
 
 ---
@@ -112,118 +113,96 @@ The full story of the port — every step from research to a native-60 stereosco
 
 ## Native renderer (beta)
 
-> **This branch (`native`) is a beta.** Every lever below defaults to `0`, which is the
-> byte-for-byte prior renderer. Nothing here is on unless you turn it on, and nothing here
-> has been proven on hardware yet — read "Hardware status" before you trust a frame.
+> **This branch (`native`) is a beta.** Every feature lever below defaults to `0`, which is the
+> byte-for-byte prior renderer. With no `[native]` section in your ini, a build from this branch
+> behaves exactly like a build from `main`.
+
+Full reference: **[`docs/NATIVE-RENDERER.md`](docs/NATIVE-RENDERER.md)** (what it is, every ini
+key, how each lever is verified). Release notes, including an explicit list of what has *not*
+been run: **[`docs/NATIVE-RELEASE-NOTES.md`](docs/NATIVE-RELEASE-NOTES.md)**.
 
 ### What it is
 
 Everything the stable build draws goes through libultraship's Fast3D interpreter
-(`interpreter.cpp`), fed by a bridge whose only job is to widen the game's 32-bit `Gfx`
-words into the 64-bit words that interpreter wants. Every triangle in F-Zero X is
-transformed and lit on the ARM11 CPU, one display-list command at a time.
+(`interpreter.cpp`), fed by a bridge whose only job is to widen the game's 32-bit `Gfx` words
+into the 64-bit words that interpreter wants. Every triangle in F-Zero X is transformed and lit
+on the ARM11 CPU, one display-list command at a time.
 
-The native renderer replaces that, piece by piece, with code that writes PICA200 vertex
-buffers directly — and keeps the old path alive beside it. It is a **hybrid** renderer by
-design, not a rewrite: the menus, the course editor, the ending and the long tail of
-one-off screens stay on an interpreter.
+The native renderer replaces that, piece by piece, with code that writes PICA200 vertex buffers
+directly — and keeps the old path alive beside it. It is a **hybrid** renderer by design, not a
+rewrite: the menus, the course editor, the ending and the long tail of one-off screens stay on an
+interpreter.
 
 Two tiers, which combine:
 
 - **Tier 1 — own the interpreter** (`interp`). A purpose-built F3DEX2→citro3d walker
-  (`port/3ds/gfx/n64/`) replaces libultraship's interpreter *and* the widening bridge.
-  Same pixels, no conversion pre-pass.
-- **Tier 2 — bypass the interpreter for the three things a race spends its frame on.**
-  `track` replays the course tessellator's vertex stream straight into a VBO; `machines`
-  draws the 30 racer meshes from baked, retained display lists; `fx_sink` / `fx_sprites` /
-  `fx_hud` batch the effect sprites and the HUD.
+  (`port/3ds/gfx/n64/`) replaces libultraship's interpreter *and* the widening bridge. Same
+  pixels, no conversion pre-pass.
+- **Tier 2 — bypass the interpreter for the three things a race spends its frame on.** `track`
+  replays the course tessellator's vertex stream straight into a VBO; `machines` draws the 30
+  racer meshes from baked, retained display lists; `fx_sink` / `fx_sprites` / `fx_hud` /
+  `ownfold` batch the effect sprites and the HUD.
 
-Each lever has a verify mode that draws the stock path and compares the native path's
-packed vertex bytes against it in-process, bit for bit, and each prints a boot receipt.
+Every lever has a verify mode that draws the stock path and compares the native path's packed
+vertex bytes against it in-process, bit for bit, and every lever prints a boot receipt.
 
-**Measured effect (emulator, relative):** the five Tier-2 levers together are +10.6 % in
-the 30-car window; the whole stack is 1.85× on the emulator's crowd frame. Emulator
-milliseconds are relative only — see below.
+### What it buys, on hardware
 
-### `[native]` ini keys
+New 3DS, canonical Mute City replay, render thread on, input pinned:
 
-In `sdmc:/3ds/gdiffuser/gdiffuser.ini`, section `[native]`, **read once at boot** (changing
-one needs a restart). Every default is the prior behaviour. Full descriptions in
-`docs/3DS-HARDWARE.md` §5.
+| | `all=0 interp=0` | `all=1 interp=0` | `all=1 interp=1` |
+|---|---|---|---|
+| total CPU ms/frame | 23.81 | 22.73 (−4.5%) | **18.98 (−20.3%)** |
+| …in the 30-car crowd bucket | 34.54 | 30.63 (−11.3%) | **27.35 (−20.8%)** |
+| in-race fps, mean | 34.4 | 35.4 | **36.3** |
+| in-race fps, minimum | 18.4 | 21.4 | 21.0 |
 
-| key | default | what it does |
-|---|---|---|
-| `all` | `0` | Master for the **Tier-2 levers only** (`machines`, `track`, `fx_sink`, `fx_sprites`, `fx_hud`): `1` = each of those that is 0-or-absent reads as 1; an explicit `2` (verify) is kept. Never touches `interp`. |
-| `interp` | `0` | `1` = the owned F3DEX2→citro3d interpreter draws the frame instead of LUS Fast3D + the bridge. Always explicit — `all` does not imply it. Carries the Tier-2 hooks, so it combines with any lever below. |
-| `interp_verify` | `0` | `1` = run BOTH interpreters over every job and compare the packed batches field by field (`[nverify]`). Slow; a correctness tool. |
-| `cpuclip` | `1` | The owned interpreter clips triangles on the CPU the way LUS does. `0` = let the PICA clip (fewer draws, different pixels). |
-| `blendflush` | `1` | The owned interpreter flushes its batch before a blend-alpha change, so alpha compare uses the register in force at the primitive (LUS parity). |
-| `machines` | `0` | `1` = the 30 racer meshes draw from baked retained lists (150 lists = 30 slots × 5 LODs), one indexed draw per material run. |
-| `machines_walk_only` | `0` | `1` = replay the baked mesh back through the interpreter's own vertex/triangle path. A bisect step. |
-| `machines_verify` | `0` | `1` = per draw, compare the walk pass and the native pass triangle streams bit-exact. |
-| `machines_mask` | `ffffffff` | Hex per-slot mask (bit *i* = machine slot *i*, 30 slots) — bisect which machine breaks. |
-| `machines_lod_mask` | `1f` | Hex per-LOD mask (bit *l* = LOD *l*+1). |
-| `track` | `0` | `1` = the course tessellator's vertex loads and index templates are recorded and replayed into a native batch, one draw per material run. `2` = verify. |
-| `trkcensus` | `0` | `1` = `[trk]` per-frame census. **Set this with `track=2`** — without it a verify run prints no coverage totals and a clean-looking pass proves nothing. |
-| `fx_sink` | `0` | `1` = the six effect sprite ring classes (debris, sparks, smoke, explosions, force field, fall explosions) are recorded at the game-side macro and replayed as native per-class batches. `2` = verify. |
-| `fx_sprites` | `0` | With `fx_sink`: fold prim/env colour changes into the vertex colour where the backend carries that input per vertex, so a colour change stops splitting the draw. |
-| `fx_hud` | `0` | The same fold rule inside the interpreter's own 2D batches — HUD digits, stars, markers stop splitting on every prim colour. Inert (pixel-neutral, no gain) under `interp=1`. |
-| `fxcensus` | `0` | `1` = `[fx]` per-class census. **Set this with `fx_sink=2`**, same reason as `trkcensus`. |
+**Read the ratios, not the budget**: the profiling pass runs with GPU tracing on, which inflates
+every millisecond, so the columns are comparable to each other but 23.81 ms is not this game's
+frame budget. The per-bucket row is there because it controls for scene complexity — the −20%
+is not an artefact of which frames got sampled. `n=1` per configuration on that pass.
 
-A boot receipt names every resolved value once:
+The mean frame rate moves ~6%; the **floor** moves more, which on a handheld is the part you
+feel. Full tables, conditions and cross-checks in
+[`docs/NATIVE-RELEASE-NOTES.md`](docs/NATIVE-RELEASE-NOTES.md).
 
-```
-[native] all= interp= machines= track= fx_sink= fx_sprites= fx_hud= fx=<bitmask> census trk= fx=
-         (resolved: all=tier2 only, interp explicit; ini latched at boot)
-[native] interp= path=lus|owned cpuclip= blendflush= verify= hooks=
-```
+### Turning it on
 
-The DBG tab shows the same state on its `NATIVE` and `NATIVE FX` rows. If a lever you set
-is missing from that line, the ini was not read — check the path and the section name.
-
-To try the whole thing:
+In `sdmc:/3ds/gdiffuser/gdiffuser.ini`, read **once at boot** (changing a key needs a restart):
 
 ```ini
 [native]
-all = 1
-interp = 1
+all = 1      ; the Tier-2 levers: track, machines, effects, HUD
+interp = 1   ; the owned interpreter (always explicit; `all` does not imply it)
 ```
 
-### Hardware status — read this
+Every key, with its default and what it does, is in
+[`docs/NATIVE-RENDERER.md`](docs/NATIVE-RENDERER.md) §2 and in `docs/3DS-HARDWARE.md` §5. If a
+lever you set is missing from the `[native]` receipt line in the log or on the DBG tab, the ini
+was not read.
 
-Being honest about what has and has not been proven:
+### What is still unproven — read this
+
+Being blunt, because a beta that oversells itself is worse than one that ships later:
 
 | thing | status |
 |---|---|
-| The base port (the `main` branch): 60 fps, audio, stereo, APT sleep/HOME/power-off, flat heap | **hardware-verified** — median 51 / p95 60 / max 60 fps over multiple sessions |
-| `track`, `machines`, `fx_sink`, `fx_sprites`, `fx_hud`, and all five together | **emulator-verified**: pixel-identical to all-off over 6002 frames on two builds, three verify modes clean, +10.6 % in the 30-car window |
-| `interp` alone | **emulator-verified**: pixel-identical to all-off over 4101 frames (title → menus → race), per-batch differential 0 mismatches over 13,440 tasks, 50-minute soak |
-| `interp` together with the Tier-2 levers | **emulator-verified**: `interp=1 all=1` vs `interp=0 all=1` pixel-identical over the canonical replay; the three verify modes report zero mismatches with nonzero coverage |
-| Any native lever **on real hardware** | **two sessions so far** (Tier-2 alone, then the full stack), both 0 errors. Not a verdict yet: no A/B frame-time numbers, and the open items below are from those runs. |
-| Stereo (3D slider) interacting with any native lever | **unverified anywhere** — the emulator never activates the right-eye pass, so the `[c3d] … anchor=` receipt has never been seen with a lever on |
-| `cpuclip=0` on a course with a tunnel | **unverified** — no committed replay has a tunnel |
-| Every millisecond in every progress doc | **emulator, relative**. Hardware is the only truth for frame time. |
+| The base port (the `main` branch): 60 fps, audio, stereo, sleep/HOME/power-off, flat heap | **hardware-verified** over multiple sessions |
+| `all=1 interp=1` frame time and frame rate, New 3DS | **measured on hardware**, the tables above — one profiling pass per configuration |
+| Pixel parity of every lever, alone and together | **emulator**: zero divergent frames across the whole replay corpus, in-process verify modes clean with non-zero coverage |
+| Stereo 3D with the native levers | **emulator**: both eyes, zero divergent frames, identical anchor receipts. The optics have not been judged by eye on a console |
+| The crash under `all=1 interp=1` | **consistent with fixed, not confirmed.** Ten clean races on hardware, two of them under the crash lever set — but not the Grand Prix second race that produced the original dump |
+| The reported "distance wobble / pop-in" | **open.** The native stack is exonerated (181 consecutive in-race frames byte-identical to stock); the deciding experiment needs a console and has not been run |
+| 30-minute soak, and HOME / sleep / lid-close under the native levers | **not run** |
+| Old 3DS / 2DS | **not started.** Every number here is a New 3DS |
 
-**Open items** (tracked in `docs/research/native/NEXT.md`):
-
-1. A HOME-menu hang seen after one hardware session; the step is being narrowed with an
-   `[apt]` trace.
-2. A reported "distant wobble / more pop-in" on hardware, not reproduced in the emulator;
-   being A/B'd lever by lever, with the dynamic-LOD hysteresis as the leading suspect.
-3. Stereo, the tunnel `cpuclip` A/B, a hardware `[prof]` A/B of the full stack, and a
-   30-minute soak are all still owed before any lever can default to on.
-4. `fx_hud` has no equivalent fold in the owned walker yet, so `interp=1 fx_hud=1` is
-   merely inert.
-5. The long-tail screens (course editor, Expansion Kit, ending, records, machine creator)
-   have no replays and have never been exercised by an automated run.
-
-Because of 1–3, **every lever stays default-0 and the old renderer stays linked.** Deleting
-the bridge and the LUS interpreter is a later milestone, gated on hardware.
+Because of the last three rows, **every lever stays default-0 and the old renderer stays
+linked.** Deleting the bridge and the libultraship interpreter is a later milestone.
 
 ### Building it
 
-Identical to the stable branch — the native renderer is compiled in either way, it is the
-ini that decides whether it draws:
+Identical to the stable branch — the native renderer is compiled in either way, it is the ini
+that decides whether it draws:
 
 ```sh
 git clone https://github.com/cruxxxxxx/gdx-3ds.git
@@ -235,20 +214,19 @@ tools/ci-3ds.sh --jobs 8
 ```
 
 `tools/ci-3ds.sh` is the whole gate and is idempotent: it verifies the vendored-LUS
-`MANIFEST.sha256`, applies the 15 `decomp-*.patch` (and fails loudly on a patch file it
-does not know about), builds and runs 7 host test binaries, then configures and builds
-`build-3ds/port/3ds/G-Diffuser-3DS.3dsx` — picking up Ninja and ccache automatically when
-they are on PATH. Add the `.cia` with
-`cmake --build build-3ds --target G-Diffuser-3DS-cia`.
+`MANIFEST.sha256`, applies the `decomp-*.patch` stack (and fails loudly on a patch file it does
+not know about), checks the bridge's cross-thread and replay-schedule invariants, builds and runs
+the host test binaries, then configures and builds
+`build-3ds/port/3ds/G-Diffuser-3DS.3dsx` — picking up Ninja and ccache automatically when they
+are on PATH. Add the `.cia` with `cmake --build build-3ds --target G-Diffuser-3DS-cia`.
 
-**The 3DS lane does not need the `libultraship` submodule.** The 36 sources and 83 headers
-the console compiles are vendored in-tree at `port/3ds/vendor/lus/` with every 3DS patch
-already folded in; `libultraship` is desktop-only and `torch` is the PC-side extractor's
-source. Full instructions, including the Windows path, in
-`docs/3DS-HARDWARE.md` §9.
+**The 3DS lane does not need the `libultraship` submodule.** The sources and headers the console
+compiles are vendored in-tree at `port/3ds/vendor/lus/` with every 3DS patch already folded in;
+`libultraship` is desktop-only and `torch` is the PC-side extractor's source. Full instructions,
+including the Windows path, in `docs/3DS-HARDWARE.md` §9.
 
-Asset conversion is unchanged and still runs on your PC from your own ROM dump — nothing
-in this build embeds game data.
+Asset conversion is unchanged and still runs on your PC from your own ROM dump — nothing in this
+build embeds game data.
 
 ## Requirements
 
