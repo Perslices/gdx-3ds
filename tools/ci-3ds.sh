@@ -128,7 +128,7 @@ command -v cc    >/dev/null 2>&1 || { echo "MISSING: cc (host compiler)" >&2; PR
 # The 3DS lane needs decomp only — the LUS carve is vendored (see the note above),
 # so libultraship/ may be absent or empty here and everything must still work.
 if [ ! -e "${ROOT}/decomp/Makefile" ]; then
-    echo "decomp submodule not initialized. Run: git submodule update --init decomp" >&2
+    echo "decomp submodule not initialized. Run: git submodule update --init decomp torch" >&2
     PREFLIGHT_OK=0
 fi
 if [ ! -e "${ROOT}/port/3ds/vendor/lus/cmake/cvars.cmake" ]; then

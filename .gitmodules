@@ -1,6 +1,6 @@
 # Which submodules you actually need depends on the lane.
 #
-#   3DS (this branch's build):  decomp
+#   3DS (this branch's build):  decomp torch   (torch supplies lib/libmio0)
 #   PC-side asset extractor:    torch
 #   Desktop G-Diffuser build:   all four, libultraship included
 #

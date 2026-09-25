@@ -8,12 +8,12 @@ name: Release (3DS, native renderer)
 # This is the `native` branch's workflow. What differs from the `main` one:
 #   * tags are `native-v*`, so a native beta never collides with a stable `v*` release;
 #   * submodules are initialised BY NAME. The 3DS lane needs `decomp` and
-#     `decomp` only — the slice of libultraship the console compiles is
+#     `decomp` and `torch` (for libmio0) — the slice of libultraship the console compiles is
 #     vendored in-tree at port/3ds/vendor/lus/ (see its PROVENANCE.md), so the
 #     `libultraship` submodule is desktop-only and is never fetched here. `torch` is the
 #     extractor's source and is fetched only by the extractor job. The one-liner for a
 #     human clone that wants both lanes is:
-#         git submodule update --init decomp
+#         git submodule update --init decomp torch
 #   * Ninja + ccache are installed in the container, so tools/ci-3ds.sh picks them up and
 #     the incremental rebuild it times is meaningful; the ccache directory is cached
 #     between runs;
@@ -106,7 +106,7 @@ jobs:
       - name: Submodules (3DS lane only — libultraship is vendored in-tree)
         run: |
           set -e
-          git submodule update --init --depth 1 decomp
+          git submodule update --init --depth 1 decomp torch
           test -f decomp/Makefile
           test -f port/3ds/vendor/lus/cmake/cvars.cmake
           echo "libultraship submodule intentionally NOT initialised:"
