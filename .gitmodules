@@ -1,15 +1,24 @@
 # Which submodules you actually need depends on the lane.
 #
-#   3DS (this branch's build):  decomp fzerox-expansion-kit
+#   3DS (this branch's build):  decomp
 #   PC-side asset extractor:    torch
 #   Desktop G-Diffuser build:   all four, libultraship included
 #
 # The 3DS lane does NOT need libultraship: the 36 sources + 83 headers the console
 # compiles are vendored in-tree at port/3ds/vendor/lus/ with every 3DS patch already
 # folded in (port/3ds/vendor/lus/PROVENANCE.md). Initialise by name rather than with
-# --recursive so a 3DS checkout stays small:
+# --recursive so a 3DS checkout stays small.
 #
-#   git submodule update --init decomp fzerox-expansion-kit torch
+# fzerox-expansion-kit is NOT a submodule here. It is needed only to REGENERATE the
+# desktop build's Expansion Kit asset recipes (port/CMakeLists.txt's G-Diffuser target,
+# --ek-yaml-dir); the 3DS target never evaluates that file. Clone it yourself if you
+# need it:
+#
+#   git clone https://github.com/Zorkats/fzerox-expansion-kit.git
+#
+# Regenerating those assets needs your own dump in any case.
+#
+#   git submodule update --init decomp torch
 #
 [submodule "libultraship"]
 	path = libultraship
@@ -20,6 +29,3 @@
 [submodule "decomp"]
 	path = decomp
 	url = https://github.com/Zorkats/fzerox.git
-[submodule "fzerox-expansion-kit"]
-	path = fzerox-expansion-kit
-	url = https://github.com/Zorkats/fzerox-expansion-kit.git

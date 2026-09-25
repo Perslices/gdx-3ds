@@ -207,7 +207,7 @@ that decides whether it draws:
 ```sh
 git clone https://github.com/cruxxxxxx/gdx-3ds.git
 cd gdx-3ds && git checkout native
-git submodule update --init decomp fzerox-expansion-kit torch
+git submodule update --init decomp torch
 
 export DEVKITPRO=/opt/devkitpro
 tools/ci-3ds.sh --jobs 8

@@ -261,7 +261,7 @@ Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MS
    ```sh
    git clone https://github.com/cruxxxxxx/gdx-3ds.git
    cd gdx-3ds
-   git submodule update --init decomp fzerox-expansion-kit
+   git submodule update --init decomp
    ```
    (`git clone --recurse-submodules` still works and just fetches more than the 3DS lane uses.)
 3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
