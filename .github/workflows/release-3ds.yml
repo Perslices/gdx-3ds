@@ -134,7 +134,7 @@ jobs:
           chmod +x tools/3ds-bin/makerom tools/3ds-bin/bannertool && ls -la tools/3ds-bin
           tools/3ds-bin/makerom -help >/dev/null 2>&1 || true; tools/3ds-bin/bannertool >/dev/null 2>&1 || true
 
-      # One gate, in this order: vendored-LUS MANIFEST.sha256 -> the 15 decomp patches
+      # One gate, in this order: vendored-LUS MANIFEST.sha256 -> the 24 decomp patches
       # (idempotent; an unlisted patch file is a hard FAIL) -> 7 host test binaries
       # (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests,
       #  gdx_interp_host_tests, gdx_gfx_atlas_uv_tests, gdx3ds_fs_host_smoke,

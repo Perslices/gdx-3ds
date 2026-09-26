@@ -77,11 +77,15 @@ The full story of the port — every step from research to a native-60 stereosco
 | Path | What |
 |---|---|
 | `port/3ds/` | The 3DS port: citro3d renderer, stereo, ndsp audio, input, touch menu, lifecycle, render thread, profilers, packaging |
-| `port/3ds/patches/` | Pure-delta patch stack applied over the untouched `decomp/` submodule — 18 `decomp-*.patch`, apply order in its README |
+| `port/3ds/patches/` | Pure-delta patch stack applied over the untouched `decomp/` submodule — 24 `decomp-*.patch`, apply order in its README |
 | `port/3ds/vendor/lus/` | The slice of libultraship the console compiles, vendored in-tree with every 3DS patch folded in (`PROVENANCE.md`, `MANIFEST.sha256`). The `libultraship` submodule is desktop-only. |
 | `port/3ds/gfx/n64/` | The **native renderer**: the owned F3DEX2→citro3d interpreter and the Tier-2 native paths (course, machines, effects, HUD) |
+| `port/gdx_disk_stream.*`, `port/gdx_block_cache.*` | The 64DD disk streamer and the shared block cache behind it — an Expansion Kit image is served off the SD card with no resident copy |
+| `port/gdx_o2r_stream.*`, `port/gdx_audio_diet.*` | Streaming the audio sample bank out of the archive instead of holding 10.25 MB of it resident |
 | `port/` | The G-Diffuser PC port this builds on (see `README-G-Diffuser.md`) |
 | `tools/prebake/` | Converts *your* ROM into the archives the console reads; `tools/ci-3ds.sh` applies the patches and builds |
+| `tools/dev/mame2ndd.py` | Bit-faithful MAME ↔ `.ndd` 64DD image converter (30,288 checks in CI). Takes no image with it — you supply your own dump |
+| `tools/gen_ek_text_pack.py` | Bakes the Expansion Kit English text pack; the reviewable row manifest is `port/gen/ek_text_pack_manifest.txt` |
 | `docs/3DS-HARDWARE.md` | Toolchain, SD layout, install, troubleshooting |
 | `docs/research/` | Working notes, briefs, measurements and verdicts written during development |
 | `docs/NATIVE-RENDERER.md` | The native renderer: the two tiers, every `[native]` ini key, and how each lever is verified |
@@ -120,6 +124,18 @@ The full story of the port — every step from research to a native-60 stereosco
 Full reference: **[`docs/NATIVE-RENDERER.md`](docs/NATIVE-RENDERER.md)** (what it is, every ini
 key, how each lever is verified). Release notes, including an explicit list of what has *not*
 been run: **[`docs/NATIVE-RELEASE-NOTES.md`](docs/NATIVE-RELEASE-NOTES.md)**.
+
+Two things have since landed on this branch that are not about the renderer at all:
+
+- **The 64DD Expansion Kit runs on a real 3DS** — it boots, it draws three things the shipped
+  build cannot, and the **course editor and machine creator load and are playable**, with the DD
+  cups racing, from a disk image streamed off the SD card. It can be built with an **English text
+  pack** so a Japanese dump reads in English without replacing the dump. It is an opt-in build,
+  it needs your own disk dump, **its audio crackles badly** and the editor has graphical glitches.
+  See [release notes §2, §3](docs/NATIVE-RELEASE-NOTES.md).
+- **The shipped build now fits an Old 3DS heap grant** — 22.4 MB against a 24,576 KiB grant, in a
+  measured configuration that is not yet the default. **No Old 3DS has ever run it**; the grant
+  was simulated on a New 3DS. See [release notes §4](docs/NATIVE-RELEASE-NOTES.md).
 
 ### What it is
 
@@ -188,16 +204,21 @@ Being blunt, because a beta that oversells itself is worse than one that ships l
 | thing | status |
 |---|---|
 | The base port (the `main` branch): 60 fps, audio, stereo, sleep/HOME/power-off, flat heap | **hardware-verified** over multiple sessions |
-| `all=1 interp=1` frame time and frame rate, New 3DS | **measured on hardware**, the tables above — one profiling pass per configuration |
+| `all=1 interp=1` frame time and frame rate, New 3DS | **measured on hardware**, the tables above — one profiling pass per configuration, and not re-taken since the Expansion Kit and memory work landed |
 | Pixel parity of every lever, alone and together | **emulator**: zero divergent frames across the whole replay corpus, in-process verify modes clean with non-zero coverage |
 | Stereo 3D with the native levers | **emulator**: both eyes, zero divergent frames, identical anchor receipts. The optics have not been judged by eye on a console |
+| The Expansion Kit: boot, main menu, course editor, machine creator, DD cups | **played on a New 3DS** |
+| Expansion Kit audio | **crackles, badly.** Reduced, not fixed; ~9× the silence the shipped build splices, worst burst 816 ms. There is a little crackle on the shipped build too |
+| Any audio, anywhere in this project | **nothing has ever listened.** No PCM has ever been hashed. The audio evidence is a delivered-byte comparison, which is a diagnostic and not a proof |
+| The Expansion Kit course editor's graphics | **glitchy.** It draws and it is usable; widget captions are clipped until the widget is selected |
+| Old 3DS heap fit | **measured under a simulated grant on a New 3DS**, plus one confirming heap reading. **No Old 3DS has ever run any build from this branch**, and no Old 3DS frame-rate claim is made. The Expansion Kit build does not fit one |
 | The crash under `all=1 interp=1` | **consistent with fixed, not confirmed.** Ten clean races on hardware, two of them under the crash lever set — but not the Grand Prix second race that produced the original dump |
 | The reported "distance wobble / pop-in" | **open.** The native stack is exonerated (181 consecutive in-race frames byte-identical to stock); the deciding experiment needs a console and has not been run |
 | 30-minute soak, and HOME / sleep / lid-close under the native levers | **not run** |
-| Old 3DS / 2DS | **not started.** Every number here is a New 3DS |
 
-Because of the last three rows, **every lever stays default-0 and the old renderer stays
-linked.** Deleting the bridge and the libultraship interpreter is a later milestone.
+Because of the crash reproduction, the soak and the suspend checks, **every lever stays default-0
+and the old renderer stays linked.** Deleting the bridge and the libultraship interpreter is a
+later milestone. The Old 3DS cuts are likewise not defaults.
 
 ### Building it
 
@@ -232,8 +253,9 @@ build embeds game data.
 
 | What | Why |
 |---|---|
-| New Nintendo 3DS / New 2DS | The port targets the New3DS CPU (804 MHz + L2). Old 3DS is unsupported. |
+| New Nintendo 3DS / New 2DS | The port targets the New3DS CPU (804 MHz + L2). Old 3DS is unsupported: on this branch the shipped build now *fits* an Old 3DS heap grant, but no Old 3DS has ever run it and no Old 3DS speed claim is made. |
 | [Luma3DS](https://3ds.hacks.guide) custom firmware | Homebrew execution (and sigpatches for the `.cia` route) |
+| **Your own 64DD disk dump** (Expansion Kit builds only) | The course editor, machine creator and DD cups live on the disk. **No disk image is included or downloadable.** `tools/dev/mame2ndd.py` converts a MAME-layout dump to the `.ndd` layout the port reads. |
 | **Your own F-Zero X (USA) ROM** | **No game data is included or downloadable — you must dump the cartridge you own.** Assets are converted on your PC (see below); the ROM itself never goes on the console. |
 | `dspfirm.cdc` DSP firmware dump | Required for audio; dump it on your own console with the DSP1 homebrew app |
 

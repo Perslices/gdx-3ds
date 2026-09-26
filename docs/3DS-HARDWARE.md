@@ -174,6 +174,23 @@ The boot log states every lever once, as RESOLVED (the `all` master already appl
 `[native] interp= path=lus|owned ... hooks=`. The DBG tab shows the same state on its
 NATIVE rows.
 
+### Memory, disk and Expansion Kit keys
+
+Three more groups of `[debug]` keys exist on this branch and are documented in one place,
+`docs/NATIVE-RENDERER.md` §2.6, rather than repeated here:
+
+- **Memory.** `audio_stream` (stream the 10.25 MB sample bank off the heap) and `tex_upload_kb`
+  (cap the 4 MiB texture staging reservation). Both default to the historical behaviour. With
+  `-DGDX_3DS_RDRAM_MB=8` they are what makes the shipped build fit an Old 3DS heap grant — a
+  configuration that has been measured under a simulated grant and **never run on an Old 3DS**.
+- **Disk.** `disk_stream = 2` serves a 64DD image off the SD card with no resident copy, plus
+  its cache and receipt keys. Only meaningful in an Expansion Kit build.
+- **Expansion Kit.** `ek_english` applies the baked English text pack over a Japanese disk.
+
+The Expansion Kit itself is `-DGDX_3DS_EXPANSION_KIT=ON`, which produces a **different binary of
+the whole game**, not the shipped one plus overlays, and needs your own ~64.9 MB `.ndd` at
+runtime. Read `docs/NATIVE-RELEASE-NOTES.md` §2 and §8 before building it.
+
 ## 6. Controls
 
 In-race semantics verified against the decomp (`decomp/src/game/racer.c`): the
@@ -265,7 +282,7 @@ Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MS
    ```
    (`git clone --recurse-submodules` still works and just fetches more than the 3DS lane uses.)
 3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
-   deltas are the 18 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
+   deltas are the 24 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
    tree in the order listed in `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that
    idempotently and then builds:
    ```sh

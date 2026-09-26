@@ -130,8 +130,37 @@ If a lever you set is missing from that line, the ini was not read — check the
 section name.
 
 Related `[debug]` keys the development harness uses and a player should leave alone: `det`, `fh`,
-`fh_every`, `fh_start`, `input_replay`, `input_record`, `replay_quit`, `gputrace`, `renderthread`.
-`[net] enabled` (the development link to a host) must stay `0` for any normal run.
+`fh_every`, `fh_start`, `input_replay`, `input_record`, `replay_quit`, `gputrace`, `renderthread`,
+`cov`, `shots`. `[net] enabled` (the development link to a host) must stay `0` for any normal run.
+
+### 2.6 Memory, disk and Expansion Kit levers
+
+These are `[debug]`, not `[native]` — they are not renderer levers, but they are the keys the
+Old 3DS result and the Expansion Kit depend on, and they are documented nowhere else.
+
+| key | default | what it does |
+|---|---|---|
+| `audio_stream` | `0` | `1` = stream the 10.25 MB audio sample bank out of the `.o2r` through a block cache instead of holding it resident. Saves about 10.25 MB of heap and cuts the boot preload from 4,573 ms to 1,703 ms. |
+| `audio_stream_cache_kb` | `512` | Size of that cache. Measured hit rate at the default is 97%, over a working set of 72 blocks. |
+| `audio_stream_block_kb` | `16` | Block size for it. |
+| `audio_stream_verify` | `0` | `1` = serve every streamed read *both* ways and compare. A correctness tool; it is a byte comparison, not a listening test. |
+| `tex_upload_kb` | `0` | `0` = the historical 4 MiB texture staging reservation. Any other value caps it, in KiB. Measured high-water across the whole replay corpus is 307,200 B on every replay, so `512` is ample; the decoders clamp and **log** if a value is set too small, and a CLAMP line means exactly that. |
+| `disk_stream` | `0` | 64DD image handling for an Expansion Kit build. `0` = resident image (does not fit on 3DS), `2` = stream off the SD card with no resident buffer. There is no useful `1` on this platform. |
+| `disk_stream_cache_kb` | `512` | Block cache for the streamed disk. Re-derived from a six-point sweep against a real disk: the whole span of the sweep is 384 KB of card reads, once, so capacity buys almost nothing above the default. |
+| `disk_stream_block_kb` | `16` | Block size for it. |
+| `disk_stream_report` | `512` | LEO reads between periodic `[diskstream]` receipts. |
+| `ek_english` | `1` | Apply the baked English text pack over the mounted disk. Inert in a build where the pack was not baked, which is every default build; skipped automatically on an already-translated image. |
+| `ek_fixed_aspect` | — | Killswitch for the fixed-4:3 fix that makes the course editor draw at all. Leave it alone. |
+| `heapattr_top`, `membudget`, `membudget_top` | `0` | Heap-attribution and memory-budget censuses. `heapattr_top` needs a build configured with `-DGDX_3DS_HEAPATTR=ON`. |
+
+Build options that go with them, all defaulting to the shipped value:
+
+| option | default | what it does |
+|---|---|---|
+| `GDX_3DS_RDRAM_MB` | `16` | Size of the emulated RDRAM arena. Measured corpus-wide high-water occupancy is 3,038,864 B (18.1%); `8` is the recommendation and is what the Old 3DS result uses. |
+| `GDX_3DS_SIM_O3DS` | `OFF` | Simulate the Old 3DS memtype-0 commit budget so a New 3DS or the emulator reproduces the real grant. **Hazard:** pinning a budget above the host console's real one panics in `crt0` with a black screen and no log. |
+| `GDX_3DS_HEAPATTR` | `OFF` | Allocator interposition and the ranked `[heap-attr]` census. A measurement build (~2.13 MB of `.bss`). |
+| `GDX_3DS_EXPANSION_KIT` | `OFF` | Compile the 64DD Expansion Kit. **Not additive** — it swaps the ROM subsystems for the disk ones and changes `#ifdef EXPANSION_KIT` behaviour in 65 translation units, so an Expansion Kit build and the shipped build are two different binaries, not two settings. Needs your own ~64.9 MB `.ndd` at runtime. |
 
 ---
 
@@ -139,10 +168,13 @@ Related `[debug]` keys the development harness uses and a player should leave al
 
 Four independent gates, in increasing order of what they can see:
 
-1. **Host tests.** `tools/ci-3ds.sh` builds and runs host test binaries covering the vertex
-   packer, the format converters, the track templates, the owned interpreter, the atlas UV
-   arithmetic, the config readers, the LOD controller and a machines harness that replays baked
-   meshes against the interpreter's own output.
+1. **Host tests.** `tools/ci-3ds.sh` builds and runs thirteen host test binaries covering the
+   vertex packer, the format converters, the track templates, the owned interpreter, the atlas UV
+   arithmetic, the config readers, the heap configuration, the LOD controller, the block cache and
+   disk streamer, the `.o2r` stream reader, the MAME ↔ `.ndd` converter (30,288 checks plus a
+   round-trip), the development CLI, and a machines harness that replays baked meshes against the
+   interpreter's own output. It also verifies the vendored-libultraship manifest and applies the
+   `decomp-*.patch` stack idempotently, failing on a patch file it does not know.
 2. **In-process verify modes.** Each lever can draw the stock path and compare the native path's
    packed vertex bytes against it, in the same frame, bit for bit — see §2.3. This catches
    differences that never reach a pixel.
@@ -183,5 +215,24 @@ sufficient proof.
 
 ## 4. What is measured
 
-See [`NATIVE-RELEASE-NOTES.md`](NATIVE-RELEASE-NOTES.md) §1 for the hardware numbers and the
-conditions they were taken under, and §3 for everything that has not been run.
+See [`NATIVE-RELEASE-NOTES.md`](NATIVE-RELEASE-NOTES.md) §1 for the renderer's hardware numbers
+and the conditions they were taken under, §4 for the Old 3DS heap result, and **§7 for everything
+that has not been run** — which includes the audio, where nothing has ever listened.
+
+---
+
+## 5. The Expansion Kit
+
+The 64DD Expansion Kit is compiled by `-DGDX_3DS_EXPANSION_KIT=ON` and is not the shipped
+configuration. It boots on a console, reaches the main menu, draws three screens' worth of
+vocabulary the shipped build cannot draw, and loads a playable course editor and machine creator
+from a disk image streamed off the SD card. It can be baked with an English text pack so a
+Japanese dump reads in English without replacing the dump.
+
+It goes through the same renderer: `interp` and the Tier-2 levers apply to it unchanged, and the
+main-menu frames are byte-identical between an Expansion Kit build and the shipped build except
+for the two extra signs.
+
+What it costs and what is still wrong with it — the audio, the editor's graphical glitches, the
+boot time, and the fact that it does not fit an Old 3DS — is
+[`NATIVE-RELEASE-NOTES.md`](NATIVE-RELEASE-NOTES.md) §2 and §7. The levers are §2.6 above.
