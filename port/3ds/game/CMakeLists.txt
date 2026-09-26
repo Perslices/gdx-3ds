@@ -31,6 +31,68 @@ option(GDX_3DS_EXPANSION_KIT
 if(GDX_3DS_EXPANSION_KIT)
     message(STATUS "G-Diffuser-3DS: GDX_3DS_EXPANSION_KIT=ON -- Expansion Kit build (NOT the shipped configuration)")
     set(GDX_EXPANSION_KIT ON)
+
+    # The EK build needs generated files that are NOT in the repo: port/gen/EkAssetPack.c
+    # (.gitignore'd -- it can contain baked disk bytes) and include/assets/us/ek/**.h.
+    # They come from tools/gen_ek_assets.py, and nothing used to run it, so EXPANSION_KIT=ON
+    # could not be configured from a clean worktree at all -- every EK result so far came
+    # from a tree where someone had produced them by hand. Run it at configure time.
+    #
+    # It imports PyYAML, which Homebrew's python3 refuses to install into (PEP 668). Prefer
+    # an interpreter that actually has it over the first one on PATH, and say so plainly
+    # rather than failing later with 345 undefined references.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(GDX_EK_PY "${Python3_EXECUTABLE}")
+    execute_process(COMMAND "${GDX_EK_PY}" -c "import yaml"
+                    RESULT_VARIABLE GDX_EK_YAML_RC OUTPUT_QUIET ERROR_QUIET)
+    if(NOT GDX_EK_YAML_RC EQUAL 0)
+        foreach(_cand "$ENV{HOME}/.local/share/gdx-tools-venv/bin/python" "${CMAKE_SOURCE_DIR}/.venv/bin/python")
+            if(NOT GDX_EK_YAML_RC EQUAL 0 AND EXISTS "${_cand}")
+                execute_process(COMMAND "${_cand}" -c "import yaml"
+                                RESULT_VARIABLE GDX_EK_YAML_RC OUTPUT_QUIET ERROR_QUIET)
+                if(GDX_EK_YAML_RC EQUAL 0)
+                    set(GDX_EK_PY "${_cand}")
+                endif()
+            endif()
+        endforeach()
+    endif()
+    if(NOT GDX_EK_YAML_RC EQUAL 0)
+        message(FATAL_ERROR
+            "GDX_3DS_EXPANSION_KIT=ON needs PyYAML for tools/gen_ek_assets.py, and neither\n"
+            "  ${Python3_EXECUTABLE}\n"
+            "nor a known venv has it. Homebrew's python3 is PEP 668 externally-managed, so:\n"
+            "  python3 -m venv ~/.local/share/gdx-tools-venv && \\\n"
+            "  ~/.local/share/gdx-tools-venv/bin/pip install pyyaml pillow")
+    endif()
+    message(STATUS "G-Diffuser-3DS: generating EK assets with ${GDX_EK_PY}")
+    execute_process(COMMAND "${GDX_EK_PY}" "${CMAKE_SOURCE_DIR}/tools/gen_ek_assets.py"
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                    RESULT_VARIABLE GDX_EK_GEN_RC
+                    OUTPUT_VARIABLE GDX_EK_GEN_OUT ERROR_VARIABLE GDX_EK_GEN_OUT)
+    if(NOT GDX_EK_GEN_RC EQUAL 0)
+        message(FATAL_ERROR "tools/gen_ek_assets.py failed:\n${GDX_EK_GEN_OUT}")
+    endif()
+    string(STRIP "${GDX_EK_GEN_OUT}" GDX_EK_GEN_OUT)
+    message(STATUS "G-Diffuser-3DS: ${GDX_EK_GEN_OUT}")
+
+    # B11m -- the English text pack (port/gen/EkTranslatedTextPack.c), also .gitignore'd and
+    # also needed for the source list to resolve from a clean worktree. Written EMPTY here so
+    # configuring never depends on owning a translated image; re-run
+    # tools/gen_ek_text_pack.py --translated <image> --reference <image> by hand to fill it,
+    # and do NOT overwrite a filled pack on a reconfigure.
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/port/gen/EkTranslatedTextPack.c")
+        execute_process(COMMAND "${GDX_EK_PY}" "${CMAKE_SOURCE_DIR}/tools/gen_ek_text_pack.py"
+                        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                        RESULT_VARIABLE GDX_EK_TEXT_RC
+                        OUTPUT_VARIABLE GDX_EK_TEXT_OUT ERROR_VARIABLE GDX_EK_TEXT_OUT)
+        if(NOT GDX_EK_TEXT_RC EQUAL 0)
+            message(FATAL_ERROR "tools/gen_ek_text_pack.py failed:\n${GDX_EK_TEXT_OUT}")
+        endif()
+        string(STRIP "${GDX_EK_TEXT_OUT}" GDX_EK_TEXT_OUT)
+        message(STATUS "G-Diffuser-3DS: ${GDX_EK_TEXT_OUT}")
+    else()
+        message(STATUS "G-Diffuser-3DS: keeping the existing port/gen/EkTranslatedTextPack.c")
+    endif()
 else()
     set(GDX_EXPANSION_KIT OFF)
 endif()
@@ -150,6 +212,13 @@ add_library(gdx3ds_glue OBJECT
     "${GDX_PORT_DIR}/mio0_wrap.c"
     "${GDX_PORT_DIR}/gdx_stall.c"
     "${GDX_PORT_DIR}/gdx_segment_source.c"
+    # C4d ([debug] audio_stream / audiodiet, both default off): the audio_table diet and the
+    # block reader it shares with the 64DD lever. gdx_block_cache is the cache diskstream
+    # wrote, lifted out of gdx_disk_stream.cpp's file statics so there is ONE of it; it builds
+    # unconditionally now because the audio arm is not EK-gated.
+    "${GDX_PORT_DIR}/gdx_block_cache.cpp"
+    "${GDX_PORT_DIR}/gdx_o2r_stream.cpp"
+    "${GDX_PORT_DIR}/gdx_audio_diet.cpp"
     "${GDX_PORT_DIR}/../torch/lib/libmio0/mio0.c"
 )
 
@@ -158,9 +227,17 @@ if(GDX_3DS_EXPANSION_KIT)
     # the fan-translation string/override layers n64_leo.c and the EK overlays call into.
     target_sources(gdx3ds_glue PRIVATE
         "${GDX_PORT_DIR}/disk_buffer.cpp"
+        "${GDX_PORT_DIR}/gdx_disk_stream.cpp"   # B11c: SD-backed block reader ([debug] disk_stream)
+        "${GDX_PORT_DIR}/gdx_disk_dcrc.cpp"      # B11m: the .dcrc cached identity fingerprint
         "${GDX_PORT_DIR}/gen/EkTranslatedOverrides.c"
         "${GDX_PORT_DIR}/gdx_ek_strings.c"
         "${GDX_PORT_DIR}/gen/EkTranslatedStrings.c"
+        # B11m: the English text pack. The .c half is generated and .gitignore'd (it is disk
+        # bytes) and is EMPTY unless tools/gen_ek_text_pack.py was run with a translated image,
+        # in which case gdx_ek_text_pack_apply() is a no-op. Always in the list so the build
+        # graph is stable, exactly as gen/EkAssetPack.c is.
+        "${GDX_PORT_DIR}/gdx_ek_text_pack.c"
+        "${GDX_PORT_DIR}/gen/EkTranslatedTextPack.c"
         gdx3ds_ek_stubs.cpp)   # 3DS stand-ins for the dropped gdx_extract_launch.cpp helpers
 endif()
 
@@ -177,6 +254,14 @@ target_link_libraries(gdx3ds_glue PRIVATE gdx3ds_lus_carve gdx3ds_cxd4_rsp)
 
 target_compile_definitions(gdx3ds_glue PRIVATE
     ${GDX_DEV_TOOLS_DEFS}
+    # B11d/B11f: -DGDX_ALLOW_JP_INPUTS=ON was reaching ONLY the desktop G-Diffuser target
+    # (port/CMakeLists.txt:178), so on 3DS it configured, printed "Japanese ROM/disk inputs
+    # are ACCEPTED", and then did nothing: rom_buffer.cpp's SHA-1 gate and disk_buffer.cpp's
+    # CRC-64 gate both still refused, and the Japanese .ndd FILENAMES were not even searched
+    # -- which presents as "[leo] no disk image found" with no mention of the gate. Both of
+    # those TUs are in THIS object library, so the definitions belong here. The option
+    # defaults OFF and tools/ci-3ds.sh never passes it, so the shipped build is unaffected.
+    ${GDX_JP_INPUT_DEFS}
     GDX_PLATFORM_3DS=1
     F3DEX_GBI_2=1
     $<$<BOOL:${GDX_3DS_EXPANSION_KIT}>:EXPANSION_KIT=1>

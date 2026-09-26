@@ -109,6 +109,12 @@ void gdx_gfx_tmem_source_stamp(uint64_t out[2]);
  * source, a missing stamp -- answers 0, which means "do the work", never "changed". */
 int gdx_gfx_tmem_source_unchanged(uintptr_t source, size_t size, unsigned clsAtStamp,
                                   const uint64_t stamp[2]);
+/* [memotear] NEXT.md B54: move the LIVE generation the class `cls` is tested against, so the
+ * next gdx_gfx_tmem_source_unchanged() over the same source MUST answer 0. Fault injection for
+ * the refusal arm, which 412,326 corpus skips never once reached (stale=0). Returns 0 when the
+ * class has no generation arm at all -- STABLE is answered with an unconditional 1, so its only
+ * refusal is the class arm. Its one caller is behind [debug] tmemfault (default 0). */
+int gdx_gfx_tmem_fault_move_generation(uintptr_t source, size_t size, unsigned cls);
 
 /* 1 when a GDX1-tagged low32 must NOT be taken verbatim: generated asset placeholder stubs and
  * the D_1000000 / D_2000000 BSS aliases. The bridge routes those through the low32 resolver. */

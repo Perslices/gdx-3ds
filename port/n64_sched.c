@@ -86,12 +86,35 @@ static unsigned long sHostThreadId = 0;
 //    window — consumer checks empty, producer sends before the consumer enqueues itself — closes:
 //    the pending defer re-checks the waiter list after the consumer has parked.
 // ---------------------------------------------------------------------------------------------
+/* B11 EK-DEADLOCK PROBE (see the gdx_watch_mq_owner block below): who holds sMqLock, and how
+ * many callers are inside the acquire. EK build only; read racily by the watchdog. */
+extern volatile uint32_t gdx_watch_mq_owner;
+extern volatile uint32_t gdx_watch_mq_waiters;
+extern volatile uint32_t gdx_watch_foreign_q;
+extern volatile uint32_t gdx_watch_foreign_ra;
+extern volatile uint32_t gdx_watch_foreign_n;
+uint32_t gdx_probe_actor(void);
+#ifdef EXPANSION_KIT
+/* EK build only: the shipped (EK=OFF) build takes these locks on a hot path and must not pay
+   for a diagnostic. The watchdog omits the fields when the counters are untouched. */
+#define GDX_MQ_PROBE_ENTER() do { gdx_watch_mq_waiters++; } while (0)
+#define GDX_MQ_PROBE_HELD()  do { gdx_watch_mq_waiters--; gdx_watch_mq_owner = gdx_probe_actor(); } while (0)
+#define GDX_MQ_PROBE_FREE()  do { gdx_watch_mq_owner = 0u; } while (0)
+#else
+#define GDX_MQ_PROBE_ENTER() do { } while (0)
+#define GDX_MQ_PROBE_HELD()  do { } while (0)
+#define GDX_MQ_PROBE_FREE()  do { } while (0)
+#endif
+
 #ifdef _WIN32
 static SRWLOCK sMqLock = SRWLOCK_INIT; /* statically initialized: the audio thread starts before gdx_sched_init() */
 void gdx_mq_lock(void) {
+    GDX_MQ_PROBE_ENTER();
     AcquireSRWLockExclusive(&sMqLock);
+    GDX_MQ_PROBE_HELD();
 }
 void gdx_mq_unlock(void) {
+    GDX_MQ_PROBE_FREE();
     ReleaseSRWLockExclusive(&sMqLock);
 }
 #elif defined(GDX_PLATFORM_3DS)
@@ -100,17 +123,23 @@ void gdx_mq_unlock(void) {
  * the pthread/SRWLOCK semantics the PORT queue paths were written against. */
 static LightLock sMqLock;
 void gdx_mq_lock(void) {
+    GDX_MQ_PROBE_ENTER();
     LightLock_Lock(&sMqLock);
+    GDX_MQ_PROBE_HELD();
 }
 void gdx_mq_unlock(void) {
+    GDX_MQ_PROBE_FREE();
     LightLock_Unlock(&sMqLock);
 }
 #else
 static pthread_mutex_t sMqMutex = PTHREAD_MUTEX_INITIALIZER;
 void gdx_mq_lock(void) {
+    GDX_MQ_PROBE_ENTER();
     pthread_mutex_lock(&sMqMutex);
+    GDX_MQ_PROBE_HELD();
 }
 void gdx_mq_unlock(void) {
+    GDX_MQ_PROBE_FREE();
     pthread_mutex_unlock(&sMqMutex);
 }
 #endif
@@ -282,11 +311,19 @@ void __osEnqueueAndYield(OSThread** queue) {
     // completions are synchronous, so the queue should never actually be empty here.
     if (sHostThreadId != 0 && gdx_fiber_current_thread_id() != sHostThreadId) {
         static int sForeignYieldLogs = 0;
+        /* B11: the guard's premise -- "this port's DMA completions are synchronous, so the queue
+         * should never actually be empty here" -- is FALSE in the EK build, where the wait can be
+         * permanent. Record WHICH queue and WHO, so the watchdog can name a spin that the capped
+         * log line cannot (docs/research/native/ekdeadlock-progress.md). */
+        gdx_watch_foreign_q = (uint32_t)(uintptr_t) queue;
+        gdx_watch_foreign_ra = (uint32_t)(uintptr_t) __builtin_return_address(0);
+        gdx_watch_foreign_n++;
         if (sForeignYieldLogs < 8) {
             sForeignYieldLogs++;
             gdx_port_logf("[sched] WARNING: __osEnqueueAndYield called from non-host thread id=%lu "
-                          "(host=%lu) -- spin-yielding instead of dispatching\n",
-                          gdx_fiber_current_thread_id(), sHostThreadId);
+                          "(host=%lu) queue=%p ra=%p -- spin-yielding instead of dispatching\n",
+                          gdx_fiber_current_thread_id(), sHostThreadId, (void*) queue,
+                          __builtin_return_address(0));
         }
 #ifdef _WIN32
         Sleep(0);
@@ -954,6 +991,48 @@ volatile uint32_t gdx_watch_audio_tick_exit = 0;
 volatile int gdx_watch_audio_stage = 0;
 volatile uint32_t gdx_watch_specwait = 0;
 
+/* ------------------------------------------------------------------------------------------
+ * B11 EK-DEADLOCK PROBE (docs/research/native/ekdeadlock-progress.md). The EK build froze in
+ * the boot-logo window with gdx_watch_audio_stage == 1 and enter/exit off by one -- the
+ * dedicated audio producer thread had entered Audio_SetupCreateTask and never come back --
+ * while the cooperative scheduler's game fiber sat in OS_STATE_RUNNING and never yielded
+ * again. Those counters cannot tell a holder from a victim, and this is a two-lock, two-OS-
+ * thread freeze, so one watchdog beat has to name both sides: `gdx_watch_mq_*` and
+ * `gdx_watch_ctx_*` give the owner and waiter count of the two HOST locks the producer thread
+ * and the game fiber share, and `gdx_watch_foreign_*` names a blocking libultra queue wait
+ * reached from a non-host OS thread -- which __osEnqueueAndYield below can only spin on, not
+ * dispatch. That combination is what identified the deadlock. Written only in the EK build,
+ * so the shipped build prints the pre-probe watchdog line byte for byte (main_3ds.cpp omits
+ * the fields while every counter is zero). Racy cross-thread reads by design, exactly like
+ * the counters above.
+ * ------------------------------------------------------------------------------------------ */
+volatile uint32_t gdx_watch_mq_owner = 0;   /* logical thread id holding sMqLock, 0 = free */
+volatile uint32_t gdx_watch_mq_waiters = 0;
+volatile uint32_t gdx_watch_ctx_owner = 0;  /* logical thread id holding sAudioCtxMutex */
+volatile uint32_t gdx_watch_ctx_waiters = 0;
+/* Last blocking libultra queue wait reached from a NON-host OS thread (the audio producer),
+ * its caller, and how many spin-yields it has burned. Nonzero here means a thread is busy
+ * waiting on a queue the cooperative scheduler cannot wake. */
+volatile uint32_t gdx_watch_foreign_q = 0;
+volatile uint32_t gdx_watch_foreign_ra = 0;
+volatile uint32_t gdx_watch_foreign_n = 0;
+
+/* B11 spin receipt for the EK disk audio library (which cannot see port_log.h). */
+void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c, unsigned int d) {
+    gdx_port_logf("[b11] %s a=%08x b=%08x c=%08x d=%08x\n", what, a, b, c, d);
+}
+
+/* Identifies a caller across both worlds: the cooperative fiber id when the caller is a game
+ * fiber on the host thread, 0x1000 + the real OS thread id otherwise (the audio producer).
+ * gdx_watch_running_thread_id() is defined below; declared here for the lock probes. */
+int gdx_watch_running_thread_id(void);
+uint32_t gdx_probe_actor(void) {
+    if (gdx_sched_on_host_thread()) {
+        return (uint32_t) (gdx_watch_running_thread_id() + 1); /* fiber id, 0 = host loop */
+    }
+    return 0x1000u + (uint32_t) gdx_fiber_current_thread_id();
+}
+
 /* Which N64 thread the cooperative scheduler is currently running (-1 = host fiber). Racy
  * cross-thread read by design; only consumed by the watchdog log line. */
 int gdx_watch_running_thread_id(void) {
@@ -1084,6 +1163,183 @@ void gdx_audio_specwait_yield(void) {
 #endif
 }
 
+/* ---- [audioload] producer-tick phase attribution (audioasync track) ----------------------
+ * Contract, rationale and site ids: port/gdx_audio_load_census.h. Everything here runs on the
+ * producer thread only (every decomp scope is reachable from gdx_audio_produce_one_tick and,
+ * under the audio thread, from nowhere else), so the accumulators need no atomics: single
+ * writer, and the only reader is that same thread's report. */
+#include "gdx_audio_load_census.h"
+
+static int sALoadEnabled = -1;   /* INI [debug] audioload,    -1 = not probed yet */
+static unsigned int sALoadMinMs; /* INI [debug] audioload_ms, tick threshold to report */
+static unsigned int sALoadTickUs[GDX_ALOAD_SITES];
+static unsigned int sALoadTickN[GDX_ALOAD_SITES];
+static unsigned int sALoadTotUs[GDX_ALOAD_SITES];
+static unsigned int sALoadTotN[GDX_ALOAD_SITES];
+static unsigned int sALoadTickStart;
+static unsigned int sALoadReports;
+static unsigned long sALoadTicks;
+
+static const char* const kALoadSiteNames[GDX_ALOAD_SITES] = {
+    "cmds",   "heapinit", "loads",  "syncsamp", "reloc",  "preload", "disk",
+    "dma",    "fontconv", "slowp",  "prelp",    "asyncp", "diskld",  "leorw",
+};
+
+/* Monotonic microseconds. The 3DS arm reads the same system-tick source as [audioring]'s
+   tick_ms histogram (SYSCLOCK_ARM11), so the two receipts are directly comparable. A µs
+   counter that wraps every ~71 min is fine: every value taken from it is the DIFFERENCE of two
+   reads a few ms apart, and unsigned arithmetic carries that across the wrap. */
+static unsigned int gdx_aload_now_us(void) {
+#if defined(GDX_PLATFORM_3DS)
+    return (unsigned int) (svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000000ULL));
+#else
+    return 0u; /* off-3DS the census never arms (gdx_aload_on), so this is never reached */
+#endif
+}
+
+static int gdx_aload_on(void) {
+    if (sALoadEnabled < 0) {
+#if defined(GDX_PLATFORM_3DS)
+        extern int gdx3ds_config_get_int(const char* section, const char* key, int fallback);
+        sALoadEnabled = gdx3ds_config_get_int("debug", "audioload", 0) != 0 ? 1 : 0;
+        sALoadMinMs = (unsigned int) gdx3ds_config_get_int("debug", "audioload_ms", 32);
+#else
+        sALoadEnabled = 0;
+        sALoadMinMs = 32u;
+#endif
+    }
+    return sALoadEnabled;
+}
+
+unsigned int gdx_aload_begin(void) {
+    if (!gdx_aload_on()) {
+        return 0u;
+    }
+    return gdx_aload_now_us() + 1u; /* +1: a genuine 0 reading must not read as "off" */
+}
+
+void gdx_aload_end(int site, unsigned int startStamp) {
+    unsigned int us;
+    if (startStamp == 0u || (unsigned int) site >= (unsigned int) GDX_ALOAD_SITES) {
+        return;
+    }
+    us = gdx_aload_now_us() + 1u - startStamp;
+    sALoadTickUs[site] += us;
+    sALoadTickN[site]++;
+    sALoadTotUs[site] += us;
+    sALoadTotN[site]++;
+}
+
+void gdx_aload_tick_begin(void) {
+    int i;
+    if (!gdx_aload_on()) {
+        return;
+    }
+    for (i = 0; i < GDX_ALOAD_SITES; i++) {
+        sALoadTickUs[i] = 0u;
+        sALoadTickN[i] = 0u;
+    }
+    sALoadTickStart = gdx_aload_now_us() + 1u;
+}
+
+/* Bounded append: never lets the cursor pass `cap - 1`, whatever snprintf reports. */
+static void ALoadAppend(char* out, unsigned int cap, unsigned int* at, const char* fmt, ...) {
+    va_list args;
+    int w;
+    if (cap == 0u || *at + 1u >= cap) {
+        return;
+    }
+    va_start(args, fmt);
+    w = vsnprintf(out + *at, cap - *at, fmt, args);
+    va_end(args);
+    if (w < 0) {
+        return;
+    }
+    *at += (unsigned int) w;
+    if (*at >= cap) {
+        *at = cap - 1u;
+    }
+}
+
+/* One receipt into one buffer. `skipEmpty` drops the sites this tick never entered, which is
+   what makes a TICK line short enough to read; the TOTAL line prints every site so a zero is
+   visible as a zero rather than as an omission. */
+static void ALoadFormat(char* out, unsigned int cap, const char* tag, unsigned int tickUs,
+                        const unsigned int* us, const unsigned int* n, int skipEmpty) {
+    /* snprintf returns the length it WOULD have written, which can exceed the space left; adding
+       that to the cursor walks it past `cap` and the next `cap - at` underflows to a huge
+       unsigned size. Advance through this helper, never by the raw return. */
+    unsigned int at = 0u;
+    int i;
+    ALoadAppend(out, cap, &at, "[audioload] %s", tag);
+    if (tickUs != 0u) {
+        ALoadAppend(out, cap, &at, " %uus n=%lu", tickUs, sALoadTicks);
+    }
+    for (i = 0; i < GDX_ALOAD_SITES; i++) {
+        if (skipEmpty && n[i] == 0u) {
+            continue;
+        }
+        ALoadAppend(out, cap, &at, " %s=%uus/%u", kALoadSiteNames[i], us[i], n[i]);
+    }
+}
+
+void gdx_aload_tick_end(void) {
+    unsigned int tickUs;
+    char line[512];
+    if (!gdx_aload_on() || sALoadTickStart == 0u) {
+        return;
+    }
+    tickUs = gdx_aload_now_us() + 1u - sALoadTickStart;
+    sALoadTickStart = 0u;
+    sALoadTicks++;
+    if (tickUs < sALoadMinMs * 1000u) {
+        return;
+    }
+    /* Cap the per-tick lines so a pathological session cannot drown its own log. The session
+       TOTAL line beside each one keeps the whole picture available regardless. */
+    if (++sALoadReports > 64u && (sALoadReports & 0x3Fu) != 0u) {
+        return;
+    }
+    /* ONE gdx_port_logf per receipt. The first cut emitted a call per field and the log
+       writer ended each one with a newline, so a receipt arrived as fifteen one-word lines
+       that no grep could read back as a record. Build the line, then print it. */
+    ALoadFormat(line, sizeof line, "TICK", tickUs, sALoadTickUs, sALoadTickN, 1);
+    gdx_port_logf("%s\n", line);
+    ALoadFormat(line, sizeof line, "TOTAL", 0u, sALoadTotUs, sALoadTotN, 0);
+    gdx_port_logf("%s\n", line);
+}
+
+/* ---- [audio_disk_step_kb] the async disk-load step size (audioasync track) ---------------
+ * The decomp's AudioLoad_DiskLoad collapses a whole multi-megabyte async transfer into ONE
+ * multi-LBA request. On console the drive DMAs that in the background; here sLeoHandler
+ * (port/n64_leo.c LeoReadWrite) serves it INLINE on the caller -- the audio producer, inside
+ * its tick, under sAudioCtxMutex. Measured at a course load: one such call, 0.87 s, while the
+ * ring ran dry for 51 consecutive chunks. Capping the batch turns it back into what its own
+ * state machine was already written to do, one step per tick.
+ *
+ * Default 16 KB = one LBA per batch (LBA sizes run 0x4D08..0x2530), which measured ~7 ms a
+ * step against the 16.5 ms of audio a tick produces. 0 = uncapped = the unchanged decomp path,
+ * byte for byte: the killswitch, and the A/B. */
+int gdx_audio_disk_step_bytes(void) {
+    static int sStepBytes = -1;
+    if (sStepBytes < 0) {
+#if defined(GDX_PLATFORM_3DS)
+        extern int gdx3ds_config_get_int(const char* section, const char* key, int fallback);
+        int kb = gdx3ds_config_get_int("debug", "audio_disk_step_kb", 16);
+#else
+        int kb = 16;
+#endif
+        if (kb < 0) {
+            kb = 0;
+        }
+        sStepBytes = kb * 1024;
+        gdx_port_logf("[audiodisk] async disk-load step = %d bytes (%s)\n", sStepBytes,
+                      sStepBytes == 0 ? "UNCAPPED -- the unchanged decomp path"
+                                      : "capped per AudioLoad_DiskLoad step");
+    }
+    return sStepBytes;
+}
+
 int gdx_audio_produce_one_tick(void) {
     /* Audio_SetupCreateTask, NOT AudioThread_CreateTask. The wrapper
        (decomp/src/audio/disk/external.c:2703) is the game's whole per-tick audio frame — the EK
@@ -1131,8 +1387,10 @@ int gdx_audio_produce_one_tick(void) {
 
     gdx_watch_audio_tick_enter++;
     gdx_watch_audio_stage = 1;
+    gdx_aload_tick_begin(); /* [audioload]: bracket the WHOLE tick, both exits (see below) */
     task = Audio_SetupCreateTask();
     if (task == NULL) {
+        gdx_aload_tick_end();
         gdx_watch_audio_stage = 0;
         gdx_watch_audio_tick_exit++;
         return 0;
@@ -1140,6 +1398,7 @@ int gdx_audio_produce_one_tick(void) {
 
     gdx_watch_audio_stage = 2;
     gdx_audio_lle_run(task->task.t.data_ptr, (unsigned int) task->task.t.data_size);
+    gdx_aload_tick_end();
     gdx_watch_audio_stage = 0;
     gdx_watch_audio_tick_exit++;
     return 1;

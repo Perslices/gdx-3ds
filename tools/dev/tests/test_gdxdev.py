@@ -6,13 +6,16 @@ the manifest round-trips through the schema check, the ini merge provably preser
 foreign agent's key, and the log parser reproduces hand-computed numbers.
 """
 
+import argparse
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import importlib.util
 import time
 import unittest
 
@@ -977,9 +980,78 @@ class Stereo3dTest(unittest.TestCase):
             self.assertIn('citra_factor_3d = "100"', opt)
             self.assertIn('citra_is_new_3ds = "New 3DS"', opt,
                           "under --3d the file IS read, so the value must be a legal one")
+            self.assertEqual(len([l for l in opt.splitlines()
+                                  if l.startswith("citra_is_new_3ds")]), 1)
             self.assertIn("rgui_config_directory", util.read_text(inst.cfg))
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class RetroModelTest(unittest.TestCase):
+    """`--model old`: the Old 3DS lane (NEXT.md C4).
+
+    Three properties, each of which has already burned somebody on this lane:
+    (a) with no --model NOTHING changes, so every baseline taken before the flag stays
+    valid; (b) the value written is one the CORE DECLARES ("Old 3DS", not "disabled"),
+    because an illegal value silently falls back to the option default and the run would
+    quietly be a New 3DS run wearing an Old 3DS label; (c) the manifest's platform.model
+    follows the flag, since that field is what any later comparison reads.
+    """
+
+    def test_no_model_writes_no_redirect(self):
+        from gdxdev import retro
+        d = tempfile.mkdtemp()
+        try:
+            inst = retro.Instance("tmodel")
+            inst.dir = d
+            retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib")
+            self.assertNotIn("rgui_config_directory", util.read_text(inst.cfg))
+            self.assertFalse(os.path.exists(os.path.join(d, "config", "Azahar",
+                                                         "Azahar.opt")))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_model_old_pins_the_core_option(self):
+        from gdxdev import retro
+        d = tempfile.mkdtemp()
+        try:
+            inst = retro.Instance("tmodel")
+            inst.dir = d
+            retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib", model="old")
+            self.assertIn("rgui_config_directory", util.read_text(inst.cfg))
+            opt = util.read_text(os.path.join(d, "config", "Azahar", "Azahar.opt"))
+            self.assertIn('citra_is_new_3ds = "Old 3DS"', opt)
+            # RetroArch's config parser returns the FIRST entry for a duplicated key, so
+            # the option must appear EXACTLY once. Appending a second assignment wrote a
+            # file that said "Old 3DS" and booted a New 3DS; only the guest's own
+            # [mem-budget] receipt caught it.
+            self.assertEqual(len([l for l in opt.splitlines()
+                                  if l.startswith("citra_is_new_3ds")]), 1)
+            self.assertNotIn('citra_is_new_3ds = "New 3DS"', opt)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_model_and_3d_compose(self):
+        from gdxdev import retro
+        d = tempfile.mkdtemp()
+        try:
+            inst = retro.Instance("tmodel")
+            inst.dir = d
+            retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib", model="old",
+                               three_d=("side-by-side", 100))
+            opt = util.read_text(os.path.join(d, "config", "Azahar", "Azahar.opt"))
+            self.assertIn('citra_is_new_3ds = "Old 3DS"', opt)
+            self.assertIn('citra_render_3d = "side-by-side"', opt)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_unknown_model_is_a_usage_error(self):
+        from gdxdev import retro
+        from gdxdev.util import GdxError
+        self.assertIsNone(retro.model_or_die(None))
+        self.assertEqual(retro.model_or_die("OLD"), "old")
+        with self.assertRaises(GdxError):
+            retro.model_or_die("old3ds")
 
 
 class FhDiffEyeTest(unittest.TestCase):
@@ -1291,6 +1363,43 @@ class ReplayCompletionTest(unittest.TestCase):
         info = replay.completion(self._block(), log, max_frame=6000, emu_alive_at_end=True)
         self.assertTrue(info["replay_complete"], info["detail"])
         self.assertEqual((info["shots_seen"], info["shots_expected"]), (2, 2))
+
+    # ---- [debug] shots=0: score on the schedule tag, not on the capture ----------
+    # The lever (native/main@cd142bc4) skips the ~280 KB BMP write so a timing run is
+    # uncontaminated, and it returns from gdx_request_frame_dump before EITHER capture
+    # receipt is emitted. Scoring on captures therefore marked every such run
+    # "49 of 49 SHOT(s) never captured" while the replay had in fact reached tick 6001
+    # with 0 fatals -- observed on /tmp/gdx-runs/stereocost/20260926-014231-sc-owned-2d.
+
+    SHOTS_OFF = "[rec] [debug] shots=0 -- SHOT tags still log, BMP writes SKIPPED\n"
+
+    def test_shots_off_scores_on_the_rec_tag(self):
+        log = (self.SHOTS_OFF + "[rec] SHOT 'a' at tick 119\n[rec] SHOT 'b' at tick 419\n"
+               + "[rec] end tick=6000 lines=6001\n")
+        info = replay.completion(self._block(), log, max_frame=6000, emu_alive_at_end=True)
+        self.assertTrue(info["replay_complete"], info["detail"])
+        self.assertTrue(info["shots_disabled"])
+        self.assertEqual((info["shots_seen"], info["shots_expected"]), (2, 2))
+
+    def test_shots_off_still_asserts_the_whole_schedule(self):
+        """Only the CAPTURE assertion is dropped. A label the replay never reached is
+        still a failure, and the wording says 'reached' rather than 'captured'."""
+        log = (self.SHOTS_OFF + "[rec] SHOT 'a' at tick 119\n"
+               + "[rec] end tick=6000 lines=6001\n")
+        info = replay.completion(self._block(), log, max_frame=6000, emu_alive_at_end=True)
+        self.assertFalse(info["replay_complete"])
+        self.assertIn("never reached", info["detail"])
+        self.assertIn("b", info["missing_shots"])
+
+    def test_without_the_receipt_captures_are_still_required(self):
+        """No shots=0 receipt: a run carrying only schedule tags and no capture at all
+        must still fail, or the fallback would silently weaken every ordinary run."""
+        log = ("[rec] SHOT 'a' at tick 119\n[rec] SHOT 'b' at tick 419\n"
+               + "[rec] end tick=6000 lines=6001\n")
+        info = replay.completion(self._block(), log, max_frame=6000, emu_alive_at_end=True)
+        self.assertFalse(info["replay_complete"])
+        self.assertFalse(info["shots_disabled"])
+        self.assertIn("never captured", info["detail"])
 
     def test_missing_shots_are_named(self):
         log = "[fh] frame=1 tag=a\n[rec] end tick=6000 lines=6001\n"
@@ -2450,8 +2559,32 @@ class FhDiffShiftTest(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+
+
+class IniSpecTypoTest(unittest.TestCase):
+    """`--ini` takes one key per flag; the comma-separated typo used to pass silently."""
+
+    def test_a_comma_list_is_refused_with_the_fix_spelled_out(self):
+        # `--ini a=1,b=2` wrote the WHOLE string as the value of `a`, so b never reached
+        # the guest. Two runs then differed only in levers that had not been applied to
+        # either, which read as a parity failure and cost a bisect across three commits.
+        with self.assertRaises(GdxError) as caught:
+            inifile.parse_spec("debug.det=1,debug.renderthread=1,native.all=1")
+        msg = str(caught.exception)
+        self.assertIn("one key per flag", msg)
+        self.assertIn("--ini debug.renderthread=1", msg)
+        self.assertIn("--ini native.all=1", msg)
+
+    def test_a_value_containing_equals_is_refused(self):
+        with self.assertRaises(GdxError):
+            inifile.parse_spec("debug.x=a=b")
+
+    def test_ordinary_specs_still_parse(self):
+        self.assertEqual(inifile.parse_spec("native.all=1"), ("native", "all", "1"))
+        self.assertEqual(inifile.parse_spec("det=1"), (inifile.DEFAULT_SECTION, "det", "1"))
+        # A path value keeps working -- only '=' and ',' are refused.
+        self.assertEqual(inifile.parse_spec("debug.input_replay=race-mutecity-start"),
+                         ("debug", "input_replay", "race-mutecity-start"))
 
 
 class HwRunRelaunchSeamTest(unittest.TestCase):
@@ -2554,6 +2687,46 @@ class HwRunRelaunchSeamTest(unittest.TestCase):
 class HwPushVerifyTest(unittest.TestCase):
     """3dslink exits 0 on a partial transfer, and its last progress line is unterminated."""
 
+    def test_a_short_byte_count_is_not_a_failed_push(self):
+        # 3dslink's progress reporting stalls at ~46% when its stdout is a pipe, so a low
+        # final count says nothing about what arrived. Two pushes were declared TRUNCATED on
+        # that evidence while the guest was in fact running -- the console is the authority.
+        seen = {"n": 0}
+
+        class UpControl:
+            def __init__(self, ip, timeout=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def command(self, line):
+                seen["n"] += 1
+                return "OK PONG native/main@abc 427 10042"
+
+        real = hw.Control
+        hw.Control = UpControl
+        try:
+            self.assertTrue(hw._wait_for_guest("1.2.3.4", 5).startswith("OK"))
+        finally:
+            hw.Control = real
+        self.assertEqual(seen["n"], 1)
+
+    def test_an_unreachable_console_is_reported_not_asserted(self):
+        class DownControl:
+            def __init__(self, ip, timeout=None):
+                raise ConnectionRefusedError(61, "Connection refused")
+
+        real = hw.Control
+        hw.Control = DownControl
+        try:
+            self.assertIsNone(hw._wait_for_guest("1.2.3.4", 1))
+        finally:
+            hw.Control = real
+
     def test_final_unterminated_progress_line_is_counted(self):
         # Scanning only the completed pieces dropped the final line, so a 100% push was
         # twice reported as TRUNCATED at 46.18% -- at the same byte count both times,
@@ -2576,3 +2749,466 @@ class HwPushVerifyTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(total, 3265100)
         self.assertEqual(sent, 3265100)
+
+
+class HarnessEntryPointTest(unittest.TestCase):
+    """`if __name__ == "__main__": unittest.main()` must be the LAST statement.
+
+    It was not. `unittest.main()` sat 100 lines from the end, and since a module runs
+    top to bottom and `unittest.main` exits the process, the two classes defined after
+    it -- HwRunRelaunchSeamTest and HwPushVerifyTest, five tests pinning the relaunch
+    seam and the push verifier -- were never collected and never ran. CI printed
+    `PASS: gdxdev_harness_tests (OK)`, which was true of the 236 it ran and silent
+    about the 5 it did not. Same shape as B45/B50/B52: a gate reporting something
+    other than what it knows.
+
+    This test is the fence. It reads its own source rather than trusting the runner,
+    because a test that fails to be collected cannot fail.
+    """
+
+    SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_gdxdev.py")
+
+    def _source(self):
+        with open(self.SRC) as fh:
+            return fh.read()
+
+    def test_nothing_is_defined_after_the_runner(self):
+        src = self._source()
+        marker = 'if __name__ == "__main__":'
+        self.assertIn(marker, src)
+        # rindex, not index: this test's own source quotes the marker.
+        tail = src[src.rindex(marker):]
+        stray = re.findall(r"^(class|def)\s+(\w+)", tail, re.M)
+        self.assertEqual(
+            [], stray,
+            "these are defined after unittest.main() and can never run: %s" % (stray,))
+
+    def test_every_test_in_the_file_was_collected(self):
+        src = self._source()
+        in_file = set(re.findall(r"^class (\w*Test\w*)\(", src, re.M))
+        loaded = set(n for n, obj in globals().items()
+                     if isinstance(obj, type) and issubclass(obj, unittest.TestCase))
+        self.assertEqual(set(), in_file - loaded,
+                         "declared in the file but not importable/collected")
+
+
+class DriverOptionShadowTest(unittest.TestCase):
+    """NEXT.md B52 — a subcommand must not discard a driver-level option.
+
+    argparse's subparser action parses into a FRESH namespace and then copies every
+    key of it onto the driver's namespace, including keys holding only the
+    SUBPARSER's default. `gdx-dev --track X retro run ...` therefore filed the run
+    under the worktree's name, and `gdx-dev --dry-run retro run ...` really ran.
+    Found when covdrift.sh reported `RESULT PASS ... shots=49/49` for every replay
+    and then `NO RUN` for every replay.
+
+    The first test is the general fence -- it walks the whole parser tree, so a
+    subcommand added later that repeats a driver-level option without
+    argparse.SUPPRESS fails here rather than in someone's run directory.
+    """
+
+    def setUp(self):
+        from gdxdev import cli
+        self.cli = cli
+        self.ap = cli.build_parser()
+
+    def _walk(self, parser, path, ancestors, found):
+        mine, subs = {}, []
+        for a in parser._actions:
+            if isinstance(a, argparse._SubParsersAction):
+                subs.append(a)
+                continue
+            if a.dest in (argparse.SUPPRESS, "help"):
+                continue
+            mine[a.dest] = a
+        for dest, action in sorted(mine.items()):
+            for apath, anc in ancestors:
+                if dest in anc and action.default is not argparse.SUPPRESS:
+                    found.append(("%s" % (" ".join(path) or "<driver>"), dest,
+                                  " ".join(apath) or "<driver>", action.default))
+        nxt = ancestors + [(path, mine)]
+        for sa in subs:
+            seen = set()
+            for name, sp in sa.choices.items():
+                if id(sp) in seen:
+                    continue
+                seen.add(id(sp))
+                self._walk(sp, path + [name], nxt, found)
+
+    def test_no_subcommand_anywhere_shadows_an_outer_option(self):
+        found = []
+        self._walk(self.ap, [], [], found)
+        self.assertEqual(
+            [], found,
+            "these redeclare an outer option with a default that will overwrite it: %s"
+            % (found,))
+
+    def test_every_driver_option_is_declared_by_the_driver(self):
+        dests = set()
+        for a in self.ap._actions:
+            if not isinstance(a, argparse._SubParsersAction):
+                dests.add(a.dest)
+        for name in self.cli.DRIVER_OPTIONS:
+            self.assertIn(name, dests)
+
+    def test_driver_track_reaches_retro_run(self):
+        args = self.ap.parse_args(["--track", "TT", "retro", "run", "x.3dsx"])
+        self.assertEqual("TT", args.track)
+
+    def test_driver_dry_run_reaches_retro_run(self):
+        # The B45 flag, at the level above the one B45 fixed. Silently discarded
+        # meant `gdx-dev --dry-run retro run` booted a real RetroArch instance.
+        args = self.ap.parse_args(["--dry-run", "retro", "run", "x.3dsx"])
+        self.assertTrue(args.dry_run)
+
+    def test_driver_json_and_run_root_reach_retro_run(self):
+        args = self.ap.parse_args(
+            ["--json", "--run-root", "/tmp/rr", "retro", "run", "x.3dsx"])
+        self.assertTrue(args.json)
+        self.assertEqual("/tmp/rr", args.run_root)
+
+    def test_driver_track_reaches_every_leaf_that_takes_one(self):
+        for argv in (["build"],
+                     ["emu", "run", "x.3dsx"],
+                     ["emu", "status"],
+                     ["prof"],
+                     ["runs", "list"],
+                     ["report"],
+                     ["retro", "run", "x.3dsx"],
+                     ["retro", "status"],
+                     ["hw-run"],
+                     ["sd", "pull", "/tmp/x"]):
+            args = self.ap.parse_args(["--track", "TT"] + argv)
+            self.assertEqual("TT", args.track, "lost by %s" % (" ".join(argv),))
+
+    def test_the_subcommand_still_wins_when_both_are_typed(self):
+        args = self.ap.parse_args(
+            ["--track", "DRIVER", "retro", "run", "x.3dsx", "--track", "SUB"])
+        self.assertEqual("SUB", args.track)
+
+    def test_neither_given_still_defaults(self):
+        args = self.ap.parse_args(["retro", "run", "x.3dsx"])
+        self.assertIsNone(args.track)
+        self.assertFalse(args.dry_run)
+
+    def test_the_driver_track_is_what_lands_in_the_run_root(self):
+        """End to end through the real CLI: `runs list` prints track and run-root."""
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..")
+        dev = os.path.join(root, "tools", "dev", "gdx-dev")
+        d = tempfile.mkdtemp()
+        try:
+            out = subprocess.run(
+                [sys.executable, dev, "--track", "zz-shadow-probe",
+                 "--run-root", d, "runs", "list"],
+                capture_output=True, text=True, timeout=120)
+            self.assertIn("zz-shadow-probe", out.stdout + out.stderr)
+            self.assertIn(d, out.stdout + out.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class PatchGateTest(unittest.TestCase):
+    """NEXT.md B50 — the decomp patch gate must name the patches that are missing.
+
+    The gate roundtrips the FULL ordered stack (reverse-all, then forward-all), which
+    is right for an order-dependent stack but leaves a third state unexplained: the
+    first M of N applied, the normal tree right after a merge that ADDS patches.
+    Forward-all dies on patch 0, reverse-all dies on patch N-1, and the old gate
+    printed "partial application / conflicting local edits" and pointed at
+    `git -C decomp diff` -- which shows the healthy drift of a correctly patched tree.
+
+    These run against a throwaway git repo, which is the reason the gate was lifted
+    out of tools/ci-3ds.sh into tools/patch-gate.sh at all: before, the only way to
+    exercise it was to damage a real worktree.
+    """
+
+    GATE = os.path.abspath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "patch-gate.sh"))
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = self.tmp
+        self.sub = os.path.join(self.root, "sub")
+        self.pdir = os.path.join(self.root, "patches")
+        os.makedirs(self.sub)
+        os.makedirs(self.pdir)
+        self._git("init", "-q")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        # 30 lines, and the three hunks land 12 lines apart, so no two patches share
+        # context. That is deliberate: it makes the LAST patch apply on its own even
+        # with its predecessor missing, which is exactly the coincidence the real
+        # decomp stack showed and the reason a short suffix cannot be trusted.
+        self._write("\n".join("line %d" % i for i in range(1, 31)) + "\n")
+        self._git("add", "f.txt")
+        self._git("commit", "-qm", "base")
+        self.base = self._git("rev-parse", "HEAD").strip()
+        self.patches = []
+        for n, at in ((1, 3), (2, 15), (3, 27)):
+            text = open(os.path.join(self.sub, "f.txt")).read()
+            text = text.replace("line %d\n" % at,
+                                "line %d\nADDED BY PATCH %d\n" % (at, n))
+            self._write(text)
+            name = "p%d.patch" % n
+            with open(os.path.join(self.pdir, name), "w") as fh:
+                fh.write(self._git("diff"))
+            # Commit between steps so the NEXT `git diff` is a pure delta and the
+            # stack is genuinely ordered rather than cumulative.
+            self._git("commit", "-qam", "p%d" % n)
+            self.patches.append(name)
+        self._git("reset", "--hard", "-q", self.base)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, text):
+        with open(os.path.join(self.sub, "f.txt"), "w") as fh:
+            fh.write(text)
+
+    def _git(self, *a):
+        return subprocess.run(["git", "-C", self.sub] + list(a),
+                              capture_output=True, text=True, check=True).stdout
+
+    def _reset_to(self, applied):
+        """Put the worktree in the state where the first `applied` patches are on."""
+        self._git("reset", "--hard", "-q", self.base)
+        for name in self.patches[:applied]:
+            subprocess.run(["git", "-C", self.sub, "apply",
+                            os.path.join(self.pdir, name)], check=True)
+
+    def _gate(self, env=None):
+        e = dict(os.environ)
+        if env:
+            e.update(env)
+        return subprocess.run(
+            ["bash", self.GATE, self.root, self.pdir] +
+            ["sub:%s" % n for n in self.patches],
+            capture_output=True, text=True, env=e, timeout=120)
+
+    def _applied_count(self):
+        body = open(os.path.join(self.sub, "f.txt")).read()
+        return sum(1 for n in (1, 2, 3) if "ADDED BY PATCH %d" % n in body)
+
+    # -- the two states the old gate already handled, kept as a no-regression fence --
+
+    def test_a_clean_tree_gets_the_whole_stack(self):
+        self._reset_to(0)
+        r = self._gate()
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("clean tree", r.stdout)
+        self.assertIn("PATCHGATE: already=0 applied=3", r.stdout)
+        self.assertEqual(3, self._applied_count())
+
+    def test_a_fully_applied_tree_roundtrips(self):
+        self._reset_to(3)
+        r = self._gate()
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("full-stack roundtrip", r.stdout)
+        self.assertIn("PATCHGATE: already=3 applied=0", r.stdout)
+        self.assertEqual(3, self._applied_count())
+
+    # ------------------------------------------------------------------ B50 --
+
+    def test_the_missing_tail_is_named_and_applied(self):
+        self._reset_to(1)
+        r = self._gate()
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("2 of 3 patches were never applied", r.stdout)
+        self.assertIn("p2.patch", r.stdout)
+        self.assertIn("p3.patch", r.stdout)
+        # and it does NOT blame the tree's own edits the way the old gate did
+        self.assertNotIn("conflicting local edits", r.stdout + r.stderr)
+        self.assertEqual(3, self._applied_count())
+
+    def test_one_missing_patch_is_named_as_one(self):
+        self._reset_to(2)
+        r = self._gate()
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("1 of 3 patches were never applied", r.stdout)
+        self.assertIn("p3.patch", r.stdout)
+        self.assertNotIn("p2.patch", r.stdout)
+        self.assertEqual(3, self._applied_count())
+
+    def test_the_repair_is_idempotent(self):
+        self._reset_to(1)
+        self.assertEqual(0, self._gate().returncode)
+        again = self._gate()
+        self.assertEqual(0, again.returncode)
+        self.assertIn("full-stack roundtrip", again.stdout)
+        self.assertEqual(3, self._applied_count())
+
+    def test_the_full_stack_roundtrip_is_still_the_correctness_check(self):
+        """A suffix that lands by coincidence must not pass as a repair.
+
+        The real decomp stack does exactly this: with the last TWO patches missing,
+        the last one still applies on its own. If the gate stopped at the first
+        suffix that fitted it would report "1 missing" and leave a tree that does
+        not roundtrip. It must keep going and find the true suffix.
+        """
+        self._reset_to(1)
+        r = self._gate()
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        # the roundtrip ran and agreed, on all three, not on the short suffix
+        self.assertIn("all 3 verified by roundtrip", r.stdout)
+
+    # ------------------------------------------------------- genuine drift --
+
+    def test_real_drift_fails_and_classifies_every_patch(self):
+        self._reset_to(3)
+        body = open(os.path.join(self.sub, "f.txt")).read()
+        self._write(body.replace("line 14", "line 14 -- a local edit nobody patched in"))
+        r = self._gate()
+        self.assertEqual(1, r.returncode)
+        err = r.stderr
+        self.assertIn("Per-patch state", err)
+        for name in self.patches:
+            self.assertIn(name, err)
+        self.assertIn("git -C sub diff", err)
+
+    def test_drift_leaves_the_tree_as_it_found_it(self):
+        self._reset_to(3)
+        before = open(os.path.join(self.sub, "f.txt")).read()
+        self._write(before.replace("line 14", "line 14 -- local"))
+        marked = open(os.path.join(self.sub, "f.txt")).read()
+        self.assertEqual(1, self._gate().returncode)
+        self.assertEqual(marked, open(os.path.join(self.sub, "f.txt")).read())
+
+    def test_skip_patch_gate_downgrades_drift_to_a_warning(self):
+        self._reset_to(3)
+        body = open(os.path.join(self.sub, "f.txt")).read()
+        self._write(body.replace("line 14", "line 14 -- local"))
+        r = self._gate({"SKIP_PATCH_GATE": "1"})
+        self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+        self.assertIn("SKIP_PATCH_GATE=1 set", r.stderr)
+
+    # ------------------------------------------- the list ci-3ds.sh owns --
+
+    def test_ci_still_owns_the_patch_list_and_calls_this_gate(self):
+        ci = os.path.abspath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "ci-3ds.sh"))
+        src = open(ci).read()
+        self.assertIn("PATCH_LIST=(", src)
+        self.assertIn("tools/patch-gate.sh", src)
+        listed = re.findall(r'"decomp:([^"]+)"', src)
+        pdir = os.path.abspath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+            "port", "3ds", "patches"))
+        on_disk = sorted(f for f in os.listdir(pdir) if f.endswith(".patch"))
+        self.assertEqual(sorted(listed), on_disk)
+
+
+class LodBurstWindowTest(unittest.TestCase):
+    """`tools/dev/lodburst.py` — B38. The receipt/transition alignment, pinned.
+
+    `gdx3ds_dynlod_receipt()` closes a 64-frame window and resets its accumulators;
+    `DynLodLogTransition()` prints the instant the tier changes, INSIDE the window. So a
+    `raise`/`lower` line that appears below window N's receipt was decided by frames of
+    window N+1. Reading it as N's is the obvious mistake and it inverts the conclusion:
+    on the one post-fix hardware log it moves every race-entry raise off the course-load
+    window and onto the quiet menu window before it, which is the difference between
+    "the load stall re-tiered the field" and "the controller raised for no reason".
+    This test is the fence; the fixture below is the shape of a real log.
+    """
+
+    LOG = "\n".join([
+        "[dynlod] init auto=1 floor=1 hi=15.0 lo=9.0 lowerN=90 dwell=15 band=6.0",
+        "[ninterp] tasks=64 lists=448 cmds=38592 rect=6272 tmem=6208 "
+        "| dl=384 ldblk=5248 | rej=0 | tex hit=10 miss=0 evict=0 clr=0 inval=0/0",
+        "[dynlod] auto=1 floor=1 tier=1 raises=0/0 lowers=0/0 ms=4.6 max=13.0 n=64 "
+        "hi=15.0 lo=9.0 since=65535 lowerN=90 dwell=15",
+        "[segment] loaded venue=4 segment=10 base=0xad636c0",
+        "[dynlod] raise 1->2 avg4=17.5 over=4/4 blk=- n=0 since=65535 hi=15.0 lo=9.0 floor=1",
+        "[ninterp] tasks=64 lists=2261 cmds=103653 rect=8025 tmem=8714 "
+        "| dl=2261 ldblk=6255 | rej=0 | tex hit=10 miss=46 evict=0 clr=1 inval=0/3",
+        "[dynlod] auto=1 floor=1 tier=2 raises=1/1 lowers=0/0 ms=12.1 max=35.7 n=64 "
+        "hi=15.0 lo=9.0 since=25 lowerN=90 dwell=15",
+        "[native] machines=1 lists=150 baked=47 draws=245 verts=23035 "
+        "us=2201/f (tnl=584 bind=410 emit=844 draw=317) linfree=25917K",
+        "",
+    ])
+
+    def _parse(self):
+        lb = _import_lodburst()
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write(self.LOG)
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        return lb, lb.parse(path)
+
+    def test_the_transition_lands_in_the_window_it_was_decided_in(self):
+        _, ws = self._parse()
+        self.assertEqual(2, len(ws))
+        self.assertEqual([], ws[0].tx, "the quiet window must not own the raise")
+        self.assertEqual(1, len(ws[1].tx))
+        self.assertIn("raise 1->2", ws[1].tx[0])
+
+    def test_the_event_lands_in_the_window_it_happened_in(self):
+        _, ws = self._parse()
+        self.assertEqual([], ws[0].tags())
+        self.assertIn("venue", ws[1].tags())
+
+    def test_the_course_load_is_named_rather_than_called_in_race_load(self):
+        lb, ws = self._parse()
+        self.assertEqual("course load", lb.classify(ws[1], ws[0]))
+
+    def test_receipts_are_joined_to_the_right_window(self):
+        _, ws = self._parse()
+        self.assertAlmostEqual(4.6, ws[0].dl["ms"])
+        self.assertAlmostEqual(12.1, ws[1].dl["ms"])
+        self.assertAlmostEqual(38592.0, ws[0].ni["cmds"])
+        self.assertAlmostEqual(245.0, ws[1].mc["draws"])
+        self.assertAlmostEqual(2201.0, ws[1].mc["us"])
+        self.assertFalse(ws[0].racing)
+        self.assertTrue(ws[1].racing)
+
+    def test_an_untimed_shot_receipt_still_counts_as_a_shot(self):
+        """Older logs' capture receipt stops at `frame=` — it must not read as shots=0
+        beside a tag list that says SHOT, which is what this tool printed once."""
+        lb = _import_lodburst()
+        old = "[autotest] SHOT captured -> autotest/title_L.bmp bytes=288054 frame=351"
+        new = old + " ms=42"
+        for line, cost in ((old, 0), (new, 42)):
+            body = self.LOG.replace("[segment] loaded venue=4 segment=10 base=0xad636c0", line)
+            with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+                fh.write(body)
+                path = fh.name
+            self.addCleanup(os.unlink, path)
+            ws = lb.parse(path)
+            self.assertEqual(1, ws[1].shots, line)
+            self.assertEqual(cost, ws[1].shot_ms, line)
+
+    def test_prof_is_the_wall_when_dynlod_is_pinned_off(self):
+        """A replay pins rival_detail_auto=0 unless [debug] replay_dynlod=1, and then every
+        dynlod receipt reads ms=0.0 — so the whole hardware matrix is blind to B38 and the
+        only wall left is [prof], which is emitted AFTER the dynlod receipt."""
+        lb = _import_lodburst()
+        body = "\n".join([
+            "[ninterp] tasks=64 lists=448 cmds=38592 | dl=384 ldblk=5248 "
+            "| rej=0 | tex hit=10 miss=0 evict=0 clr=0 inval=0/0",
+            "[dynlod] auto=0 floor=1 tier=0 raises=0/0 lowers=0/0 ms=0.0 max=0.0 n=0 "
+            "hi=15.0 lo=9.0 since=65535 lowerN=90 dwell=15",
+            "[prof] frame=257 n=64 br=0.00 dsp=2.26 vtx=0.00 tri=0.97 imp=1.04 drw=0.10 "
+            "mtx=0.00 oth=0.25 | vtxN=0",
+            "",
+        ])
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write(body)
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        ws = lb.parse(path)
+        self.assertEqual(1, len(ws), "[prof] must land on the window already filed")
+        self.assertAlmostEqual(4.62, ws[0].pf["total"], places=2)
+        self.assertEqual("prof", lb.pick_wall(ws, None))
+        self.assertAlmostEqual(4.62, lb.wall(ws[0], "prof"), places=2)
+
+
+def _import_lodburst():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lodburst.py")
+    spec = importlib.util.spec_from_file_location("lodburst", os.path.abspath(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

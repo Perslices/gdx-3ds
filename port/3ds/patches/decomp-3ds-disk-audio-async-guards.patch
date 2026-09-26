@@ -1,0 +1,69 @@
+--- a/src/audio/disk/lib/load.c
++++ b/src/audio/disk/lib/load.c
+@@ -1601,12 +1601,66 @@
+         osSendMesg(retQueue, (OSMesg) (retData << 0x18), OS_MESG_NOBLOCK);
+     } else {
+         table = AudioLoad_GetLoadTable(tableType);
++#ifdef PORT
++        /* B11d: AudioLoad_GetLoadTable RETURNS NULL for any tableType that is not one of the
++           three (its own `default:` arm, load.c:896), and every caller here dereferences it
++           without checking. GCC takes that at its word: on the null path it constant-folds the
++           base away, emits `ldr r3, [realId*16 + 20]` with no base register, and terminates the
++           block with a literal `udf #0`. That trap is what the no-disk EK boot actually hits --
++           measured as ExceptionRaised(UndefinedInstruction) at a fixed offset inside this
++           function, disassembled to exactly that `lsl r6,r6,#4 / ldr r3,[r6,#20] / udf #0`.
++
++           So it is not a hang and not a NULL data abort: it is the COMPILER's trap for a path
++           it proved undefined. Honour the contract the callee already states. The sync twin
++           (AudioLoad_SyncLoadInner) dereferences the same possibly-null table and is left alone
++           here rather than edited in passing -- filed, not fixed. */
++        if (table == NULL) {
++            extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b,
++                                    unsigned int c, unsigned int d);
++            static s32 sNullTableLogs = 0;
++            if (sNullTableLogs < 8) {
++                sNullTableLogs++;
++                gdx_ek_note("[audio-disk] AsyncLoad REFUSED null load table type/id/realId",
++                            (unsigned int) tableType, (unsigned int) id, (unsigned int) realId, 0u);
++            }
++            return NULL;
++        }
++#endif
+         size = table->entries[realId].size;
+         size = ALIGN16(size);
+         medium = table->entries[id].medium;
+         cachePolicy = table->entries[id].cachePolicy;
+         devAddr = table->entries[realId].romAddr;
+         loadStatus = LOAD_STATUS_COMPLETE;
++
++#ifdef PORT
++        /* B11d: the SAME bug ekdeadlock fixed in AudioLoad_SyncLoadInner, one function over,
++           and left unfixed there. The switch above has no default arm, so a table entry whose
++           cachePolicy is outside 0..4 leaves ramAddr UNINITIALISED and the async load below is
++           started against a stack value. With no disk mounted the EK tables are garbage --
++           ekdeadlock measured cachePolicy 13 and medium 0x5F on exactly this boot -- and
++           cachePolicy is a SIGNED s8, so a negative value also indexes the compiler's jump
++           table out of range: measured as a guest UndefinedInstruction inside this very
++           function, which is why the no-disk EK boot crashes on some binaries and not others.
++           THE GUARD MUST PRECEDE THE SWITCH. Placed after it (which is where ekdeadlock put
++           the sync twin's, and where this one was first written) the fault happens in the
++           dispatch itself and the guard never runs -- measured, pc moved from 0x0010B480 to
++           0x0010B4B8 and the crash stayed. Fail the load instead, exactly the way every
++           allocation failure in the switch already does, and post nothing -- an async load that was never started must not
++           report a completion its caller would read as data (n64_leo.c:79's policy). */
++        if ((u32) cachePolicy > 4u) {
++            extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b,
++                                    unsigned int c, unsigned int d);
++            static s32 sBadAsyncPolicyLogs = 0;
++            if (sBadAsyncPolicyLogs < 8) {
++                sBadAsyncPolicyLogs++;
++                gdx_ek_note("[audio-disk] AsyncLoad REFUSED bad cachePolicy table/id/policy/medium",
++                            (unsigned int) tableType, (unsigned int) realId,
++                            (unsigned int) cachePolicy, (unsigned int) medium);
++            }
++            return NULL;
++        }
++#endif
+ 
+         switch (cachePolicy) {
+             case 0:

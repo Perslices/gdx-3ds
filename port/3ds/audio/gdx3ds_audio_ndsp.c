@@ -401,6 +401,265 @@ static int PrimeHoldsRing(void) {
     return 1;
 }
 
+/* ---- [audioring] ring-occupancy census + producer stall map (audioring track) -------------
+ * WHY THIS EXISTS. `covfinish` refused an audio census family because a SHOT is a framebuffer
+ * hash and cannot see audio; `audiodiet` proved byte-equality of the driver's READS but stated
+ * plainly that nothing ever listened and that the audio thread's read multiset is not
+ * deterministic even under det=1. So no frame-hash gate can ever cover "does it crackle".
+ * This is the substitute: crackle as a NUMBER, taken on the two threads that own the problem.
+ *
+ * A splice is silence the drain spliced into the stream because the ring was short when a wave
+ * slot came free. Two of them were previously invisible:
+ *   - `s.underrunChunks` counts only PARTIAL chunks (0 < real < 512). A chunk that found the
+ *     ring EMPTY (real == 0) was deliberately not counted, on the reasoning that pure silence
+ *     "is the steady state whenever production is legitimately idle". In THIS port that
+ *     reasoning does not hold: AudioThread_CreateTaskImpl calls osAiSetNextBuffer with a full
+ *     AI buffer on EVERY tick whatever the content is, so the producer never stops pushing
+ *     while the game runs. A dry chunk is therefore an underrun, and the worst kind -- 16 ms
+ *     of hard silence, not a tail. `under=` undercounts the damage; `dry=` is the rest of it.
+ *   - Nothing recorded the DISTRIBUTION of ring occupancy, only `rmin` since the last receipt,
+ *     which a single dip pins to 0 and then says nothing about how often.
+ *
+ * WHAT IT ANSWERS, and it is the discrimination this track was asked for: the producer's own
+ * histograms separate "the producer was not scheduled" (gap between ticks) from "the producer
+ * was stuck inside one tick" (tick duration). A 3DS EK build's producer tick can perform a
+ * synchronous 64DD read -- AudioLoad_SyncLoadSample / AudioLoad_RelocateFontAndPreloadSamples
+ * / AudioLoad_PreloadSamplesForFont all call AudioLoad_SyncDiskDrive, which blocks on a whole
+ * LBA through gdx_disk_stream, on this thread, inside sAudioCtxMutex. That shows up in
+ * tick_us; CPU starvation shows up in gap_us. They cannot be confused.
+ *
+ * COST WHEN OFF. Every hook early-returns on one int compare. No allocation, no lock: the
+ * counters are the port's benign aligned-int cross-thread diag idiom, same as [audio-out]'s.
+ * [debug] audioring = 0 (off) | 1 (periodic + FINAL) | 2 (+ per-receipt reset of the
+ * histograms so each line is a window rather than a running total).
+ * [debug] audioring_report = drain polls between receipts (default 2500 ~= 5 s; ekdrive's
+ * lesson -- a cadence you cannot lower can hide the thing you are measuring). */
+#define GDX3DS_AUDIO_RC_BUCKETS 8u
+#define GDX3DS_AUDIO_RC_PUSH_GRACE 64u /* chunks (~1 s) after the last push that still count as
+                                        * "the producer is live", so boot/prime/suspend quiet
+                                        * is not booked as starvation */
+static int sRcEnabled;                 /* INI [debug] audioring */
+static uint32_t sRcReportPolls;        /* INI [debug] audioring_report */
+/* drain side */
+static uint32_t sRcChunks;             /* chunks submitted since the census armed */
+static uint32_t sRcSilFrames;          /* padding frames spliced into those chunks */
+static uint32_t sRcDry;                /* chunks that found the ring EMPTY */
+static uint32_t sRcPart;               /* chunks that found 0 < ring < 512 */
+static uint32_t sRcStarveChunks;       /* short chunks with the producer live (see grace) */
+static uint32_t sRcStarveFrames;       /* padding frames in those */
+static uint32_t sRcDryRun;             /* current consecutive-dry run */
+static uint32_t sRcDryRunMax;          /* longest consecutive-dry run (= worst single gap) */
+static uint32_t sRcOcc[GDX3DS_AUDIO_RC_BUCKETS]; /* ring level at each pull */
+static uint32_t sRcRingMax;
+static uint32_t sRcChunksSincePush;
+/* producer side */
+static uint32_t sRcWakes;              /* producer loop iterations */
+static uint32_t sRcWakesIdle;          /* wakes that produced no tick (already at target) */
+static uint32_t sRcWakesCapped;        /* wakes that left on kMaxTicksPerWake, still short */
+static uint32_t sRcTicks;
+static uint32_t sRcTicksThisWake;
+static uint32_t sRcTickUs[GDX3DS_AUDIO_RC_BUCKETS];
+static uint32_t sRcGapUs[GDX3DS_AUDIO_RC_BUCKETS];
+static uint32_t sRcBufAtWake[GDX3DS_AUDIO_RC_BUCKETS];
+/* CONTENT, not just cadence. `audiodiet` 6.6 and `audioring` 6 both end on the same
+ * sentence: nothing in this project has ever listened. A sample-exact hash cannot close that
+ * here -- audioring measured the audio thread's own read multiset as non-deterministic under
+ * det=1, so two identical runs would not agree and the check would be worse than useless.
+ * What IS stable run to run, and what a broken sample load would visibly move, is the LEVEL:
+ * the mean absolute sample value over every REAL (non-padded) frame the drain submitted, and
+ * the session peak. Silence reads 0/0; a load that fell back to garbage reads far higher; the
+ * same music at the same volume reads the same to within a few percent. It is a weaker claim
+ * than a frame hash and it is stated as one -- but it is a MEASUREMENT, where before there was
+ * an inference. Costs one pass over the chunk, only while [debug] audioring is on. */
+static uint64_t sRcMagSum;             /* sum of |sample| over real frames, both channels */
+static uint32_t sRcMagFrames;          /* real frames counted into sRcMagSum */
+static uint32_t sRcPeak;               /* session max |sample| */
+static uint32_t sRcTickUsMax;
+static uint32_t sRcGapUsMax;
+static uint64_t sRcLastTickEndTick;
+/* levers (both default 0 = the unchanged path, so the shipped pacing is byte-identical) */
+static int32_t sRcTargetOverride;      /* INI [debug] audio_target_frames */
+static uint32_t sRcRingOverride;       /* INI [debug] audio_ring_frames */
+
+static uint32_t RcOccBucket(uint32_t frames) {
+    if (frames == 0u) {
+        return 0u;
+    }
+    if (frames < 128u) {
+        return 1u;
+    }
+    if (frames < 256u) {
+        return 2u;
+    }
+    if (frames < 512u) {
+        return 3u;
+    }
+    if (frames < 1024u) {
+        return 4u;
+    }
+    if (frames < 2048u) {
+        return 5u;
+    }
+    if (frames < 4096u) {
+        return 6u;
+    }
+    return 7u;
+}
+
+/* 1 ms, 2, 4, 8, 16, 32, 64, >=64 -- one octave per bucket from the 2 ms drain poll up past
+ * the 64 ms the two queued chunks buy. */
+static uint32_t RcUsBucket(uint32_t us) {
+    uint32_t b = 0u;
+    uint32_t lim = 1000u;
+    while (b < GDX3DS_AUDIO_RC_BUCKETS - 1u && us >= lim) {
+        lim <<= 1;
+        b++;
+    }
+    return b;
+}
+
+static void RcResetWindow(void) {
+    uint32_t i;
+    sRcChunks = 0u;
+    sRcSilFrames = 0u;
+    sRcDry = 0u;
+    sRcPart = 0u;
+    sRcStarveChunks = 0u;
+    sRcStarveFrames = 0u;
+    sRcDryRunMax = 0u;
+    sRcRingMax = 0u;
+    sRcWakes = 0u;
+    sRcWakesIdle = 0u;
+    sRcWakesCapped = 0u;
+    sRcTicks = 0u;
+    sRcTickUsMax = 0u;
+    sRcGapUsMax = 0u;
+    sRcMagSum = 0u;
+    sRcMagFrames = 0u;
+    sRcPeak = 0u;
+    for (i = 0u; i < GDX3DS_AUDIO_RC_BUCKETS; i++) {
+        sRcOcc[i] = 0u;
+        sRcTickUs[i] = 0u;
+        sRcGapUs[i] = 0u;
+        sRcBufAtWake[i] = 0u;
+    }
+}
+
+/* Drain thread only, once per submitted chunk. `ringBefore` is the ring level the pull saw
+ * (count after the pull plus what it took); the unlocked re-read is the benign diag race. */
+static void RcNoteChunk(uint32_t ringBefore, uint32_t real) {
+    uint32_t pad;
+    if (!sRcEnabled) {
+        return;
+    }
+    sRcChunks++;
+    sRcChunksSincePush++;
+    sRcOcc[RcOccBucket(ringBefore)]++;
+    if (ringBefore > sRcRingMax) {
+        sRcRingMax = ringBefore;
+    }
+    if (real >= GDX3DS_AUDIO_CHUNK_FRAMES) {
+        sRcDryRun = 0u;
+        return;
+    }
+    pad = GDX3DS_AUDIO_CHUNK_FRAMES - real;
+    sRcSilFrames += pad;
+    if (real == 0u) {
+        sRcDry++;
+        sRcDryRun++;
+        if (sRcDryRun > sRcDryRunMax) {
+            sRcDryRunMax = sRcDryRun;
+        }
+    } else {
+        sRcPart++;
+        sRcDryRun = 0u;
+    }
+    if (sRcChunksSincePush <= GDX3DS_AUDIO_RC_PUSH_GRACE) {
+        sRcStarveChunks++;
+        sRcStarveFrames += pad;
+    }
+}
+
+/* Drain thread (periodic) and main thread (FINAL, after both audio threads have joined).
+ * `sil_ppk` is the headline: spliced silence frames per 1000 submitted frames. It is the
+ * closest thing this port has to a measurement of "crackle", and unlike `under=` it counts
+ * the dry chunks too. */
+/* The EFFECTIVE producer target, with no side effects: gdx3ds_audio_producer_target_frames
+ * also RELEASES the boot target and logs a one-shot when it does, and that release is the
+ * producer thread's to make -- a receipt printed from the drain thread must never move it.
+ * The clamp is shared with that function so the two can never disagree. */
+static int32_t RcClampTarget(int32_t want) {
+    int32_t cap = (int32_t)s.capacityFrames - 1024; /* target + one 528-frame tick, with room */
+    if (cap < GDX3DS_AUDIO_PRIME2_RUN_TARGET_FRAMES) {
+        cap = GDX3DS_AUDIO_PRIME2_RUN_TARGET_FRAMES;
+    }
+    return (want > cap) ? cap : want;
+}
+
+static int32_t RcEffectiveTarget(void) {
+    if (sRcTargetOverride > 0 && s.initialized) {
+        return RcClampTarget(sRcTargetOverride);
+    }
+    return sBootTargetActive ? GDX3DS_AUDIO_PRIME2_BOOT_TARGET_FRAMES
+                             : GDX3DS_AUDIO_PRIME2_RUN_TARGET_FRAMES;
+}
+
+static void LogRingCensus(const char* tag) {
+    uint32_t frames;
+    uint32_t silPpk;
+    uint32_t dryPct;
+    if (!sRcEnabled) {
+        return;
+    }
+    frames = sRcChunks * GDX3DS_AUDIO_CHUNK_FRAMES;
+    silPpk = (frames != 0u) ? (uint32_t)(((uint64_t)sRcSilFrames * 1000ull) / frames) : 0u;
+    dryPct = (sRcChunks != 0u) ? ((sRcDry * 100u) / sRcChunks) : 0u;
+    AudioOutLogf("[audioring] %s t=%lums chunks=%lu sil=%lu/%lu sil_ppk=%lu dry=%lu(%lu%%) "
+                 "part=%lu dryrun=%lu starve=%lu/%lu ringmax=%lu target=%d",
+                 tag, (unsigned long)MsSinceInit(), (unsigned long)sRcChunks,
+                 (unsigned long)sRcSilFrames, (unsigned long)frames, (unsigned long)silPpk,
+                 (unsigned long)sRcDry, (unsigned long)dryPct, (unsigned long)sRcPart,
+                 (unsigned long)sRcDryRunMax, (unsigned long)sRcStarveChunks,
+                 (unsigned long)sRcStarveFrames, (unsigned long)sRcRingMax,
+                 /* the EFFECTIVE target, override included -- [audioprime2]'s own lines print
+                  * the unoverridden constant and would disagree with the ring if quoted here */
+                 (int)RcEffectiveTarget());
+    AudioOutLogf("[audioring] %s level mag=%lu peak=%lu magframes=%lu",
+                 tag,
+                 (unsigned long)(sRcMagFrames != 0u
+                                     ? (uint32_t)(sRcMagSum /
+                                                  ((uint64_t)sRcMagFrames * GDX3DS_AUDIO_CHANNELS))
+                                     : 0u),
+                 (unsigned long)sRcPeak, (unsigned long)sRcMagFrames);
+    AudioOutLogf("[audioring] %s occ[0|128|256|512|1k|2k|4k|+]=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
+                 tag, (unsigned long)sRcOcc[0], (unsigned long)sRcOcc[1],
+                 (unsigned long)sRcOcc[2], (unsigned long)sRcOcc[3], (unsigned long)sRcOcc[4],
+                 (unsigned long)sRcOcc[5], (unsigned long)sRcOcc[6], (unsigned long)sRcOcc[7]);
+    AudioOutLogf("[audioring] %s prod wakes=%lu idle=%lu capped=%lu ticks=%lu "
+                 "tick_ms[1|2|4|8|16|32|64|+]=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu max=%luus",
+                 tag, (unsigned long)sRcWakes, (unsigned long)sRcWakesIdle,
+                 (unsigned long)sRcWakesCapped, (unsigned long)sRcTicks,
+                 (unsigned long)sRcTickUs[0], (unsigned long)sRcTickUs[1],
+                 (unsigned long)sRcTickUs[2], (unsigned long)sRcTickUs[3],
+                 (unsigned long)sRcTickUs[4], (unsigned long)sRcTickUs[5],
+                 (unsigned long)sRcTickUs[6], (unsigned long)sRcTickUs[7],
+                 (unsigned long)sRcTickUsMax);
+    AudioOutLogf("[audioring] %s prod gap_ms[1|2|4|8|16|32|64|+]=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu "
+                 "max=%luus buf[0|128|256|512|1k|2k|4k|+]=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu",
+                 tag, (unsigned long)sRcGapUs[0], (unsigned long)sRcGapUs[1],
+                 (unsigned long)sRcGapUs[2], (unsigned long)sRcGapUs[3],
+                 (unsigned long)sRcGapUs[4], (unsigned long)sRcGapUs[5],
+                 (unsigned long)sRcGapUs[6], (unsigned long)sRcGapUs[7],
+                 (unsigned long)sRcGapUsMax, (unsigned long)sRcBufAtWake[0],
+                 (unsigned long)sRcBufAtWake[1], (unsigned long)sRcBufAtWake[2],
+                 (unsigned long)sRcBufAtWake[3], (unsigned long)sRcBufAtWake[4],
+                 (unsigned long)sRcBufAtWake[5], (unsigned long)sRcBufAtWake[6],
+                 (unsigned long)sRcBufAtWake[7]);
+    if (sRcEnabled >= 2) {
+        RcResetWindow(); /* level 2: each line is a window, not a running total */
+    }
+}
+
 /* Drain thread only, audioprime2 on: the companion line for an `under edge` one-shot (see the
  * [audioprime2] header, item c). Unlocked reads of the producer's tick state: benign
  * aligned-int diag race. */
@@ -429,6 +688,10 @@ static void FillAndSubmitSlot(uint32_t slotIndex) {
     uint32_t real = 0;
     if (!PrimeHoldsRing()) {
         real = PullFromRing(pcm, GDX3DS_AUDIO_CHUNK_FRAMES);
+        /* [audioring]: the level the pull SAW = what it left plus what it took. The unlocked
+         * re-read is the benign aligned-int diag race used throughout this file. Chunks the
+         * prime deliberately holds are not censused -- they are policy, not starvation. */
+        RcNoteChunk(s.countFrames + real, real);
     }
     if (real < GDX3DS_AUDIO_CHUNK_FRAMES) {
         memset(pcm + (size_t)real * GDX3DS_AUDIO_CHANNELS, 0,
@@ -450,6 +713,32 @@ static void FillAndSubmitSlot(uint32_t slotIndex) {
         }
     }
     slot->realFrames = real;
+
+    /* [audioring] LEVEL census: mean |sample| and peak over the REAL frames only, so the
+     * silence the drain splices in cannot dilute the figure it is meant to cross-check. */
+    if (sRcEnabled && real != 0u) {
+        const uint32_t n = real * GDX3DS_AUDIO_CHANNELS;
+        uint64_t sum = 0;
+        uint32_t peak = 0;
+        uint32_t k;
+        for (k = 0; k < n; k++) {
+            int32_t v = pcm[k];
+            uint32_t a;
+            if (v < 0) {
+                v = -v;
+            }
+            a = (uint32_t)v;
+            sum += a;
+            if (a > peak) {
+                peak = a;
+            }
+        }
+        sRcMagSum += sum;
+        sRcMagFrames += real;
+        if (peak > sRcPeak) {
+            sRcPeak = peak;
+        }
+    }
 
     if (sTestTone) {
         /* Output-plumbing bisector: the ring was still drained above (pacing identical),
@@ -597,6 +886,9 @@ static void DrainThreadMain(void* arg) {
                 LogPrimeReceipt();
             }
         }
+        if (sRcEnabled && sRcReportPolls != 0u && ((polls + 1u) % sRcReportPolls) == 0u) {
+            LogRingCensus("win");
+        }
         if (sDiagAudio && (++polls % GDX3DS_AUDIO_DIAG_POLLS) == 0u) {
             /* Unlocked reads: benign aligned-int diag race, same as the watchdog counters.
              * Reading the line: done==0 while sub grows => DSP never plays (ndsp/firmware
@@ -698,6 +990,15 @@ int gdx3ds_audio_init(uint32_t bufferFrames) {
     if (sPrime2Enabled && bufferFrames == 0) {
         s.capacityFrames = GDX3DS_AUDIO_PRIME2_RING_FRAMES; /* room for the boot target + a tick */
     }
+    /* [audioring] levers, both default 0 = the unchanged path. audio_ring_frames only ever
+     * GROWS the ring (a smaller one would change drop-oldest behaviour for no benefit), and
+     * audio_target_frames is clamped against it in gdx3ds_audio_producer_target_frames so a
+     * target can never exceed what the ring plus one 528-frame tick can hold. */
+    sRcTargetOverride = (int32_t)gdx3ds_config_get_int("debug", "audio_target_frames", 0);
+    sRcRingOverride = (uint32_t)gdx3ds_config_get_int("debug", "audio_ring_frames", 0);
+    if (bufferFrames == 0 && sRcRingOverride > s.capacityFrames) {
+        s.capacityFrames = sRcRingOverride;
+    }
     sBootTargetActive = sPrime2Enabled;
     sBootTargetReleaseMs = 0;
     sProdInTick = 0;
@@ -712,6 +1013,13 @@ int gdx3ds_audio_init(uint32_t bufferFrames) {
     }
 
     sDiagAudio = gdx3ds_config_get_bool("debug", "diag_audio", 0);
+    sRcEnabled = gdx3ds_config_get_int("debug", "audioring", 0);
+    sRcReportPolls = (uint32_t)gdx3ds_config_get_int("debug", "audioring_report", 2500);
+    RcResetWindow();
+    sRcChunksSincePush = GDX3DS_AUDIO_RC_PUSH_GRACE + 1u; /* nothing pushed yet */
+    sRcDryRun = 0u;
+    sRcTicksThisWake = 0u;
+    sRcLastTickEndTick = 0u;
     sTestTone = gdx3ds_config_get_bool("debug", "audio_testtone", 0);
     sPrimeEnabled = gdx3ds_config_get_bool("debug", "audioprime", 1);
     sStallSimMs = gdx3ds_config_get_int("debug", "audio_stallsim", 0);
@@ -828,6 +1136,7 @@ void gdx3ds_audio_shutdown(void) {
     if (!s.initialized) {
         return;
     }
+    LogRingCensus("FINAL"); /* whole-session totals; both threads are still the only writers */
     s.stopRequested = 1;         /* set BEFORE the signal: the park loop re-checks it */
     __dmb();
     LightEvent_Signal(&sDrainParkEvent); /* a drain parked by the suspend gate must see stop */
@@ -883,6 +1192,7 @@ size_t gdx3ds_audio_push(const int16_t* samples, size_t frames) {
      * 0x0000 if every sample ever pushed was zero. Scan gated on diag_audio (2 KB/push). */
     sPushCalls++;
     sPushFrames += (uint32_t)frames;
+    sRcChunksSincePush = 0u; /* [audioring]: the producer is live as of this chunk */
     if (sFirstPushMs == 0) {
         sFirstPushMs = osGetTime(); /* prime timeout base; producer thread only */
     }
@@ -1178,6 +1488,13 @@ int gdx3ds_audio_prime2_enabled(void) {
  * run target (byte-identical pacing). On = the boot target until the first race-active frame
  * or the boot window elapses; the release is a one-shot receipt. */
 int32_t gdx3ds_audio_producer_target_frames(int raceActive) {
+    /* [debug] audio_target_frames overrides the cushion the producer paces to, for BOTH the
+     * boot and run phases. 0 (default) leaves every branch below exactly as it was. It is
+     * clamped so a target plus one 528-frame producer tick can never wrap the ring into
+     * drop-oldest, which would turn a cushion into silence. */
+    if (sRcTargetOverride > 0 && s.initialized) {
+        return RcClampTarget(sRcTargetOverride);
+    }
     if (!sPrime2Enabled || !s.initialized) {
         return GDX3DS_AUDIO_PRIME2_RUN_TARGET_FRAMES;
     }
@@ -1209,6 +1526,17 @@ int32_t gdx3ds_audio_producer_target_frames(int raceActive) {
 void gdx3ds_audio_producer_tick_begin(void) {
     sProdTickStartTick = svcGetSystemTick();
     sProdInTick = 1;
+    /* [audioring]: the GAP between the end of the previous tick and the start of this one is
+     * the producer's "was I allowed to run" axis. A long gap with short ticks means the thread
+     * did not get the core; a long TICK means it was stuck inside production (on the EK build,
+     * typically AudioLoad_SyncDiskDrive blocking on a 64DD LBA). The two cannot be confused. */
+    if (sRcEnabled && sRcLastTickEndTick != 0u) {
+        uint32_t gapUs = TicksToUs(sProdTickStartTick - sRcLastTickEndTick);
+        sRcGapUs[RcUsBucket(gapUs)]++;
+        if (gapUs > sRcGapUsMax) {
+            sRcGapUsMax = gapUs;
+        }
+    }
 }
 
 void gdx3ds_audio_producer_tick_end(void) {
@@ -1219,6 +1547,37 @@ void gdx3ds_audio_producer_tick_end(void) {
         sProdMaxTickUs = us;
     }
     sProdTickCount++;
+    if (sRcEnabled) {
+        sRcTicks++;
+        sRcTicksThisWake++;
+        sRcTickUs[RcUsBucket(us)]++;
+        if (us > sRcTickUsMax) {
+            sRcTickUsMax = us;
+        }
+        sRcLastTickEndTick = svcGetSystemTick();
+    }
+}
+
+/* HLE producer thread only, once per loop iteration, BEFORE the catch-up loop. Folds in what
+ * the previous iteration did (ticks produced, whether it left on the kMaxTicksPerWake cap) and
+ * records the buffered level the producer is about to pace against. Off = one int compare. */
+void gdx3ds_audio_producer_wake(int32_t target, int32_t maxTicksPerWake) {
+    uint32_t buffered;
+    if (!sRcEnabled) {
+        return;
+    }
+    buffered = s.countFrames + s.inFlightFrames; /* unlocked: benign aligned-int diag race */
+    if (sRcWakes != 0u) {
+        if (sRcTicksThisWake == 0u) {
+            sRcWakesIdle++;
+        } else if ((int32_t)sRcTicksThisWake >= maxTicksPerWake) {
+            sRcWakesCapped++;
+        }
+    }
+    sRcTicksThisWake = 0u;
+    sRcWakes++;
+    sRcBufAtWake[RcOccBucket(buffered)]++;
+    (void)target;
 }
 
 /* Main thread: boot phase tag for the under-edge thread map (string literal, never freed). */

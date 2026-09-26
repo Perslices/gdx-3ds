@@ -2722,7 +2722,36 @@ void GfxRenderingAPIC3D::EnsureMissingTexture() {
     mMissingTexInited = true;
 }
 
+/* C4c: the decoded-texture staging high-water.
+ *
+ * Fast3D's Interpreter::Init allocates ONE `malloc(max_tex_size * max_tex_size * 4)` and
+ * holds it for the process lifetime; on this backend GetMaxTextureSize() is 1024, so that
+ * is 4,194,304 B -- the single largest heap block the port has that no [mem-res] row names,
+ * and 16% of an Old 3DS memtype-0 grant. Every decode writes 4*width*height bytes of it and
+ * then lands here, so this is the one place that sees the real demand without touching a
+ * vendored decoder. A pure max-update: three compares on a path that is about to do a
+ * width*height texture copy.
+ *
+ * It reads slightly HIGH, deliberately: ImportTextureImg uploads its source buffer directly
+ * rather than the staging one, so its extent is counted here although it never touched the
+ * staging buffer. A high-water that over-reports is the safe direction for sizing. */
+extern "C" {
+unsigned long gdx3ds_tex_upload_hwm_bytes = 0;
+unsigned long gdx3ds_tex_upload_hwm_w = 0;
+unsigned long gdx3ds_tex_upload_hwm_h = 0;
+unsigned long gdx3ds_tex_upload_count = 0;
+}
+
 void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
+    {
+        const unsigned long bytes = (unsigned long)width * (unsigned long)height * 4ul;
+        gdx3ds_tex_upload_count++;
+        if (bytes > gdx3ds_tex_upload_hwm_bytes) {
+            gdx3ds_tex_upload_hwm_bytes = bytes;
+            gdx3ds_tex_upload_hwm_w = width;
+            gdx3ds_tex_upload_hwm_h = height;
+        }
+    }
     const uint32_t id = mBoundTextureIds[mLastSelectedTile];
     if (id >= mTextures.size() || width == 0 || height == 0) {
         mTexUploadFails++;
@@ -3850,7 +3879,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
      * this is where a frame's combiner / render-mode / texture-format vocabulary is recorded.
      * One branch on gdx3ds_cov_on when the census is off, which is every shipped run. */
     if (gdx3ds_cov_on) {
-        CovNoteDraw(prg, texBacked, anchoredDraw);
+        CovNoteDraw(prg, texBacked, anchoredDraw, numVerts, bufVboNumTris);
     }
     if (packed) {
         sPackedDrawCalls++; // [triloop] receipt: dPk on the [c3d] line
@@ -3910,7 +3939,8 @@ void GfxRenderingAPIC3D::CovNoteTexture(int unit, uint32_t texId) {
                                        (cms << 6) | (cmt << 4)));
 }
 
-void GfxRenderingAPIC3D::CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw) {
+void GfxRenderingAPIC3D::CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw,
+                                     size_t numVerts, size_t numTris) {
     /* Combiner: the two 64-bit shader ids folded to 24 bits. A fold, not an identity — a
      * collision would merge two combiners into one coverage feature, which costs a sample, and
      * the alternative (a dense side table) costs a per-draw map probe in the hot path. */
@@ -3941,6 +3971,15 @@ void GfxRenderingAPIC3D::CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked
         gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_RM, rm | 0x10000u));
     }
     gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_FB, texBacked ? 1u : 0u));
+
+    /* Batch MAGNITUDE (NEXT.md B51), log2-bucketed. Every family above this line describes
+     * state; this one describes size, which is the only thing a batching or merging
+     * regression changes. See gdx3ds_cov.h for why log2 and why (path, verts, tris) is one
+     * joint key rather than three. */
+    gdx3ds_cov_mark(GDX3DS_COV_KEY(
+        GDX3DS_COV_FAM_BATCH,
+        GDX3DS_COV_BATCH_VAL(mNativeActive ? GDX3DS_COV_BATCH_INDEXED : GDX3DS_COV_BATCH_ARRAY,
+                             CovLog2u((uint32_t)numVerts), CovLog2u((uint32_t)numTris))));
 
     for (int tile = 0; tile < 2; tile++) {
         if (prg.cc.usedTextures[tile]) {

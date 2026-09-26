@@ -35,6 +35,7 @@ extern "C" int gdx3ds_trectbatch_enabled(void) __attribute__((weak));
 /* The bridge's two memo levers, RESOLVED, for the [native] receipt (n64_gfx_bridge.cpp). */
 extern "C" int gdx_bridge_dlfacts_on(void) __attribute__((weak));
 extern "C" int gdx_bridge_stubgen_narrow_on(void) __attribute__((weak));
+extern "C" int gdx_bridge_memoorder(void) __attribute__((weak));
 extern "C" void gdx3ds_atlas_arm(int on) __attribute__((weak));
 extern "C" int gdx3ds_tex_page(uint32_t texId) __attribute__((weak));
 extern "C" void gdx3ds_vbopack_refresh(Gdx3dsVboPackParams* params) __attribute__((weak));
@@ -249,6 +250,16 @@ int sTimgMemo = 1;   /* [native] timgmemo: cross-frame SETTIMG classification me
  * [native] tmemcls arms the class census alone and changes no behaviour. */
 int sTmemSkip = 0;
 int sTmemCls = 0;
+/* [memotear] [debug] tmemfault -- FAULT INJECTION for the tmemskip refusal arm (NEXT.md B54).
+ * tmemblock gated tmemskip green over 412,326 corpus skips with stale=0, i.e. the corpus never
+ * once drove the gate to say STALE; only the host test does. 0 = off (always, by default).
+ * N > 0 = force staleness on every Nth load that WOULD have skipped, alternating the two
+ * mechanisms the gate is supposed to catch (the source generation moving, and the class
+ * changing under the span). Inert unless tmemskip != 0, so the shipping default cannot reach
+ * it. The gate result is the pair (a) tmemStale climbs by the injection count and the skip does
+ * not happen, (b) the frame is byte-identical to the tmemskip=0 run -- a refusal means the
+ * mirror is rewritten, which is exactly what tmemskip=0 does every time. */
+int sTmemFault = 0;
 BackendC3D* sBackend = nullptr;
 gdxn::Interp* sInterp = nullptr;
 GdxInterpSeam* sSeam = nullptr; /* the native replay seam over sInterp (gdx_seam_owned.cpp) */
@@ -314,6 +325,7 @@ void Latch() {
     /* Not Tier-2 and not a boolean: tmemskip is a LEVEL (see sTmemSkip). */
     sTmemSkip = gdx3ds_config_get_int("native", "tmemskip", 0);
     sTmemCls = gdx3ds_config_get_int("native", "tmemcls", 0);
+    sTmemFault = gdx3ds_config_get_int("debug", "tmemfault", 0);
     /* ownfold IS Tier-2 (`all=1` turns it on, exactly as it turns on fx_hud -- they are the
        same fold, one per interpreter); an explicit `ownfold = 0` still wins. */
     sOwnFold = gdx3ds_native_lever("ownfold", 0) != 0;
@@ -347,14 +359,18 @@ void Latch() {
     const int dlFactsResolved = (&gdx_bridge_dlfacts_on != nullptr) ? gdx_bridge_dlfacts_on() : -1;
     const int stubGenResolved =
         (&gdx_bridge_stubgen_narrow_on != nullptr) ? gdx_bridge_stubgen_narrow_on() : -1;
+    /* [memotear] [native] memoorder -- the publication-order/barrier level of the six
+       process-wide [brfast] memos. Same weak-accessor rule as the two above. */
+    const int memoOrderResolved = (&gdx_bridge_memoorder != nullptr) ? gdx_bridge_memoorder() : -1;
     char buf[512];
     snprintf(buf, sizeof(buf),
              "[native] interp=%d path=%s cpuclip=%d blendflush=%d palhash=%d texhash_ci=%d texinval=%d "
              "rawcopywhole=%d verify=%d ncensus=%d dspcensus=%d ownfold=%d timgmemo=%d dlfacts=%d stubgen=%d "
-             "tmemskip=%d tmemcls=%d texstalefix=%d vtxclamp=%d hooks=%s",
+             "tmemskip=%d tmemcls=%d texstalefix=%d vtxclamp=%d memoorder=%d tmemfault=%d hooks=%s",
              sInterpOn, sInterpOn ? "owned" : "lus", sCpuClip, sBlendFlush, sPalHash, sTexHashCi,
              sTexInval, sRawCopyWhole, sVerifyOn, sCensus, sDspCensus, sOwnFold, sTimgMemo,
              dlFactsResolved, stubGenResolved, sTmemSkip, sTmemCls, sTexStaleFix, sVtxClamp,
+             memoOrderResolved, sTmemFault,
              sInterpOn ? "noop(track,fx)+dl(machines)" : "lus");
     RtLog(buf);
 }
@@ -541,13 +557,15 @@ void EmitReceipt() {
                           is the column that carries the invalidation claim: it is the memo
                           catching a real write, not a collision.
              cls          every load by source class: Native / Stable / Dma / Unknown. */
-        char ts[256];
+        char ts[320];
         snprintf(ts, sizeof(ts),
                  "[tmemskip] lvl=%d loads=%u skips=%u (imm=%u gen=%u) desc=%u stale=%u | "
-                 "cls n=%u s=%u d=%u u=%u | miss span=%u kind=%u words=%u addr=%u other=%u",
+                 "cls n=%u s=%u d=%u u=%u | miss span=%u kind=%u words=%u addr=%u other=%u | "
+                 "fault=%d inj=%u/%u caught=%u missed=%u",
                  sTmemSkip, s.tmemLoads, s.tmemSkips, s.tmemSkipImm, s.tmemSkipGen, s.tmemDescSame,
                  s.tmemStale, s.tmemClsN, s.tmemClsS, s.tmemClsD, s.tmemClsU, s.tmemMissSpan,
-                 s.tmemMissKind, s.tmemMissWords, s.tmemMissAddr, s.tmemMissOther);
+                 s.tmemMissKind, s.tmemMissWords, s.tmemMissAddr, s.tmemMissOther,
+                 sTmemFault, s.tmemFaultGen, s.tmemFaultCls, s.tmemFaultCaught, s.tmemFaultMissed);
         RtLog(ts);
     }
     if (&gdx3ds_dynlod_receipt != nullptr) {
@@ -701,6 +719,12 @@ extern "C" int gdx_ninterp_tmemskip(void) {
 extern "C" int gdx_ninterp_tmemcls(void) {
     Latch();
     return sTmemCls;
+}
+
+/* [memotear] [debug] tmemfault -- see sTmemFault. */
+extern "C" int gdx_ninterp_tmemfault(void) {
+    Latch();
+    return sTmemFault;
 }
 
 extern "C" int gdx_ninterp_timgmemo(void) {

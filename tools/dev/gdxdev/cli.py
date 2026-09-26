@@ -19,13 +19,40 @@ exit codes: 0 PASS  1 FAIL  2 usage  3 preflight  4 lock  5 staging  6 no data  
 """
 
 
-def _common(p):
-    p.add_argument("--track", help="track name (default: worktree basename)")
-    p.add_argument("--run-root", default=None,
+#: The driver-level options. Declared once here so `_common` and the regression
+#: test that walks the parser tree (test_gdxdev.py::DriverOptionShadowTest) read
+#: the same list.
+DRIVER_OPTIONS = ("track", "run_root", "json", "quiet", "dry_run")
+
+
+def _common(p, driver=False):
+    """The driver-level options, repeated on every subparser for discoverability.
+
+    NEXT.md B52. argparse's subparser action parses into a FRESH namespace and then
+    copies EVERY key of it onto the driver's namespace — including keys that only
+    hold the SUBPARSER's default. So a repeat of a driver-level option silently
+    overwrote the value the driver had already parsed: `gdx-dev --track X retro run`
+    filed the run under the worktree's name, not X, and `gdx-dev --dry-run retro
+    run` really ran. Caught when covdrift.sh reported `RESULT PASS ... shots=49/49`
+    for every replay and then `NO RUN` for every replay.
+
+    The fix is that only the DRIVER declares defaults. Every repeat uses
+    `argparse.SUPPRESS`, which leaves the key absent from the subnamespace unless it
+    was actually typed, so nothing is copied over and the driver's value survives.
+    Typing it on both still works and the subcommand's value wins, which is the
+    order a reader expects.
+    """
+    def dflt(value):
+        return value if driver else argparse.SUPPRESS
+
+    p.add_argument("--track", default=dflt(None),
+                   help="track name (default: worktree basename)")
+    p.add_argument("--run-root", default=dflt(None),
                    help="run directory root (default: %s)" % util.DEFAULT_RUN_ROOT)
-    p.add_argument("--json", action="store_true", help="machine-readable result on stdout")
-    p.add_argument("--quiet", action="store_true")
-    p.add_argument("--dry-run", action="store_true",
+    p.add_argument("--json", action="store_true", default=dflt(False),
+                   help="machine-readable result on stdout")
+    p.add_argument("--quiet", action="store_true", default=dflt(False))
+    p.add_argument("--dry-run", action="store_true", default=dflt(False),
                    help="print exactly what this invocation would do and do NONE of it: "
                         "nothing launched, written, downloaded or locked")
 
@@ -50,6 +77,24 @@ def _add_3d(p):
                         % stereo3d.DEFAULT_DEPTH)
 
 
+def _add_model(p):
+    """`--model new|old` (gdxdev/retro.py MODELS).
+
+    Old 3DS is NEXT.md C4's target: half the FCRAM and no core 2, so the port's render
+    thread self-disables there whatever `[debug] renderthread` says. An `old` run is
+    therefore a different EXECUTION from every New 3DS cell, not a different setting --
+    never quote its frame hashes against one.
+    """
+    from . import retro
+    p.add_argument("--model", dest="model", default=None,
+                   choices=sorted(retro.MODELS),
+                   help="emulated system model: %s (default: the core's own, New 3DS). "
+                        "--model old is the Old 3DS lane; it forces the core-options "
+                        "redirect, so --gfx starts being honoured too."
+                        % ", ".join("%s (%s)" % (k, v)
+                                    for k, v in sorted(retro.MODELS.items())))
+
+
 def retro_defaults():
     """(no-replay default, staged-replay default) seconds, from the lane itself."""
     from . import retro
@@ -61,7 +106,7 @@ def build_parser():
         prog="gdx-dev",
         description="One CLI for the 3DS fork's dev loop: build, emulator, profile, SD.",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    _common(ap)
+    _common(ap, driver=True)
     sub = ap.add_subparsers(dest="cmd")
 
     # ---- build
@@ -275,6 +320,7 @@ def build_parser():
                          "behaviour (wobble, dynlod). Same as --ini debug.replay_quit=0")
     rr.add_argument("--build-dir", default=buildmod.DEFAULT_BUILD_DIR)
     _add_3d(rr)
+    _add_model(rr)
     rr.set_defaults(func=_retro_dispatch)
     rs = rtsub.add_parser("setup", help="install/verify the core and write per-instance configs")
     _common(rs)

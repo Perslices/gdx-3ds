@@ -335,6 +335,44 @@ def _run_3dslink(ip, path):
     return proc.returncode, state["sent"], state["total"]
 
 
+
+def _wait_for_guest(ip, timeout):
+    """Poll the control port until the freshly pushed guest answers PING. -> reply or None.
+
+    This is the push's real verification: bytes on the wire are what 3dslink claims, a PONG
+    is what the console did with them.
+    """
+    deadline = time.time() + max(1, timeout)
+    while time.time() < deadline:
+        try:
+            with Control(ip, timeout=3.0) as c:
+                reply = c.command("PING")
+            if reply.startswith("OK"):
+                return reply
+        except Exception:
+            pass
+        time.sleep(3.0)
+    return None
+
+
+def _post_push(srv, args):
+    if not srv:
+        return 0
+    line = srv.wait_for("[net] link up", args.wait)
+    if line:
+        print("=> %s" % line)
+    else:
+        print("!! no '[net] link up' within %ds. Either [net] enabled=0 in "
+              "gdiffuser.ini, or the console cannot reach this Mac." % args.wait)
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nstopping log server")
+        srv.stop.set()
+    return 0
+
+
 def cmd_push(args):
     if not os.path.exists(LINK3DS):
         die("3dslink not found at %s.\n"
@@ -370,17 +408,25 @@ def cmd_push(args):
     # and throws an error that reads like a bad build. Verify the byte count it reported
     # against the file we handed it, and against the announced total.
     want = os.path.getsize(path)
-    if total is not None and total != want:
-        die("3dslink announced %d bytes but %s is %d bytes on disk." % (total, path, want))
-    if sent is None:
-        die("3dslink printed no progress line, so the transfer cannot be confirmed. "
-            "Re-arm the netloader screen (press Y) and push again.")
-    if sent != want:
-        die("TRUNCATED PUSH: 3dslink exited 0 after sending %d of %d bytes (%.2f%%).\n"
-            "The console now holds a partial .3dsx and will error on launch.\n"
-            "Re-arm hbmenu's netloader screen (press Y) and push again."
-            % (sent, want, 100.0 * sent / want if want else 0.0))
-    print("pushed %d bytes (verified). hbmenu should be launching it now." % sent)
+    # 3dslink's byte counter CANNOT verify this transfer. When its stdout is a pipe rather
+    # than a tty it stops emitting progress updates partway through -- every piped push here
+    # stalls its reporting at ~46% -- so a low final count says nothing about what arrived.
+    # Two pushes were wrongly declared TRUNCATED on that evidence while the guest was in fact
+    # running. The honest test is whether the console comes up, so ask it.
+    if sent is not None and sent >= want:
+        print("pushed %d bytes (3dslink reported the full transfer)." % sent)
+        return _post_push(srv, args)
+    progress = ("3dslink reported %d of %d bytes (%.2f%%)" % (sent, want, 100.0 * sent / want)
+                if sent else "3dslink printed no progress line")
+    print("%s -- piped output under-reports, so confirming against the console." % progress)
+    booted = _wait_for_guest(ip, args.verify_wait)
+    if booted:
+        print("pushed and CONFIRMED: %s" % booted)
+    else:
+        print("!! could not confirm the guest within %ds. Either the transfer really was\n"
+              "   short (re-arm the netloader screen and push again), [net] enabled=0 in\n"
+              "   gdiffuser.ini, or the console cannot reach this Mac." % args.verify_wait)
+    return _post_push(srv, args)
     if srv:
         line = srv.wait_for("[net] link up", args.wait)
         if line:
@@ -770,6 +816,10 @@ def main(argv):
     p.add_argument("--log", action="store_true", help="also run the log server and tail it")
     p.add_argument("--out", help="log file (default artifacts/hw-<ts>.log)")
     p.add_argument("--wait", type=int, default=40, help="seconds to wait for [net] link up")
+    p.add_argument("--verify-wait", dest="verify_wait", type=int, default=45,
+                   help="seconds to wait for the pushed guest to answer PING on the control "
+                        "port. This, not 3dslink's byte counter, is what confirms a push: "
+                        "piped 3dslink output stalls its progress reporting partway through.")
     p.set_defaults(fn=cmd_push)
 
     p = sub.add_parser("log", help="serve the log link on 17491 and tail it")

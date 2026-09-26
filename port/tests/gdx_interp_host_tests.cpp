@@ -63,6 +63,7 @@ static int gdx_test_timgmemo = 1;
    that goes red is the widened gate skipping a load the shipping gate would have performed.
    The suite runs the TMEM tests at BOTH levels -- see TmemSkipSuite. */
 static int gdx_test_tmemskip = 0;
+static int gdx_test_tmemfault = 0;   /* [memotear] B54 fault injection */
 static int gdx_test_tmemcls = 0;
 /* Mock generations, so a test can move one and prove the skip stops firing, and the class the
    mock seam reports for an in-range source (STABLE unless a test asks for another). */
@@ -203,6 +204,25 @@ int gdx_ninterp_tmemskip(void) {
 }
 int gdx_ninterp_tmemcls(void) {
     return gdx_test_tmemcls;
+}
+int gdx_ninterp_tmemfault(void) {
+    return gdx_test_tmemfault;
+}
+/* [memotear] B54: the mock's generations are the ones gdx_gfx_tmem_source_unchanged above
+   reads, so moving them here is the same fault the real seam injects through the bridge's bump
+   helper and dirty-range recorder. STABLE has no generation arm in the real seam either, so the
+   mock answers 0 for it and the injector falls back to the class mechanism -- which is the
+   behaviour under test, not a mock limitation. */
+int gdx_gfx_tmem_fault_move_generation(uintptr_t, size_t, unsigned cls) {
+    if (cls == GDX_TMEMSRC_NATIVE) {
+        gdx_test_native_gen++;
+        return 1;
+    }
+    if (cls == GDX_TMEMSRC_DMA) {
+        gdx_test_dma_gen++;
+        return 1;
+    }
+    return 0;
 }
 unsigned long long gdx_ninterp_child_ticks(void) {
     return 0;
@@ -1109,11 +1129,139 @@ static void TestTmemSkipWidened() {
     gdx_test_src_cls = GDX_TMEMSRC_STABLE;
 }
 
+/* [memotear] NEXT.md B54 -- the INJECTOR itself, tested before it is trusted in the guest.
+ *
+ * The two arms above prove the gate CAN say stale when the test drives the mock generations by
+ * hand. B54 is the different claim that the shipping fault injector ([debug] tmemfault) drives
+ * them, on real content, from inside the walk -- because the corpus never once reached the
+ * refusal arm (412,326 skips, stale=0), so the only thing that has ever exercised it is a hand
+ * -written frame. A fault injector that silently injected nothing would make the guest run say
+ * `stale=0` too, and look exactly like a clean gate. So: every injection is caught, none is
+ * missed, and the pixels do not move. */
+static void TestTmemFaultInjection() {
+    static uint8_t texels[16 * 16 * 2];
+    for (int i = 0; i < 256; i++) {
+        const uint16_t c = static_cast<uint16_t>((31 << 11) | 1);
+        texels[2 * i] = c >> 8;
+        texels[2 * i + 1] = c & 0xFF;
+    }
+    static W root[16];
+    int n = 0;
+    root[n++] = Wv(0xE3001001u, 0x00000000u);
+    root[n++] = Wv(0xFC121824u, 0xFF33FFFFu);
+    root[n++] = Wp(0xFD10000Fu, texels);
+    root[n++] = Wv(0xF5100000u, 0x07000000u);
+    root[n++] = Wv(0xF3000000u, 0x070FF800u);
+    root[n++] = Wv(0xF5100800u, 0x00000000u);
+    root[n++] = Wv(0xF2000000u, 0x0003C03Cu);
+    root[n++] = Wv(0xE4064064u, 0x00000000u);
+    root[n++] = Wv(0xE1000000u, 0x00000000u);
+    root[n++] = Wv(0xF1000000u, 0x04000400u);
+    root[n++] = Wv(0xDF000000u, 0);
+    const size_t rootBytes = static_cast<size_t>(n) * 16;
+
+    /* Both admitted classes, because they fail differently: NATIVE has a generation arm and
+       STABLE has none at all (gdx_gfx_tmem_source_unchanged answers it with an unconditional
+       1), so STABLE's only refusal is the class arm and the injector must fall back to it. */
+    const unsigned classes[] = { GDX_TMEMSRC_NATIVE, GDX_TMEMSRC_STABLE };
+    std::vector<float> reference;
+    for (unsigned cls : classes) {
+        /* Leg A: the lever on, the injector OFF -- the skip fires and nothing is stale. */
+        uint32_t cleanSkips = 0;
+        for (int inject = 0; inject <= 1; inject++) {
+            gRanges.clear();
+            Reg(root, sizeof(root), 16, false, false, true);
+            Reg(texels, sizeof(texels), 8, false, false, false);
+            gRoot = reinterpret_cast<uintptr_t>(root);
+            gRootBytes = rootBytes;
+            gdx_test_tmemskip = 1;
+            gdx_test_src_cls = cls;
+            gdx_test_native_gen = 1;
+            gdx_test_dma_gen = 1;
+            gdx_test_tmemfault = inject ? 1 : 0; /* 1 = every admitted skip */
+            MockBackend mb;
+            gdxn::Interp it(&mb);
+            for (int f = 0; f < 4; f++) {
+                it.RunFrame(nullptr, Cfg(), 0);
+            }
+            const gdxn::Counters& st = it.Stats();
+            if (inject == 0) {
+                cleanSkips = st.tmemSkips;
+                CHECK(cleanSkips > 0);          /* the lever really does skip on this class */
+                CHECK(st.tmemStale == 0);       /* ...and nothing was stale */
+                CHECK(st.tmemFaultGen == 0 && st.tmemFaultCls == 0);
+            } else {
+                const uint32_t injections = st.tmemFaultGen + st.tmemFaultCls;
+                if (injections == 0 || st.tmemFaultMissed != 0 || st.tmemFaultCaught != injections) {
+                    printf("  [tmemfault] cls=%u inj=%u/%u caught=%u missed=%u stale=%u skips=%u\n", cls,
+                           st.tmemFaultGen, st.tmemFaultCls, st.tmemFaultCaught, st.tmemFaultMissed,
+                           st.tmemStale, st.tmemSkips);
+                }
+                /* It injected something... */
+                CHECK(injections > 0);
+                /* ...the gate REFUSED every one of them... */
+                CHECK(st.tmemFaultCaught == injections);
+                CHECK(st.tmemFaultMissed == 0);
+                CHECK(st.tmemStale >= injections);
+                /* ...and the refusals really removed skips, so the injector is not a counter
+                   that increments beside a gate that was going to refuse anyway. */
+                CHECK(st.tmemSkips < cleanSkips);
+                /* NATIVE has a generation arm and must use it; STABLE has none and must fall
+                   back to the class arm rather than report a fault it did not cause. */
+                if (cls == GDX_TMEMSRC_NATIVE) {
+                    CHECK(st.tmemFaultGen > 0);
+                } else {
+                    CHECK(st.tmemFaultGen == 0 && st.tmemFaultCls > 0);
+                }
+            }
+            /* THE FRAME STILL DRAWS CORRECTLY -- the whole second half of B54. A refusal
+               re-mirrors, which is what tmemskip=0 does every load, so every leg of every class
+               must emit the same vertex bytes. */
+            CHECK(!mb.batches.empty());
+            if (reference.empty()) {
+                reference = mb.batches[0].vbo;
+            } else if (!mb.batches.empty()) {
+                CHECK(reference.size() == mb.batches[0].vbo.size());
+                CHECK(memcmp(reference.data(), mb.batches[0].vbo.data(), reference.size() * 4) == 0);
+            }
+            for (size_t b = 1; b < mb.batches.size(); b++) {
+                CHECK(mb.batches[b].vbo.size() == mb.batches[0].vbo.size());
+                CHECK(memcmp(mb.batches[b].vbo.data(), mb.batches[0].vbo.data(),
+                             mb.batches[0].vbo.size() * 4) == 0);
+            }
+        }
+    }
+
+    /* The injector is inert with the lever off: it is only ever reached from an admitted skip,
+       and tmemskip=0 admits none. This is what keeps it out of every shipped configuration. */
+    gRanges.clear();
+    Reg(root, sizeof(root), 16, false, false, true);
+    Reg(texels, sizeof(texels), 8, false, false, false);
+    gRoot = reinterpret_cast<uintptr_t>(root);
+    gRootBytes = rootBytes;
+    gdx_test_tmemskip = 0;
+    gdx_test_tmemfault = 1;
+    gdx_test_src_cls = GDX_TMEMSRC_NATIVE;
+    {
+        MockBackend mb;
+        gdxn::Interp it(&mb);
+        it.RunFrame(nullptr, Cfg(), 0);
+        it.RunFrame(nullptr, Cfg(), 0);
+        CHECK(it.Stats().tmemFaultGen == 0);
+        CHECK(it.Stats().tmemFaultCls == 0);
+        CHECK(it.Stats().tmemStale == 0);
+    }
+    gdx_test_tmemfault = 0;
+    gdx_test_tmemskip = 0;
+    gdx_test_src_cls = GDX_TMEMSRC_STABLE;
+}
+
 int main() {
     TestWalk();
     TestCC();
     TestRectTexture();
     TestTmemSkipWidened();
+    TestTmemFaultInjection();
     TestTri3D();
     TestCiRecycle();
     TestOwnFold();

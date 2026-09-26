@@ -48,6 +48,17 @@ unsigned int gdx_segment_source_fallback_total(void);
 int GdxSegmentSourceFamilyStats(unsigned int index, const char** outKey,
                                 unsigned int* outFallbackReads);
 
+/* O3DS BUDGET residency census (port/3ds/gdx3ds_membudget.cpp). Same [0, familyCount)
+ * enumeration as GdxSegmentSourceFamilyStats, but reporting BYTES rather than fallbacks:
+ * *outPayloadBytes is the usable payload span and *outAllocBytes the whole-file buffer
+ * the loader actually holds (payload + the 0x44 archive framing), or 0 for a family that
+ * has been discovered but never loaded. Every one of these buffers is process-lifetime,
+ * so a non-zero *outAllocBytes is resident for the rest of the run. Any out pointer may
+ * be NULL; returns 1 while `index` names a populated slot. */
+int GdxSegmentSourceFamilyResidency(unsigned int index, const char** outKey,
+                                    unsigned int* outPayloadBytes,
+                                    unsigned int* outAllocBytes);
+
 /* Boot-time preload: forces the lazy archive load of the blob family whose verbatim ROM
  * slice contains `romBase`, so the payload is resident before the first audio DMA rather
  * than loading on a game/audio tick. Returns 1 when the payload is resident from the
@@ -63,6 +74,22 @@ int GdxSegmentSourcePreload(uint32_t romBase);
  * Idempotent; an already-loaded family returns its live payload/size. Returns 0 when the
  * family is unmapped, already failed, or the allocation failed. */
 int GdxSegmentSourcePreallocPayload(uint32_t romBase, void** outPayload, uint32_t* outCap);
+
+/* C4d WINDOW INTERPOSER (port/gdx_audio_diet.cpp). Declares that reads landing fully inside
+ * [romBase, romBase+span) should be offered to `readFn` FIRST, with a family-relative offset.
+ *
+ * `readFn` returns 1 when it served `dst` in full, or 0 to decline -- on which the ordinary
+ * resident/raw-ROM path serves and `auditFn` (may be NULL) is called with the same relative
+ * offset, the destination, and whether that path succeeded. The decline arm is what lets one
+ * census instrument measure both the resident baseline and the streamed build.
+ *
+ * ON REFUSAL `readFn` MUST LEAVE `dst` UNTOUCHED, so that a decline after a partial write
+ * cannot hand the fallback a half-filled destination. Arming is boot-time and one-shot; the
+ * always-on cost on the read path is a single NULL compare. */
+typedef int (*GdxSegWindowReadFn)(uint32_t relOffset, uint32_t size, void* dst);
+typedef void (*GdxSegWindowAuditFn)(uint32_t relOffset, uint32_t size, const void* dst, int ok);
+void GdxSegmentSourceSetWindow(uint32_t romBase, uint32_t span, GdxSegWindowReadFn readFn,
+                               GdxSegWindowAuditFn auditFn);
 
 /* Millisecond monotonic clock backing the [seg-src]/[audio-load] load receipts; exported
  * so decomp-side diag code can time loads without platform headers. */

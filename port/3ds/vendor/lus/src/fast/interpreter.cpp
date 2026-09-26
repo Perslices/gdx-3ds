@@ -65,6 +65,13 @@ std::stack<std::string> currentDir;
 // Run-log shim from the port (port_log.h), used by the env-gated diagnostics below.
 extern "C" void gdx_dbg_logf(const char* fmt, ...);
 
+/* C4c (port/3ds/gdx3ds_texupload.c): the decoded-texture staging reservation and the
+   extent clamps every decoder below is bounded by. Declared here rather than pulled in as
+   a header so the vendored carve keeps exactly one new dependency edge. */
+extern "C" size_t gdx3ds_tex_upload_pick_size(size_t defaultBytes);
+extern "C" uint32_t gdx3ds_tex_upload_clamp_rows(uint32_t width, uint32_t height);
+extern "C" size_t gdx3ds_tex_upload_clamp_bytes(size_t want);
+
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -2003,6 +2010,7 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
                 uint64_t opaqueCount = 0;
                 uint64_t transparentCount = 0;
                 uint64_t forcedOpaqueCount = 0;
+                height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
                 for (uint32_t y = 0; y < height; y++) {
                     const uint8_t* row = tmemSrc + static_cast<size_t>(y) * lineBytes;
                     for (uint32_t x = 0; x < width; x++) {
@@ -2157,6 +2165,7 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
     uint64_t transparentPixels = 0;
     uint64_t forcedOpaquePixels = 0;
 
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t clrIdx = (y * (fullImageLineSizeBytes / 2)) + (x);
@@ -2301,6 +2310,7 @@ void Interpreter::ImportTextureRgba32(int tile, bool importReplacement) {
     // Copy pixel by pixel, respecting full image stride (handles sub-tile loads)
     uint32_t fullImageStridePixels = full_image_line_size_bytes / 4;
     uint32_t i = 0;
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t srcIdx = y * fullImageStridePixels + x;
@@ -2343,6 +2353,7 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t srcPixelIdx = y * (fullImageLineSizeBytes * 2) + x;
@@ -2389,6 +2400,7 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t srcIdx = y * fullImageLineSizeBytes + x;
@@ -2436,6 +2448,7 @@ void Interpreter::ImportTextureIA16(int tile, bool importReplacement) {
 
     uint32_t i = 0;
 
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t clrIdx = (y * (full_image_line_size_bytes / 2)) + (x);
@@ -2531,6 +2544,7 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
 
     uint32_t i = 0;
 
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t clrIdx = (y * (fullImageLineSizeBytes * 2)) + (x);
@@ -2608,6 +2622,7 @@ void Interpreter::ImportTextureI8(int tile, bool importReplacement) {
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint8_t intensity = addr[y * fullImageLineSizeBytes + x];
@@ -2684,6 +2699,7 @@ void Interpreter::ImportTextureCi4(int tile, bool importReplacement) {
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             uint32_t srcPixelIdx = y * (fullImageLineSizeBytes * 2) + x;
@@ -2768,6 +2784,7 @@ void Interpreter::ImportTextureCi8(int tile, bool importReplacement) {
     ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t out = 0;
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
             uint8_t idx = addr[y * fullImageLineSizeBytes + x];
@@ -2911,6 +2928,12 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
         safeLineSizeBytes = resourceImageSizeBytes;
         safeFullImageLineSizeBytes = resourceImageSizeBytes;
     }
+
+    // C4c: this is the one decoder that fills the staging buffer by byte count rather than
+    // by texel, so it takes the byte form of the clamp. Both the copy and the zero-fill are
+    // bounded, and the second one starts at an offset the first has already cleared.
+    safeLoadedBytes = (uint32_t)gdx3ds_tex_upload_clamp_bytes(safeLoadedBytes);
+    numLoadedBytes = (uint32_t)gdx3ds_tex_upload_clamp_bytes(numLoadedBytes);
 
     // Safely only copy the amount of bytes the resource can allow
     for (uint32_t i = 0, j = 0; i < safeLoadedBytes; i += safeLineSizeBytes, j += safeFullImageLineSizeBytes) {
@@ -3446,6 +3469,7 @@ void Interpreter::ImportTextureMask(int i, int tile) {
             break;
     }
 
+    height = gdx3ds_tex_upload_clamp_rows(width, height); // C4c: bound the decode to the staging reservation
     for (uint32_t texIndex = 0; texIndex < width * height; texIndex++) {
         uint8_t masked = orig_addr[texIndex];
         if (masked) {
@@ -10159,7 +10183,15 @@ void Interpreter::Init(class GfxWindowBackend* wapi, class GfxRenderingAPI* rapi
     if (mTexUploadBuffer == nullptr) {
         // We cap texture max to 8k, because why would you need more?
         int max_tex_size = std::min(8192, mRapi->GetMaxTextureSize());
-        mTexUploadBuffer = (uint8_t*)malloc(max_tex_size * max_tex_size * 4);
+        // C4c: on this backend GetMaxTextureSize() is the PICA200's 1024, so the stock
+        // reservation below is 4,194,304 B held for the life of the process -- rank 3 of the
+        // whole heap in the allocation census and 16.7% of an Old 3DS memtype-0 grant, and
+        // no [mem-res] row has ever named it. [debug] tex_upload_kb (DEFAULT 0) keeps
+        // exactly this size; a non-zero value reserves that many KiB instead, and every
+        // decoder above is clamped to whatever it gets. port/3ds/gdx3ds_texupload.c.
+        const size_t stockBytes = (size_t)max_tex_size * (size_t)max_tex_size * 4u;
+        const size_t texBytes = gdx3ds_tex_upload_pick_size(stockBytes);
+        mTexUploadBuffer = (uint8_t*)malloc(texBytes);
     }
 
     ucode_handler_index = UcodeHandlers::ucode_f3dex2;

@@ -235,6 +235,58 @@ Guards: every destination is forced under `3ds/` on the card, and the card's
 `gdiffuser.ini` is **merged**, never rewritten, so the user's own keys (`border_mode`,
 `deadzone`, stereo) survive. Ejects with `diskutil` unless `--no-eject`.
 
+## `mkdisk64.py` — the synthetic 64DD disk image (B11c)
+
+`tools/dev/mkdisk64.py` writes a **structurally correct 64,931,840-byte `.ndd` containing NO
+game content**, so the Expansion Kit's disk path — the block reader, the LBA arithmetic, the
+cache, the CRC pass and every refusal path — can be tested and CI-gated with nothing
+copyrighted in the tree and no dump anywhere near it.
+
+```sh
+tools/dev/mkdisk64.py build out.ndd --seed 20260924 [--disk-type 0..6]  # + out.ndd.manifest.json
+tools/dev/mkdisk64.py geometry --disk-type 0        # the derived zone/LBA table, writes nothing
+tools/dev/mkdisk64.py truncate in.ndd short.ndd --bytes 0x100000
+tools/dev/mkdisk64.py corrupt  in.ndd bad.ndd --at 0x200000 --len 64
+```
+
+Every structural fact is read out of THIS repository (the decomp's libleo tables and MFS
+headers, the port's own constants) and the geometry **self-validates** by reproducing four
+independent in-tree constants from its own per-block walk — including all seven
+`LEORAM_BYTE[]` entries. The manifest records the seed, the sha256, the CRC-64 and an explicit
+implemented / guessed / deliberately-absent breakdown; read it beside the image.
+
+`tools/ci-3ds.sh` generates one into `build-3ds/host-tests/diskimg/` (cached, ~10 s) and runs
+`gdx_disk_stream_host_tests` against it. See `docs/research/native/diskstream-progress.md`.
+
+### Running an EK build against a REAL disk (B11d, `ekdrive`)
+
+```sh
+# the image goes on the instance's PRIVATE virtual SD, never on a real card
+MED=~/Library/Application\ Support/gdx-retro/<instance>/saves/Azahar/Azahar/sdmc/3ds/gdiffuser/media
+ln <scratch>/baserom.jp.ek.ndd "$MED/baserom.jp.ek.ndd"    # 64,931,840 B, block-linear .ndd
+
+gdx-dev retro run build-3ds-ek/port/3ds/G-Diffuser-3DS.3dsx --instance <instance> \
+  --gfx software --replay ek-courseedit \
+  --ini debug.disk_stream=2          `# stream-only: NO 61.9 MB resident image` \
+  --ini debug.disk_stream_report=16  `# LEO reads per [diskstream] receipt (default 512)` \
+  --ini debug.disk_stream_cache_kb=512
+```
+
+Three things that cost `ekdrive` time and are not obvious:
+
+- **`-DGDX_ALLOW_JP_INPUTS=ON` is needed at CONFIGURE time for a Japanese `.ndd`**, and before
+  B11d it silently did nothing on 3DS. Without it only `baserom.translated.ek.ndd` is even
+  opened, and the failure reads `[leo] no disk image found` with no mention of a gate.
+- **`disk_stream_report`'s default 512 can exceed a whole session's LEO read count**, so a
+  measurement run gets exactly one receipt — taken at the mount, before the traffic. Lower it.
+- **`retro run` does not clear the guest's `autotest/` between runs**, so `shots/` can hold a
+  previous run's BMPs under plausible names. Delete
+  `<instance>/saves/Azahar/Azahar/sdmc/autotest` before any run you intend to `framediff`.
+
+The receipt's `uniqBlk` / `wsKB` / `refetch` are the working set and what the cache failed to
+hold — those, not `hit%`, are what `disk_stream_cache_kb` is chosen against. See
+`docs/research/native/ekdrive-progress.md`.
+
 ## `gdx-dev diff` / `gdx-dev hw` — delegations
 
 These are thin on purpose and must stay that way: they never implement image comparison
@@ -431,6 +483,36 @@ pruned nothing at any threshold.
 `reap` requires **positive** evidence that a driver is gone. A process with a live parent
 and no pid file is left alone — several tracks share this machine, and "no lock" means
 "started before this feature", not "orphan".
+
+## System model (`--model old|new`, RetroArch lane) — the Old 3DS lane
+
+```sh
+tools/dev/gdx-dev retro run <3dsx> --model old --replay race-mutecity-start \
+    --ini debug.membudget=1
+```
+
+NEXT.md C4. The core declares `citra_is_new_3ds` ("System Model") with the legal pair
+`"New 3DS"` / `"Old 3DS"`. Without `--model` **not one byte changes** and no core-options
+redirect is written, so every baseline taken on this lane before the flag existed stays
+valid; with it, the redirect is written and `--gfx` starts being honoured too (the same
+re-baseline `--3d` carries).
+
+Three things it is not:
+
+- **It is not a setting you can A/B against a New 3DS cell.** Old 3DS has no core 2, so
+  `gdx3ds_renderthread.cpp` refuses to start the render thread whatever `[debug]
+  renderthread` says. An `old` run is a `renderthread=0` **execution**, and PROTOCOL's
+  rule applies: parity is same-render-thread-mode only. `platform.model` in the manifest
+  follows the flag (`emu-old3ds`) so nothing downstream compares the two by accident.
+- **It is not the real Old 3DS memory layout.** Azahar's Old 3DS reports `memtype=2` —
+  the 96 MB *extended* layout — not the 64 MB default a 3dsx inherits under hbmenu. The
+  lane is more generous than the console and cannot reproduce the binding constraint.
+  See `docs/research/native/o3dsbudget-progress.md` §1.4.
+- **It is not confirmed by this file.** Read the pin back off the GUEST:
+  `[mem-budget] model=old3ds memtype=2` with `[debug] membudget=1`. The first version of
+  this flag appended its assignment after the template's own, RetroArch's config parser
+  returns the **first** entry for a duplicated key, and the run wrote a file that said
+  "Old 3DS" and booted a New 3DS. The harness could not see it; the guest could.
 
 ## Stereoscopic 3D (`--3d`, both lanes)
 
@@ -661,3 +743,13 @@ between buckets and each bucket ends up comparing different scenes. The owned-in
 fold (−22% draws) read as **+5.9% slower in every bucket** while the whole-run total was flat.
 `--ab` now warns when the two runs' mean `nD` differ by more than 5%. Cut the band by scene tag
 (between two SHOT receipts) instead.
+
+### Two consoles on the link
+
+`tools/dev/hw.ini` is gitignored (it holds a local IP). It carries the New 3DS under
+`[hw]`, and the Old 3DS gets its own `[hw.o3ds]` section: both consoles can be on the
+dev link at the same time, so the O3DS is a named entry rather than an `--ip` passed
+per session. `gdx-dev hw-run --ip` and `hw.py --ip` still override either. When adding
+the O3DS, push a `[net] enabled=1` build to it once by hand with `hw.py push` first --
+`hw-run` drives an already-running guest and cannot bootstrap one.
+

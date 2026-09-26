@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* port/shims.c -- the C-side allocation-failure receipt (see its comment there). */
+extern void gdx_alloc_fail(const char* site, size_t bytes);
+
 #include "gdx_stall.h" /* A10: attribute the first-touch archive read as a load stall */
 #include "port_log.h"
 #if defined(GDX_PLATFORM_3DS)
@@ -245,6 +248,10 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
     staged = (slot->stagedBuf != NULL);
     buf = staged ? slot->stagedBuf : (unsigned char*)malloc(cap);
     if (buf == NULL) {
+        /* This used to return 0 in silence. It is the single largest C allocation in the
+           process after the RDRAM arena (audio_blob/audio_table is 10.25 MB), and o3dssim's
+           frame-3 wedge is what a silent one looks like from the outside. */
+        gdx_alloc_fail("seg-src/family-blob", cap);
         slot->loadState = 2;
         return 0;
     }
@@ -302,6 +309,31 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
 }
 
 static int GdxSegmentSourceReadImpl(uint32_t romBase, uint32_t size, void* dst);
+static int seg_read_resident(uint32_t romBase, uint32_t size, void* dst);
+
+/* C4d WINDOW INTERPOSER. One family may declare itself served from somewhere other than its
+ * resident payload (port/gdx_audio_diet.cpp streams audio_blob/audio_table off the .o2r
+ * instead of holding 10.25 MB of it). Armed once at boot, never cleared, and inert until it
+ * is: the always-on cost on the read path is one NULL compare.
+ *
+ * `readFn` may DECLINE (return 0), in which case the normal resident/raw-ROM path serves and
+ * `auditFn` is then told what it produced. That is what lets the same census measure the
+ * resident baseline and the streamed build with one instrument. */
+static GdxSegWindowReadFn sWindowRead;
+static GdxSegWindowAuditFn sWindowAudit;
+static uint32_t sWindowBase;
+static uint32_t sWindowSpan;
+
+void GdxSegmentSourceSetWindow(uint32_t romBase, uint32_t span, GdxSegWindowReadFn readFn,
+                               GdxSegWindowAuditFn auditFn) {
+    seg_lock();
+    sWindowBase = romBase;
+    sWindowSpan = span;
+    sWindowAudit = auditFn;
+    SEG_RELEASE_FENCE();
+    sWindowRead = readFn; /* published last: a reader that sees it also sees base/span */
+    seg_unlock();
+}
 
 /* MAINPROF: the single ROM/archive read funnel -- Dma_RomCopy, MIO0 staging, asset byte
  * loads all land here. Charged to the [mprof] `dma` bucket for main-context callers only
@@ -319,6 +351,24 @@ int GdxSegmentSourceRead(uint32_t romBase, uint32_t size, void* dst) {
 }
 
 static int GdxSegmentSourceReadImpl(uint32_t romBase, uint32_t size, void* dst) {
+    if (sWindowRead != NULL && size != 0u && dst != NULL && romBase >= sWindowBase &&
+        (uint32_t)(romBase - sWindowBase) <= sWindowSpan - size) {
+        const uint32_t rel = romBase - sWindowBase;
+        int ok;
+        SEG_ACQUIRE_FENCE(); /* order the fn load before the base/span reads */
+        if (sWindowRead(rel, size, dst)) {
+            return 1; /* the window owner served AND censused this read */
+        }
+        ok = seg_read_resident(romBase, size, dst);
+        if (sWindowAudit != NULL) {
+            sWindowAudit(rel, size, dst, ok);
+        }
+        return ok;
+    }
+    return seg_read_resident(romBase, size, dst);
+}
+
+static int seg_read_resident(uint32_t romBase, uint32_t size, void* dst) {
 #if defined(GDX_PLATFORM_3DS)
     /* RENDER THREAD (ahead mode): the destination may be read by the in-flight walk. */
     {
@@ -469,8 +519,11 @@ int GdxSegmentSourcePreallocPayload(uint32_t romBase, void** outPayload, uint32_
             ok = 1;
         } else if (slot->loadState != 2) {
             if (slot->stagedBuf == NULL) {
-                slot->stagedBuf =
-                    (unsigned char*)malloc((size_t)GDX_ARCHIVE_PAYLOAD_OFFSET + (size_t)entry->size);
+                const size_t want = (size_t)GDX_ARCHIVE_PAYLOAD_OFFSET + (size_t)entry->size;
+                slot->stagedBuf = (unsigned char*)malloc(want);
+                if (slot->stagedBuf == NULL) {
+                    gdx_alloc_fail("seg-src/prealloc-payload", want);
+                }
             }
             if (slot->stagedBuf != NULL) {
                 *outPayload = slot->stagedBuf + GDX_ARCHIVE_PAYLOAD_OFFSET;
@@ -524,6 +577,33 @@ unsigned int gdx_segment_source_fallback_total(void) {
     total += sUnmappedFallback;
     seg_unlock();
     return total;
+}
+
+int GdxSegmentSourceFamilyResidency(unsigned int index, const char** outKey,
+                                    unsigned int* outPayloadBytes,
+                                    unsigned int* outAllocBytes) {
+    int found = 0;
+    seg_lock();
+    if (index < sFamilyCount) {
+        const GdxSegFamilySlot* slot = &sFamilies[index];
+        if (outKey != NULL) {
+            *outKey = slot->entry->o2r_key;
+        }
+        if (outPayloadBytes != NULL) {
+            *outPayloadBytes = (slot->payload != NULL) ? slot->payloadSize : 0u;
+        }
+        if (outAllocBytes != NULL) {
+            /* Mirror of the loader's own `cap` (seg_load_family): the whole-file buffer is
+             * header + size field + the span the generated table promises, and it is never
+             * freed. A staged buffer was allocated the same way, so the two agree. */
+            *outAllocBytes = (slot->payload != NULL)
+                                 ? (unsigned int)GDX_ARCHIVE_PAYLOAD_OFFSET + slot->entry->size
+                                 : 0u;
+        }
+        found = 1;
+    }
+    seg_unlock();
+    return found;
 }
 
 int GdxSegmentSourceFamilyStats(unsigned int index, const char** outKey,

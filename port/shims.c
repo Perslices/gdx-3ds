@@ -20,6 +20,24 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include "port_log.h"
+#if !defined(_WIN32)
+#include <malloc.h>
+#endif
+
+/* Heap counters for the allocation-failure receipt. newlib (3DS) and glibc both answer
+   mallinfo; on Windows there is no equivalent and the receipt degrades to the size alone. */
+void gdx_host_heap_stats(unsigned long* used, unsigned long* avail, unsigned long* arena) {
+#if !defined(_WIN32)
+    struct mallinfo mi = mallinfo();
+    if (used != NULL)  { *used  = (unsigned long)mi.uordblks; }
+    if (avail != NULL) { *avail = (unsigned long)mi.fordblks; }
+    if (arena != NULL) { *arena = (unsigned long)mi.arena; }
+#else
+    if (used != NULL)  { *used  = 0; }
+    if (avail != NULL) { *avail = 0; }
+    if (arena != NULL) { *arena = 0; }
+#endif
+}
 
 #define GDX_LEO_TEST_UNIT_MR 0x01
 #define GDX_LEO_ERROR_MEDIUM_NOT_PRESENT 42
@@ -137,7 +155,75 @@ void bcopy(const void* src, void* dst, int n) { memmove(dst, src, (size_t)n); }
 
 // Host CRT wrappers for decomp-side code. The gdiffuser_game object target must not include
 // MSVC system headers, so it calls these wrappers instead of relying on implicit CRT prototypes.
-void* gdx_host_calloc(size_t count, size_t size) { return calloc(count, size); }
+
+// ---- C-side allocation-failure receipt --------------------------------------------------
+// WHY THIS EXISTS. main_3ds.cpp replaces global operator new and logs "[fatal] operator new
+// failed" with the size, the heap state and a return address. That covers `operator new` and
+// nothing else -- and on this port `operator new` is 6.09 MB of a 44.46 MB heap. The other
+// 38.36 MB (86%) is plain C malloc/calloc, and it reported NOTHING: a C allocation returning
+// NULL under a tight grant produced a frozen frame counter, a [tt] park line and not one
+// diagnostic (o3dssim-progress.md §4.2b, the frame-3 wedge that cost a whole bisect).
+//
+// This is the receipt. It is NOT a universal malloc hook -- it is called at the C sites that
+// hold the big blocks (the RDRAM arena, the segment-source whole-file buffers, the venue
+// texture cache, the raw ROM buffer), which is ~31 MB of that 38 MB. Sites it does not cover
+// are still silent, and the progress doc says which.
+//
+// Always on: it costs one already-taken NULL branch on a path that was about to fail anyway,
+// and gating a failure receipt behind a build flag would put it in every build EXCEPT the one
+// that is failing.
+// C4c UPDATE: port/3ds/gdx3ds_mallocwrap.c now calls this from inside the allocator itself
+// (-Wl,--wrap=_malloc_r), so on a 3DS build the coverage above is no longer "~31 MB of the
+// 38 MB" -- it is every byte the process mallocs. Two things follow.
+//
+// (1) The `ra` argument. A named site can say WHAT it was allocating; the allocator can only
+//     say WHO asked, so the return address is the whole attribution there. gdx_alloc_fail
+//     keeps its old signature and passes NULL, and the receipt then omits the field rather
+//     than printing a fake one.
+//
+// (2) The reentry guard, which is not belt-and-braces. This runs when malloc has just
+//     returned NULL. It formats through vsnprintf and writes through the port log, and
+//     newlib's stdio allocates its buffer lazily on first use -- so the first [alloc-fail]
+//     on a heap that is genuinely full can itself call malloc, fail, and re-enter here.
+//     Unbounded recursion on the out-of-memory path turns a diagnosable OOM into a stack
+//     overflow with no receipt at all, which is exactly what this instrument exists to
+//     prevent. The flag is a plain int: a torn read costs at most one dropped duplicate
+//     line, and the dropped count rides the next line that does get out.
+static volatile int sAllocFailBusy = 0;
+static volatile unsigned long sAllocFailDropped = 0;
+
+void gdx_alloc_fail_ra(const char* site, size_t bytes, void* ra) {
+    extern void gdx_dbg_logf(const char* fmt, ...);
+    unsigned long used = 0, avail = 0, arena = 0;
+    if (sAllocFailBusy) {
+        sAllocFailDropped++;
+        return;
+    }
+    sAllocFailBusy = 1;
+    gdx_host_heap_stats(&used, &avail, &arena);
+    if (ra != NULL) {
+        gdx_dbg_logf("[alloc-fail] site=%s bytes=%d heapUsed=%d heapFree=%d arena=%d ra=%p"
+                     " dropped=%d\n",
+                     site != NULL ? site : "?", (int)bytes, (int)used, (int)avail, (int)arena,
+                     ra, (int)sAllocFailDropped);
+    } else {
+        gdx_dbg_logf("[alloc-fail] site=%s bytes=%d heapUsed=%d heapFree=%d arena=%d\n",
+                     site != NULL ? site : "?", (int)bytes, (int)used, (int)avail, (int)arena);
+    }
+    sAllocFailBusy = 0;
+}
+
+void gdx_alloc_fail(const char* site, size_t bytes) {
+    gdx_alloc_fail_ra(site, bytes, NULL);
+}
+
+void* gdx_host_calloc(size_t count, size_t size) {
+    void* p = calloc(count, size);
+    if (p == NULL && count != 0 && size != 0) {
+        gdx_alloc_fail("gdx_host_calloc", count * size);
+    }
+    return p;
+}
 void gdx_host_free(void* ptr) { free(ptr); }
 void  gdx_host_exit(int status) { exit(status); }
 /* Every abort so far reached the 3DS log as a bare "[fatal] abort() called": the reason

@@ -542,6 +542,75 @@ static int gdx_mode_forces_fixed_aspect(s32 gamemode) {
     return (mode == GAMEMODE_COURSE_EDIT) || (mode == GAMEMODE_CREATE_MACHINE);
 }
 
+#if defined(GDX_PLATFORM_3DS) && defined(EXPANSION_KIT)
+/* B11g -- why the Course Editor drew NOTHING on 3DS, and why the flag above is the cause.
+ *
+ * The flag's desktop implementation is a PAIR of steps that only make sense together
+ * (vendored interpreter.cpp): AdjXForAspectRatio returns x unchanged, so the frame renders
+ * native 4:3 stretched across the whole window, AND StartFrame forces mRendersToFb, so the
+ * whole frame lands in the offscreen mGameFb texture -- which Fast3dGui::DrawGame then
+ * composites back into a CENTRED 4:3 sub-rect of the window. Step two un-stretches step one.
+ *
+ * Neither half is right on 3DS, and the second one is fatal:
+ *
+ *  - There is no Gui on this platform, so NOTHING consumes the published texture.
+ *    Fast3dWindow::GetGfxFrameBuffer (port/3ds/lus_glue/gdx3ds_fast3d_window.cpp:353) has no
+ *    caller in the 3DS build at all, and the owned interpreter's epilogue
+ *    (port/3ds/gfx/n64/gdx_interp.cpp:235-240) binds framebuffer 0, CLEARS it to opaque black
+ *    and publishes the texture id to a consumer that does not exist. That is the whole of
+ *    `[c3d] draws=N (scr=0 tex=N)` and of every in-editor SHOT reading 0 non-black of 96,000.
+ *    gdx3ds_fast3d_window.cpp:177-183 already names this exact failure ("a guaranteed-black top
+ *    screen even with a fully working draw path") for the OTHER disjunct of the same `if`.
+ *
+ *  - The 3DS does not NEED step one either, because on this platform hor+ IS the pillarbox.
+ *    AdjXForAspectRatio is x * (4/3) / aspect; the top screen is a fixed 400x240, so the factor
+ *    is exactly (4/3)/(5/3) = 0.8 and 320-space content lands 1:1 in a centred 320-px band with
+ *    40-px black bars. That is the same mapping ekdrive measured on the main menu: the slot-4
+ *    sign at main_menu.c:612's x = 32 lands at NDC 32/160 - 1 = -0.8, times 0.8 = -0.64, i.e.
+ *    screen pixel (1 - 0.64) / 2 * 400 = 72, 64 px wide -- its measured band is exactly 72..135.
+ *
+ * So on 3DS the request is not just unimplementable, it is unnecessary: the editors already get
+ * a true 4:3 pillarbox from the path every other screen uses. Declining it here leaves the
+ * editors rendering to framebuffer 0 like everything else. [debug] ek_fixed_aspect=1 restores
+ * the desktop behaviour as a named bisect lever (and, on 3DS, restores the black screen).
+ *
+ * Scope: BOTH guards are load-bearing. GDX_PLATFORM_3DS keeps desktop untouched -- there the
+ * pair is coherent and the composite exists. EXPANSION_KIT keeps the shipped 3DS build BYTE
+ * IDENTICAL: gdx3ds_glue only gets EXPANSION_KIT=1 under GDX_3DS_EXPANSION_KIT, and the two
+ * modes above are unreachable without a 64DD disk anyway.
+ *
+ * NOT fixed here, and filed in ekdraw-progress.md: the same StartFrame `if` also forces the
+ * offscreen target when gEnhancements.Graphics.Widescreen is 0, which on 3DS is the identical
+ * guaranteed-black screen for the WHOLE game. It is not reachable from this track's lever and
+ * fixing it would move the shipped binary, so it is filed rather than taken in passing.
+ */
+extern int gdx3ds_config_get_int(const char* section, const char* key, int fallback);
+extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c, unsigned int d);
+
+static int gdx_ek_fixed_aspect_lever(void) {
+    static int sLever = -1;
+    if (sLever < 0) {
+        sLever = gdx3ds_config_get_int("debug", "ek_fixed_aspect", 0) != 0 ? 1 : 0;
+    }
+    return sLever;
+}
+
+/* One always-on receipt per transition, not per frame: gdx_fixed_aspect_publish runs every
+ * dispatch. a = the mode asked about, b = what the desktop flag would have been, c = what was
+ * published, d = the lever. */
+static int gdx_ek_fixed_aspect_resolve(s32 effectiveMode, int want) {
+    static int sPrevPublished = -1;
+    const int published = (want && !gdx_ek_fixed_aspect_lever()) ? 0 : want;
+    if (published != sPrevPublished) {
+        sPrevPublished = published;
+        gdx_ek_note("[fbroute] fixedAspect mode/want/published/lever", (unsigned int) effectiveMode,
+                    (unsigned int) want, (unsigned int) published,
+                    (unsigned int) gdx_ek_fixed_aspect_lever());
+    }
+    return published;
+}
+#endif /* GDX_PLATFORM_3DS && EXPANSION_KIT */
+
 void gdx_fixed_aspect_publish(void) {
     extern void gdx_set_force_fixed_aspect(int on); // libultraship interpreter.cpp
     extern s32 gQueuedGameMode;                     // decomp/src/game/game.c
@@ -563,7 +632,11 @@ void gdx_fixed_aspect_publish(void) {
     // which never change gGameMode -- is still forced to 4:3. The accepted cost is rendering the
     // outgoing screen in the destination aspect during its wipe, which the wipe covers.
     s32 effectiveMode = (gGameMode != gQueuedGameMode) ? gQueuedGameMode : gGameMode;
-    gdx_set_force_fixed_aspect(gdx_mode_forces_fixed_aspect(effectiveMode));
+    int want = gdx_mode_forces_fixed_aspect(effectiveMode);
+#if defined(GDX_PLATFORM_3DS) && defined(EXPANSION_KIT)
+    want = gdx_ek_fixed_aspect_resolve(effectiveMode, want); /* B11g, see above */
+#endif
+    gdx_set_force_fixed_aspect(want);
 }
 
 void gdx_fixed_aspect_tick(void) {

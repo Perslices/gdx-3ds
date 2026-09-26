@@ -1,0 +1,477 @@
+diff --git a/src/audio/disk/lib/heap.c b/src/audio/disk/lib/heap.c
+index 16f75aa..a09b12e 100644
+--- a/src/audio/disk/lib/heap.c
++++ b/src/audio/disk/lib/heap.c
+@@ -1,4 +1,29 @@
+ #include "global.h"
++/* [audioload] producer-tick phase attribution (audioasync track), defined in
++   port/n64_sched.c beside the producer tick it measures.
++
++   RAW EXTERNS, not an #include: the decomp game target's include path deliberately does not
++   carry port/ (port/3ds/game/CMakeLists.txt lists only the decomp roots, the Torch asset
++   headers and the track shim), and this is a decomp-headers-only TU -- the same reason
++   port/n64_leo.c spells gdx_ek_note and gdx_disk_save_mark_dirty as raw externs. The site ids
++   below MUST stay in step with port/gdx_audio_load_census.h, which is the canonical list and
++   carries the rationale.
++
++   gdx_aload_begin() returns 0 when [debug] audioload is off, and gdx_aload_end() returns on a
++   0 stamp, so an armed-off build pays one int compare per scope and reads no clock. */
++#ifdef PORT
++extern unsigned int gdx_aload_begin(void);
++extern void gdx_aload_end(int site, unsigned int startStamp);
++#define GDX_ALOAD_CMDS 0
++#define GDX_ALOAD_HEAPINIT 1
++#define GDX_ALOAD_LOADS 2
++#define GDX_ALOAD_SYNCSAMP 3
++#define GDX_ALOAD_RELOC 4
++#define GDX_ALOAD_PRELOAD 5
++#define GDX_ALOAD_DISK 6
++#define GDX_ALOAD_DMA 7
++#define GDX_ALOAD_FONTCONV 8
++#endif
+ #include "audio.h"
+ 
+ f32 AudioHeap_CalculateAdsrDecay(f32 scaleInv) {
+@@ -834,6 +859,9 @@ bool AudioHeap_ResetStep(void) {
+ }
+ 
+ void AudioHeap_Init(void) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
++#endif
+     s32 pad1[4];
+     s16* ramAddr;
+     s32 persistentSize;
+@@ -1070,6 +1098,9 @@ void AudioHeap_Init(void) {
+     intMask = osSetIntMask(OS_IM_NONE);
+     osWritebackDCacheAll();
+     osSetIntMask(intMask);
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_HEAPINIT, gdxALoad); /* [audioload] */
++#endif
+ }
+ 
+ void* AudioHeap_SearchPermanentCache(s32 tableType, s32 id) {
+diff --git a/src/audio/disk/lib/load.c b/src/audio/disk/lib/load.c
+index 805c128..b2ea877 100644
+--- a/src/audio/disk/lib/load.c
++++ b/src/audio/disk/lib/load.c
+@@ -1,4 +1,37 @@
+ #include "global.h"
++/* [audioload] producer-tick phase attribution (audioasync track), defined in
++   port/n64_sched.c beside the producer tick it measures.
++
++   RAW EXTERNS, not an #include: the decomp game target's include path deliberately does not
++   carry port/ (port/3ds/game/CMakeLists.txt lists only the decomp roots, the Torch asset
++   headers and the track shim), and this is a decomp-headers-only TU -- the same reason
++   port/n64_leo.c spells gdx_ek_note and gdx_disk_save_mark_dirty as raw externs. The site ids
++   below MUST stay in step with port/gdx_audio_load_census.h, which is the canonical list and
++   carries the rationale.
++
++   gdx_aload_begin() returns 0 when [debug] audioload is off, and gdx_aload_end() returns on a
++   0 stamp, so an armed-off build pays one int compare per scope and reads no clock. */
++#ifdef PORT
++extern unsigned int gdx_aload_begin(void);
++extern void gdx_aload_end(int site, unsigned int startStamp);
++#define GDX_ALOAD_CMDS 0
++#define GDX_ALOAD_HEAPINIT 1
++#define GDX_ALOAD_LOADS 2
++#define GDX_ALOAD_SYNCSAMP 3
++#define GDX_ALOAD_RELOC 4
++#define GDX_ALOAD_PRELOAD 5
++#define GDX_ALOAD_DISK 6
++#define GDX_ALOAD_DMA 7
++#define GDX_ALOAD_FONTCONV 8
++#define GDX_ALOAD_SLOWP 9
++#define GDX_ALOAD_PRELP 10
++#define GDX_ALOAD_ASYNCP 11
++#define GDX_ALOAD_DISKLD 12
++#define GDX_ALOAD_LEORW 13
++/* The async disk-load step size, in BYTES (port/n64_sched.c; `[debug] audio_disk_step_kb`).
++   0 = the unchanged decomp behaviour. See AudioLoad_DiskLoad for why it exists. */
++extern int gdx_audio_disk_step_bytes(void);
++#endif
+ #include "audio.h"
+ #ifdef PORT
+ /* Host CRT headers collide with the decomp libc typedefs; allocation goes
+@@ -443,12 +476,18 @@ static void GDX_SampleCensus(const char* tag, s32 fontId, Sample* sample, u8* lo
+ #endif
+ 
+ s32 AudioLoad_SyncLoadSample(Sample* sample, s32 fontId) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
++#endif
+     u8* sampleAddr;
+ 
+     if ((sample->isRelocated == 1) && (sample->medium != 0)) {
+         sampleAddr = AudioHeap_AllocSampleCache(sample->size, AudioLoad_GetSampleBankIdForFont(fontId, sample->medium),
+                                                 sample->sampleAddr, sample->medium, 1);
+         if (sampleAddr == NULL) {
++#ifdef PORT
++            gdx_aload_end(GDX_ALOAD_SYNCSAMP, gdxALoad); /* [audioload]: the early exit too */
++#endif
+             return -1;
+         }
+         if (sample->medium == MEDIUM_LBA) {
+@@ -463,6 +502,9 @@ s32 AudioLoad_SyncLoadSample(Sample* sample, s32 fontId) {
+         sample->medium = MEDIUM_RAM;
+         sample->sampleAddr = sampleAddr;
+     }
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_SYNCSAMP, gdxALoad); /* [audioload] */
++#endif
+     //! @bug Missing return.
+     GDX_AVOID_UB_RETURN(0);
+ }
+@@ -1200,6 +1242,9 @@ static void gdx_fontconv_tuned_sample(GdxFontConv* conv, TunedSample* dest, u32
+ }
+ 
+ static void gdx_audio_convert_font(s32 fontId, const u8* fontData, SampleBankRelocInfo* relocInfo) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
++#endif
+     static GdxFontConv sConv; /* large; audio thread only */
+     s32 numDrums = gAudioCtx.soundFontList[fontId].numDrums;
+     s32 numInstruments = gAudioCtx.soundFontList[fontId].numInstruments;
+@@ -1280,6 +1325,9 @@ static void gdx_audio_convert_font(s32 fontId, const u8* fontData, SampleBankRel
+     gAudioCtx.soundFontList[fontId].drums = drumPtrs;
+     gAudioCtx.soundFontList[fontId].soundEffects = sfxArr;
+     gAudioCtx.soundFontList[fontId].instruments = instPtrs;
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_FONTCONV, gdxALoad); /* [audioload] */
++#endif
+ }
+ #endif /* PORT */
+ 
+@@ -1363,6 +1411,9 @@ void AudioLoad_RelocateFont(s32 fontId, uintptr_t fontBaseAddr, SampleBankRelocI
+ #endif /* !PORT */
+ 
+ void AudioLoad_SyncDma(uintptr_t devAddr, u8* ramAddr, size_t size, s32 medium) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
++#endif
+ 
+     size = ALIGN16(size);
+     Audio_InvalDCache(ramAddr, size);
+@@ -1383,9 +1434,15 @@ void AudioLoad_SyncDma(uintptr_t devAddr, u8* ramAddr, size_t size, s32 medium)
+         osRecvMesg(&gAudioCtx.syncDmaQueue, NULL, OS_MESG_BLOCK);
+     }
+     PRINTF("Convert to %d %d\n");
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_DMA, gdxALoad); /* [audioload] */
++#endif
+ }
+ 
+ void AudioLoad_SyncDiskDrive(uintptr_t devAddr, u8* ramAddr, size_t size, s32 lba) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
++#endif
+     uintptr_t adjustedDevAddr = devAddr;
+     s32 startLba;
+     s32 pad;
+@@ -1397,6 +1454,9 @@ void AudioLoad_SyncDiskDrive(uintptr_t devAddr, u8* ramAddr, size_t size, s32 lb
+        the wrong disk offset on Linux. Sequence the calls. Same fix at every call site. */
+     startLba = AudioLoad_GetStartLbaAddr(lba, &adjustedDevAddr);
+     AudioLoad_DiskDrive(startLba, adjustedDevAddr, ramAddr, size);
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_DISK, gdxALoad); /* [audioload] */
++#endif
+ }
+ 
+ #ifdef PORT
+@@ -1725,13 +1785,35 @@ void* AudioLoad_AsyncLoadInner(s32 tableType, s32 id, s32 nChunks, s32 retData,
+ }
+ 
+ void AudioLoad_ProcessLoads(s32 resetStatus) {
++#ifdef PORT
++    /* [audioload]: each pump is bracketed at the CALL rather than inside, because all three
++       callees have many exits. `loads` is their sum plus this function's own overhead. */
++    unsigned int gdxALoad = gdx_aload_begin();
++    unsigned int gdxALoadStep = gdx_aload_begin();
+     AudioLoad_ProcessSlowLoads(resetStatus);
++    gdx_aload_end(GDX_ALOAD_SLOWP, gdxALoadStep);
++    gdxALoadStep = gdx_aload_begin();
+     AudioLoad_ProcessSamplePreloads(resetStatus);
++    gdx_aload_end(GDX_ALOAD_PRELP, gdxALoadStep);
++    gdxALoadStep = gdx_aload_begin();
+     AudioLoad_ProcessAsyncLoads(resetStatus);
++    gdx_aload_end(GDX_ALOAD_ASYNCP, gdxALoadStep);
++    gdx_aload_end(GDX_ALOAD_LOADS, gdxALoad);
++#else
++    AudioLoad_ProcessSlowLoads(resetStatus);
++    AudioLoad_ProcessSamplePreloads(resetStatus);
++    AudioLoad_ProcessAsyncLoads(resetStatus);
++#endif
+ }
+ 
+ s32 AudioLoad_ReadWriteDisk(LEOCmd* cmdBlock, s32 direction, u32 lba, void* ptr, u32 nLbas, OSMesgQueue* mq,
+                             bool usingLbaVaddrPair) {
++#ifdef PORT
++    /* [audioload]: the device read itself -- sLeoHandler is the port's LeoReadWrite, which
++       serves the bytes INLINE on the calling thread (memcpy from the resident image, or an SD
++       read through gdx_disk_stream). Whatever the caller, sync or async, the time is here. */
++    unsigned int gdxALoad = gdx_aload_begin();
++#endif
+     void* vAddr;
+     LbaVaddrPair* lbaVaddrPair;
+ 
+@@ -1740,6 +1822,9 @@ s32 AudioLoad_ReadWriteDisk(LEOCmd* cmdBlock, s32 direction, u32 lba, void* ptr,
+         vAddr = lbaVaddrPair->vAddr;
+         if ((lba == lbaVaddrPair->lba) && (nLbas == 1)) {
+             osSendMesg(mq, NULL, 0);
++#ifdef PORT
++            gdx_aload_end(GDX_ALOAD_LEORW, gdxALoad); /* [audioload]: the cache HIT exit */
++#endif
+             return 0;
+         }
+     } else {
+@@ -1750,6 +1835,9 @@ s32 AudioLoad_ReadWriteDisk(LEOCmd* cmdBlock, s32 direction, u32 lba, void* ptr,
+     if ((nLbas == 1) && usingLbaVaddrPair) {
+         lbaVaddrPair->lba = lba;
+     }
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_LEORW, gdxALoad); /* [audioload] */
++#endif
+     return 0;
+ }
+ 
+@@ -2271,13 +2359,31 @@ void AudioLoad_ProcessAsyncLoadDiskDrive(AudioAsyncLoad* asyncLoad, s32 resetSta
+                            asyncLoad->bytesRemaining);
+         asyncLoad->delay = 0;
+     } else if (resetStatus != 0) {
++#ifdef PORT
++        /* [audioload]: THE busy-drain. A reset (= a spec change, i.e. a course load) finishes
++           the whole in-flight disk load here, spinning on the state machine, on the producer
++           thread, under sAudioCtxMutex. */
++        unsigned int gdxALoadD = gdx_aload_begin();
++#endif
+         do {
+         } while (AudioLoad_DiskLoad(&D_806F2350) != 1);
++#ifdef PORT
++        gdx_aload_end(GDX_ALOAD_DISKLD, gdxALoadD);
++#endif
+         asyncLoad->status = 0;
+         gAudioCtx.curDiskDriveLoad = NULL;
+-    } else if (AudioLoad_DiskLoad(&D_806F2350) == 1) {
+-        AudioLoad_FinishAsyncLoad(asyncLoad);
+-        gAudioCtx.curDiskDriveLoad = NULL;
++    } else {
++#ifdef PORT
++        unsigned int gdxALoadD = gdx_aload_begin();
++        s32 gdxDone = AudioLoad_DiskLoad(&D_806F2350);
++        gdx_aload_end(GDX_ALOAD_DISKLD, gdxALoadD);
++        if (gdxDone == 1) {
++#else
++        if (AudioLoad_DiskLoad(&D_806F2350) == 1) {
++#endif
++            AudioLoad_FinishAsyncLoad(asyncLoad);
++            gAudioCtx.curDiskDriveLoad = NULL;
++        }
+     }
+ }
+ 
+@@ -2435,6 +2541,9 @@ void AudioLoad_RelocateFontAndPreloadSamples(s32 fontId, void* fontData, SampleB
+ #else
+ void AudioLoad_RelocateFontAndPreloadSamples(s32 fontId, uintptr_t fontData, SampleBankRelocInfo* sampleBankReloc,
+                                              s32 async) {
++#endif
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
+ #endif
+     AudioPreloadReq* preload;
+     AudioPreloadReq* topPreload;
+@@ -2544,6 +2653,9 @@ void AudioLoad_RelocateFontAndPreloadSamples(s32 fontId, uintptr_t fontData, Sam
+         AudioLoad_StartAsyncLoad((uintptr_t) sample->sampleAddr, topPreload->ramAddr, sample->size, sample->medium,
+                                  nChunks, &gAudioCtx.preloadSampleQueue, topPreload->encodedInfo);
+     }
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_RELOC, gdxALoad); /* [audioload] */
++#endif
+ }
+ 
+ bool AudioLoad_ProcessSamplePreloads(s32 resetStatus) {
+@@ -2682,6 +2794,9 @@ void AudioLoad_AddUsedSample(TunedSample* tunedSample) {
+ }
+ 
+ void AudioLoad_PreloadSamplesForFont(s32 fontId, s32 async, SampleBankRelocInfo* sampleBankReloc) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload] */
++#endif
+     s32 numDrums;
+     s32 numInstruments;
+     s32 numSfx;
+@@ -2736,6 +2851,9 @@ void AudioLoad_PreloadSamplesForFont(s32 fontId, s32 async, SampleBankRelocInfo*
+     }
+ 
+     if (gAudioCtx.numUsedSamples == 0) {
++#ifdef PORT
++        gdx_aload_end(GDX_ALOAD_PRELOAD, gdxALoad); /* [audioload]: the early exit too */
++#endif
+         return;
+     }
+ 
+@@ -2814,6 +2932,9 @@ void AudioLoad_PreloadSamplesForFont(s32 fontId, s32 async, SampleBankRelocInfo*
+         AudioLoad_StartAsyncLoad((uintptr_t) sample->sampleAddr, topPreload->ramAddr, sample->size, sample->medium,
+                                  nChunks, &gAudioCtx.preloadSampleQueue, topPreload->encodedInfo);
+     }
++#ifdef PORT
++    gdx_aload_end(GDX_ALOAD_PRELOAD, gdxALoad); /* [audioload] */
++#endif
+ }
+ 
+ void AudioLoad_LoadPermanentSamples(void) {
+@@ -2939,6 +3060,38 @@ s32 AudioLoad_DiskInit(AudioDiskInfo* diskInfo, s32 lba, uintptr_t devAddr, u8*
+ }
+ 
+ s32 AudioLoad_DiskLoad(AudioDiskInfo* diskInfo) {
++#ifdef PORT
++    /* THE ASYNC DISK LOAD WAS ONLY ASYNC ON CONSOLE (docs/research/native/audioasync-progress.md).
++     *
++     * Case 0 below walks `bytesRemaining` and collapses EVERY whole LBA into ONE multi-LBA
++     * AudioLoad_ReadWriteDisk request, then returns 0 and waits for it across later ticks. On
++     * a 64DD that is correct and cheap: the drive DMAs the whole span in the background while
++     * the state machine polls. In this port `sLeoHandler` is LeoReadWrite (port/n64_leo.c),
++     * which serves the WHOLE request INLINE on the calling thread -- and the calling thread is
++     * the audio producer, inside gdx_audio_produce_one_tick, holding sAudioCtxMutex. So the
++     * "async" path blocks for the whole transfer in a single call.
++     *
++     * Measured, EK build, race-mutecity-start, [debug] audioload=1:
++     *   [audioload] TICK 872952us ... asyncp=870796us/1 diskld=870791us/1 leorw=870745us/1
++     * ONE ReadWriteDisk call, 0.87 s, on the producer thread, at the course load -- which is
++     * where audioring measured the ring going dry for 51 consecutive chunks (816 ms).
++     *
++     * The state machine already knows how to come back next tick; it simply never had to. Cap
++     * the batch, and re-enter through the decomp's own AudioLoad_DiskInit for the remainder
++     * (PORT transferState 3). The cap is a byte budget rather than an LBA count because the
++     * LBA size varies by zone (D_80771978: 0x4D08 down to 0x2530), and it applies only AFTER
++     * at least one whole LBA is in the batch -- a batch of zero LBAs would fall into case 1's
++     * tail read and transfer the wrong bytes.
++     *
++     * THE SIZING RULE: a step must cost less than the 16.5 ms of audio one producer tick
++     * produces, or the producer still loses ground; it just loses it more slowly. One LBA
++     * measured ~7 ms on the lane, so the default (16 KB = exactly one LBA per batch) leaves
++     * better than 2x headroom. `[debug] audio_disk_step_kb` = 0 restores the unchanged path
++     * byte for byte, which is the killswitch and the A/B. */
++    const s32 gdxStepBytes = gdx_audio_disk_step_bytes();
++    s32 gdxBatchBytes = 0;
++    s32 gdxCapped = 0;
++#endif
+ 
+     switch (diskInfo->transferState) {
+         case 0:
+@@ -2982,12 +3135,30 @@ s32 AudioLoad_DiskLoad(AudioDiskInfo* diskInfo) {
+                     diskInfo->blockSize = diskInfo->bytesRemaining;
+                     break;
+                 }
++#ifdef PORT
++                /* Never cap to zero LBAs: case 1 would then read a tail that is not the tail. */
++                if (gdxStepBytes > 0 && diskInfo->nLbas > 0 && gdxBatchBytes >= gdxStepBytes) {
++                    gdxCapped = 1;
++                    break;
++                }
++                gdxBatchBytes += diskInfo->blockSize;
++#endif
+                 diskInfo->finalLba++;
+                 diskInfo->bytesRemaining -= diskInfo->blockSize;
+                 diskInfo->endRamAddr += diskInfo->blockSize;
+                 diskInfo->nLbas++;
+             }
+ 
++#ifdef PORT
++            if (gdxCapped) {
++                /* Bytes still to come after this batch. diskInfo->blockSize holds the NEXT
++                   LBA's full size here, not a tail, so state 3 must not let case 1 see it. */
++                AudioLoad_ReadWriteDisk(&diskInfo->cmdBlock, OS_READ, diskInfo->nextLba,
++                                        diskInfo->ramAddr, diskInfo->nLbas, &diskInfo->mq, false);
++                diskInfo->transferState = 3;
++                return 0;
++            }
++#endif
+             if (diskInfo->nLbas != 0) {
+                 AudioLoad_ReadWriteDisk(&diskInfo->cmdBlock, OS_READ, diskInfo->nextLba, diskInfo->ramAddr,
+                                         diskInfo->nLbas, &diskInfo->mq, false);
+@@ -3012,6 +3183,21 @@ s32 AudioLoad_DiskLoad(AudioDiskInfo* diskInfo) {
+             }
+             bcopy(diskInfo->lbaVaddrPair->vAddr, diskInfo->endRamAddr, diskInfo->blockSize);
+             return 1;
++#ifdef PORT
++        case 3:
++            /* A CAPPED batch has landed and bytes remain. Restart the machine on the rest
++               through the decomp's own entry point rather than open-coding the advance:
++               DiskInit re-arms the single-LBA read case 0 expects, resets transferState and
++               recomputes blockSize, so the only state this arm owns is where to resume.
++               devAddr is 0 because everything from here is LBA-aligned -- the unaligned head
++               was consumed by the first case 0. */
++            if (AudioLoad_DiskCheckQueue(diskInfo) == -1) {
++                return 0;
++            }
++            AudioLoad_DiskInit(diskInfo, diskInfo->finalLba, 0, diskInfo->endRamAddr,
++                               diskInfo->bytesRemaining);
++            return 0;
++#endif
+         default:
+             return 0;
+     }
+diff --git a/src/audio/disk/lib/thread.c b/src/audio/disk/lib/thread.c
+index 16b9140..0b89dac 100644
+--- a/src/audio/disk/lib/thread.c
++++ b/src/audio/disk/lib/thread.c
+@@ -1,4 +1,29 @@
+ #include "global.h"
++/* [audioload] producer-tick phase attribution (audioasync track), defined in
++   port/n64_sched.c beside the producer tick it measures.
++
++   RAW EXTERNS, not an #include: the decomp game target's include path deliberately does not
++   carry port/ (port/3ds/game/CMakeLists.txt lists only the decomp roots, the Torch asset
++   headers and the track shim), and this is a decomp-headers-only TU -- the same reason
++   port/n64_leo.c spells gdx_ek_note and gdx_disk_save_mark_dirty as raw externs. The site ids
++   below MUST stay in step with port/gdx_audio_load_census.h, which is the canonical list and
++   carries the rationale.
++
++   gdx_aload_begin() returns 0 when [debug] audioload is off, and gdx_aload_end() returns on a
++   0 stamp, so an armed-off build pays one int compare per scope and reads no clock. */
++#ifdef PORT
++extern unsigned int gdx_aload_begin(void);
++extern void gdx_aload_end(int site, unsigned int startStamp);
++#define GDX_ALOAD_CMDS 0
++#define GDX_ALOAD_HEAPINIT 1
++#define GDX_ALOAD_LOADS 2
++#define GDX_ALOAD_SYNCSAMP 3
++#define GDX_ALOAD_RELOC 4
++#define GDX_ALOAD_PRELOAD 5
++#define GDX_ALOAD_DISK 6
++#define GDX_ALOAD_DMA 7
++#define GDX_ALOAD_FONTCONV 8
++#endif
+ #include "audio.h"
+ #include "audiothread_cmd.h"
+ #include "fzx_thread.h"
+@@ -568,6 +593,9 @@ void AudioThread_ProcessCmd(AudioCmd* cmd) {
+ }
+ 
+ void AudioThread_ProcessCmds(u32 msg) {
++#ifdef PORT
++    unsigned int gdxALoad = gdx_aload_begin(); /* [audioload]: the whole command drain */
++#endif
+     static u8 sCurCmdRdPos = 0;
+     AudioCmd* cmd;
+     u8 endPos;
+@@ -580,12 +608,18 @@ void AudioThread_ProcessCmds(u32 msg) {
+         endPos = msg & 0xFF;
+         if (sCurCmdRdPos == endPos) {
+             gAudioCtx.threadCmdQueueFinished = false;
++#ifdef PORT
++            gdx_aload_end(GDX_ALOAD_CMDS, gdxALoad); /* [audioload] */
++#endif
+             return;
+         }
+ 
+         cmd = &gAudioCtx.threadCmdBuf[sCurCmdRdPos++ & 0xFF];
+         if (cmd->op == AUDIOCMD_OP_GLOBAL_STOP_AUDIOCMDS) {
+             gAudioCtx.threadCmdQueueFinished = true;
++#ifdef PORT
++            gdx_aload_end(GDX_ALOAD_CMDS, gdxALoad); /* [audioload] */
++#endif
+             return;
+         }
+ 

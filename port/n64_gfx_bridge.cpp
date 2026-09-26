@@ -200,6 +200,15 @@ enum GdxRaceSite {
 };
 static uint8_t gGdxRaceMask[GDX_RACE_SITE_COUNT];
 static uint32_t gGdxRaceRtTouch[GDX_RACE_SITE_COUNT];
+/* [memotear] B37 (a): FOREIGN reach. gGdxRaceMask is noted INSIDE the GdxMemoOwnedHere() guard,
+ * so it counts the OWNER and can never distinguish "no second thread asked" from "a second
+ * thread asked every frame and was refused". Those are the two worlds B37's premise turns on.
+ * This mask is noted on the REFUSED path instead -- a path that is already taking a full
+ * uncached scan, so the OR is free where it matters -- and a bit that stays 0 for a whole run
+ * says no thread but the owner ever reached that memo. Cumulative, never reset, like the mask
+ * above. See docs/research/native/memotear-progress.md S1d. */
+static uint8_t gGdxRaceForeignMask[GDX_RACE_SITE_COUNT];
+static uint32_t gGdxRaceForeignTouch[GDX_RACE_SITE_COUNT];
 /* Peak sizes of the three tables EnsureAssetSegmentImageImpl appends to, against the capacity
  * sGdxTablesReserved pins. size == capacity is the moment a push_back reallocates under a
  * concurrent scan, so the receipt has to carry the headroom, not just "it is reserved". */
@@ -221,9 +230,15 @@ static inline void GdxRaceNote(GdxRaceSite site) {
         gGdxRaceRtTouch[site]++;
     }
 }
+static inline void GdxRaceNoteForeign(GdxRaceSite site) {
+    const uint8_t bit = GdxRaceBit();
+    gGdxRaceForeignMask[site] = (uint8_t)(gGdxRaceForeignMask[site] | bit);
+    gGdxRaceForeignTouch[site]++;
+}
 #else
 static inline uint8_t GdxRaceBit() { return 1u; }
 static inline void GdxRaceNote(GdxRaceSite site) { gGdxRaceMask[site] |= 1u; }
+static inline void GdxRaceNoteForeign(GdxRaceSite site) { gGdxRaceForeignMask[site] |= 1u; }
 #endif
 
 /* [resolverace] 6d: THE FOUR [brfast] MEMOS HAVE ONE OWNER THREAD.
@@ -276,6 +291,101 @@ static inline bool GdxMemoOwnedHere() {
 #else
 static inline bool GdxMemoOwnedHere() { return true; }
 #endif
+
+/* [memotear] Site-aware ownership test: the one every memo entry uses. Identical to
+ * GdxMemoOwnedHere() on the owning thread; on a refused thread it also notes the FOREIGN reach
+ * (see gGdxRaceForeignMask) before sending the caller down the uncached path. The note is on
+ * the refused path only, which is already paying a full uncached scan. */
+static inline bool GdxMemoOwnedFor(GdxRaceSite site) {
+    if (GdxMemoOwnedHere()) {
+        return true;
+    }
+    GdxRaceNoteForeign(site);
+    return false;
+}
+
+/* [memotear] B37 PUBLICATION ORDER for the six process-wide [brfast] memos.
+ *
+ * Every memo entry is a direct-mapped slot that is REUSED: on a fill the slot's publication
+ * word (`filled` / `valid` / `count`) is already non-zero, so a reader has no way to tell the
+ * entry is mid-write. The fills used to store the KEY first and the PAYLOAD after, so a reader
+ * matching a newly stored key could read the PREVIOUS entry's payload -- see
+ * docs/research/native/memotear-progress.md S2 for what that produces per memo (it is not
+ * uniform: gRangeClassMemo carries a stride/endianness decision, not a pointer).
+ *
+ * Every fill now runs RETIRE -> payload+keys -> PUBLISH, with the publication word written
+ * last, so nothing an entry says is observable until all of it is. That reordering is free and
+ * unconditional: it is not observable on one thread, so it is not behind a lever.
+ *
+ * What IS behind a lever is the BARRIER, because on ARMv6K (ARM11 MPCore) there is no
+ * ldar/stlr and an acquire lowers to a dmb -- on a probe that runs for every VTX/MTX/SETTIMG
+ * operand of every list. [native] memoorder:
+ *
+ *   0 -- no barrier at all (the pre-memotear memory behaviour; bisect lever)
+ *   1 -- compiler barriers only (DEFAULT). Zero instructions emitted; pins the store order
+ *        against the compiler, which is the whole guarantee on one core, and the fiber backend
+ *        makes "the submitting thread" one core by construction (gdx_fiber_3ds.c).
+ *   2 -- real std::atomic_thread_fence release/acquire: the cross-core guarantee, and a dmb on
+ *        every memo probe. Priced in memotear-progress.md S6.
+ *
+ * Level 1 is deliberately NOT claimed to be a cross-core guarantee. The reason it is enough is
+ * S1: these memos have exactly ONE owner thread in every configuration this build ships, which
+ * GdxMemoOwnedFor() enforces and the [resolverace] fgn mask measures. */
+#ifdef __3DS__
+/* Declared here as well as at the INI block below: this helper sits above it, and the memos are
+ * only ever entered from a walking adapter, which is constructed long after the ini is read. */
+extern "C" int gdx3ds_native_lever(const char* key, int fallback);
+#endif
+static int gGdxMemoOrder = -1;
+static inline int GdxMemoOrder() {
+    if (gGdxMemoOrder < 0) {
+#ifdef __3DS__
+        int v = gdx3ds_native_lever("memoorder", 1);
+#else
+        const char* env = std::getenv("GDX_MEMOORDER");
+        int v = (env != nullptr) ? std::atoi(env) : 1;
+#endif
+        if (v < 0 || v > 2) {
+            v = 1;
+        }
+        gGdxMemoOrder = v;
+    }
+    return gGdxMemoOrder;
+}
+extern "C" int gdx_bridge_memoorder(void) { return GdxMemoOrder(); }
+
+/* Store side. GdxMemoRetire() must be the FIRST statement of a fill and GdxMemoPublish() the
+ * LAST; everything between is payload and keys, in any order, because none of it is visible. */
+template <typename T>
+static inline void GdxMemoRetire(T& publicationWord) {
+    publicationWord = static_cast<T>(0);
+    const int lvl = GdxMemoOrder();
+    if (lvl >= 2) {
+        std::atomic_thread_fence(std::memory_order_release);
+    } else if (lvl >= 1) {
+        std::atomic_signal_fence(std::memory_order_release);
+    }
+}
+template <typename T>
+static inline void GdxMemoPublish(T& publicationWord, T value) {
+    const int lvl = GdxMemoOrder();
+    if (lvl >= 2) {
+        std::atomic_thread_fence(std::memory_order_release);
+    } else if (lvl >= 1) {
+        std::atomic_signal_fence(std::memory_order_release);
+    }
+    publicationWord = value;
+}
+/* Load side: called after the publication word has been read non-zero and BEFORE any key or
+ * payload field of the same entry is read. */
+static inline void GdxMemoAcquire() {
+    const int lvl = GdxMemoOrder();
+    if (lvl >= 2) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+    } else if (lvl >= 1) {
+        std::atomic_signal_fence(std::memory_order_acquire);
+    }
+}
 
 extern "C" uint8_t D_3000000[];
 extern "C" uint8_t D_3000028[];
@@ -1158,11 +1268,32 @@ void RecordHostWrite(uintptr_t begin, size_t size) {
 
 } // namespace (temporarily close to define extern "C")
 
+/* ---- GDX_MEMPROBE: RDRAM classification watermark (compile-time, OFF in shipped builds) ---
+ * GDX_RDRAM_SIZE is not only an allocation size, it is the upper bound of the window in which
+ * this file treats a bare u32 as an RDRAM offset. Shrinking the arena therefore NARROWS a
+ * classification window, and an offset that used to resolve into the arena would stop
+ * resolving. This records the highest offset any resolver ever admitted, so the cost of a
+ * proposed smaller bound is a number rather than an argument. */
+#ifdef GDX_MEMPROBE
+static unsigned int gGdxProbeRdramPhysHi = 0; /* benign race: monotone max, worst case a lost update */
+static inline void GdxProbeNoteRdramOffset(uint32_t off, size_t bytes) {
+    const unsigned int end = static_cast<unsigned int>(off) + static_cast<unsigned int>(bytes ? bytes : 1u);
+    if (end > gGdxProbeRdramPhysHi) {
+        gGdxProbeRdramPhysHi = end;
+    }
+}
+extern "C" unsigned int gdx_gfx_probe_rdram_phys_hi(void) { return gGdxProbeRdramPhysHi; }
+#else
+static inline void GdxProbeNoteRdramOffset(uint32_t, size_t) { }
+extern "C" unsigned int gdx_gfx_probe_rdram_phys_hi(void) { return 0u; }
+#endif
+
 extern "C" void gdx_record_dma_load(uint32_t rdram_phys, uint32_t rom_offset, uint32_t size) {
     (void)rom_offset;
     GdxDmaRangesGuard dmaGuard;
     ++gDmaGeneration;
     if (gdx_rdram != nullptr && size != 0 && rdram_phys < GDX_RDRAM_SIZE) {
+        GdxProbeNoteRdramOffset(rdram_phys, std::min<size_t>(size, GDX_RDRAM_SIZE - rdram_phys));
         const uintptr_t begin = reinterpret_cast<uintptr_t>(gdx_rdram) + rdram_phys;
         const uintptr_t end = begin + std::min<size_t>(size, GDX_RDRAM_SIZE - rdram_phys);
         gDmaDirtyRanges.push_back({begin, end, gDmaGeneration});
@@ -1543,19 +1674,23 @@ bool IsAssetPlaceholderPointer(uint32_t low32) {
        (result), so a foreign thread can match the new keys and read the previous entry's
        answer. The factsrace audit did not name this one. Same owner latch as the other four;
        LookupAssetSegment below is the uncached path a foreign thread falls through to. */
-    if (GdxBrFastOn() && GdxMemoOwnedHere()) {
+    if (GdxBrFastOn() && GdxMemoOwnedFor(GDX_RACE_PLACEHOLDER_MEMO)) {
         GdxRaceNote(GDX_RACE_PLACEHOLDER_MEMO);
         memo = &gPlaceholderMemo[((low32 >> 3) ^ (low32 >> 14)) & 2047u];
-        if (memo->valid != 0 && memo->low32 == low32) {
-            return memo->result != 0;
+        if (memo->valid != 0) {
+            GdxMemoAcquire();
+            if (memo->low32 == low32) {
+                return memo->result != 0;
+            }
         }
     }
     AssetSegmentLookup scratch = {};
     const bool result = LookupAssetSegment(low32, scratch);
     if (memo != nullptr) {
+        GdxMemoRetire(memo->valid);
         memo->low32 = low32;
-        memo->valid = 1;
         memo->result = result ? 1 : 0;
+        GdxMemoPublish<uint8_t>(memo->valid, 1);
     }
     return result;
 }
@@ -2056,6 +2191,7 @@ bool ResolveRdramLow32(uint32_t raw, size_t requiredBytes, uintptr_t* outHost) {
         return false;
     }
 
+    GdxProbeNoteRdramOffset(offset, requiredBytes);
     *outHost = full;
     return true;
 }
@@ -2232,6 +2368,7 @@ bool G2ResolvePhysical(void* /*user*/, uint32_t raw, size_t required_bytes, uint
         if (phys < static_cast<uint32_t>(GDX_RDRAM_SIZE)) {
             const uintptr_t full = base + phys;
             if (ReadableByteLimit(full) >= required_bytes) {
+                GdxProbeNoteRdramOffset(phys, required_bytes);
                 *out_host = full;
                 return true;
             }
@@ -2251,6 +2388,7 @@ bool G2ResolvePhysical(void* /*user*/, uint32_t raw, size_t required_bytes, uint
         (raw < static_cast<uint32_t>(GDX_RDRAM_SIZE))) {
         const uintptr_t full = base + raw;
         if (ReadableByteLimit(full) >= required_bytes) {
+            GdxProbeNoteRdramOffset(raw, required_bytes);
             *out_host = full;
             return true;
         }
@@ -3400,7 +3538,7 @@ uintptr_t MakePersistentRawTextureCopy(uintptr_t source, size_t requiredBytes, b
        here is what says whether that is ever two threads. Measured mask so far: see
        docs/research/native/resolverace-progress.md.) */
     GdxRaceNote(GDX_RACE_TEXCOPY);
-    if (GdxBrFastOn() && GdxMemoOwnedHere()) {
+    if (GdxBrFastOn() && GdxMemoOwnedFor(GDX_RACE_TEXCOPY)) {
         if (gRawTextureCopyIndex.size() != gRawTextureCopies.size()) {
             gRawTextureCopyIndex.clear();
             gRawTextureCopyIndex.reserve(gRawTextureCopies.size() + 64);
@@ -5455,7 +5593,7 @@ class N64DisplayListAdapter {
         /* Some game-built lists live inside the emulated RDRAM arena but use the
          * PORT Gfx ABI (16-byte packets with a pointer-width w1). They must win
          * over the general "RDRAM is raw N64" classification. */
-        if (mBrFast && GdxMemoOwnedHere()) {
+        if (mBrFast && GdxMemoOwnedFor(GDX_RACE_CLASS_MEMO)) {
             const GdxRangeClassMemoEntry& c = RangeClassFor(ptr);
             if (c.isWide != 0) {
                 return kHostBuiltGfxStride;
@@ -5469,15 +5607,22 @@ class N64DisplayListAdapter {
     }
     const GdxRangeClassMemoEntry& RangeClassFor(uintptr_t ptr) const {
         GdxRangeClassMemoEntry& e = gRangeClassMemo[static_cast<size_t>((ptr >> 4) ^ (ptr >> 14)) & 1023u];
-        if (e.filled == 0 || e.ptr != ptr || e.ver != GdxResolveTablesVersion()) {
+        /* [memotear] `filled` is the publication word: read it, acquire, THEN the keys. */
+        bool hit = false;
+        if (e.filled != 0) {
+            GdxMemoAcquire();
+            hit = (e.ptr == ptr && e.ver == GdxResolveTablesVersion());
+        }
+        if (!hit) {
             gGdxBrFastStat[4]++;
             GdxRaceNote(GDX_RACE_CLASS_MEMO);
+            GdxMemoRetire(e.filled);
             e.ptr = ptr;
             e.ver = GdxResolveTablesVersion();
             e.isWide = IsHostWideCommandPointer(ptr) ? 1 : 0;
             e.isRaw = IsRawN64HostPointer(ptr) ? 1 : 0;
             e.isN64Cmd = IsHostN64CommandPointer(ptr) ? 1 : 0;
-            e.filled = 1;
+            GdxMemoPublish<uint8_t>(e.filled, 1);
         }
         return e;
     }
@@ -5575,7 +5720,7 @@ class N64DisplayListAdapter {
         }
 
         const uintptr_t ptr = reinterpret_cast<uintptr_t>(source);
-        if (mBrFast && GdxMemoOwnedHere()) {
+        if (mBrFast && GdxMemoOwnedFor(GDX_RACE_CLASS_MEMO)) {
             const GdxRangeClassMemoEntry& c = RangeClassFor(ptr);
             if (c.isRaw == 0 || c.isN64Cmd != 0) {
                 return false;
@@ -5736,7 +5881,7 @@ class N64DisplayListAdapter {
        full resolve PLUS a probe PLUS a fill on every host-tagged SETTIMG. */
     uint32_t StubMemoGen() const { return mStubGenNarrow ? mStubGen : mSegGen; }
     uintptr_t ResolveWideAssetStubPointerFast(uintptr_t full, size_t requiredBytes) const {
-        if (!mBrFast || full == 0 || requiredBytes > 0xFFFFFFFFu || !GdxMemoOwnedHere()) {
+        if (!mBrFast || full == 0 || requiredBytes > 0xFFFFFFFFu || !GdxMemoOwnedFor(GDX_RACE_STUB_MEMO)) {
             return ResolveWideAssetStubPointer(full, mModuleBegin, mModuleEnd, requiredBytes);
         }
         if (GdxSegmentEpochSnapshot() != mEpochAtGen) {
@@ -5745,14 +5890,18 @@ class N64DisplayListAdapter {
         const uint32_t low = Low32(full);
         const uint32_t h = (low * 2654435761u) ^ (static_cast<uint32_t>(requiredBytes) * 40503u) ^ 0x5bd1e995u;
         GdxResolveMemoEntry& e = gWideStubMemo[(h >> 22) & 1023u];
-        if (e.filled != 0 && e.raw == low && e.required == static_cast<uint32_t>(requiredBytes) &&
-            e.ver == GdxResolveTablesVersion() && e.segGen == StubMemoGen() && e.full == full) {
-            gGdxBrFastStat[2]++;
-            return e.result;
+        if (e.filled != 0) {
+            GdxMemoAcquire();
+            if (e.raw == low && e.required == static_cast<uint32_t>(requiredBytes) &&
+                e.ver == GdxResolveTablesVersion() && e.segGen == StubMemoGen() && e.full == full) {
+                gGdxBrFastStat[2]++;
+                return e.result;
+            }
         }
         gGdxBrFastStat[3]++;
         GdxRaceNote(GDX_RACE_STUB_MEMO);
         const uintptr_t out = ResolveWideAssetStubPointer(full, mModuleBegin, mModuleEnd, requiredBytes);
+        GdxMemoRetire(e.filled);
         e.raw = low;
         e.required = static_cast<uint32_t>(requiredBytes);
         e.ver = GdxResolveTablesVersion();
@@ -5762,15 +5911,15 @@ class N64DisplayListAdapter {
         e.segment = 0;
         e.segmented = 0;
         e.ok = (out != 0) ? 1 : 0;
-        e.filled = 1;
         e.result = out;
+        GdxMemoPublish<uint8_t>(e.filled, 1);
         return out;
     }
     bool TryResolveAddress(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false,
                            uintptr_t sourceHint = 0) const {
         if (!mBrFast || preferPhysical || sourceHint != 0 || raw == 0 || requiredBytes > 0xFFFFFFFFu ||
             LegacyResolveEnabled() || gdx_dev_gate(GDX_GATE_LOG_FILE) || gdx_dev_gate(GDX_GATE_DIAG_NODEINFO) ||
-            !GdxMemoOwnedHere()) {
+            !GdxMemoOwnedFor(GDX_RACE_RESOLVE_MEMO)) {
             return TryResolveAddressUncached(raw, out, requiredBytes, preferPhysical, sourceHint);
         }
         if (GdxSegmentEpochSnapshot() != mEpochAtGen) {
@@ -5778,20 +5927,24 @@ class N64DisplayListAdapter {
         }
         const uint32_t h = (raw * 2654435761u) ^ (static_cast<uint32_t>(requiredBytes) * 40503u);
         GdxResolveMemoEntry& e = gResolveMemo[(h >> 19) & 8191u];
-        if (e.filled != 0 && e.raw == raw && e.required == static_cast<uint32_t>(requiredBytes) &&
-            e.ver == GdxResolveTablesVersion() && e.segGen == mSegGen) {
-            gGdxBrFastStat[0]++;
-            if (e.ok != 0) {
-                out.full = e.full;
-                out.segment = e.segment;
-                out.offset = e.offset;
-                out.segmented = (e.segmented != 0);
+        if (e.filled != 0) {
+            GdxMemoAcquire();
+            if (e.raw == raw && e.required == static_cast<uint32_t>(requiredBytes) &&
+                e.ver == GdxResolveTablesVersion() && e.segGen == mSegGen) {
+                gGdxBrFastStat[0]++;
+                if (e.ok != 0) {
+                    out.full = e.full;
+                    out.segment = e.segment;
+                    out.offset = e.offset;
+                    out.segmented = (e.segmented != 0);
+                }
+                return e.ok != 0;
             }
-            return e.ok != 0;
         }
         gGdxBrFastStat[1]++;
         GdxRaceNote(GDX_RACE_RESOLVE_MEMO);
         const bool ok = TryResolveAddressUncached(raw, out, requiredBytes, false, 0);
+        GdxMemoRetire(e.filled);
         e.raw = raw;
         e.required = static_cast<uint32_t>(requiredBytes);
         e.ver = GdxResolveTablesVersion(); // the call itself may have appended (asset load)
@@ -5801,7 +5954,7 @@ class N64DisplayListAdapter {
         e.segment = out.segment;
         e.segmented = out.segmented ? 1 : 0;
         e.ok = ok ? 1 : 0;
-        e.filled = 1;
+        GdxMemoPublish<uint8_t>(e.filled, 1);
         return ok;
     }
     bool TryResolveAddressUncached(uint32_t raw, ResolvedAddress& out, size_t requiredBytes = 1, bool preferPhysical = false,
@@ -5847,14 +6000,20 @@ class N64DisplayListAdapter {
             int32_t matchIdx = -1;
             bool memoHit = false;
             GdxN64RangeMemoEntry* memo = nullptr;
-            if (GdxBrFastOn() && GdxMemoOwnedHere() && rangeCount != 0 && requiredBytes <= 0xFFFFFFFFu &&
+            if (GdxBrFastOn() && GdxMemoOwnedFor(GDX_RACE_N64RANGE_MEMO) && rangeCount != 0 &&
+                requiredBytes <= 0xFFFFFFFFu &&
                 rangeCount <= 0x7FFFFFFFu) {
                 const uint32_t h = (raw * 2654435761u) ^ (static_cast<uint32_t>(requiredBytes) * 40503u);
                 memo = &gN64RangeMemo[(h >> 22) & 1023u];
-                if (memo->count == static_cast<uint32_t>(rangeCount) && memo->raw == raw &&
-                    memo->required == static_cast<uint32_t>(requiredBytes)) {
-                    matchIdx = memo->idx;
-                    memoHit = true;
+                /* [memotear] `count` is the publication word -- it can never legitimately be 0
+                   here, because the arm above refuses rangeCount == 0. */
+                if (memo->count != 0) {
+                    GdxMemoAcquire();
+                    if (memo->count == static_cast<uint32_t>(rangeCount) && memo->raw == raw &&
+                        memo->required == static_cast<uint32_t>(requiredBytes)) {
+                        matchIdx = memo->idx;
+                        memoHit = true;
+                    }
                 }
             }
             if (!memoHit) {
@@ -5871,10 +6030,11 @@ class N64DisplayListAdapter {
                 }
                 if (memo != nullptr) {
                     GdxRaceNote(GDX_RACE_N64RANGE_MEMO);
+                    GdxMemoRetire(memo->count);
                     memo->raw = raw;
                     memo->required = static_cast<uint32_t>(requiredBytes);
-                    memo->count = static_cast<uint32_t>(rangeCount);
                     memo->idx = matchIdx;
+                    GdxMemoPublish<uint32_t>(memo->count, static_cast<uint32_t>(rangeCount));
                 }
             }
             if (matchIdx >= 0) {
@@ -5976,6 +6136,7 @@ class N64DisplayListAdapter {
         if (raw >= 0x80000000u && raw <= 0xBFFFFFFFu) {
             const uint32_t phys = raw & 0x1FFFFFFFu;
             if (phys < static_cast<uint32_t>(GDX_RDRAM_SIZE) && gdx_rdram != nullptr) {
+                GdxProbeNoteRdramOffset(phys, 1u);
                 out.full = reinterpret_cast<uintptr_t>(gdx_rdram) + phys;
                 out.segmented = false;
                 return true;
@@ -6038,6 +6199,7 @@ class N64DisplayListAdapter {
         if ((raw >= static_cast<uint32_t>(GDX_RDRAM_GFXPOOL_OFFSET)) &&
             (raw < static_cast<uint32_t>(GDX_RDRAM_SIZE)) &&
             (gdx_rdram != nullptr)) {
+            GdxProbeNoteRdramOffset(raw, 1u);
             out.full = reinterpret_cast<uintptr_t>(gdx_rdram) + raw;
             out.segmented = false;
             return true;
@@ -9751,6 +9913,24 @@ extern "C" void gdx_request_frame_dump(const char* label) {
     if (label == nullptr || label[0] == '\0') {
         return;
     }
+    /* [debug] shots (default 1). A SHOT writes a ~280 KB BMP on the main thread, and it is
+       the single biggest source of visible hitching during a replay -- 12 of 12 sub-40fps
+       beats in the B38 hardware run were immediately preceded by a dump, and every
+       [dynlod] window in it reported max=~890 ms for the same reason. lodburst's finding
+       was that a SHOT is invisible in `ms=` and dominates `max=`; this is the switch that
+       lets a run be WATCHED, or a timing figure be taken, without that contamination.
+       The tag still logs, so the replay's structure is unchanged -- only the write is
+       skipped. Latched once: this is called from the display-list path. */
+    static int sShotsOn = -1;
+    if (sShotsOn < 0) {
+        sShotsOn = gdx3ds_config_get_bool("debug", "shots", 1) ? 1 : 0;
+        if (!sShotsOn) {
+            gdx_port_logf("[rec] [debug] shots=0 -- SHOT tags still log, BMP writes SKIPPED\n");
+        }
+    }
+    if (!sShotsOn) {
+        return;
+    }
     if (gdx3ds_gpuprof_note_shot != nullptr) {
         gdx3ds_gpuprof_note_shot(label);
     }
@@ -11285,7 +11465,7 @@ static void GdxEmitWalkReceipts() {
                 static const char* const kRaceSiteNames[GDX_RACE_SITE_COUNT] = {
                     "seg", "ver", "rmemo", "smemo", "cmemo", "nmemo", "scan", "pmemo", "texcopy"
                 };
-                char raceLine[512];
+                char raceLine[768];
                 int raceLen = snprintf(raceLine, sizeof(raceLine), "[resolverace] mask");
                 for (int i = 0; i < (int) GDX_RACE_SITE_COUNT; ++i) {
                     raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
@@ -11296,6 +11476,19 @@ static void GdxEmitWalkReceipts() {
                     raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
                                         " %s=%u", kRaceSiteNames[i], (unsigned) gGdxRaceRtTouch[i]);
                 }
+                /* [memotear] FOREIGN reach: the mask above is noted inside the ownership guard
+                   and therefore counts the OWNER. This one is noted on the REFUSED path, so a
+                   bit that stays 0 says no thread but the owner ever reached that memo -- which
+                   is the condition B37's hazard needs. fgnN = refused calls. */
+                raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen, " | fgn");
+                unsigned fgnTotal = 0;
+                for (int i = 0; i < (int) GDX_RACE_SITE_COUNT; ++i) {
+                    raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
+                                        " %s=%u", kRaceSiteNames[i], (unsigned) gGdxRaceForeignMask[i]);
+                    fgnTotal += gGdxRaceForeignTouch[i];
+                }
+                raceLen += snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
+                                    " fgnN=%u memoorder=%d", fgnTotal, GdxMemoOrder());
                 snprintf(raceLine + raceLen, sizeof(raceLine) - (size_t) raceLen,
                          " | owner=%u segdefer=%u/%u | peak host=%u/%u raw=%u/%u assets=%u/%u",
                          (unsigned) gGdxMemoOwnerBit.load(std::memory_order_relaxed),
@@ -13673,6 +13866,35 @@ extern "C" void gdx_gfx_tmem_source_stamp(uint64_t out[2]) {
 extern "C" int gdx_gfx_tmem_source_unchanged(uintptr_t source, size_t size, unsigned clsAtStamp,
                                              const uint64_t stamp[2]) {
     return GdxTmemSourceUnchanged(source, size, clsAtStamp, stamp);
+}
+
+/* [memotear] NEXT.md B54 fault injection: move the LIVE generation that a stamp of class `cls`
+   over [source, size) was taken against, so the next gdx_gfx_tmem_source_unchanged() must
+   answer 0. This drives the real plumbing -- the same bump helper gdx_set_native_rgba16_-
+   texture_range uses, and the same dirty-range recorder gdx_record_dma_load feeds -- rather
+   than corrupting the stored stamp, so what it exercises is the invalidation path and not a
+   comparison.
+
+   Returns 1 when a generation exists for that class and was moved; 0 when the class has NO
+   generation arm, which is a fact about the gate and not a failure of the injector:
+   GdxTmemSourceUnchanged answers kTmemSrcStable with an unconditional 1 ("stable by
+   construction once its segment is loaded"), so STABLE has no staleness arm to exercise at
+   all, and its only refusal is the CLASS arm. UNKNOWN never skips, so it has none either.
+
+   Both effects are in the conservative direction -- a moved generation can only cause MORE
+   re-copies and re-mirrors, never fewer -- so an injected run must still draw the same pixels.
+   The only caller is behind [debug] tmemfault, which is 0 in every shipped configuration. */
+extern "C" int gdx_gfx_tmem_fault_move_generation(uintptr_t source, size_t size, unsigned cls) {
+    switch (cls) {
+        case GDX_TMEMSRC_NATIVE:
+            GdxBumpNativeRgba16Generation();
+            return 1;
+        case GDX_TMEMSRC_DMA:
+            RecordHostWrite(source, size);
+            return 1;
+        default:
+            return 0;
+    }
 }
 
 extern "C" int gdx_gfx_low32_needs_resolver(uint32_t low32) {

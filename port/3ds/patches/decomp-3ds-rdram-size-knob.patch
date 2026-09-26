@@ -1,0 +1,38 @@
+--- a/src/sys/dma.c
++++ b/src/sys/dma.c
+@@ -2,7 +2,16 @@
+ #include "fzx_thread.h"
+ #ifdef PORT
+ extern unsigned char* gdx_rdram;
+-#define GDX_DMA_RDRAM_SIZE ((size_t)0x1000000u)  /* must match GDX_RDRAM_SIZE in n64_rdram.h */
++/* Must match GDX_RDRAM_SIZE in port/n64_rdram.h. It no longer CAN drift: the 3DS build defines
++ * GDX_RDRAM_SIZE_BYTES on the command line (port/3ds/CMakeLists.txt, the -DGDX_3DS_RDRAM_MB
++ * knob) and this TU picks up the same value; the fallback is the shipped 16 MB, so a host build
++ * with no knob compiles what it compiled before. Both uses below are UPPER-BOUND range tests on
++ * a destination pointer, so a stale 16 MB here against a smaller arena would admit pointers
++ * past the end of the buffer and record DMA into bytes the process does not own. */
++#ifndef GDX_RDRAM_SIZE_BYTES
++#define GDX_RDRAM_SIZE_BYTES 0x1000000u
++#endif
++#define GDX_DMA_RDRAM_SIZE ((size_t)GDX_RDRAM_SIZE_BYTES)
+ extern void gdx_record_dma_load(unsigned int rdram_phys, unsigned int rom_offset, unsigned int size);
+ /* port/gdx_segment_source.{h,c}. Forward-declared rather than #include'd: this decomp TU's
+  * include path does not carry port/. Returns verbatim ROM bytes, archive-first. */
+--- a/src/game/object.c	2026-09-24 21:40:24
++++ b/src/game/object.c	2026-09-24 21:40:24
+@@ -48,9 +48,14 @@
+ /* The renderer only invalidates on recorded writes (HostRangeChanged, n64_gfx_bridge.cpp), and
+    the per-mode arena rewind reuses destination addresses, so an unrecorded asset copy leaves the
+    previous mode's texture bytes on screen. */
++/* Same bound as GDX_RDRAM_SIZE (port/n64_rdram.h), tracking the -DGDX_3DS_RDRAM_MB knob through
++   the command-line define the 3DS build sets; the fallback is the shipped 16 MB. */
++#ifndef GDX_RDRAM_SIZE_BYTES
++#define GDX_RDRAM_SIZE_BYTES 0x1000000u
++#endif
+ static void GDX_RecordAssetWrite(u8* startAddr, size_t size) {
+     if (gdx_rdram != NULL && startAddr >= gdx_rdram &&
+-        startAddr < gdx_rdram + 0x1000000u /* GDX_RDRAM_SIZE */) {
++        startAddr < gdx_rdram + (size_t)GDX_RDRAM_SIZE_BYTES) {
+         gdx_record_dma_load((unsigned int)(size_t)(startAddr - gdx_rdram), 0u, (unsigned int)size);
+     }
+ }

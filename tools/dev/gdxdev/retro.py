@@ -497,7 +497,29 @@ video_driver = "%(video_driver)s"
 # This redirection is applied ONLY under --3d. Honouring core options for the first time is
 # a real behaviour change for the lane (it is what finally makes `--gfx` reach the core),
 # and that deserves its own re-baseline rather than riding in on a stereo branch.
-CFG_3D_EXTRA = 'rgui_config_directory = "%s"\n'
+CFG_COREOPT_REDIRECT = 'rgui_config_directory = "%s"\n'
+# Kept under its old name for any caller that still spells it that way.
+CFG_3D_EXTRA = CFG_COREOPT_REDIRECT
+
+# `--model`. The core declares `citra_is_new_3ds` as "System Model" ("Select whether to
+# emulate the original 3DS or New 3DS. New 3DS has additional CPU power and memory"), and
+# the legal values are these two labels -- verified against the pinned core's own option
+# strings, not assumed. `--model old` is the Old 3DS lane (NEXT.md C4): the render thread
+# self-disables there (gdx3ds_renderthread.cpp refuses without APT_CheckNew3DS), so an
+# `old` run is a renderthread=0 execution NO MATTER what [debug] renderthread says --
+# which makes it a different execution from every N3DS parity cell, never a comparison
+# against one (PROTOCOL: parity is same-render-thread-mode only).
+MODELS = {"new": "New 3DS", "old": "Old 3DS"}
+
+
+def model_or_die(name):
+    if name is None:
+        return None
+    key = str(name).strip().lower()
+    if key not in MODELS:
+        raise GdxError("unknown --model %r; expected one of: %s"
+                       % (name, ", ".join(sorted(MODELS))), util.EXIT_USAGE)
+    return key
 
 # Values written under --3d. Spelled so every one of them is LEGAL for the core, because
 # under --3d the file is finally read: `citra_is_new_3ds = "enabled"` (the mono template's
@@ -507,9 +529,13 @@ CFG_3D_EXTRA = 'rgui_config_directory = "%s"\n'
 # else; only citra_graphics_api actually starts being honoured, and it is asked for the
 # value it was defaulting to anyway.
 CORE_OPTIONS_3D_TEMPLATE = """\
-# Written by `gdx-dev retro run --3d`. Unlike retroarch-core-options.cfg this path IS read
-# (see CFG_3D_EXTRA), so every value here has to be one the core declares.
-citra_is_new_3ds = "New 3DS"
+# Written by `gdx-dev retro run --3d` / `--model`. Unlike retroarch-core-options.cfg this
+# path IS read (see CFG_COREOPT_REDIRECT), so every value here has to be one the core
+# declares. `citra_is_new_3ds` is SUBSTITUTED rather than appended to, because RetroArch's
+# config parser returns the FIRST entry for a duplicated key -- appending a second
+# assignment wrote a file that said "Old 3DS" and booted a New 3DS, which the guest's
+# [mem-budget] receipt caught and nothing else would have.
+citra_is_new_3ds = "%(model)s"
 citra_graphics_api = "%(gfx)s"
 citra_use_hw_shader = "enabled"
 citra_resolution_factor = "1"
@@ -533,12 +559,13 @@ citra_region_value = "Auto"
 
 
 def write_config(inst, gfx="Vulkan", audio="false", video_driver="vulkan",
-                 core=None, three_d=None):
+                 core=None, three_d=None, model=None):
     """Write this instance's retroarch.cfg + core-options file.
 
-    `three_d` is (mode, depth) from `--3d`, or None. When it is None not one byte of the
-    core-options file changes, so a non-3D run is exactly the run it was before this flag
-    existed.
+    `three_d` is (mode, depth) from `--3d`, or None. `model` is "new"/"old" from
+    `--model`, or None. When BOTH are None not one byte of the core-options file changes
+    and no redirect is written, so a plain run is exactly the run it was before either
+    flag existed -- which is what keeps every baseline taken on this lane valid.
     """
     for d in (inst.dir, inst.system, inst.saves, inst.screenshots):
         os.makedirs(d, exist_ok=True)
@@ -549,22 +576,33 @@ def write_config(inst, gfx="Vulkan", audio="false", video_driver="vulkan",
             "shots": inst.screenshots, "coreopts": inst.core_options,
             "cores": os.path.dirname(core or core_path() or ""), "dir": inst.dir,
             "port": inst.port, "audio": audio, "video_driver": video_driver,
-            "extra": (CFG_3D_EXTRA % cfg_dir) if three_d else "",
+            "extra": (CFG_COREOPT_REDIRECT % cfg_dir) if (three_d or model) else "",
         })
     with open(inst.core_options, "w") as f:
         f.write(CORE_OPTIONS_TEMPLATE % {"gfx": gfx})
-    if three_d:
+    if three_d or model:
         from . import stereo3d
         # The path RetroArch actually reads. "Azahar" is the core's `corename`, which is
-        # both the directory and the file stem of a per-core options file.
+        # both the directory and the file stem of a per-core options file. Every value
+        # written here has to be one the core DECLARES, or it silently falls back to the
+        # option default -- the trap CORE_OPTIONS_3D_TEMPLATE's comment records.
         opt = os.path.join(cfg_dir, "Azahar", "Azahar.opt")
         os.makedirs(os.path.dirname(opt), exist_ok=True)
         with open(opt, "w") as f:
-            f.write(CORE_OPTIONS_3D_TEMPLATE % {"gfx": gfx})
-            f.write("# --3d: the HOST knob. Without it the emulated 3D slider reads 0 and\n"
-                    "# the guest skips its right-eye pass whatever [stereo] enabled says.\n")
-            for key, value in stereo3d.core_options(*three_d):
-                f.write('%s = "%s"\n' % (key, value))
+            if model:
+                # --model: the emulated SYSTEM MODEL. "Old 3DS" halves the FCRAM the guest
+                # is granted and removes core 2, so the port's render thread self-disables
+                # (APT_CheckNew3DS). Restart required, which a fresh instance per run
+                # already satisfies. Verify it landed with the guest's own [mem-budget]
+                # receipt (model=/memtype=), never with this file.
+                f.write(CORE_OPTIONS_3D_TEMPLATE % {"gfx": gfx, "model": MODELS[model]})
+            else:
+                f.write(CORE_OPTIONS_3D_TEMPLATE % {"gfx": gfx, "model": MODELS["new"]})
+            if three_d:
+                f.write("# --3d: the HOST knob. Without it the emulated 3D slider reads 0 and\n"
+                        "# the guest skips its right-eye pass whatever [stereo] enabled says.\n")
+                for key, value in stereo3d.core_options(*three_d):
+                    f.write('%s = "%s"\n' % (key, value))
     return inst.cfg
 
 
@@ -837,7 +875,7 @@ def cmd_extra(args):
 
 
 def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, attempt,
-             three_d=None):
+             three_d=None, model=None):
     """One boot. -> (ok, early_crash, guest_log_text, detail).
 
     `early_crash` means RetroArch died on its own before the deadline AND the guest never
@@ -846,7 +884,8 @@ def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, 
     next renderer instead.
     """
     video_driver = {"Vulkan": "vulkan", "OpenGL": "glcore", "Software": "gl"}.get(gfx, "gl")
-    write_config(inst, gfx=gfx, video_driver=video_driver, core=core, three_d=three_d)
+    write_config(inst, gfx=gfx, video_driver=video_driver, core=core, three_d=three_d,
+                 model=model)
     seed_sd(inst, out, settings)
     suppress_restore_prompt(out)
     for stale in (inst.log, rd.sub("log-%s.txt" % inst.name)):
@@ -989,6 +1028,10 @@ def do_run(args, out, ctx):
     # citra_render_3d / citra_factor_3d core options. Without the flag nothing below
     # changes and the pinned release core is used exactly as before.
     three_d = _three_d_or_none(args)
+    # --model: the emulated system model (NEXT.md C4). None keeps the lane byte-identical
+    # to what it was: no core-options redirect, so the core's own default (New 3DS) still
+    # decides, exactly as every existing baseline on this lane was taken.
+    model = model_or_die(getattr(args, "model", None))
     if dry:
         # ensure_core() DOWNLOADS and unzips. "Change nothing" means nothing.
         core = core_3d_path() if three_d else core_path()
@@ -1006,7 +1049,7 @@ def do_run(args, out, ctx):
         # the FIRST thing after the arguments are understood and BEFORE anything that
         # writes, downloads, locks, or launches.
         return _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit,
-                        three_d)
+                        three_d, model)
 
     suppress_restore_prompt(out)
     load_at_launch = wait_for_host(out)
@@ -1052,7 +1095,7 @@ def do_run(args, out, ctx):
         for attempt in range(1, EARLY_CRASH_ATTEMPTS + 1):
             ok, early, sd_log, why = _attempt(inst, gfx, core, threedsx, cmd_extra(args),
                                               seconds, settings, rd, ctx, out, attempt,
-                                              three_d=three_d)
+                                              three_d=three_d, model=model)
             alive_at_end = not _LAST_ATTEMPT.get("exited_early", False)
             attempts_log.append({"gfx": gfx, "attempt": attempt, "ok": ok,
                                  "early_crash": early, "detail": why})
@@ -1092,7 +1135,11 @@ def do_run(args, out, ctx):
         gputrace=inifile.truthy(settings.get(("debug", "gputrace"), "0")), seconds=seconds,
         platform={"host": "darwin-arm64", "azahar": None, "gfx": used_gfx,
                   "gfx_requested": want_gfx or GFX_ORDER[0],
-                  "retroarch": retroarch_version(), "model": "emu-new3ds"},
+                  "retroarch": retroarch_version(),
+                  # The manifest's `model` is a CLAIM about which console was emulated, so
+                  # it has to follow --model. An Old 3DS run mislabelled emu-new3ds would
+                  # be compared against New 3DS cells by anything that reads this field.
+                  "model": "emu-old3ds" if model == "old" else "emu-new3ds"},
         result={"verdict": "UNKNOWN", "fatals": 0, "max_frame": None,
                 "distinct_frames": 0, "errors": {}},
         artifacts={"log": "log-%s.txt" % inst.name, "emu_log": "retroarch-%s.log" % inst.name,
@@ -1146,7 +1193,8 @@ def do_run(args, out, ctx):
     return util.EXIT_OK if result["verdict"] == "PASS" else util.EXIT_FAIL
 
 
-def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three_d):
+def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three_d,
+             model=None):
     """`--dry-run`: say exactly what a real run would do, and do none of it.
 
     NEXT.md B45. This flag existed, was documented, was parsed — and `retro run` never
@@ -1188,6 +1236,9 @@ def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three
         ["host gate", "wait for < %d live instance(s) and load <= %.0f (now %.2f)"
          % (MAX_CONCURRENT, MAX_LOADAVG, host_load())],
         ["tree", buildmod.tree_receipt(tree)],
+        ["system model", "%s%s" % (MODELS.get(model, "New 3DS"),
+                                   "" if model else "  (core default; no core-options "
+                                                    "redirect written)")],
     ])
     out.say("")
     out.say("would seed this guest ini (every [debug]/[native] key stripped first):")
@@ -1203,6 +1254,7 @@ def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three
         out.warn(stale)
     out.emit({"dry_run": True, "cmd": cmd, "instance": inst.name, "sdmc": inst.sdmc(),
               "seconds": seconds, "seconds_why": seconds_why, "gfx": gfx_list,
+              "model": model,
               "replay": replay_block, "tree": tree,
               "ini": {"%s.%s" % k: v for k, v in settings.items()}})
     return util.EXIT_OK

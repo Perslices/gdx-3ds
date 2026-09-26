@@ -196,7 +196,8 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     /* COVERAGE ([debug] cov, NEXT.md B15/B43): record this draw's combiner, render mode,
      * render target and both bound textures as per-frame features. Diagnostic only; never
      * called unless gdx3ds_cov_on. */
-    void CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw);
+    void CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw,
+                     size_t numVerts, size_t numTris);
     void CovNoteTexture(int unit, uint32_t texId);
     void NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux);
 

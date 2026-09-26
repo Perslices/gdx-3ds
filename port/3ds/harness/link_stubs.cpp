@@ -107,6 +107,23 @@ extern "C" void gdx_dbg_logf(const char* fmt, ...) {
     va_end(args);
 }
 
+/* C4c: the Fast3D staging reservation and its extent clamps (port/3ds/gdx3ds_texupload.c
+   in the game target). The harness has no gdiffuser.ini and no [debug] lever, so it keeps
+   the stock reservation and clamps nothing -- which is exactly the pre-C4c behaviour the
+   DL replay tests were written against. */
+extern "C" size_t gdx3ds_tex_upload_pick_size(size_t defaultBytes) {
+    return defaultBytes;
+}
+
+extern "C" uint32_t gdx3ds_tex_upload_clamp_rows(uint32_t width, uint32_t height) {
+    (void)width;
+    return height;
+}
+
+extern "C" size_t gdx3ds_tex_upload_clamp_bytes(size_t want) {
+    return want;
+}
+
 extern "C" int gdx_workshop_texture_dump_enabled(void) {
     return 0;
 }

@@ -395,6 +395,12 @@ struct Counters {
          addr   same span, same length -- a DIFFERENT SOURCE POINTER, i.e. another texture
          other  same pointer, some other descriptor field moved (sizes, strides, swap, o2r) */
     uint32_t tmemMissSpan, tmemMissKind, tmemMissWords, tmemMissAddr, tmemMissOther;
+    /* [memotear] [debug] tmemfault receipt (NEXT.md B54): the refusal arm, exercised on
+       purpose. tmemFaultGen/tmemFaultCls are the injections made by each mechanism (the source
+       generation moved; the class changed under the span); tmemFaultCaught are the ones the
+       gate then REFUSED, and tmemFaultMissed the ones it skipped anyway. caught == gen + cls
+       and missed == 0 is the claim. All zero unless [debug] tmemfault != 0. */
+    uint32_t tmemFaultGen, tmemFaultCls, tmemFaultCaught, tmemFaultMissed;
     uint32_t timgMemoHit, timgMemoMiss, timgMemoInert; /* [native] timgmemo receipt */
     /* Miss BREAKDOWN -- which part of the key failed. A memo that misses is useless in three
        different ways and they have three different fixes, so the receipt says which:
@@ -654,6 +660,12 @@ class Interp {
        staleness gate are two different answers to "are the SOURCE BYTES the same", asked over
        one shared, unchanged definition of "is everything else the same". */
     bool SameContentDescriptor(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const;
+
+    /* [memotear] Fault injection for the tmemskip refusal arm: called on a load that HAS been
+       admitted and whose stamp/class both still match, i.e. the load that is about to skip.
+       Returns true when it has forced the world stale (and says which way through `outKind`),
+       having applied the fault to the state the gate is about to read. */
+    bool TmemInjectStaleness(uint16_t base, unsigned cls, uintptr_t src, uint32_t readBytes);
     bool SameContentLoad(uint16_t base, uint8_t kind, const LoadedTexture& fresh) const;
     /* [native] tmemskip: decide the load, stamp it, and keep the receipt. Returns true when the
        mirror + span store can be skipped outright; otherwise fills `outStamp`/`outCls` with the
@@ -786,6 +798,12 @@ class Interp {
      * Default 0. The invalidation argument is docs/research/native/tmemblock-progress.md S2. */
     int mTmemSkip = 0;
     int mTmemCls = 0; /* [native] tmemcls: class census only; changes no behaviour */
+    /* [memotear] [debug] tmemfault -- fault injection for the refusal arm. 0 off (default and
+     * the only value the shipped build ever resolves); N forces staleness on every Nth load
+     * that would otherwise have skipped. Inert unless mTmemSkip != 0. See
+     * docs/research/native/memotear-progress.md S7. */
+    int mTmemFault = 0;
+    uint32_t mTmemFaultTick = 0;
     uint32_t mBatchesAtTaskStart = 0;
 
     /* [native] timgmemo -- the cross-frame SETTIMG classification memo.

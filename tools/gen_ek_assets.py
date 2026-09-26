@@ -9,12 +9,28 @@ Reads the disk-side asset yamls from the fzerox-expansion-kit decomp and emits:
                                         runtime resolvers need real storage sizes), plus
                                         gdx_ek_assets_fill() copying data from the 64DD
                                         disk image.
+  * port/gen/EkAssetPack.c           -- B11e. The SAME 765 slices sEkAssetFills[] reads,
+                                        concatenated in table order, as a build-time
+                                        constant. Empty (size 0) unless --bake is given.
+
+--bake <image.ndd>: the build-time asset bake. sEkAssetFills[] already knows every EK
+asset's (symbol, physical .ndd offset, size); with --bake the generator reads those
+655,956 bytes ONCE at configure time and emits them as gEkAssetPack, so a build can
+populate every EK asset symbol with NO disk image resident at runtime, no whole-image
+CRC-64 pass and no LEO read. It does not replace the runtime path: gdx_ek_assets_fill()
+still prefers a mounted image when one is present, and the pack only serves the no-disk
+case. See docs/research/native/ekcart-progress.md.
+
+The bake is OPT-IN and off by default, and the image it reads is never copied into the
+repository: only the 655,956 bytes the fill table names reach the generated file, which
+is itself a build artifact (port/gen/EkAssetPack.c is .gitignore'd).
 
 The yaml offsets address the synthetic baserom.jp.z64dd assembled by
 fzerox-expansion-kit/tools/extract_baserom.py. They are not physical offsets in
 an .ndd image. This generator maps each synthetic section back to its source
 LBA, then converts that LBA to the physical/block-linear .ndd byte offset.
 """
+import argparse
 import ast
 import bisect
 import glob
@@ -29,6 +45,7 @@ EK_YAML_DIR = os.path.join(REPO, "fzerox-expansion-kit", "assets", "yaml", "jp")
 HEADER_OUT_DIR = os.path.join(REPO, "include", "assets", "us", "ek")
 PAYLOAD_OUT_DIR = os.path.join(REPO, "decomp", "src", "assets", "us", "ek")
 BINDING_C = os.path.join(REPO, "port", "gen", "EkAssetBindings.c")
+PACK_C = os.path.join(REPO, "port", "gen", "EkAssetPack.c")
 SLICE_MANIFEST = os.path.join(REPO, "port", "gen", "ek_slice_manifest.txt")
 DECOMP_SRC = os.path.join(REPO, "decomp", "src")
 EK_PATCH_SCRIPT = os.path.join(REPO, "fzerox-expansion-kit", "tools", "patch.py")
@@ -64,6 +81,123 @@ LEO_VZONE_PZONE = (
     (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x0F),
     (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08),
 )
+
+
+def _parse_args():
+    ap = argparse.ArgumentParser(description="G-Diffuser Expansion Kit asset generator")
+    ap.add_argument("--allow-jp", action="store_true",
+                    help="Permit baking a RETAIL JAPANESE Expansion Kit disk. The port refuses "
+                         "one at runtime unless it was configured -DGDX_ALLOW_JP_INPUTS=ON "
+                         "(port/disk_buffer.cpp: gdx_disk_is_refused_japanese), and a build-time "
+                         "bake must not become a way around that policy, so the same refusal is "
+                         "enforced here.")
+    ap.add_argument("--force-bindings", action="store_true",
+                    help="rewrite port/gen/EkAssetBindings.c even though it exists. That "
+                         "file is COMMITTED and carries hand-edited sizes this generator "
+                         "cannot reproduce: regenerating it drops 455 lines, including "
+                         "D_80769DF0 (the 64DD boot logo) and aCupSelectDD1Tex/DD2Tex (the "
+                         "EDIT CUP plates), and EXPANSION_KIT=ON then fails to link with 345 "
+                         "undefined references. Only pass this if you mean to re-derive it.")
+    ap.add_argument("--bake", metavar="IMAGE.ndd", default=None,
+                    help="Bake the 765 EK asset slices into port/gen/EkAssetPack.c from this "
+                         "raw 64DD .ndd image (64,931,840 bytes, block-linear -- the format "
+                         "port/disk_buffer.cpp and tools/dev/mkdisk64.py already use). "
+                         "Off by default; without it the pack is emitted EMPTY and the build "
+                         "behaves exactly as before.")
+    return ap.parse_args()
+
+
+OPTS = _parse_args()
+
+
+# The emitted body of gdx_ek_assets_fill(). Kept verbatim here so the generator and the
+# committed port/gen/EkAssetBindings.c (which carries hand-edited SIZES and must not be
+# regenerated wholesale -- see docs/research/native/ekbuild-progress.md) stay the same code.
+GDX_EK_FILL_BODY = r'''    /* B11e -- the build-time asset bake. With no image mounted, serve every row from
+       gEkAssetPack (port/gen/EkAssetPack.c): the SAME 765 slices, concatenated in table order
+       at configure time, so the runtime cursor is a running sum and needs no per-row index.
+       The pack is EMPTY unless tools/gen_ek_assets.py was run with --bake, in which case
+       gEkAssetPackSize is 0 and this returns exactly as it always did, leaving every symbol
+       zero-filled. A MOUNTED IMAGE ALWAYS WINS: the pack serves the no-disk case only, so a
+       user's own dump is never overridden by whatever the build was baked from.
+
+       B11d -- the residency seam. `disk == 0` no longer means "no image": in [debug]
+       disk_stream=2 the image is mounted as an SD STREAM with no resident buffer, so the
+       rows come from gdx_disk_image_read instead of from a pointer. That is still a mounted
+       image, so it still beats the pack. */
+    {
+        unsigned int packCursor = 0;
+        int fromPack = 0;
+        int fromImage = 0;
+        extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);
+        extern int gdx_disk_image_available(void);
+        extern unsigned int gdx_disk_image_size(void);
+        if (disk == 0) {
+            if (gdx_disk_image_available()) {
+                fromImage = 1;
+                diskSize = (unsigned long long) gdx_disk_image_size();
+            } else if (gEkAssetPackSize == 0) {
+                return;
+            } else {
+                fromPack = 1;
+            }
+        }
+        for (i = 0; sEkAssetFills[i].dest != 0; i++) {
+            unsigned char* dest = (unsigned char*)sEkAssetFills[i].dest;
+            unsigned int size = sEkAssetFills[i].size;
+            const unsigned char* src = 0;
+            if (fromPack) {
+                /* Every row has a slice, including any the bake had to zero-fill, so the
+                   cursor advances unconditionally -- a skipped row would shift every later
+                   slice. A pack that cannot cover the table is refused whole rather than
+                   half-applied. */
+                if (packCursor > gEkAssetPackSize || size > gEkAssetPackSize - packCursor) { break; }
+                src = gEkAssetPack + packCursor;
+                packCursor += size;
+            } else if (fromImage) {
+                /* Straight into `dest`: the seam has the same "N bytes at offset O" shape the
+                   pointer arithmetic had, and on refusal it leaves `dest` untouched (i.e.
+                   zero-filled, as it was) rather than half-written. */
+                if ((unsigned long long)sEkAssetFills[i].diskOffset + size > diskSize) { continue; }
+                if (!gdx_disk_image_read(sEkAssetFills[i].diskOffset, size, dest)) { continue; }
+            } else {
+                if ((unsigned long long)sEkAssetFills[i].diskOffset + size > diskSize) { continue; }
+                src = disk + sEkAssetFills[i].diskOffset;
+            }
+            if (src != 0) {
+                /* byte loop: this TU compiles with the decomp's headers, which
+                   clash with the MSVC CRT's <string.h> */
+                for (b = 0; b < size; b++) {
+                    dest[b] = src[b];
+                }
+            }
+            if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {
+                for (b = 0; b + 1 < size; b += 2) {
+                    unsigned char hi = dest[b];
+                    dest[b] = dest[b + 1];
+                    dest[b + 1] = hi;
+                }
+            } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_VTX) {
+                /* Vtx fields are big-endian on disk. Swap xyz, flag, and st;
+                   leave the final four colour/normal bytes untouched. */
+                for (b = 0; b + 16 <= size; b += 16) {
+                    unsigned int k;
+                    for (k = 0; k < 12; k += 2) {
+                        unsigned char hi = dest[b + k];
+                        dest[b + k] = dest[b + k + 1];
+                        dest[b + k + 1] = hi;
+                    }
+                }
+            } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_GFX) {
+                gdx_register_host_raw_n64_range(dest, size);
+            }
+            if (sEkAssetFills[i].n64Address != 0) {
+                gdx_register_n64_address_range(sEkAssetFills[i].n64Address, dest, size);
+            }
+            gdx_register_host_pointer_stub(dest, size);
+        }
+    }
+'''
 
 
 def load_patch_dict(name):
@@ -361,160 +495,156 @@ for rel_payload, lines in payloads:
         f.write("\n".join(lines))
         f.write("\n")
 
-with open(BINDING_C, "w") as f:
-    f.write("// AUTO-GENERATED by tools/gen_ek_assets.py. Do not edit by hand.\n")
-    f.write("// Real-size definitions for Expansion Kit disk asset symbols plus the\n")
-    f.write("// disk-image fill table. Compiled only when GDX_EXPANSION_KIT is enabled.\n")
-    f.write('#include "global.h"\n\n')
-    for ctype, sym, count, _size in definitions:
-        f.write("{} {}[{}];\n".format(ctype, sym, count))
-    for ctype, _asset_type, sym, disk_off, size, _n64_address in fills:
-        f.write("extern {} {}[];\n".format(ctype, sym))
-    f.write("\nextern void gdx_register_host_raw_n64_range(void* ptr, size_t size);\n")
-    f.write("extern void gdx_register_host_n64_command_range(void* ptr, size_t size);\n")
-    f.write("extern void gdx_register_n64_address_range(unsigned int n64Begin, void* hostBegin, size_t size);\n")
-    # E3: registers each filled entry's own host address/size so
-    # ResolveHostPointerStub (port/n64_gfx_bridge.cpp) recognizes a wide SETTIMG
-    # pointer that carries the array's address directly, covering the full fill
-    # table instead of a hand-maintained subset.
-    f.write("extern void gdx_register_host_pointer_stub(void* dest, size_t size);\n")
-    f.write("\nenum { GDX_EK_ASSET_OTHER, GDX_EK_ASSET_GFX, GDX_EK_ASSET_VP, GDX_EK_ASSET_VTX };\n")
-    f.write("typedef struct { void* dest; unsigned int diskOffset; unsigned int size; unsigned int n64Address; unsigned char kind; } GdxEkAssetFill;\n")
-    f.write("static const GdxEkAssetFill sEkAssetFills[] = {\n")
-    for _ctype, asset_type, sym, disk_off, size, n64_address in fills:
-        kind = {
-            "GFX": "GDX_EK_ASSET_GFX",
-            "VP": "GDX_EK_ASSET_VP",
-            "VTX": "GDX_EK_ASSET_VTX",
-        }.get(asset_type, "GDX_EK_ASSET_OTHER")
-        f.write("    {{ {}, 0x{:08X}U, 0x{:X}U, 0x{:08X}U, {} }},\n".format(
-            sym, disk_off, size, n64_address, kind
-        ))
-    f.write("    { 0, 0U, 0U, 0U, GDX_EK_ASSET_OTHER }\n};\n\n")
-    f.write("/* Copies EK payloads from the 64DD image and records their original N64\n")
-    f.write(" * address ranges. Gfx commands remain big-endian/raw; Vp and Vtx fields\n")
-    f.write(" * used directly by the host interpreter are converted to native order. */\n")
-    f.write("void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize) {\n")
-    f.write("    int i;\n")
-    f.write("    unsigned int b;\n")
-    f.write("    /* Table-shift bracket: gSampleBankTable entries read -0x30 at audio init\n")
-    f.write("       in static-variant boots. Canary before/after this fill localizes\n")
-    f.write("       whether the corruption happens inside it. */\n")
-    f.write("    extern void gdx_cki(const char* s, int v);\n")
-    f.write("    {\n")
-    f.write("        typedef struct { unsigned int p[4]; } GdxTblHdr;\n")
-    f.write("        extern unsigned char gSampleBankTable[];\n")
-    f.write("        unsigned int v;\n")
-    f.write("        const unsigned char* e1 = gSampleBankTable + 0x10 + 0x10; /* entries[1].romAddr */\n")
-    f.write("        v = (unsigned int)e1[0] | ((unsigned int)e1[1] << 8) | ((unsigned int)e1[2] << 16) | ((unsigned int)e1[3] << 24);\n")
-    f.write("        gdx_cki(\"[tblwatch] pre-fill entries[1].romAddr\", (int) v);\n")
-    f.write("    }\n")
-    f.write("    if (disk == 0) { return; }\n")
-    f.write("    for (i = 0; sEkAssetFills[i].dest != 0; i++) {\n")
-    f.write("        if ((unsigned long long)sEkAssetFills[i].diskOffset + sEkAssetFills[i].size <= diskSize) {\n")
-    f.write("            unsigned char* dest = (unsigned char*)sEkAssetFills[i].dest;\n")
-    f.write("            const unsigned char* src = disk + sEkAssetFills[i].diskOffset;\n")
-    f.write("            /* byte loop: this TU compiles with the decomp's headers, which\n")
-    f.write("               clash with the MSVC CRT's <string.h> */\n")
-    f.write("            for (b = 0; b < sEkAssetFills[i].size; b++) {\n")
-    f.write("                dest[b] = src[b];\n")
-    f.write("            }\n")
-    f.write("            if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {\n")
-    f.write("                for (b = 0; b + 1 < sEkAssetFills[i].size; b += 2) {\n")
-    f.write("                    unsigned char hi = dest[b];\n")
-    f.write("                    dest[b] = dest[b + 1];\n")
-    f.write("                    dest[b + 1] = hi;\n")
-    f.write("                }\n")
-    f.write("            } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_VTX) {\n")
-    f.write("                /* Vtx fields are big-endian on disk. Swap xyz, flag, and st;\n")
-    f.write("                   leave the final four colour/normal bytes untouched. */\n")
-    f.write("                for (b = 0; b + 16 <= sEkAssetFills[i].size; b += 16) {\n")
-    f.write("                    unsigned int k;\n")
-    f.write("                    for (k = 0; k < 12; k += 2) {\n")
-    f.write("                        unsigned char hi = dest[b + k];\n")
-    f.write("                        dest[b + k] = dest[b + k + 1];\n")
-    f.write("                        dest[b + k + 1] = hi;\n")
-    f.write("                    }\n")
-    f.write("                }\n")
-    f.write("            } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_GFX) {\n")
-    f.write("                gdx_register_host_raw_n64_range(dest, sEkAssetFills[i].size);\n")
-    f.write("            }\n")
-    f.write("            if (sEkAssetFills[i].n64Address != 0) {\n")
-    f.write("                gdx_register_n64_address_range(sEkAssetFills[i].n64Address, dest, sEkAssetFills[i].size);\n")
-    f.write("            }\n")
-    f.write("            gdx_register_host_pointer_stub(dest, sEkAssetFills[i].size);\n")
-    f.write("        }\n")
-    f.write("    }\n")
-    f.write("    {\n")
-    f.write("        extern unsigned char gSampleBankTable[];\n")
-    f.write("        unsigned int v;\n")
-    f.write("        const unsigned char* e1 = gSampleBankTable + 0x10 + 0x10;\n")
-    f.write("        v = (unsigned int)e1[0] | ((unsigned int)e1[1] << 8) | ((unsigned int)e1[2] << 16) | ((unsigned int)e1[3] << 24);\n")
-    f.write("        gdx_cki(\"[tblwatch] post-fill entries[1].romAddr\", (int) v);\n")
-    f.write("    }\n")
-    f.write("}\n")
-    f.write("\n/* Returns the byte extent of a generated disk-resident segmented image. */\n")
-    f.write("unsigned int gdx_ek_segment_image_size(unsigned char segment) {\n")
-    f.write("    unsigned int required = 0;\n")
-    f.write("    int i;\n")
-    f.write("    for (i = 0; sEkAssetFills[i].dest != 0; i++) {\n")
-    f.write("        unsigned int address = sEkAssetFills[i].n64Address;\n")
-    f.write("        unsigned int offset;\n")
-    f.write("        unsigned int end;\n")
-    f.write("        if ((address >> 24) != segment) { continue; }\n")
-    f.write("        offset = address & 0x00FFFFFFU;\n")
-    f.write("        end = offset + sEkAssetFills[i].size;\n")
-    f.write("        if (end >= offset && end > required) { required = end; }\n")
-    f.write("    }\n")
-    f.write("    return required;\n")
-    f.write("}\n")
-    f.write("\n/* Rebuilds one disk-resident segment in its original address layout while\n")
-    f.write(" * applying only the host-order conversions required by direct consumers. */\n")
-    f.write("int gdx_ek_segment_image_fill(unsigned char segment, const unsigned char* disk,\n")
-    f.write("                              unsigned long long diskSize, unsigned char* dest,\n")
-    f.write("                              unsigned int capacity) {\n")
-    f.write("    unsigned int required = gdx_ek_segment_image_size(segment);\n")
-    f.write("    unsigned int b;\n")
-    f.write("    int i;\n")
-    f.write("    if (disk == 0 || dest == 0 || required == 0 || required > capacity) { return 0; }\n")
-    f.write("    for (b = 0; b < required; b++) { dest[b] = 0; }\n")
-    f.write("    for (i = 0; sEkAssetFills[i].dest != 0; i++) {\n")
-    f.write("        unsigned int address = sEkAssetFills[i].n64Address;\n")
-    f.write("        unsigned int offset;\n")
-    f.write("        unsigned char* item;\n")
-    f.write("        const unsigned char* src;\n")
-    f.write("        if ((address >> 24) != segment) { continue; }\n")
-    f.write("        offset = address & 0x00FFFFFFU;\n")
-    f.write("        if (offset > capacity || sEkAssetFills[i].size > capacity - offset ||\n")
-    f.write("            (unsigned long long)sEkAssetFills[i].diskOffset + sEkAssetFills[i].size > diskSize) {\n")
-    f.write("            return 0;\n")
-    f.write("        }\n")
-    f.write("        item = dest + offset;\n")
-    f.write("        src = disk + sEkAssetFills[i].diskOffset;\n")
-    f.write("        for (b = 0; b < sEkAssetFills[i].size; b++) { item[b] = src[b]; }\n")
-    f.write("        if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {\n")
-    f.write("            for (b = 0; b + 1 < sEkAssetFills[i].size; b += 2) {\n")
-    f.write("                unsigned char hi = item[b]; item[b] = item[b + 1]; item[b + 1] = hi;\n")
-    f.write("            }\n")
-    f.write("        } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_VTX) {\n")
-    f.write("            for (b = 0; b + 16 <= sEkAssetFills[i].size; b += 16) {\n")
-    f.write("                unsigned int k;\n")
-    f.write("                for (k = 0; k < 12; k += 2) {\n")
-    f.write("                    unsigned char hi = item[b + k];\n")
-    f.write("                    item[b + k] = item[b + k + 1]; item[b + k + 1] = hi;\n")
-    f.write("                }\n")
-    f.write("            }\n")
-    f.write("        } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_GFX) {\n")
-    f.write("            for (b = 0; b + 3 < sEkAssetFills[i].size; b += 4) {\n")
-    f.write("                unsigned char b0 = item[b]; unsigned char b1 = item[b + 1];\n")
-    f.write("                item[b] = item[b + 3]; item[b + 1] = item[b + 2];\n")
-    f.write("                item[b + 2] = b1; item[b + 3] = b0;\n")
-    f.write("            }\n")
-    f.write("            gdx_register_host_n64_command_range(item, sEkAssetFills[i].size);\n")
-    f.write("        }\n")
-    f.write("    }\n")
-    f.write("    return 1;\n")
-    f.write("}\n")
+# EkAssetBindings.c is committed and hand-edited (see the note above GDX_EK_FILL_BODY).
+# The generator used to overwrite it unconditionally, which is how a configure-time run of
+# this script broke the EK link: -fcommon merges the payload and binding definitions at the
+# LARGER size, so the hand-edited sizes are load-bearing, and a wholesale rewrite silently
+# drops the symbols nothing else defines. Regenerate only when explicitly asked.
+if os.path.exists(BINDING_C) and not OPTS.force_bindings:
+    print("EK assets: keeping existing {} (hand-edited; --force-bindings to rewrite)".format(
+        os.path.relpath(BINDING_C, REPO)))
+else:
+  with open(BINDING_C, "w") as f:
+      f.write("// AUTO-GENERATED by tools/gen_ek_assets.py. Do not edit by hand.\n")
+      f.write("// Real-size definitions for Expansion Kit disk asset symbols plus the\n")
+      f.write("// disk-image fill table. Compiled only when GDX_EXPANSION_KIT is enabled.\n")
+      f.write('#include "global.h"\n\n')
+      for ctype, sym, count, _size in definitions:
+          f.write("{} {}[{}];\n".format(ctype, sym, count))
+      for ctype, _asset_type, sym, disk_off, size, _n64_address in fills:
+          f.write("extern {} {}[];\n".format(ctype, sym))
+      f.write("\nextern void gdx_register_host_raw_n64_range(void* ptr, size_t size);\n")
+      f.write("extern void gdx_register_host_n64_command_range(void* ptr, size_t size);\n")
+      f.write("extern void gdx_register_n64_address_range(unsigned int n64Begin, void* hostBegin, size_t size);\n")
+      # E3: registers each filled entry's own host address/size so
+      # ResolveHostPointerStub (port/n64_gfx_bridge.cpp) recognizes a wide SETTIMG
+      # pointer that carries the array's address directly, covering the full fill
+      # table instead of a hand-maintained subset.
+      f.write("extern void gdx_register_host_pointer_stub(void* dest, size_t size);\n")
+      f.write("\n/* B11e: port/gen/EkAssetPack.c. Empty (gEkAssetPackSize == 0) unless the generator was\n")
+      f.write("   run with --bake, which is off by default. */\n")
+      f.write("extern const unsigned char gEkAssetPack[];\n")
+      f.write("extern const unsigned int gEkAssetPackSize;\n")
+      f.write("extern const unsigned long long gEkAssetPackDiskCrc64;\n")
+      f.write("\nenum { GDX_EK_ASSET_OTHER, GDX_EK_ASSET_GFX, GDX_EK_ASSET_VP, GDX_EK_ASSET_VTX };\n")
+      f.write("typedef struct { void* dest; unsigned int diskOffset; unsigned int size; unsigned int n64Address; unsigned char kind; } GdxEkAssetFill;\n")
+      f.write("static const GdxEkAssetFill sEkAssetFills[] = {\n")
+      for _ctype, asset_type, sym, disk_off, size, n64_address in fills:
+          kind = {
+              "GFX": "GDX_EK_ASSET_GFX",
+              "VP": "GDX_EK_ASSET_VP",
+              "VTX": "GDX_EK_ASSET_VTX",
+          }.get(asset_type, "GDX_EK_ASSET_OTHER")
+          f.write("    {{ {}, 0x{:08X}U, 0x{:X}U, 0x{:08X}U, {} }},\n".format(
+              sym, disk_off, size, n64_address, kind
+          ))
+      f.write("    { 0, 0U, 0U, 0U, GDX_EK_ASSET_OTHER }\n};\n\n")
+      f.write("/* Copies EK payloads from the 64DD image and records their original N64\n")
+      f.write(" * address ranges. Gfx commands remain big-endian/raw; Vp and Vtx fields\n")
+      f.write(" * used directly by the host interpreter are converted to native order. */\n")
+      f.write("void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize) {\n")
+      f.write("    int i;\n")
+      f.write("    unsigned int b;\n")
+      f.write("    /* Table-shift bracket: gSampleBankTable entries read -0x30 at audio init\n")
+      f.write("       in static-variant boots. Canary before/after this fill localizes\n")
+      f.write("       whether the corruption happens inside it. */\n")
+      f.write("    extern void gdx_cki(const char* s, int v);\n")
+      f.write("    {\n")
+      f.write("        typedef struct { unsigned int p[4]; } GdxTblHdr;\n")
+      f.write("        extern unsigned char gSampleBankTable[];\n")
+      f.write("        unsigned int v;\n")
+      f.write("        const unsigned char* e1 = gSampleBankTable + 0x10 + 0x10; /* entries[1].romAddr */\n")
+      f.write("        v = (unsigned int)e1[0] | ((unsigned int)e1[1] << 8) | ((unsigned int)e1[2] << 16) | ((unsigned int)e1[3] << 24);\n")
+      f.write("        gdx_cki(\"[tblwatch] pre-fill entries[1].romAddr\", (int) v);\n")
+      f.write("    }\n")
+      f.write(GDX_EK_FILL_BODY)
+      f.write("    {\n")
+      f.write("        extern unsigned char gSampleBankTable[];\n")
+      f.write("        unsigned int v;\n")
+      f.write("        const unsigned char* e1 = gSampleBankTable + 0x10 + 0x10;\n")
+      f.write("        v = (unsigned int)e1[0] | ((unsigned int)e1[1] << 8) | ((unsigned int)e1[2] << 16) | ((unsigned int)e1[3] << 24);\n")
+      f.write("        gdx_cki(\"[tblwatch] post-fill entries[1].romAddr\", (int) v);\n")
+      f.write("    }\n")
+      f.write("}\n")
+      f.write("\n/* Returns the byte extent of a generated disk-resident segmented image. */\n")
+      f.write("unsigned int gdx_ek_segment_image_size(unsigned char segment) {\n")
+      f.write("    unsigned int required = 0;\n")
+      f.write("    int i;\n")
+      f.write("    for (i = 0; sEkAssetFills[i].dest != 0; i++) {\n")
+      f.write("        unsigned int address = sEkAssetFills[i].n64Address;\n")
+      f.write("        unsigned int offset;\n")
+      f.write("        unsigned int end;\n")
+      f.write("        if ((address >> 24) != segment) { continue; }\n")
+      f.write("        offset = address & 0x00FFFFFFU;\n")
+      f.write("        end = offset + sEkAssetFills[i].size;\n")
+      f.write("        if (end >= offset && end > required) { required = end; }\n")
+      f.write("    }\n")
+      f.write("    return required;\n")
+      f.write("}\n")
+      f.write("\n/* Rebuilds one disk-resident segment in its original address layout while\n")
+      f.write(" * applying only the host-order conversions required by direct consumers. */\n")
+      f.write("int gdx_ek_segment_image_fill(unsigned char segment, const unsigned char* disk,\n")
+      f.write("                              unsigned long long diskSize, unsigned char* dest,\n")
+      f.write("                              unsigned int capacity) {\n")
+      f.write("    unsigned int required = gdx_ek_segment_image_size(segment);\n")
+      f.write("    unsigned int b;\n")
+      f.write("    int i;\n")
+      # B11d: `disk == 0` no longer means "no image" -- disk_stream=2 mounts it as an SD stream
+      # with no resident buffer. Take the bytes through the residency seam in that case. Segment 9
+      # is the Course Edit texture set, so this arm is exactly what makes the editor's content
+      # reachable without the 61.9 MB malloc.
+      f.write("    extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);\n")
+      f.write("    extern int gdx_disk_image_available(void);\n")
+      f.write("    extern unsigned int gdx_disk_image_size(void);\n")
+      f.write("    if (dest == 0 || required == 0 || required > capacity) { return 0; }\n")
+      f.write("    if (disk == 0) {\n")
+      f.write("        if (!gdx_disk_image_available()) { return 0; }\n")
+      f.write("        diskSize = (unsigned long long) gdx_disk_image_size();\n")
+      f.write("    }\n")
+      f.write("    for (b = 0; b < required; b++) { dest[b] = 0; }\n")
+      f.write("    for (i = 0; sEkAssetFills[i].dest != 0; i++) {\n")
+      f.write("        unsigned int address = sEkAssetFills[i].n64Address;\n")
+      f.write("        unsigned int offset;\n")
+      f.write("        unsigned char* item;\n")
+      f.write("        const unsigned char* src;\n")
+      f.write("        (void) src;\n")
+      f.write("        if ((address >> 24) != segment) { continue; }\n")
+      f.write("        offset = address & 0x00FFFFFFU;\n")
+      f.write("        if (offset > capacity || sEkAssetFills[i].size > capacity - offset ||\n")
+      f.write("            (unsigned long long)sEkAssetFills[i].diskOffset + sEkAssetFills[i].size > diskSize) {\n")
+      f.write("            return 0;\n")
+      f.write("        }\n")
+      f.write("        item = dest + offset;\n")
+      f.write("        if (disk != 0) {\n")
+      f.write("            src = disk + sEkAssetFills[i].diskOffset;\n")
+      f.write("            for (b = 0; b < sEkAssetFills[i].size; b++) { item[b] = src[b]; }\n")
+      f.write("        } else if (!gdx_disk_image_read(sEkAssetFills[i].diskOffset,\n")
+      f.write("                                       sEkAssetFills[i].size, item)) {\n")
+      f.write("            return 0;\n")
+      f.write("        }\n")
+      f.write("        if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {\n")
+      f.write("            for (b = 0; b + 1 < sEkAssetFills[i].size; b += 2) {\n")
+      f.write("                unsigned char hi = item[b]; item[b] = item[b + 1]; item[b + 1] = hi;\n")
+      f.write("            }\n")
+      f.write("        } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_VTX) {\n")
+      f.write("            for (b = 0; b + 16 <= sEkAssetFills[i].size; b += 16) {\n")
+      f.write("                unsigned int k;\n")
+      f.write("                for (k = 0; k < 12; k += 2) {\n")
+      f.write("                    unsigned char hi = item[b + k];\n")
+      f.write("                    item[b + k] = item[b + k + 1]; item[b + k + 1] = hi;\n")
+      f.write("                }\n")
+      f.write("            }\n")
+      f.write("        } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_GFX) {\n")
+      f.write("            for (b = 0; b + 3 < sEkAssetFills[i].size; b += 4) {\n")
+      f.write("                unsigned char b0 = item[b]; unsigned char b1 = item[b + 1];\n")
+      f.write("                item[b] = item[b + 3]; item[b + 1] = item[b + 2];\n")
+      f.write("                item[b + 2] = b1; item[b + 3] = b0;\n")
+      f.write("            }\n")
+      f.write("            gdx_register_host_n64_command_range(item, sEkAssetFills[i].size);\n")
+      f.write("        }\n")
+      f.write("    }\n")
+      f.write("    return 1;\n")
+      f.write("}\n")
 
 
 def _mf_field(value):
@@ -549,6 +679,110 @@ with open(SLICE_MANIFEST, "w", newline="\n") as f:
             sym, disk_off, size, typ,
             _mf_field(fmt), _mf_field(w), _mf_field(h), tlut_hex,
         ))
+
+# ---------------------------------------------------------------------------------------------
+# B11e -- the build-time asset bake (port/gen/EkAssetPack.c).
+#
+# WHY THIS EXISTS. Every EK asset symbol is a zero-filled array that gdx_ek_assets_fill()
+# populates at runtime from a mounted 64DD image. That runtime path is the reason reaching any
+# EK content has cost a 61.9 MB resident malloc (GDX_DISK_EXACT_BYTES) plus a whole-image
+# CRC-64 pass -- and the fill actually reads only 655,956 bytes of that image, at offsets this
+# generator already computes at configure time. So the bake reads exactly those bytes once,
+# here, and emits them as a constant. A baked build populates every EK asset with NO image
+# resident, NO CRC pass and NO LEO read.
+#
+# WHAT IT IS NOT. It does not replace the disk. gdx_ek_assets_fill() still prefers a mounted
+# image whenever one is present -- the pack serves the no-disk case only -- and it does nothing
+# for the three things the assets are not: the MFS RAM area the editors read and write, the
+# drive-presence flag gLeoDriveConnectionState, and the MEDIUM_LBA audio (every sequence and DD
+# sample bank, tens of MB). See docs/research/native/ekcart-progress.md.
+#
+# The pack is written on EVERY run so the source list is stable; without --bake it is empty and
+# the generated fill loop's pack arm is unreachable.
+PACK_NDD_SIZE = 64_931_840
+
+pack_bytes = bytearray()
+pack_rows_zeroed = 0
+pack_crc64 = 0
+if OPTS.bake:
+    size_on_disk = os.path.getsize(OPTS.bake)
+    if size_on_disk != PACK_NDD_SIZE:
+        raise SystemExit(
+            "--bake expects a raw block-linear 64DD .ndd of exactly {} bytes; {} is {} bytes. "
+            "A MAME-format dump (70,627,520 B) must be converted first -- "
+            "fzerox-expansion-kit/tools/leo64dd_python converts one, and tools/dev/mkdisk64.py "
+            "writes a synthetic image in the right format.".format(
+                PACK_NDD_SIZE, OPTS.bake, size_on_disk))
+    with open(OPTS.bake, "rb") as f:
+        image = f.read()
+    # Region policy, enforced at the SAME place the runtime enforces it rather than left to
+    # whoever runs the generator. The 64DD Disk ID's game name (LEODiskID.gameName, physical
+    # LBA 14, inside the system area this image still carries) ends in the region letter: the
+    # retail Japanese Expansion Kit disk is "EFZJ" and the fan-translated one is "EFZE". Read
+    # by scanning the system area for the token rather than walking the physical geometry --
+    # the two tokens are unambiguous and this needs no second transcription of the zone tables.
+    system_area = image[:NDD_SYSTEM_AREA_BYTES]
+    is_jp_disk = (b"EFZJ" in system_area) and (b"EFZE" not in system_area)
+    if is_jp_disk and not OPTS.allow_jp:
+        raise SystemExit(
+            "--bake refused: {} is the retail JAPANESE Expansion Kit disk (Disk ID game name "
+            "EFZJ), and Japanese-region support is off by default in this project "
+            "(port/disk_buffer.cpp gates the same content at runtime behind "
+            "-DGDX_ALLOW_JP_INPUTS). Pass --allow-jp to bake it anyway; the resulting build "
+            "carries Japanese EK text.".format(OPTS.bake))
+    # Same CRC-64/XZ the port fingerprints a disk with (port/disk_savefile.cpp: reflected
+    # ECMA-182, poly 0xC96C5795D7870F42, init/xorout all-ones). Recorded in the pack so a baked
+    # build can report WHICH disk it was baked from and select the same layout variant the
+    # runtime loader would have (gdx_disk_finalize's translated/JP-retail decision).
+    _crc_tbl = []
+    for _n in range(256):
+        _c = _n
+        for _ in range(8):
+            _c = (0xC96C5795D7870F42 ^ (_c >> 1)) if (_c & 1) else (_c >> 1)
+        _crc_tbl.append(_c)
+    _crc = 0xFFFFFFFFFFFFFFFF
+    for _b in image:
+        _crc = _crc_tbl[(_crc ^ _b) & 0xFF] ^ (_crc >> 8)
+    pack_crc64 = _crc ^ 0xFFFFFFFFFFFFFFFF
+
+    for _ctype, _asset_type, _sym, disk_off, size, _n64_address in fills:
+        chunk = image[disk_off:disk_off + size]
+        if len(chunk) != size:
+            # Reserve the row's space anyway: the runtime cursor advances once per row, so a
+            # short row must not shift every later row's slice. A zeroed row is exactly what an
+            # unbaked build already has for that symbol.
+            chunk = bytes(size)
+            pack_rows_zeroed += 1
+        pack_bytes.extend(chunk)
+
+with open(PACK_C, "w", newline="\n") as f:
+    f.write("// AUTO-GENERATED by tools/gen_ek_assets.py. Do not edit by hand.\n")
+    f.write("// B11e build-time EK asset bake. Concatenation of the SAME 765 slices\n")
+    f.write("// sEkAssetFills[] (port/gen/EkAssetBindings.c) reads, in table order, so the\n")
+    f.write("// runtime cursor is a running sum and needs no per-row index.\n")
+    f.write("// Empty unless tools/gen_ek_assets.py was run with --bake <image.ndd>.\n")
+    f.write("// Compiled only when GDX_EXPANSION_KIT is enabled.\n\n")
+    f.write("const unsigned int gEkAssetPackSize = {}U;\n".format(len(pack_bytes)))
+    f.write("const unsigned long long gEkAssetPackDiskCrc64 = 0x{:016X}ULL;\n".format(pack_crc64))
+    f.write("const unsigned int gEkAssetPackRows = {}U;\n\n".format(len(fills) if pack_bytes else 0))
+    if pack_bytes:
+        f.write("const unsigned char gEkAssetPack[{}] = {{\n".format(len(pack_bytes)))
+        for start in range(0, len(pack_bytes), 32):
+            f.write("".join("{},".format(b) for b in pack_bytes[start:start + 32]))
+            f.write("\n")
+        f.write("};\n")
+    else:
+        # A 1-byte placeholder rather than [0]: a zero-length array is a GNU extension and the
+        # extern declaration in EkAssetBindings.c is `[]` either way. gEkAssetPackSize == 0 is
+        # what the fill loop tests, never sizeof.
+        f.write("const unsigned char gEkAssetPack[1] = { 0 };\n")
+
+print("EK asset pack: {} bytes, {} rows{} -> {}".format(
+    len(pack_bytes), len(fills) if pack_bytes else 0,
+    "" if not pack_rows_zeroed else " ({} zeroed: past end of image)".format(pack_rows_zeroed),
+    PACK_C))
+if pack_bytes:
+    print("EK asset pack: baked from {} (CRC-64/XZ 0x{:016X})".format(OPTS.bake, pack_crc64))
 
 print("EK assets: {} headers, {} symbol defs, {} disk fills".format(len(headers), len(definitions), len(fills)))
 print("EK slice manifest: {} rows ({} textures) -> {}".format(len(manifest_rows), texture_count, SLICE_MANIFEST))

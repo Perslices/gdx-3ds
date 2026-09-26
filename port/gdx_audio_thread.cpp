@@ -71,6 +71,11 @@ extern "C" int gdx3ds_audio_producer_park_if_suspended(void); // 1 = released fo
 extern "C" int32_t gdx3ds_audio_producer_target_frames(int raceActive);
 extern "C" void gdx3ds_audio_producer_tick_begin(void);
 extern "C" void gdx3ds_audio_producer_tick_end(void);
+// [audioring]: once per producer loop iteration, before the catch-up loop. Records the wake,
+// the buffered level it is about to pace against, and whether the PREVIOUS iteration left on
+// the kMaxTicksPerWake cap -- the difference between "the producer had nothing to do" and
+// "the producer could not catch up". A no-op (one int compare) unless [debug] audioring is on.
+extern "C" void gdx3ds_audio_producer_wake(int32_t target, int32_t maxTicksPerWake);
 extern "C" int gGdxRaceActive; // set by the first course load (port/decomp_port.c)
 #else
 #include "libultraship/bridge/audiobridge.h"
@@ -279,6 +284,10 @@ void AudioThreadMain() {
         }
         const int32_t desired = gdx3ds_audio_producer_target_frames(gGdxRaceActive); // R2 + audioprime2
         int iterations = 0;
+        // Deliberately does NOT pass gdx3ds_audio_buffered(): that takes the ring lock, and the
+        // shipped path must not acquire it one extra time per 5 ms wake for a diagnostic. The
+        // hook reads the two counters unlocked itself, and only when the census is armed.
+        gdx3ds_audio_producer_wake(desired, kMaxTicksPerWake);
         while ((int32_t)gdx3ds_audio_buffered() < desired && iterations < kMaxTicksPerWake) { // R3
             gdx3ds_audio_producer_tick_begin();
 #else
@@ -385,11 +394,32 @@ extern "C" int gdx_audio_thread_active(void) {
     return sThreadActive.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
+// B11 EK-DEADLOCK PROBE (port/n64_sched.c, docs/research/native/ekdeadlock-progress.md):
+// sAudioCtxMutex is held across the producer's ENTIRE tick, and the game fiber takes it in
+// AudioThread_QueueCmd. When the EK build wedges, the watchdog has to say which side owns it.
+// The counters are plain volatiles read racily by the watchdog; nothing reads them in the
+// shipped build, where the probe fields are omitted from the line entirely.
+extern "C" {
+extern volatile uint32_t gdx_watch_ctx_owner;
+extern volatile uint32_t gdx_watch_ctx_waiters;
+uint32_t gdx_probe_actor(void);
+}
+
 extern "C" void gdx_audio_ctx_lock(void) {
+#ifdef EXPANSION_KIT
+    gdx_watch_ctx_waiters++;
     sAudioCtxMutex.lock();
+    gdx_watch_ctx_waiters--;
+    gdx_watch_ctx_owner = gdx_probe_actor();
+#else
+    sAudioCtxMutex.lock();
+#endif
 }
 
 extern "C" void gdx_audio_ctx_unlock(void) {
+#ifdef EXPANSION_KIT
+    gdx_watch_ctx_owner = 0u;
+#endif
     sAudioCtxMutex.unlock();
 }
 

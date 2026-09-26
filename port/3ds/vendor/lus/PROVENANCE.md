@@ -51,7 +51,7 @@ The twelfth is **excluded**:
 
 From the vendoring commit onward **this tree is the source of truth**. `patches/` is
 frozen history: it is no longer applied by `tools/ci-3ds.sh` (whose `PATCH_LIST` is now
-the 10 `decomp-*.patch` only), and it will rot the moment the vendored sources are
+the `decomp-*.patch` stack only), and it will rot the moment the vendored sources are
 edited. Fix bugs by editing `src/`/`include/` here, not by adding patches.
 
 ## Regenerating / auditing
@@ -76,8 +76,7 @@ Recorded in `docs/research/native/vendor-progress.md`: `compile_commands.json` d
 per-TU preprocessed-output sha256 for all 36 carve TUs + the two harness mains,
 per-object `.text` sha256, `.elf` symbol list, and an Azahar SHOT comparison against
 the pre-vendoring build. Every vendored file was additionally cross-checked
-byte-for-byte against a second, independently patched checkout of the same pin
-(`~/code/gdx-3ds/m1/libultraship`): 122/122 identical.
+byte-for-byte against a second, independently patched checkout of the same pin: 122/122 identical.
 
 ## Post-vendoring folds
 

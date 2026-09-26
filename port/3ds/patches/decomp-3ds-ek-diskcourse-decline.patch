@@ -1,0 +1,238 @@
+--- a/src/game/course_gadgets.c
++++ b/src/game/course_gadgets.c
+@@ -3922,6 +3922,12 @@ extern s32 gLeoDriveConnectionState;
+ UNUSED s32 D_800CD21C = 0;
+ 
+ #ifdef PORT
++#ifdef EXPANSION_KIT
++/* The always-on EK receipt sink (port/n64_sched.c). gdx_cki rides GDX_GATE_TRACE, which
++   nothing on 3DS ever sets, and PRINTF is compiled out -- ekdrive's "two silences". Every
++   decline added below therefore reports through gdx_ek_note or it is not a receipt. */
++extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c, unsigned int d);
++#endif
+ // ROM data is big-endian (.z64); only the multi-byte fields memcpy'd into the host struct need
+ // swapping, so s8/u8/char fields are deliberately absent below.
+ static void Gdx_SwapU16InPlace(void* p) {
+@@ -4002,6 +4008,31 @@ void Course_Load(s32 courseIndex) {
+         Course_GenerateRandomCourse();
+         return;
+     } else if (courseIndex >= COURSE_EDIT_1) {
++#if defined(EXPANSION_KIT) && defined(PORT)
++        /* B11j -- this arm covers courses 24..47: the EDIT cup (COURSE_EDIT_1..6 = 24..29)
++           AND both DD cups (30..41). All of them come off the 64DD disk; only COURSE_X_1
++           (48) and above take the branches above. With no drive EVERY route through here
++           ends at the `while (true) {}` below -- DiskDrive_LoadData zero-fills
++           (disk_drive_dd.c's documented "nothing readable here" case), the
++           checksum/creatorId test fails, func_8070F8A4 paints error 9, and this thread
++           parks forever. On a console that is a hard freeze with no fault and no Luma dump,
++           which is exactly what the first hardware session hit on the RECORDS cup row.
++           port/n64_leo.c:79's policy, one layer up: "an error return that never posts parks
++           that thread forever."
++
++           The decline is a plain return that leaves COURSE_CONTEXT()->courseData UNTOUCHED
++           -- the same contract gdx_disk_image_read and gdx_disk_stream_read already state:
++           on refusal the destination keeps its old bytes rather than new wrong ones. The
++           caller then builds its preview from the previously loaded (valid) course.
++           Course_GenerateRandomCourse() was tried here first and is NOT safe: it is the
++           X-cup generator, and calling it for a DD-cup preview (courseIndex 30) killed the
++           guest immediately after this receipt printed. Measured, not assumed. */
++        if (gLeoDriveConnectionState == 0) {
++            gdx_ek_note("[courseload] Course_Load: no drive, disk course DECLINED idx/disk",
++                        (unsigned int) courseIndex, (unsigned int) (courseIndex - COURSE_EDIT_1), 0u, 0u);
++            return;
++        }
++#endif
+         diskCourseIndex = courseIndex - COURSE_EDIT_1;
+ #ifndef EXPANSION_KIT
+         if (func_800760F8() != 2) {
+@@ -4055,8 +4086,22 @@ void Course_Load(s32 courseIndex) {
+             if ((Course_CalculateChecksum() != COURSE_CONTEXT()->courseData.checksum) ||
+                 (COURSE_CONTEXT()->courseData.creatorId != CREATOR_NINTENDO) ||
+                 (COURSE_CONTEXT()->courseData.bgm > BGM_NEW_04)) {
++#if defined(EXPANSION_KIT) && defined(PORT)
++                /* Defence in depth for the same class: a 3DS has no 64DD front panel and no
++                   reset for a parked thread, so a corrupt disk course must DECLINE rather
++                   than halt. The guard at the head of this arm keeps the NO-DRIVE case out
++                   before the read; this covers a MOUNTED image whose course data does not
++                   validate, where DiskDrive_LoadData has already zero-filled courseData.
++                   Deliberate divergence from the retail drive's error 9 halt, and NOT
++                   exercised -- it needs a mounted-but-invalid image. */
++                gdx_ek_note("[courseload] disk course FAILED validation idx/creator/bgm",
++                            (unsigned int) courseIndex,
++                            (unsigned int) COURSE_CONTEXT()->courseData.creatorId,
++                            (unsigned int) COURSE_CONTEXT()->courseData.bgm, 0u);
++#else
+                 func_8070F8A4(-1, 9);
+                 while (true) {}
++#endif
+             }
+         } else {
+             /* Same gLeoDriveConnectionState gate; unreachable without a disk in practice. */
+@@ -4103,8 +4148,22 @@ void Course_Load(s32 courseIndex) {
+                         if ((Course_CalculateChecksum() != COURSE_CONTEXT()->courseData.checksum) ||
+                             (COURSE_CONTEXT()->courseData.creatorId != CREATOR_NINTENDO) ||
+                             (COURSE_CONTEXT()->courseData.bgm > BGM_NEW_04)) {
++#if defined(EXPANSION_KIT) && defined(PORT)
++                            /* Defence in depth for the same class: a 3DS has no 64DD front panel and no
++                               reset for a parked thread, so a corrupt disk course must DECLINE rather
++                               than halt. The guard at the head of this arm keeps the NO-DRIVE case out
++                               before the read; this covers a MOUNTED image whose course data does not
++                               validate, where DiskDrive_LoadData has already zero-filled courseData.
++                               Deliberate divergence from the retail drive's error 9 halt, and NOT
++                               exercised -- it needs a mounted-but-invalid image. */
++                            gdx_ek_note("[courseload] disk course FAILED validation idx/creator/bgm",
++                                        (unsigned int) courseIndex,
++                                        (unsigned int) COURSE_CONTEXT()->courseData.creatorId,
++                                        (unsigned int) COURSE_CONTEXT()->courseData.bgm, 0u);
++#else
+                             func_8070F8A4(-1, 9);
+                             while (true) {}
++#endif
+                         }
+                     }
+                 }
+@@ -4195,6 +4254,31 @@ void func_80702448(s32 courseIndex) {
+         Course_GenerateRandomCourse();
+         return;
+     } else if (courseIndex >= COURSE_EDIT_1) {
++#if defined(EXPANSION_KIT) && defined(PORT)
++        /* B11j -- this arm covers courses 24..47: the EDIT cup (COURSE_EDIT_1..6 = 24..29)
++           AND both DD cups (30..41). All of them come off the 64DD disk; only COURSE_X_1
++           (48) and above take the branches above. With no drive EVERY route through here
++           ends at the `while (true) {}` below -- DiskDrive_LoadData zero-fills
++           (disk_drive_dd.c's documented "nothing readable here" case), the
++           checksum/creatorId test fails, func_8070F8A4 paints error 9, and this thread
++           parks forever. On a console that is a hard freeze with no fault and no Luma dump,
++           which is exactly what the first hardware session hit on the RECORDS cup row.
++           port/n64_leo.c:79's policy, one layer up: "an error return that never posts parks
++           that thread forever."
++
++           The decline is a plain return that leaves COURSE_CONTEXT()->courseData UNTOUCHED
++           -- the same contract gdx_disk_image_read and gdx_disk_stream_read already state:
++           on refusal the destination keeps its old bytes rather than new wrong ones. The
++           caller then builds its preview from the previously loaded (valid) course.
++           Course_GenerateRandomCourse() was tried here first and is NOT safe: it is the
++           X-cup generator, and calling it for a DD-cup preview (courseIndex 30) killed the
++           guest immediately after this receipt printed. Measured, not assumed. */
++        if (gLeoDriveConnectionState == 0) {
++            gdx_ek_note("[courseload] preview: no drive, disk course DECLINED idx/disk",
++                        (unsigned int) courseIndex, (unsigned int) (courseIndex - COURSE_EDIT_1), 0u, 0u);
++            return;
++        }
++#endif
+         PRINTF("ENTRY CHECK\n");
+         diskCourseIndex = courseIndex - COURSE_EDIT_1;
+         PRINTF("INDEX %d\n", diskCourseIndex);
+@@ -4249,8 +4333,22 @@ void func_80702448(s32 courseIndex) {
+             if ((Course_CalculateChecksum() != COURSE_CONTEXT()->courseData.checksum) ||
+                 (COURSE_CONTEXT()->courseData.creatorId != CREATOR_NINTENDO) ||
+                 (COURSE_CONTEXT()->courseData.bgm > BGM_NEW_04)) {
++#if defined(EXPANSION_KIT) && defined(PORT)
++                /* Defence in depth for the same class: a 3DS has no 64DD front panel and no
++                   reset for a parked thread, so a corrupt disk course must DECLINE rather
++                   than halt. The guard at the head of this arm keeps the NO-DRIVE case out
++                   before the read; this covers a MOUNTED image whose course data does not
++                   validate, where DiskDrive_LoadData has already zero-filled courseData.
++                   Deliberate divergence from the retail drive's error 9 halt, and NOT
++                   exercised -- it needs a mounted-but-invalid image. */
++                gdx_ek_note("[courseload] disk course FAILED validation idx/creator/bgm",
++                            (unsigned int) courseIndex,
++                            (unsigned int) COURSE_CONTEXT()->courseData.creatorId,
++                            (unsigned int) COURSE_CONTEXT()->courseData.bgm, 0u);
++#else
+                 func_8070F8A4(-1, 9);
+                 while (true) {}
++#endif
+             }
+         } else {
+             /* Same gLeoDriveConnectionState gate; unreachable without a disk in practice. */
+@@ -4299,8 +4397,22 @@ void func_80702448(s32 courseIndex) {
+                         if ((Course_CalculateChecksum() != COURSE_CONTEXT()->courseData.checksum) ||
+                             (COURSE_CONTEXT()->courseData.creatorId != CREATOR_NINTENDO) ||
+                             (COURSE_CONTEXT()->courseData.bgm > BGM_NEW_04)) {
++#if defined(EXPANSION_KIT) && defined(PORT)
++                            /* Defence in depth for the same class: a 3DS has no 64DD front panel and no
++                               reset for a parked thread, so a corrupt disk course must DECLINE rather
++                               than halt. The guard at the head of this arm keeps the NO-DRIVE case out
++                               before the read; this covers a MOUNTED image whose course data does not
++                               validate, where DiskDrive_LoadData has already zero-filled courseData.
++                               Deliberate divergence from the retail drive's error 9 halt, and NOT
++                               exercised -- it needs a mounted-but-invalid image. */
++                            gdx_ek_note("[courseload] disk course FAILED validation idx/creator/bgm",
++                                        (unsigned int) courseIndex,
++                                        (unsigned int) COURSE_CONTEXT()->courseData.creatorId,
++                                        (unsigned int) COURSE_CONTEXT()->courseData.bgm, 0u);
++#else
+                             func_8070F8A4(-1, 9);
+                             while (true) {}
++#endif
+                         }
+                     }
+                 }
+--- a/src/overlays/course_select/course_select.c
++++ b/src/overlays/course_select/course_select.c
+@@ -128,6 +128,14 @@
+ extern s32 gCourseIndex;
+ extern s8 gSettingEverythingUnlocked;
+ extern s8 gUnlockableLevel;
++#ifdef EXPANSION_KIT
++extern s32 gLeoDriveConnectionState;
++extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c, unsigned int d);
++#endif
++#if defined(EXPANSION_KIT) && defined(PORT)
++/* One-shot so a held D-pad cannot flood the log: the first bounce is the diagnostic. */
++static s32 sGdxEditCupBounceNoted = 0;
++#endif
+ 
+ #ifdef EXPANSION_KIT
+ void func_i5_80077D60(void) {
+@@ -415,7 +423,20 @@
+             if (gCupSelectOption >= 13) {
+                 gCupSelectOption = 10;
+             }
++#ifdef PORT
++            /* B11j: a saved gLastRecordsCourseIndex can name a COURSE_EDIT_* course from a
++               session that HAD a drive. Restoring the cursor onto cup option 10 with no drive
++               walks straight into course_gadgets.c's disk arm, which used to park this thread
++               forever. Same bounce as the input arm in CourseSelect_Update. */
++            if ((gCupSelectOption >= 10) && (gLeoDriveConnectionState == 0)) {
++                gdx_ek_note("[cupsel] no drive: disk cup not restored, course/opt",
++                            (unsigned int) k, (unsigned int) gCupSelectOption, 0u, 0u);
++                gCupSelectOption = 0;
++                sCourseSelectTrackNo = 0;
++                k = 0;
++            }
+ #endif
++#endif
+         } else {
+             gCupSelectOption = k / 6;
+         }
+@@ -663,6 +684,28 @@
+                 }
+ #endif
+             }
++#if defined(EXPANSION_KIT) && defined(PORT)
++            /* B11j -- with no drive, bounce the cup cursor off the WHOLE bottom row
++               exactly as main_menu.c:203 bounces MODE_COURSE_EDIT / MODE_CREATE_MACHINE off
++               the SELECT MODE grid. Options 10/11/12 are the EDIT cup and the two DD cups,
++               i.e. courses 24..29 and 30..41, and course_gadgets.c serves ALL of them from
++               the 64DD disk -- only COURSE_X_1 (48) and above take another branch. (An
++               earlier draft of this guard covered option 10 only, on the assumption that the
++               DD cups were cart-ROM backed; a run measured the decline firing at
++               courseIndex 30, which is COURSE_SILENCE_3, so they are not.) Letting the
++               cursor rest here arms CourseModel_Init -> func_80702448 -> the disk arm, which
++               parked the main fiber forever: a hard console freeze, no fault, no dump. The
++               editor slots already decline this way; the cup row did not. */
++            if ((gCupSelectOption >= 10) && (gLeoDriveConnectionState == 0)) {
++                gCupSelectOption = (originalCupSelectOption >= 10) ? 0 : originalCupSelectOption;
++                if (!sGdxEditCupBounceNoted) {
++                    sGdxEditCupBounceNoted = 1;
++                    gdx_ek_note("[cupsel] no drive: disk cup row bounced from/to/mode",
++                                (unsigned int) originalCupSelectOption, (unsigned int) gCupSelectOption,
++                                (unsigned int) gGameMode, 0u);
++                }
++            }
++#endif
+             if (gCupSelectOption >= 10) {
+ #ifdef EXPANSION_KIT
+                 if (gCupSelectOption == 10) {

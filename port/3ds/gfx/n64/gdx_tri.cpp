@@ -528,9 +528,24 @@ void Interp::SpTri(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bool is
          * cap is therefore counted, not raised: raising it would diverge from the reference
          * path this code exists to match, and clipPolyHw on the receipt is what proves the
          * bound empirically instead of by argument. */
-        LoadedVertex polygonA[16] = { *v1, *v2, *v3 };
+        /* NEITHER buffer is zero-filled, and that is deliberate: both zero-fills were dead
+         * stores, 1024 B of memset per clipped triangle that the shipped build really ran
+         * (objdump: two `bl <memset>` with r2=512, both gone). The clipper only ever reads
+         * the prefix it has written on this call -- `outputCount` is incremented on exactly
+         * the two arms that write the slot they consume, the truncation arms increment
+         * nothing, and the ping-pong makes the next plane's `input` precisely that prefix --
+         * so `input[0 .. inputCount-1]` is fully assigned at every read, including the fan
+         * emit below. `= { *v1, *v2, *v3 }` would zero all 512 bytes of polygonA before
+         * writing [0..2] over the top, hence the explicit assignment instead.
+         * Full derivation, and the four differences from the gdx3ds_vtx_math.h sibling that
+         * had to be re-checked rather than inherited (the mClipPolyMax lever, the recursive
+         * SpTri between the fan's reads, LoadedVertex's unnamed tail padding, and the absence
+         * of a caller): docs/research/native/tooling3-progress.md §3. NEXT.md B26's sibling. */
+        LoadedVertex polygonA[16];
+        polygonA[0] = *v1;
+        polygonA[1] = *v2;
+        polygonA[2] = *v3;
         LoadedVertex polygonB[16];
-        memset(polygonB, 0, sizeof(polygonB));
         LoadedVertex* input = polygonA;
         LoadedVertex* output = polygonB;
         size_t inputCount = 3;

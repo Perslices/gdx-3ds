@@ -1,0 +1,54 @@
+# ek-courseedit: enter the 64DD COURSE EDIT mode from the SELECT MODE grid.
+#
+# EXPANSION-KIT-ONLY, AND DISK-ONLY. main_menu.c:222's EK arm bounces the cursor off
+# MODE_COURSE_EDIT (4) and MODE_CREATE_MACHINE (7) whenever gLeoDriveConnectionState == 0, so
+# on a no-disk build this replay walks to slot 5 (PRACTICE) instead and proves nothing. It is
+# therefore NOT a corpus replay and is not in covdrift.sh's set: it is the B11d receipt, and
+# it is only meaningful against a mounted 64DD image ([debug] disk_stream=2 + a .ndd under
+# media/). Run it BOTH ways -- the no-disk run is the control that shows the bounce.
+#
+# Grid geometry (main_menu.c:612): index = (row * 4) + column, cursor starts at
+# MODE_GP_RACE = 0 (game/common.c:21). One DOWN moves +4 -> MODE_COURSE_EDIT. A enters
+# (main_menu.c:279 returns GAMEMODE_COURSE_EDIT = 0xD).
+#
+# SHOTs are hand-placed here rather than derived, because the thing being proved is "a
+# specific screen exists at all", not "the schedule covers a census". See
+# docs/research/native/ekdrive-progress.md.
+build native/ekdrive
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=1 bridgemain=1 det=1
+note SELECT MODE grid is 4x2; the EK arm bounces idx4/idx7 only when the drive is absent.
+at 350
+wait 1
+at 400
+press START 15 0
+at 600
+wait 1
+shot menu_before
+at 660
+press DOWN 12 0
+at 760
+wait 1
+shot menu_cursor
+at 820
+press A 12 0
+at 1000
+wait 1
+shot enter_0
+at 1200
+wait 1
+shot enter_1
+at 1500
+wait 1
+shot enter_2
+at 1900
+wait 1
+shot enter_3
+at 2400
+wait 1
+shot enter_4
+at 2900
+wait 1
+shot enter_5
+len 3000

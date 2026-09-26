@@ -18,6 +18,7 @@ extern "C" int gdx_ninterp_ownfold(void);
 extern "C" int gdx_ninterp_dspcensus(void);
 extern "C" int gdx_ninterp_timgmemo(void);
 extern "C" int gdx_ninterp_tmemskip(void);
+extern "C" int gdx_ninterp_tmemfault(void);
 extern "C" int gdx_ninterp_tmemcls(void);
 
 Interp::Interp(Backend* backend) : mBackend(backend) {
@@ -52,6 +53,9 @@ Interp::Interp(Backend* backend) : mBackend(backend) {
     mTimgMemo = gdx_ninterp_timgmemo();
     mTmemSkip = gdx_ninterp_tmemskip();
     mTmemCls = gdx_ninterp_tmemcls();
+    /* [memotear] B54 fault injection -- inert unless tmemskip is also on (the injector is only
+       ever reached from an admitted skip), and 0 in every shipped configuration. */
+    mTmemFault = gdx_ninterp_tmemfault();
     memset(mTimgClassMemo, 0, sizeof(mTimgClassMemo));
 }
 

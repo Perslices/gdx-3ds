@@ -117,13 +117,13 @@ run_census() {
     for att in $(seq 1 "$ATTEMPTS"); do
         echo "    attempt $att/$ATTEMPTS gfx=$GFX  uptime: $(uptime)"
         t0=$(date +%s)
-        # --track is passed to BOTH the driver and `retro run`, on purpose. `retro run`
-        # declares its own --track into the same argparse namespace with default None, so the
-        # DRIVER-level --track is silently overwritten and the run lands in the track named
-        # after the worktree instead. Caught here when every run reported PASS and then
-        # `NO RUN`; tools/dev/verifymatrix.sh has the same shape and the same silent loss.
+        # The driver-level --track/--run-root are enough again. They used to be
+        # silently overwritten by `retro run`'s own copies (NEXT.md B52, caught here
+        # when every run reported PASS and then `NO RUN`); the workaround was to pass
+        # them on BOTH sides. Fixed in gdxdev/cli.py -- the subcommand copies now use
+        # argparse.SUPPRESS, so only the driver defines the default -- and fenced by
+        # test_gdxdev.py::DriverOptionShadowTest, which walks the whole parser tree.
         "$DEV" --track "$TRACKNAME" --run-root "$RUNROOT" retro run "$PINNED" \
-            --track "$TRACKNAME" --run-root "$RUNROOT" \
             --name "cd-$rep" --replay "$rep" --gfx "$GFX" --seconds "$SECONDS_RUN" "${ini[@]}"
         rc=$?
         t1=$(date +%s)

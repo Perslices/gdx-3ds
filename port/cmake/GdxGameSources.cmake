@@ -152,6 +152,10 @@ set(GDX_GAME_CORE_SOURCES
 set(GDX_GAME_EK_PORT_SOURCES
     "${GDX_PORT_DIR}/n64_leo.c"
     "${GDX_PORT_DIR}/gen/EkAssetBindings.c"
+    # B11e: the build-time asset bake. Generated on every tools/gen_ek_assets.py run and EMPTY
+    # (gEkAssetPackSize == 0) unless that run passed --bake, so it is always in the source list
+    # and never in git -- a baked pack holds disk bytes and is a build artifact, not content.
+    "${GDX_PORT_DIR}/gen/EkAssetPack.c"
     "${GDX_PORT_DIR}/gen/EkLinkStubs.c"
     "${GDX_PORT_DIR}/gdx_ek_disk_overrides.c")
 

@@ -55,8 +55,39 @@ extern "C" {
 #define GDX3DS_COV_FAM_TLUT 0x09u /* value = (tmem << 8) | count class — a palette load     */
 #define GDX3DS_COV_FAM_TC   0x0Au /* value = texture-cache event, see GDX3DS_COV_TC_*       */
 #define GDX3DS_COV_FAM_FB   0x0Bu /* value = 0 screen target, 1 texture target, 2 right eye */
-/* 0x0C is unused: the viewport COUNT of a frame is the number of distinct VP keys in it,
- * which covsched.py derives — a separate family would be the same fact twice. */
+#define GDX3DS_COV_FAM_BATCH 0x0Cu /* value = per-draw MAGNITUDE, see GDX3DS_COV_BATCH_* below  */
+
+/* Family 0x0C, `batch` (NEXT.md B51). Every other family above describes STATE — which mode,
+ * which combiner, which render mode, which texture, which viewport. NONE describes MAGNITUDE,
+ * so a screen drawn as one 2000-vertex batch and the same screen drawn as a hundred 20-vertex
+ * batches produce the IDENTICAL feature set, and a batching or merging regression is invisible
+ * to a coverage-derived schedule. Four tracks in this fork are in that business (ownedbatch,
+ * trectbatch, dispatch, the triloop packer).
+ *
+ *   value = (path << 8) | (vclass << 4) | tclass
+ *     tclass = floor(log2(triangles in this draw)), clamped to 15
+ *     vclass = floor(log2(vertices in this draw)),  clamped to 15
+ *     path   = 0 array stream (3 verts per triangle), 1 native indexed mesh (verts reused)
+ *
+ * LOG2, and bucketed rather than exact, for coverage2's gotcha 3: a sensor finer than the
+ * quantity's frame-to-frame variation mints a key per frame of an ANIMATION and the set cover
+ * then samples animation frames (at 4 px the viewport family did exactly that and picked a
+ * frame with a documented non-deterministic transient). A log2 bucket only moves when the
+ * count DOUBLES, i.e. its quantiser is 100% wide in relative terms, while a steady scene's
+ * per-draw batch sizes wobble by far less than a factor of two — so the key is stable across
+ * a scene and still separates "one big batch" from "many small ones", which is the whole
+ * point. Measured on the corpus: 21-34 keys per replay, and the SHORTEST-lived batch key on
+ * the canonical replay lives longer than the median key of every state family.
+ *
+ * (path, magnitude) is a JOINT key on purpose. `mNativeActive` is already a bit in family RM,
+ * but the union of two separate keys cannot say which path carried which size: the indexed
+ * ladder's vertex/triangle RATIO is the thing ownedbatch/dispatch/triloop change, and it only
+ * exists as a pair. A native draw with zero vertices buckets as vclass 0, same as one vertex;
+ * a zero-triangle draw cannot reach here (DrawTriangles early-outs on it). */
+#define GDX3DS_COV_BATCH_ARRAY   0u
+#define GDX3DS_COV_BATCH_INDEXED 1u
+#define GDX3DS_COV_BATCH_VAL(path, vclass, tclass) \
+    ((uint32_t)((((path) & 1u) << 8) | (((vclass) & 0xFu) << 4) | ((tclass) & 0xFu)))
 
 #define GDX3DS_COV_RM_ZTEST  0x01u
 #define GDX3DS_COV_RM_ZWRITE 0x02u

@@ -54,6 +54,25 @@ omitted is a lever inherited). The easy way to get one is to let covdrift.sh do 
     tools/dev/covdrift.sh --rederive <replay>      # runs the census, and on a FAIL prints the
                                                    # exact `derive --rewrite` command to fix it
 
+WHAT 100% COVERAGE DOES NOT MEAN, measured (ekmenu-progress.md, NEXT.md B11b). Every family
+here keys a CLASS, not an identity -- family 06 is (unit, atlas/own, fmt, log2 w, log2 h,
+filter, clamp) and family 0C is a log2 magnitude bucket. So content that reuses an existing
+shape mints NO new key and is invisible to both the census and the cover report. The Expansion
+Kit build draws two menu signs the shipped build never draws (aMenuSignCourseEditTex /
+aMenuSignCreateMachineTex, main_menu.c:576) and its census has exactly ONE key the shipped
+census does not -- and that key is the boot logo, not a sign: all eight signs are 0x40 x 0x56,
+so the two new ones land in the same family-06 key as the six already there, and two more
+64x86 texrects do not move a family-0C bucket either. The committed menus-longtail schedule
+still sampled them, via the mode-anchor rule and the --max-gap floor, and a pixel compare
+(tools/dev/framediff.py between the two builds' SHOT BMPs) is what PROVED they were drawn.
+
+That class blindness is deliberate -- see gdx3ds_cov.h's family-0C comment on why a sensor
+finer than the quantity's frame-to-frame variation mints a key per ANIMATION frame and makes
+the set cover sample animation frames. But read the number for what it is:
+
+    100% here means NO NEW FEATURE CLASS GOES UNSAMPLED. It does NOT mean every new draw was
+    checked, and for a same-size, same-format texture swap it cannot. Use framediff.py.
+
 Stdlib only (PROTOCOL.md: host tools are stdlib-only).
 """
 
@@ -79,6 +98,7 @@ FAMILY = {
     0x09: "tlut",
     0x0A: "texcache",
     0x0B: "target",
+    0x0C: "batch",
 }
 
 # port/3ds/gfx/gdx3ds_fx_record.h: EXPLOSION is 0 and OTHER is 7, not the other way round.
@@ -104,6 +124,10 @@ def key_name(key):
         return "target:%s" % ("texture" if val else "screen")
     if fam == 0x01:
         return "mode:%d" % val
+    if fam == 0x0C:
+        # (path, vertex class, triangle class) — log2 buckets, see port/3ds/include/gdx3ds_cov.h.
+        return "batch:%s/v2^%d/t2^%d" % ("idx" if (val >> 8) & 1 else "arr",
+                                         (val >> 4) & 0xF, val & 0xF)
     return "%s:%06x" % (name, val)
 
 
@@ -251,11 +275,139 @@ def fill_gaps(c, chosen, max_gap, min_frame, avoid):
     return out
 
 
-def derive(c, edge=1, budget=None, min_frame=120, avoid=(), max_gap=300):
+def signature_spend(c, chosen, sig_budget, rule, min_frame, avoid, family=None):
+    """Spend a BOUNDED extra budget of SHOTs on the most distinctive frame SIGNATURES.
+
+    WHY THIS EXISTS (NEXT.md B55, and it is a structural gap, not a sensor gap).
+
+    A greedy set cover covers KEYS, not key-SETS. Once every individual feature a frame
+    carries appears somewhere else in the schedule, the cover has no reason to ever choose
+    that frame -- however distinctive its COMBINATION is. `batchcov` measured the consequence
+    on the canonical replay: the machines-truncation bug (`meshcapverts=64`, `meshtruncfix=0`
+    vs `1`) reaches pixels on exactly two frames, 3870 and 3889 of 6028, and each of those
+    frames carries a batch signature that is UNIQUE IN THE WHOLE RUN -- as do 121 of 6028
+    frames (2.0%), and 308 of 6028 (5.1%) on the full feature set. The census singles them
+    out perfectly well. The cover simply never picks them.
+
+    So `coverage2`'s boundary was stated one notch too strong. It is not "no census can
+    distinguish those frames"; it is "no set COVER will select them", and that is fixable.
+
+    A FULL signature cover is not affordable: 542 distinct full feature sets and 294 distinct
+    batch signatures on that one replay, against a 49-SHOT schedule. What is affordable is a
+    BUDGET -- keep the key cover and its mandatory rules exactly as they are, then spend
+    `sig_budget` further SHOTs on the frames whose signatures the schedule has least to say
+    about. The budget is stated in SHOTs because SHOT cost is the whole constraint
+    (`coverage2`: +0.2 s of wall clock for 41 extra SHOTs, after `shot_fastwrite`).
+
+    THREE RULES, and the measurements that pick between them are in
+    docs/research/native/sigcover-progress.md. Each takes the same budget and differs only in
+    how it ranks candidates:
+
+      `farthest`  FARTHEST-FIRST (maximin symmetric difference). Repeatedly take the frame
+                  whose feature set is furthest -- in symmetric-difference size -- from EVERY
+                  frame already scheduled, then fold it in and repeat. This is the rule that
+                  works, and it works because it is the only one of the three that scores a
+                  frame against the SCHEDULE rather than against the run: a frame is worth a
+                  SHOT exactly when nothing already sampled looks like it. On the canonical
+                  replay it picks frame 3889 as its SECOND extra SHOT.
+      `unique`    frames whose full signature is unique in the run, ranked by rarity weight.
+      `rarity`    every frame ranked by sum(1/residency) over its keys, deduplicated by
+                  signature.
+
+    The last two rank by a property of the RUN, so they spend the budget on the rarest
+    features rather than on the least-represented combinations -- and both walk straight into
+    `coverage2` gotcha 3, because the rarest features in a run are its one-frame transients.
+    On the canonical replay both of them pick frame 1704 first, which is adjacent to the
+    documented non-deterministic transient at 1702/1703. They need 58 and 84 extra SHOTs
+    respectively to reach frame 3889. They are kept because the comparison is the evidence
+    for `farthest`, not because anything should use them.
+
+    `family` restricts the signature to one census family (e.g. 0x0C, batch). Measured and
+    NOT recommended: a batch-only signature is 16-17 keys wide against the full set's 96, so
+    its distances quantise into a handful of values, the rule ties everywhere and the budget
+    goes to arbitrary tie-breaks. `farthest` over the batch family alone does not reach
+    either target frame within 200 extra SHOTs.
+
+    This runs AFTER fill_gaps() on purpose: every frame it adds can only shrink an unsampled
+    gap, so the --max-gap floor the schedule was derived at is preserved by construction, and
+    the cost of the option is exactly `sig_budget` SHOTs and never more.
+    """
+    def sig(f):
+        s = c.sets[f]
+        return frozenset(k for k in s if (k >> 24) == family) if family else s
+
+    pool = [f for f in c.frames if f >= min_frame and f not in avoid and f not in chosen]
+    if not pool or sig_budget <= 0:
+        return []
+    res = dict((k, c.summary.get(k, (0, 0, 1))[2]) for k in c.keys)
+
+    def rarity(f):
+        return sum(1.0 / max(1, res.get(k, 1)) for k in sig(f))
+
+    if rule in ("unique", "rarity"):
+        if rule == "unique":
+            counts = {}
+            for f in c.frames:
+                counts[sig(f)] = counts.get(sig(f), 0) + 1
+            pool = [f for f in pool if counts[sig(f)] == 1]
+        # Deduplicate by signature: two frames carrying the same set are the same sample.
+        pool.sort(key=lambda f: (-rarity(f), f))
+        seen, out = set(sig(f) for f in chosen), []
+        for f in pool:
+            if sig(f) in seen:
+                continue
+            seen.add(sig(f))
+            out.append(f)
+            if len(out) >= sig_budget:
+                break
+        return out
+
+    if rule != "farthest":
+        raise ValueError("unknown --sig-rule %r" % rule)
+
+    # Farthest-first. The distance cache makes this O(budget * frames) rather than
+    # O(budget * frames * schedule): only the frame just added can lower a min-distance.
+    picked = []
+    sel_sets = [sig(f) for f in chosen]
+    mind = {}
+    for f in pool:
+        s = sig(f)
+        mind[f] = min(len(s ^ t) for t in sel_sets) if sel_sets else len(s)
+    for _ in range(sig_budget):
+        best = None
+        best_score = (0, 0)
+        for f in pool:
+            if f in picked:
+                continue
+            score = (mind[f], -f)          # ties -> the earliest frame, so the rule is stable
+            if best is None or score > best_score:
+                best, best_score = f, score
+        # Distance 0 means some scheduled frame already carries exactly this signature: there
+        # is nothing distinctive left to buy, so stop rather than spend the rest of the budget
+        # on duplicates.
+        if best is None or mind[best] == 0:
+            break
+        picked.append(best)
+        bs = sig(best)
+        for f in pool:
+            d = len(sig(f) ^ bs)
+            if d < mind[f]:
+                mind[f] = d
+    return picked
+
+
+def derive(c, edge=1, budget=None, min_frame=120, avoid=(), max_gap=300,
+           sig_budget=0, sig_rule="farthest", sig_family=None):
     """Mandatory mode anchors + a greedy set cover of everything they miss + a gap floor.
 
     `min_frame` keeps samples out of the boot window, where the guest is still bringing the
-    window, the SD and the o2r up and a capture is not a frame of the game."""
+    window, the SD and the o2r up and a capture is not a frame of the game.
+
+    `sig_budget` is OPT-IN and defaults to 0, which is the shipped algorithm unchanged. Every
+    committed schedule in replays/ was derived without it and tools/dev/covdrift.sh asserts
+    against those schedules, so turning it on by default would silently re-break the corpus --
+    which is `batchcov`'s and `covfinish`'s shared lesson, and the reason B55 asked for an
+    option rather than a new default. See signature_spend()."""
     avoid = set(avoid)
     chosen = set(f for f in mode_anchors(c, edge) if f in c.sets and f >= min_frame and f not in avoid)
     covered = set()
@@ -287,7 +439,11 @@ def derive(c, edge=1, budget=None, min_frame=120, avoid=(), max_gap=300):
         covered |= c.sets[best]
         if budget is not None and len(chosen) >= budget:
             break
-    return sorted(fill_gaps(c, chosen, max_gap, min_frame, avoid))
+    chosen = set(fill_gaps(c, chosen, max_gap, min_frame, avoid))
+    if sig_budget:
+        chosen |= set(signature_spend(c, chosen, sig_budget, sig_rule, min_frame,
+                                      avoid, sig_family))
+    return sorted(chosen)
 
 
 def label_for(c, frame, used):
@@ -459,7 +615,8 @@ def cmd_derive(args):
     c = parse(args.log)
     frames = derive(c, edge=args.edge, budget=args.budget, min_frame=args.min_frame,
                     avoid=set(int(x) for x in args.avoid.split(",")) if args.avoid else set(),
-                    max_gap=args.max_gap)
+                    max_gap=args.max_gap, sig_budget=args.sig_budget, sig_rule=args.sig_rule,
+                    sig_family=int(args.sig_family, 0) if args.sig_family else None)
     seen, allk = coverage(c, frames)
     used = set()
     sched = [(c.tick[f], label_for(c, f, used), f) for f in frames]
@@ -487,7 +644,8 @@ def cmd_report(args):
     old = [int(x) + 1 for x in args.old.split(",")] if args.old else []
     new = derive(c, edge=args.edge, budget=args.budget, min_frame=args.min_frame,
                  avoid=set(int(x) for x in args.avoid.split(",")) if args.avoid else set(),
-                 max_gap=args.max_gap)
+                 max_gap=args.max_gap, sig_budget=args.sig_budget, sig_rule=args.sig_rule,
+                 sig_family=int(args.sig_family, 0) if args.sig_family else None)
     o_seen, allk = coverage(c, old)
     n_seen, _ = coverage(c, new)
     o_fam, n_fam = per_family(c, old), per_family(c, new)
@@ -616,6 +774,24 @@ def main(argv):
     p.add_argument("--max-gap", type=int, default=300,
                    help="floor sampling rate: never leave more than N frames unsampled "
                         "(0 = pure set cover). A mitigation, not a guarantee -- see fill_gaps()")
+    p.add_argument("--sig-budget", type=int, default=0, metavar="N",
+                   help="OPT-IN (default 0 = off, the shipped algorithm unchanged): after the "
+                        "key cover and the gap floor, spend N FURTHER SHOTs on the most "
+                        "distinctive frame SIGNATURES. A greedy set cover covers keys, not "
+                        "key-SETS, so a frame whose every individual feature appears elsewhere "
+                        "is never selected however unique its combination is -- NEXT.md B55. "
+                        "The cost is exactly N SHOTs. Do not turn this on for the committed "
+                        "corpus without re-deriving and re-gating every replay.")
+    p.add_argument("--sig-rule", default="farthest", choices=("farthest", "unique", "rarity"),
+                   help="how the signature budget is spent (default farthest: maximin "
+                        "symmetric difference against the frames already scheduled). "
+                        "`unique`/`rarity` rank by a property of the RUN instead and spend the "
+                        "budget on one-frame transients -- kept for comparison, see "
+                        "signature_spend()")
+    p.add_argument("--sig-family", metavar="HEX",
+                   help="restrict the signature to one census family (e.g. 0x0C for batch). "
+                        "Measured and NOT recommended -- a one-family signature is too narrow "
+                        "to separate frames; see signature_spend()")
     p.add_argument("--rewrite", nargs=2, metavar=("IN.gdxrec", "OUT.gdxrec"))
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(fn=cmd_derive)
@@ -628,6 +804,24 @@ def main(argv):
     p.add_argument("--min-frame", type=int, default=120)
     p.add_argument("--avoid")
     p.add_argument("--max-gap", type=int, default=300)
+    p.add_argument("--sig-budget", type=int, default=0, metavar="N",
+                   help="OPT-IN (default 0 = off, the shipped algorithm unchanged): after the "
+                        "key cover and the gap floor, spend N FURTHER SHOTs on the most "
+                        "distinctive frame SIGNATURES. A greedy set cover covers keys, not "
+                        "key-SETS, so a frame whose every individual feature appears elsewhere "
+                        "is never selected however unique its combination is -- NEXT.md B55. "
+                        "The cost is exactly N SHOTs. Do not turn this on for the committed "
+                        "corpus without re-deriving and re-gating every replay.")
+    p.add_argument("--sig-rule", default="farthest", choices=("farthest", "unique", "rarity"),
+                   help="how the signature budget is spent (default farthest: maximin "
+                        "symmetric difference against the frames already scheduled). "
+                        "`unique`/`rarity` rank by a property of the RUN instead and spend the "
+                        "budget on one-frame transients -- kept for comparison, see "
+                        "signature_spend()")
+    p.add_argument("--sig-family", metavar="HEX",
+                   help="restrict the signature to one census family (e.g. 0x0C for batch). "
+                        "Measured and NOT recommended -- a one-family signature is too narrow "
+                        "to separate frames; see signature_spend()")
     p.add_argument("--gaps", type=int, default=0, help="list N features the old schedule missed")
     p.set_defaults(fn=cmd_report)
 

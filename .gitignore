@@ -43,6 +43,7 @@ torch.hash.yml
 # Copied to decomp-recipes/ by an UNCONDITIONAL POST_BUILD step (port/CMakeLists.txt
 # ~556 for G-Diffuser, ~957 for the JP target), so a clone without it fails the build.
 !/port/gen/ek_slice_manifest.txt
+!/port/gen/ek_text_pack_manifest.txt
 # Extraction goldens. These are __has_include-guarded in gdx_extract_launch.cpp, so a
 # clone without them still builds -- but it silently falls back to placeholder
 # expectations and every extraction is treated as unverifiable. Track them so a
@@ -114,3 +115,9 @@ tools/dev/hw.ini
 
 # test fixtures are not build logs
 !tools/dev/tests/fixtures/*.log
+
+# B11e: build-time EK asset bake (tools/gen_ek_assets.py --bake). Generated, and when baked
+# it holds 64DD disk bytes -- a build artifact, never committed.
+port/gen/EkAssetPack.c
+# B11m: the English text pack is translated disk bytes as C, same rule.
+port/gen/EkTranslatedTextPack.c

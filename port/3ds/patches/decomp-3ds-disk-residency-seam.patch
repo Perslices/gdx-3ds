@@ -1,0 +1,66 @@
+diff --git a/src/sys/disk/disk_drive_dd.c b/src/sys/disk/disk_drive_dd.c
+index 08c600b..6b64445 100644
+--- a/src/sys/disk/disk_drive_dd.c
++++ b/src/sys/disk/disk_drive_dd.c
+@@ -94,8 +94,13 @@ s32 DiskDrive_LoadData(s32 startLba, void* vram, s32 diskSize, s32 bssSize) {
+        a tagged handle from SEGMENT_DISK_START (port_disk_segments.h), served straight out of
+        the disk buffer; anything not yet mapped zero-fills rather than reading garbage. */
+     {
+-        extern unsigned char* gdx_disk_buffer;
+-        extern unsigned int gdx_disk_size;
++        /* B11d: through the residency seam (port/disk_buffer.cpp) rather than by indexing
++           gdx_disk_buffer. In [debug] disk_stream=2 there is no resident buffer at all and
++           the same bytes come off the SD card; in mode 0/1 this is the bcopy it always was.
++           gdx_disk_image_read bounds-checks and, on refusal, leaves `vram` UNTOUCHED -- so
++           the zero-fill arm below still owns the "nothing readable here" case rather than
++           the read half-writing one. */
++        extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);
+         extern void gdx_cki(const char* s, int v);
+         u32 handle = (u32) startLba;
+         u32 phys = 0;
+@@ -110,9 +115,7 @@ s32 DiskDrive_LoadData(s32 startLba, void* vram, s32 diskSize, s32 bssSize) {
+             }
+         }
+ 
+-        if (mapped && gdx_disk_buffer != NULL &&
+-            (unsigned long long) phys + (u32) diskSize <= (unsigned long long) gdx_disk_size) {
+-            bcopy(gdx_disk_buffer + phys, vram, diskSize);
++        if (mapped && gdx_disk_image_read(phys, (unsigned int) diskSize, vram)) {
+             gdx_cki("[dd] served phys", (s32) phys);
+         } else {
+             bzero(vram, diskSize);
+diff --git a/src/sys/disk/disk_mount_dd.c b/src/sys/disk/disk_mount_dd.c
+index bf2ab7b..9cd2008 100644
+--- a/src/sys/disk/disk_mount_dd.c
++++ b/src/sys/disk/disk_mount_dd.c
+@@ -43,10 +43,17 @@ extern LEODiskID D_800CD2B0;
+  * dirty range (port/disk_savefile.cpp), same as any game save.
+  */
+ 
+-/* port/disk_buffer.cpp -- the loaded disk image. Raw extern because this decomp TU cannot include
+-   the host headers; same boundary idiom as mfs_ram.c's gdx_disk_allow_format() and 75000.c's
+-   gdx_cki(). Only used to skip the pass when no disk is mounted. */
+-extern unsigned char* gdx_disk_buffer;
++/* port/disk_buffer.cpp -- is a 64DD image mounted at all. Raw extern because this decomp TU
++   cannot include the host headers; same boundary idiom as mfs_ram.c's gdx_disk_allow_format()
++   and 75000.c's gdx_cki(). Only used to skip the pass when no disk is mounted.
++
++   B11d: this test used to be `gdx_disk_buffer != NULL`. In [debug] disk_stream=2 that pointer
++   is null even though a disk IS mounted -- the image is streamed off SD with no resident
++   buffer. Skipping the byte-order pass there would leave gMfsRamArea big-endian,
++   Mfs_GetDirectoryIndex would never match MFS_FILE_ATTR_DIRECTORY, and the editors' file
++   picker would come up empty with no error: exactly the silent failure this pass exists to
++   prevent. */
++extern int gdx_disk_image_available(void);
+ 
+ /* Mfs_ReadRamArea/Mfs_BackupRamArea move exactly this many LBAs, and the backup copy sits exactly
+    this far behind the primary. Naming the constant keeps the two uses provably in step. */
+@@ -166,7 +173,7 @@ static void GdxMfsNormalizeWindow(s32 startLBA) {
+ static void GdxDiskNormalizeMfsManagementArea(void) {
+     s32 startLBA;
+ 
+-    if (gdx_disk_buffer == NULL) {
++    if (!gdx_disk_image_available()) {
+         return;
+     }
+     /* gRamAreaCapacity is not populated yet (func_i1_80404204 runs from the first MFS mount, which

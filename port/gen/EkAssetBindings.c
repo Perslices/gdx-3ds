@@ -1545,6 +1545,12 @@ extern void gdx_register_host_n64_command_range(void* ptr, size_t size);
 extern void gdx_register_n64_address_range(unsigned int n64Begin, void* hostBegin, size_t size);
 extern void gdx_register_host_pointer_stub(void* dest, size_t size);
 
+/* B11e: port/gen/EkAssetPack.c. Empty (gEkAssetPackSize == 0) unless the generator was
+   run with --bake, which is off by default. */
+extern const unsigned char gEkAssetPack[];
+extern const unsigned int gEkAssetPackSize;
+extern const unsigned long long gEkAssetPackDiskCrc64;
+
 enum { GDX_EK_ASSET_OTHER, GDX_EK_ASSET_GFX, GDX_EK_ASSET_VP, GDX_EK_ASSET_VTX };
 typedef struct { void* dest; unsigned int diskOffset; unsigned int size; unsigned int n64Address; unsigned char kind; } GdxEkAssetFill;
 static const GdxEkAssetFill sEkAssetFills[] = {
@@ -2334,18 +2340,66 @@ void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize) 
         v = (unsigned int)e1[0] | ((unsigned int)e1[1] << 8) | ((unsigned int)e1[2] << 16) | ((unsigned int)e1[3] << 24);
         gdx_cki("[tblwatch] pre-fill entries[1].romAddr", (int) v);
     }
-    if (disk == 0) { return; }
-    for (i = 0; sEkAssetFills[i].dest != 0; i++) {
-        if ((unsigned long long)sEkAssetFills[i].diskOffset + sEkAssetFills[i].size <= diskSize) {
+    /* B11e -- the build-time asset bake. With no image mounted, serve every row from
+       gEkAssetPack (port/gen/EkAssetPack.c): the SAME 765 slices, concatenated in table order
+       at configure time, so the runtime cursor is a running sum and needs no per-row index.
+       The pack is EMPTY unless tools/gen_ek_assets.py was run with --bake, in which case
+       gEkAssetPackSize is 0 and this returns exactly as it always did, leaving every symbol
+       zero-filled. A MOUNTED IMAGE ALWAYS WINS: the pack serves the no-disk case only, so a
+       user's own dump is never overridden by whatever the build was baked from.
+
+       B11d -- the residency seam. `disk == 0` no longer means "no image": in [debug]
+       disk_stream=2 the image is mounted as an SD STREAM with no resident buffer, so the
+       rows come from gdx_disk_image_read instead of from a pointer. That is still a mounted
+       image, so it still beats the pack. */
+    {
+        unsigned int packCursor = 0;
+        int fromPack = 0;
+        int fromImage = 0;
+        extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);
+        extern int gdx_disk_image_available(void);
+        extern unsigned int gdx_disk_image_size(void);
+        if (disk == 0) {
+            if (gdx_disk_image_available()) {
+                fromImage = 1;
+                diskSize = (unsigned long long) gdx_disk_image_size();
+            } else if (gEkAssetPackSize == 0) {
+                return;
+            } else {
+                fromPack = 1;
+            }
+        }
+        for (i = 0; sEkAssetFills[i].dest != 0; i++) {
             unsigned char* dest = (unsigned char*)sEkAssetFills[i].dest;
-            const unsigned char* src = disk + sEkAssetFills[i].diskOffset;
-            /* byte loop: this TU compiles with the decomp's headers, which
-               clash with the MSVC CRT's <string.h> */
-            for (b = 0; b < sEkAssetFills[i].size; b++) {
-                dest[b] = src[b];
+            unsigned int size = sEkAssetFills[i].size;
+            const unsigned char* src = 0;
+            if (fromPack) {
+                /* Every row has a slice, including any the bake had to zero-fill, so the
+                   cursor advances unconditionally -- a skipped row would shift every later
+                   slice. A pack that cannot cover the table is refused whole rather than
+                   half-applied. */
+                if (packCursor > gEkAssetPackSize || size > gEkAssetPackSize - packCursor) { break; }
+                src = gEkAssetPack + packCursor;
+                packCursor += size;
+            } else if (fromImage) {
+                /* Straight into `dest`: the seam has the same "N bytes at offset O" shape the
+                   pointer arithmetic had, and on refusal it leaves `dest` untouched (i.e.
+                   zero-filled, as it was) rather than half-written. */
+                if ((unsigned long long)sEkAssetFills[i].diskOffset + size > diskSize) { continue; }
+                if (!gdx_disk_image_read(sEkAssetFills[i].diskOffset, size, dest)) { continue; }
+            } else {
+                if ((unsigned long long)sEkAssetFills[i].diskOffset + size > diskSize) { continue; }
+                src = disk + sEkAssetFills[i].diskOffset;
+            }
+            if (src != 0) {
+                /* byte loop: this TU compiles with the decomp's headers, which
+                   clash with the MSVC CRT's <string.h> */
+                for (b = 0; b < size; b++) {
+                    dest[b] = src[b];
+                }
             }
             if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {
-                for (b = 0; b + 1 < sEkAssetFills[i].size; b += 2) {
+                for (b = 0; b + 1 < size; b += 2) {
                     unsigned char hi = dest[b];
                     dest[b] = dest[b + 1];
                     dest[b + 1] = hi;
@@ -2353,7 +2407,7 @@ void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize) 
             } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_VTX) {
                 /* Vtx fields are big-endian on disk. Swap xyz, flag, and st;
                    leave the final four colour/normal bytes untouched. */
-                for (b = 0; b + 16 <= sEkAssetFills[i].size; b += 16) {
+                for (b = 0; b + 16 <= size; b += 16) {
                     unsigned int k;
                     for (k = 0; k < 12; k += 2) {
                         unsigned char hi = dest[b + k];
@@ -2362,12 +2416,12 @@ void gdx_ek_assets_fill(const unsigned char* disk, unsigned long long diskSize) 
                     }
                 }
             } else if (sEkAssetFills[i].kind == GDX_EK_ASSET_GFX) {
-                gdx_register_host_raw_n64_range(dest, sEkAssetFills[i].size);
+                gdx_register_host_raw_n64_range(dest, size);
             }
             if (sEkAssetFills[i].n64Address != 0) {
-                gdx_register_n64_address_range(sEkAssetFills[i].n64Address, dest, sEkAssetFills[i].size);
+                gdx_register_n64_address_range(sEkAssetFills[i].n64Address, dest, size);
             }
-            gdx_register_host_pointer_stub(dest, sEkAssetFills[i].size);
+            gdx_register_host_pointer_stub(dest, size);
         }
     }
     {
@@ -2403,13 +2457,21 @@ int gdx_ek_segment_image_fill(unsigned char segment, const unsigned char* disk,
     unsigned int required = gdx_ek_segment_image_size(segment);
     unsigned int b;
     int i;
-    if (disk == 0 || dest == 0 || required == 0 || required > capacity) { return 0; }
+    extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);
+    extern int gdx_disk_image_available(void);
+    extern unsigned int gdx_disk_image_size(void);
+    if (dest == 0 || required == 0 || required > capacity) { return 0; }
+    if (disk == 0) {
+        if (!gdx_disk_image_available()) { return 0; }
+        diskSize = (unsigned long long) gdx_disk_image_size();
+    }
     for (b = 0; b < required; b++) { dest[b] = 0; }
     for (i = 0; sEkAssetFills[i].dest != 0; i++) {
         unsigned int address = sEkAssetFills[i].n64Address;
         unsigned int offset;
         unsigned char* item;
         const unsigned char* src;
+        (void) src;
         if ((address >> 24) != segment) { continue; }
         offset = address & 0x00FFFFFFU;
         if (offset > capacity || sEkAssetFills[i].size > capacity - offset ||
@@ -2417,8 +2479,13 @@ int gdx_ek_segment_image_fill(unsigned char segment, const unsigned char* disk,
             return 0;
         }
         item = dest + offset;
-        src = disk + sEkAssetFills[i].diskOffset;
-        for (b = 0; b < sEkAssetFills[i].size; b++) { item[b] = src[b]; }
+        if (disk != 0) {
+            src = disk + sEkAssetFills[i].diskOffset;
+            for (b = 0; b < sEkAssetFills[i].size; b++) { item[b] = src[b]; }
+        } else if (!gdx_disk_image_read(sEkAssetFills[i].diskOffset,
+                                       sEkAssetFills[i].size, item)) {
+            return 0;
+        }
         if (sEkAssetFills[i].kind == GDX_EK_ASSET_VP) {
             for (b = 0; b + 1 < sEkAssetFills[i].size; b += 2) {
                 unsigned char hi = item[b]; item[b] = item[b + 1]; item[b + 1] = hi;

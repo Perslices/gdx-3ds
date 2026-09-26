@@ -34,6 +34,19 @@ def parse_spec(spec):
     section, key = section.strip(), key.strip()
     if not section or not key:
         raise GdxError("bad --ini %r: empty section or key" % spec, util.EXIT_USAGE)
+    # `--ini` takes ONE key per flag. A comma-separated list is the natural typo, and it
+    # used to be accepted in silence: `--ini a=1,b=2,c=3` wrote the whole string as the
+    # VALUE of `a`, so b and c never reached the guest and the run looked ordinary. That
+    # cost a full bisect across three commits chasing a parity failure that was a typo --
+    # both legs had silently run with the same levers. No legitimate value contains `=`,
+    # and a `,` in a value here has always meant the same mistake.
+    if "=" in value or "," in value:
+        raise GdxError(
+            "bad --ini %r: a value may not contain '=' or ','.\n"
+            "--ini takes one key per flag; repeat it:\n"
+            "    %s" % (spec, "  ".join("--ini %s" % part
+                                        for part in spec.split(",") if part)),
+            util.EXIT_USAGE)
     return section, key, value
 
 

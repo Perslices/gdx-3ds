@@ -33,7 +33,37 @@
  * only on the translated variant. Idempotent: re-applying writes the same bytes.
  */
 #include "gen/EkTranslatedStrings.h"
+#include "gdx_ek_text_pack.h"
 #include "port_log.h"
+
+/* B11m -- the English text pack puts the SAME three tables on screen with no
+ * translated disk mounted, so the repoint loop is shared rather than copied.
+ * Declared in gdx_ek_text_pack.h; defined here because the cast it needs is this
+ * file's, and duplicating that cast is how the two copies drift. */
+void gdx_ek_strings_repoint_tables(void) {
+    unsigned int i;
+
+    for (i = 0; i < gEkTranslatedStringTableCount; i++) {
+        const GdxEkTranslatedStringTable* tbl = &gEkTranslatedStringTables[i];
+        /* The three arrays are not declared alike in the decomp -- two char*, one
+         * const char* -- so the table carries dest as void* and the single cast
+         * happens here. Entries are only ever read (drawn), so handing a char* slot
+         * a pointer to a string literal is safe; an extern that misstated one
+         * array's type to make the assignment look tidy would not be. */
+        const char** dest = (const char**) tbl->dest;
+        unsigned int e;
+
+        for (e = 0; e < tbl->count; e++) {
+            dest[e] = tbl->text[e];
+        }
+    }
+}
+
+/* B11d -- the residency seam. `disk == 0` no longer means "no image": in [debug]
+ * disk_stream=2 the image is mounted as an SD stream with no resident buffer. */
+extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);
+extern int gdx_disk_image_available(void);
+extern unsigned int gdx_disk_image_size(void);
 
 void gdx_ek_strings_apply(const unsigned char* disk, unsigned long long diskSize) {
     unsigned int i;
@@ -41,13 +71,16 @@ void gdx_ek_strings_apply(const unsigned char* disk, unsigned long long diskSize
     unsigned int repointed = 0;
 
     if (disk == 0) {
-        return;
+        if (!gdx_disk_image_available()) {
+            return;
+        }
+        diskSize = (unsigned long long) gdx_disk_image_size();
     }
 
     for (i = 0; i < gEkTranslatedStringCount; i++) {
         const GdxEkTranslatedString* row = &gEkTranslatedStrings[i];
         unsigned char* dest = (unsigned char*) row->dest;
-        const unsigned char* src = disk + row->diskOffset;
+        const unsigned char* src = (disk != 0) ? disk + row->diskOffset : 0;
         unsigned int b;
 
         /* Both bounds are generated, so neither should ever trip. Checked anyway
@@ -64,8 +97,16 @@ void gdx_ek_strings_apply(const unsigned char* disk, unsigned long long diskSize
             continue;
         }
 
-        for (b = 0; b < row->size; b++) {
-            dest[b] = src[b];
+        if (src != 0) {
+            for (b = 0; b < row->size; b++) {
+                dest[b] = src[b];
+            }
+        } else if (!gdx_disk_image_read(row->diskOffset, row->size, dest)) {
+            /* Refused reads leave `dest` as the compiled-in Japanese initializer rather than
+               half-English, which is the readable failure. */
+            gdx_port_logf("[ek-strings] SKIP %s: streamed read refused at 0x%08X+%u\n",
+                          row->name, row->diskOffset, row->size);
+            continue;
         }
         /* Clear the tail rather than leave the Japanese initializer's bytes after
          * the new NUL. Nothing reads past a terminator today, but a half-Japanese
@@ -76,20 +117,9 @@ void gdx_ek_strings_apply(const unsigned char* disk, unsigned long long diskSize
         copied++;
     }
 
+    gdx_ek_strings_repoint_tables();
     for (i = 0; i < gEkTranslatedStringTableCount; i++) {
-        const GdxEkTranslatedStringTable* tbl = &gEkTranslatedStringTables[i];
-        /* The three arrays are not declared alike in the decomp -- two char*, one
-         * const char* -- so the table carries dest as void* and the single cast
-         * happens here. Entries are only ever read (drawn), so handing a char* slot
-         * a pointer to a string literal is safe; an extern that misstated one
-         * array's type to make the assignment look tidy would not be. */
-        const char** dest = (const char**) tbl->dest;
-        unsigned int e;
-
-        for (e = 0; e < tbl->count; e++) {
-            dest[e] = tbl->text[e];
-        }
-        repointed += tbl->count;
+        repointed += gEkTranslatedStringTables[i].count;
     }
 
     gdx_port_logf("[ek-strings] bound %u array string(s) and repointed %u table entry(s)"

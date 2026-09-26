@@ -38,6 +38,8 @@
 #include "gdx3ds_fps_hud.h" // FPS-HUD: bottom-screen counter (debug.fps, default ON)
 #include "gdx3ds_mainprof.h" // MAINPROF: [mprof] main-thread section profiler ([debug] mainprof)
 #include "gdx3ds_menu.h"    // MENU: v1 bottom-screen touch menu ([menu] enabled, default ON)
+#include "gdx3ds_membudget.h" // O3DS BUDGET: [mem-budget] + [mem-res] census ([debug] membudget)
+#include "gdx_audio_diet.h"   // C4d: audio_table diet + census ([debug] audio_stream / audiodiet)
 #include "gdx3ds_cov.h"     // COVERAGE: [cov] per-frame feature census ([debug] cov)
 #include "gdx3ds_oracle.h"  // ORACLE: true frame capture + [fh] receipts (after EndFrame)
 #include "gdx3ds_dynlod.h"  // ORACLE: dynlod tier pin under .gdxrec replay
@@ -119,6 +121,16 @@ extern volatile uint32_t gdx_watch_specwait;
 extern volatile uint32_t gdx_watch_hle_runs;
 extern volatile uint32_t gdx_watch_hle_op;
 extern volatile uint32_t gdx_watch_hle_idx;
+// B11 EK-DEADLOCK PROBE (port/n64_sched.c). Only the EK build writes these, so in the shipped
+// build they stay 0 and the extra fields are omitted entirely -- the pre-probe [watchdog] line
+// is byte-identical there.
+extern volatile uint32_t gdx_watch_mq_owner;
+extern volatile uint32_t gdx_watch_mq_waiters;
+extern volatile uint32_t gdx_watch_ctx_owner;
+extern volatile uint32_t gdx_watch_ctx_waiters;
+extern volatile uint32_t gdx_watch_foreign_q;
+extern volatile uint32_t gdx_watch_foreign_ra;
+extern volatile uint32_t gdx_watch_foreign_n;
 int gdx_watch_running_thread_id(void);
 // [tt] TIMETRIAL-FREEZE: per-fiber park-state dump (port/n64_sched.c). Names the exact
 // message queue each game thread is blocked on when the watchdog fires.
@@ -329,7 +341,7 @@ static void watchdogThreadMain(void*) {
             sHeapNextTrigger = used + (unsigned long)(sHeapWatchStepMb > 0 ? sHeapWatchStepMb : 1) * 1024u * 1024u;
             sHeapTriggerPending = 1;
         }
-        char msg[256];
+        char msg[384]; // 256 + the B11 probe fields below
         int n = std::snprintf(msg, sizeof(msg),
                               "[watchdog] beat=%lu frame=%lu(+%lu) stage=%d fiber=%d "
                               "aud=%lu/%lu astage=%d spec=%lu hle=%lu op=%02lX idx=%lu "
@@ -347,6 +359,23 @@ static void watchdogThreadMain(void*) {
                               (unsigned long)mi.uordblks,
                               (unsigned long)mi.fordblks,
                               (unsigned long)sHeapHwm, (unsigned long)sHeapBaseline);
+        // B11 EK-DEADLOCK PROBE: the two host-lock owners and their waiter counts (owner is the
+        // fiber id + 1, or 0x1000 + the OS thread id for a non-fiber thread). Written only in the
+        // EK build, so the shipped build's line is unchanged.
+        // A non-host thread busy-waiting on a libultra queue nothing will post to: name the
+        // queue, its caller and the spin count. Zero in a healthy build, on any configuration.
+        if (n > 0 && gdx_watch_foreign_n != 0) {
+            n += std::snprintf(msg + n, sizeof(msg) - (size_t)n, " fq=%08lx fra=%08lx fn=%lu",
+                               (unsigned long)gdx_watch_foreign_q,
+                               (unsigned long)gdx_watch_foreign_ra,
+                               (unsigned long)gdx_watch_foreign_n);
+        }
+        if (n > 0 && (gdx_watch_mq_owner | gdx_watch_mq_waiters | gdx_watch_ctx_owner |
+                      gdx_watch_ctx_waiters) != 0) {
+            n += std::snprintf(msg + n, sizeof(msg) - (size_t)n, " mq=%lu+%lu ctx=%lu+%lu",
+                               (unsigned long)gdx_watch_mq_owner, (unsigned long)gdx_watch_mq_waiters,
+                               (unsigned long)gdx_watch_ctx_owner, (unsigned long)gdx_watch_ctx_waiters);
+        }
         // HWLINK: one extra field so a silent host is distinguishable from a wedged game
         // (0 down / 1 log link / 2 log + control client). Omitted entirely when [net]
         // enabled = 0, which keeps the pre-hwlink [watchdog] line byte-identical.
@@ -858,6 +887,21 @@ extern "C" size_t malloc_usable_size(void* ptr);
 static volatile unsigned long gLiveHistCount[GDX_MALLOC_HIST_BUCKETS];
 static volatile unsigned long gLiveHistBytes[GDX_MALLOC_HIST_BUCKETS];
 
+/* C4c: the RA sampler's window is aimable. It shipped hard-coded to 129..1024 B sampled
+ * 1-in-512, which was right for the leak hunt it was built for (race-time churn concentrates
+ * there) and useless for a RESIDENCY question, where the bytes that matter are the ones no
+ * [mem-res] row owns and they are not all in that window. The four keys below default to
+ * exactly the old numbers, so an unaimed run logs byte-identical output; point them at
+ * whichever [live-hist] class dominates and that class's sites get named.
+ *   [debug] live_ra_min / live_ra_max   inclusive usable-size window (default 129 / 1024)
+ *   [debug] live_ra_every               log 1 in N matching allocations (default 512)
+ *   [debug] live_ra_cap                 stop after N lines (default 512)
+ * All four are read once, in main(), before the histogram is armed. */
+static volatile unsigned long sLiveRaMin = 129;
+static volatile unsigned long sLiveRaMax = 1024;
+static volatile unsigned long sLiveRaEvery = 512;
+static volatile int sLiveRaCap = 512;
+
 static inline void tallyLiveAlloc(void* p, void* ra) {
     if (!sMallocHistogramEnabled || p == nullptr) {
         return;
@@ -866,12 +910,12 @@ static inline void tallyLiveAlloc(void* p, void* ra) {
     int b = gdxMallocSizeBucket(usable);
     gLiveHistCount[b] += 1;
     gLiveHistBytes[b] += (unsigned long)usable;
-    if (usable > 128u && usable <= 1024u) {
+    if (usable >= sLiveRaMin && usable <= sLiveRaMax) {
         static volatile unsigned long sRaTick = 0;
         sRaTick = sRaTick + 1;
-        if ((sRaTick & 511u) == 0u) {
+        if ((sRaTick % sLiveRaEvery) == 0u) {
             static volatile int sRaLogs = 0;
-            if (sRaLogs < 512) {
+            if (sRaLogs < sLiveRaCap) {
                 sRaLogs = sRaLogs + 1;
                 char msg[64];
                 int n = std::snprintf(msg, sizeof(msg), "[live-ra] size=%lu ra=%p",
@@ -904,6 +948,8 @@ static void dumpLiveHistogram(unsigned long frameNum) {
     if (!sMallocHistogramEnabled) {
         return;
     }
+    long liveTotal = 0;
+    long liveCount = 0;
     for (int b = 0; b < GDX_MALLOC_HIST_BUCKETS; b++) {
         unsigned long count = gLiveHistCount[b];
         if (count == 0) {
@@ -914,6 +960,27 @@ static void dumpLiveHistogram(unsigned long frameNum) {
         int n = std::snprintf(msg, sizeof(msg),
                               "[live-hist] frame=%lu class<=%luB live=%ld bytes=%ld",
                               frameNum, upper, (long)count, (long)gLiveHistBytes[b]);
+        if (n > 0) {
+            svcOutputDebugString(msg, n);
+            gdx3ds_filelog_write(msg, (size_t)n);
+        }
+        liveTotal += (long)gLiveHistBytes[b];
+        liveCount += (long)count;
+    }
+    /* C4c: the class rows are only half the answer. This TU hooks operator new/delete and
+     * NOTHING else, so plain C malloc() -- libctru thread stacks, the fiber stacks, the
+     * RDRAM arena's calloc, newlib's own buffers -- is invisible to every row above. The
+     * totals line states that blind spot instead of leaving it to be discovered: `cxx` is
+     * what the size classes account for and `cmalloc` is mallinfo's live total minus it,
+     * which is the C-side residency nobody has ever measured. */
+    {
+        struct mallinfo mi = mallinfo();
+        const long heapUsed = (long)mi.uordblks;
+        char msg[128];
+        int n = std::snprintf(msg, sizeof(msg),
+                              "[live-hist] totals frame=%lu live=%ld cxx=%ld heapUsed=%ld "
+                              "cmalloc=%ld",
+                              frameNum, liveCount, liveTotal, heapUsed, heapUsed - liveTotal);
         if (n > 0) {
             svcOutputDebugString(msg, n);
             gdx3ds_filelog_write(msg, (size_t)n);
@@ -1027,6 +1094,12 @@ static void emitMemCensus(Ship::Context* ctx, unsigned long frameNum, const char
         svcOutputDebugString(msg, n);
         gdx3ds_filelog_write(msg, (size_t)n);
     }
+    // O3DS BUDGET: the ranked residency census rides this cadence (and this render-thread
+    // join) rather than opening a second one. No-op unless [debug] membudget=1.
+    gdx3ds_membudget_census(frameNum, why, census, lusBytes, gBigAllocBytes);
+    // C4d: the audio_table read census rides the same cadence. No-op unless [debug]
+    // audiodiet or [debug] audio_stream is set.
+    gdx_audio_diet_receipt();
     (void)why;
 }
 
@@ -1151,10 +1224,20 @@ int main(int argc, char** argv) {
         int enabled = (env != nullptr) ? (env[0] != '0' && env[0] != '\0')
                                        : gdx3ds_config_get_bool("debug", "malloc_histogram", 0);
         sMallocHistogramEnabled = enabled;
+        sLiveRaMin = (unsigned long)gdx3ds_config_get_int("debug", "live_ra_min", 129);
+        sLiveRaMax = (unsigned long)gdx3ds_config_get_int("debug", "live_ra_max", 1024);
+        {
+            const int every = gdx3ds_config_get_int("debug", "live_ra_every", 512);
+            sLiveRaEvery = (every > 0) ? (unsigned long)every : 1ul; /* % 0 would trap */
+        }
+        sLiveRaCap = gdx3ds_config_get_int("debug", "live_ra_cap", 512);
         if (enabled) {
             logStep("malloc histogram ENABLED (dumps to [malloc-hist] on the mem-census cadence)");
         }
     }
+    // O3DS BUDGET: latch [debug] membudget / membudget_top. The boot receipt itself waits
+    // until the window and the heaps are up (gdx3ds_membudget_boot, below).
+    gdx3ds_membudget_configure();
     sHeapWatchMb = gdx3ds_config_get_int("debug", "heap_watch", 8);
     sHeapWatchStepMb = gdx3ds_config_get_int("debug", "heap_watch_step", 4);
     sHeapWatchArm = gdx3ds_config_get_bool("debug", "heap_watch_arm", 0);
@@ -1164,6 +1247,11 @@ int main(int argc, char** argv) {
     // svc/console; everything from here lands in sdmc:/3ds/gdiffuser/log.txt when
     // debug.filelog=1.
     gdx3ds_filelog_init();
+    // O3DS BUDGET: the grant receipt, as early as a sink exists for it. The grants are
+    // fixed at __system_allocateHeaps (before main), so this is the whole truth about what
+    // this console gave us -- and it prints BEFORE the ~10.7 MB audio_table preload below,
+    // so a build that dies during that load still says what it was working with.
+    gdx3ds_membudget_boot();
     // HWLINK: dev link before the window so boot logSteps reach the host. [net] enabled=0
     // (the default) makes this an immediate return — no SOC buffer, no thread, no receipt.
     gdx3ds_net_init(argc, argv);
@@ -1337,6 +1425,26 @@ int main(int argc, char** argv) {
             0x00527AF0u, // PORT_audio_seq_ROM_START   (audio_blob/audio_seq)
             0x00528730u, // PORT_audio_table_ROM_START (audio_blob/audio_table, ~10.7 MB)
         };
+        // C4d ([debug] audio_stream, default 0): arm the audio_table diet BEFORE the preload
+        // list is walked, because arming it is what decides whether audio_table is preloaded
+        // at all. The archive list is passed in REVERSE mount order -- ArchiveManager is
+        // last-mounted-wins, so fzerox.o2r shadows gdiffuser.o2r and must be looked at first.
+        //
+        // audioTableCount is the whole lever on this side: 3 keeps the shipped behaviour
+        // (all three blobs resident), 2 drops the 10,744,340 B one. Verify mode deliberately
+        // keeps it resident as WELL as streamed -- it is the proof, not the product.
+        const std::string o2rBase = gdx3ds_fs_base_path();
+        const std::string o2rGame = o2rBase + "fzerox.o2r";
+        const std::string o2rMod = o2rBase + "gdiffuser.o2r";
+        const char* o2rPaths[2] = { o2rGame.c_str(), o2rMod.c_str() };
+        GdxAudioDietConfig dietCfg = {};
+        dietCfg.stream = gdx3ds_config_get_int("debug", "audio_stream", 0);
+        dietCfg.verify = gdx3ds_config_get_int("debug", "audio_stream_verify", 0);
+        dietCfg.census = gdx3ds_config_get_int("debug", "audiodiet", 0);
+        dietCfg.cacheKb = (unsigned)gdx3ds_config_get_int("debug", "audio_stream_cache_kb", 512);
+        dietCfg.blockKb = (unsigned)gdx3ds_config_get_int("debug", "audio_stream_block_kb", 16);
+        const bool dietStreaming = gdx_audio_diet_init(&dietCfg, o2rPaths, 2) != 0;
+        const size_t audioTableCount = (dietStreaming && !dietCfg.verify) ? 2u : 3u;
         // RACE-START-POLISH: the four segment_blob families the FIRST race load touches
         // first (bases from port/gen/AssetBindings.c sSegmentBlobMap). They were the last
         // synchronous SD reads left on the race-start path — measured right at race entry:
@@ -1353,19 +1461,21 @@ int main(int argc, char** argv) {
             0x002747F0u, // segment_blob/super_textures           (0x4000)
             0x002B9EA0u, // segment_blob/common_assets_compressed (0x26AA80, MIO0 inside)
         };
-        for (uint32_t baseAddr : kAudioBlobBases) {
+        for (size_t i = 0; i < audioTableCount; ++i) {
+            const uint32_t baseAddr = kAudioBlobBases[i];
             void* payload = nullptr;
             uint32_t cap = 0;
             if (GdxSegmentSourcePreallocPayload(baseAddr, &payload, &cap) && payload != nullptr) {
                 gdx_register_host_range(payload, cap);
             }
         }
+        static size_t sAudioTableCount = audioTableCount;
         ThreadFunc preloadWorker = [](void*) {
             const double t0 = gdx_host_ms_now();
             int resident = 0;
             gdx3ds_audio_note_preload_running(1);
-            for (uint32_t baseAddr : kAudioBlobBases) {
-                if (GdxSegmentSourcePreload(baseAddr)) {
+            for (size_t i = 0; i < sAudioTableCount; ++i) {
+                if (GdxSegmentSourcePreload(kAudioBlobBases[i])) {
                     ++resident;
                 }
             }
@@ -1380,9 +1490,10 @@ int main(int argc, char** argv) {
             }
             char line[96];
             int n = std::snprintf(line, sizeof(line),
-                                  "[audio-blob] preload worker: %d/7 families (audio+race) "
+                                  "[audio-blob] preload worker: %d/%d families (audio+race) "
                                   "resident in %d ms",
-                                  resident, (int)(gdx_host_ms_now() - t0));
+                                  resident, (int)(sAudioTableCount + 4u),
+                                  (int)(gdx_host_ms_now() - t0));
             if (n > 0) {
                 svcOutputDebugString(line, (size_t)n);
                 gdx3ds_filelog_write(line, (size_t)n);
@@ -1676,7 +1787,10 @@ int main(int argc, char** argv) {
         // cache (byte-accounted by the 3DS cap patch), big is the cumulative >=256 KB C++
         // allocation counters, lin is linearSpaceFree. Main-thread only. Periodic under
         // verbose; also fired by HEAP-WATCH when the watchdog sees the heap cross a line.
-        if (verboseTelemetry && frameNum > 8 && (frameNum & 255) == 2) {
+        // O3DS BUDGET: a budget run wants the census cadence without buying the whole
+        // verbose telemetry set, so [debug] membudget=1 arms it on its own.
+        if ((verboseTelemetry || gdx3ds_membudget_enabled()) && frameNum > 8 &&
+            (frameNum & 255) == 2) {
             emitMemCensus(ctx.get(), (unsigned long)frameNum, "periodic");
         }
         // HWLINK: execute at most one pending control command on the MAIN thread (the net

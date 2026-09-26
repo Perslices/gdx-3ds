@@ -1,0 +1,60 @@
+# ek-machinecreate: enter the 64DD CREATE MACHINE mode from the SELECT MODE grid.
+#
+# EXPANSION-KIT-ONLY, AND DISK-ONLY, for exactly the reasons ek-courseedit.gdxs gives:
+# main_menu.c:222's EK arm bounces the cursor off MODE_COURSE_EDIT (4) and
+# MODE_CREATE_MACHINE (7) whenever gLeoDriveConnectionState == 0. NOT a corpus replay,
+# not in covdrift.sh's set, SHOTs hand-placed -- the thing being proved is that a screen
+# exists and what it says, not that the schedule covers a census.
+#
+# Grid geometry (main_menu.c:612): index = (row * 4) + column, cursor starts at
+# MODE_GP_RACE = 0 (game/common.c:21). MODE_CREATE_MACHINE = 7 = row 1, column 3, so the
+# walk is DOWN (0 -> 4) then RIGHT three times (4 -> 5 -> 6 -> 7). A enters.
+#
+# B11m: this is the machine-creator half of the English text pack's receipt -- the three
+# reshaped Create-Machine labels (aMachineCreateMachineNameTex, aMachineCreateSettingsTex,
+# D_xk3_80138930) are the only pack rows whose GEOMETRY changes with the translation, and
+# machine_create_draw.c:402/908 pick that geometry off gdx_ek_disk_is_translated().
+build native/ektranslate
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=1 bridgemain=1 det=1
+note SELECT MODE grid is 4x2; CREATE MACHINE is index 7 (row 1, column 3).
+at 350
+wait 1
+at 400
+press START 15 0
+at 600
+wait 1
+shot menu_before
+at 660
+press DOWN 12 0
+at 760
+press RIGHT 12 0
+at 860
+press RIGHT 12 0
+at 960
+press RIGHT 12 0
+at 1060
+wait 1
+shot menu_cursor
+at 1120
+press A 12 0
+at 1300
+wait 1
+shot enter_0
+at 1600
+wait 1
+shot enter_1
+at 2000
+wait 1
+shot enter_2
+at 2500
+wait 1
+shot enter_3
+at 3000
+wait 1
+shot enter_4
+at 3500
+wait 1
+shot enter_5
+len 3600

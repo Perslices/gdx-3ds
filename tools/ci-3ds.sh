@@ -11,6 +11,9 @@
 #   3. builds the host-side unit tests that run on this machine and runs them
 #      (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests,
 #       gdx3ds_config_host_tests, gdx3ds_native_cfg_host_tests, gdx3ds_dynlod_host_tests,
+#       gdx3ds_heapcfg_host_tests,
+#       gdx_disk_stream_host_tests (against a synthetic 64DD image -- no dump required),
+#       gdx_o2r_stream_host_tests (C4d: the audio_table byte source, against a synthetic zip),
 #       gdx3ds_fs_host_smoke,
 #      gdx_machines_harness —
 #      compiled directly with the host compiler; no desktop configure needed);
@@ -205,6 +208,12 @@ PATCH_LIST=(
     "decomp:decomp-3ds-mainprof-checkpoints.patch"
     "decomp:decomp-3ds-disk-audio-ilp32.patch"
     "decomp:decomp-3ds-disk-audio-heap-ilp32.patch"
+    "decomp:decomp-3ds-disk-audio-deadlock.patch"
+    "decomp:decomp-3ds-rdram-size-knob.patch"
+    "decomp:decomp-3ds-disk-residency-seam.patch"
+    "decomp:decomp-3ds-disk-audio-async-guards.patch"
+    "decomp:decomp-3ds-ek-diskcourse-decline.patch"
+    "decomp:decomp-3ds-disk-audio-load-census.patch"
 )
 
 banner "submodule patches (decomp)"
@@ -238,96 +247,31 @@ for entry in "${PATCH_LIST[@]}"; do
     fi
 done
 
-# The gate is verified PER SUBMODULE against the FULL ordered stack, not
-# per-patch. Order-dependent stacks are the reason: patches later in a series are
-# generated against the tree the earlier ones produce, so their hunks are
-# addressed AT line numbers that only exist post-application. A per-patch check
-# against a fully patched tree then matches neither forward NOR reverse, and the
-# old gate false-aborted on a correctly patched checkout. (The worst offenders
-# were in the libultraship series, now vendored; the decomp stack keeps the same
-# whole-stack treatment because the property is not specific to it.)
+# The gate itself lives in tools/patch-gate.sh, so it can be unit-tested against a
+# throwaway git repo (tools/dev/tests/test_gdxdev.py::PatchGateTest) instead of only
+# ever running against this one checkout. PATCH_LIST above stays the single source of
+# truth — the gate script is handed the list and knows nothing else.
 #
-# Why not a combined `git apply --check`? `--check` with several patch files
-# validates every file against the SAME starting tree, so an order-dependent
-# stack fails the combined check even when it applies fine. A real `git apply`
-# (no --check), by contrast, applies the listed patches SEQUENTIALLY and is
-# atomic — on any failure it touches nothing. We exploit exactly that:
-#   * combined forward apply succeeds       -> clean tree, now patched. Done.
-#   * else combined reverse apply succeeds   -> tree WAS fully applied; we then
-#     re-apply forward to restore it (a proven forward<->reverse roundtrip).
-#   * else                                   -> real drift, FAIL.
-# Sequential real applies are immune to the inter-patch context overlap that
-# broke the per-patch check.
+# It keeps the full-stack forward<->reverse roundtrip as the correctness check, and
+# adds what NEXT.md B50 asks for: a tree with the first M of N applied (the normal
+# state right after a merge that ADDS patches) is no longer reported as "partial
+# application / conflicting local edits" pointing at `git -C decomp diff`. The gate
+# names the patches that were never applied, applies just those, and re-proves the
+# whole stack with the roundtrip.
 #
 # SKIP_PATCH_GATE=1 downgrades a drift FAIL to a warning and force-applies any
 # individual patch that still applies (escape hatch for a knowingly-dirty
 # working tree; leaves the build to catch anything genuinely broken).
-SKIP_PATCH_GATE="${SKIP_PATCH_GATE:-0}"
-
-# Distinct submodules in first-seen order (bash 3.2: no associative arrays).
-SUBMODULES=()
-for entry in "${PATCH_LIST[@]}"; do
-    sub="${entry%%:*}"
-    seen=0
-    for s in "${SUBMODULES[@]:-}"; do
-        if [ "$s" = "$sub" ]; then seen=1; break; fi
-    done
-    if [ "$seen" -eq 0 ]; then SUBMODULES+=("$sub"); fi
-done
-
-# Ordered absolute patch paths for one submodule, on stdout (one per line).
-patches_for_sub() { # sub
-    local want="$1" entry
-    for entry in "${PATCH_LIST[@]}"; do
-        if [ "${entry%%:*}" = "$want" ]; then
-            printf '%s\n' "${PATCH_DIR}/${entry#*:}"
-        fi
-    done
-}
-
 if [ "$PATCHES_OK" -eq 1 ]; then
-  for sub in "${SUBMODULES[@]}"; do
-    # Forward order (apply order) and reverse order (undo order) arrays.
-    fwd=()
-    while IFS= read -r line; do fwd+=("$line"); done < <(patches_for_sub "$sub")
-    rev=()
-    idx=$(( ${#fwd[@]} - 1 ))
-    while [ "$idx" -ge 0 ]; do rev+=("${fwd[$idx]}"); idx=$((idx - 1)); done
-
-    # 1. Clean tree? A real sequential forward apply lands the whole stack.
-    #    Atomic: if it can't fully apply it changes nothing, and we fall through.
-    if git -C "${ROOT}/${sub}" apply "${fwd[@]}" >/dev/null 2>&1; then
-        echo "applied:         ${sub} (${#fwd[@]} patches, clean tree)"
-        APPLIED_NOW=$((APPLIED_NOW + ${#fwd[@]}))
-    # 2. Already fully applied? A real sequential reverse apply reverts it; if
-    #    that succeeds we immediately re-apply forward to restore the tree,
-    #    proving a clean forward<->reverse roundtrip without leaving it reverted.
-    elif git -C "${ROOT}/${sub}" apply --reverse "${rev[@]}" >/dev/null 2>&1; then
-        git -C "${ROOT}/${sub}" apply "${fwd[@]}"
-        echo "already applied: ${sub} (${#fwd[@]} patches, full-stack roundtrip)"
-        ALREADY=$((ALREADY + ${#fwd[@]}))
-    elif [ "$SKIP_PATCH_GATE" = "1" ]; then
-        echo "WARN: ${sub} stack neither applies nor reverses as a whole." >&2
-        echo "      SKIP_PATCH_GATE=1 set — force-applying still-applicable patches." >&2
-        for p in "${fwd[@]}"; do
-            if git -C "${ROOT}/${sub}" apply --check "$p" >/dev/null 2>&1; then
-                git -C "${ROOT}/${sub}" apply "$p"
-                echo "applied (forced): ${sub} <- $(basename "$p")"
-                APPLIED_NOW=$((APPLIED_NOW + 1))
-            else
-                echo "skipped (already/blocked): ${sub} <- $(basename "$p")" >&2
-            fi
-        done
+    PG_OUT="$(mktemp -t gdx-patch-gate)"
+    if bash "${ROOT}/tools/patch-gate.sh" "${ROOT}" "${PATCH_DIR}" "${PATCH_LIST[@]}" \
+            | tee "${PG_OUT}"; then
+        ALREADY="$(sed -n 's/^PATCHGATE: already=\([0-9]*\) applied=\([0-9]*\)$/\1/p' "${PG_OUT}" | tail -1)"
+        APPLIED_NOW="$(sed -n 's/^PATCHGATE: already=\([0-9]*\) applied=\([0-9]*\)$/\2/p' "${PG_OUT}" | tail -1)"
     else
-        echo "FAIL: ${sub} patch stack neither applies nor reverses cleanly." >&2
-        echo "      The submodule working tree has drifted (partial application or" >&2
-        echo "      conflicting local edits). Inspect with:" >&2
-        echo "        git -C ${sub} diff" >&2
-        echo "        git -C ${sub} apply --check ${PATCH_DIR#${ROOT}/}/<patch>" >&2
-        echo "      Or re-run with SKIP_PATCH_GATE=1 to force past a known-dirty tree." >&2
         PATCHES_OK=0
     fi
-  done
+    rm -f "${PG_OUT}"
 fi
 
 if [ "$PATCHES_OK" -ne 1 ]; then
@@ -413,10 +357,49 @@ fi
 #     GdxMemoOwnedHere(), which latches the first thread to reach a memo and sends any other
 #     thread down the uncached path the memo memoises. Measured: with the latch, the memo masks
 #     under `[native] interp=1 interp_verify=1` drop from 3 (both threads) to 1.
-rr_owned=$(grep -c 'GdxMemoOwnedHere()' "${BRIDGE_SRC}" || true)
-# 1 definition (3DS) + 1 desktop stub + 6 call sites.
-if [ "${rr_owned}" -lt 8 ]; then
-    rr_fail="${rr_fail} the [brfast] memo owner latch is gone from some call site (GdxMemoOwnedHere x${rr_owned}, expected >= 8);"
+# [memotear] ...and the latch is checked PER SITE, by the enum the census names it with, rather
+#     than by a total count. A count could be satisfied by six calls at five sites, which is
+#     exactly how a latch gets dropped one call site at a time. GdxMemoOwnedFor() is the
+#     site-aware wrapper; it also notes the FOREIGN reach, which is the instrument that says
+#     whether any thread but the owner ever asked (memotear-progress.md S1d).
+for rr_site in GDX_RACE_RESOLVE_MEMO GDX_RACE_STUB_MEMO GDX_RACE_CLASS_MEMO GDX_RACE_N64RANGE_MEMO \
+               GDX_RACE_PLACEHOLDER_MEMO GDX_RACE_TEXCOPY; do
+    if ! grep -qE "GdxMemoOwnedFor\(${rr_site}\)" "${BRIDGE_SRC}"; then
+        rr_fail="${rr_fail} the [brfast] memo owner latch is gone from the ${rr_site} site;"
+    fi
+done
+if ! grep -qE 'static inline bool GdxMemoOwnedFor\(GdxRaceSite site\)' "${BRIDGE_SRC}" ||
+   ! grep -qE 'GdxRaceNoteForeign\(site\)' "${BRIDGE_SRC}"; then
+    rr_fail="${rr_fail} GdxMemoOwnedFor/the foreign-reach note is gone;"
+fi
+#  5. [memotear, NEXT.md B37] PAYLOAD BEFORE KEY. Every one of the five memos with a
+#     publication word fills RETIRE -> payload+keys -> PUBLISH, with the publication word
+#     (`filled` / `valid` / `count`) written LAST and only ever through GdxMemoPublish, and every
+#     probe reads that word first and takes GdxMemoAcquire() before any key or payload field.
+#     The old order stored the KEY first, so a reader matching a newly stored key could read the
+#     PREVIOUS entry's payload -- for gRangeClassMemo that payload is a stride/endianness
+#     decision, not a pointer, which is the one site where "silent, no crash" does not hold
+#     (memotear-progress.md S2). Like the four above this is a fence on the SHAPE of the code:
+#     Azahar time-slices both emulated cores onto one host thread, so no lane can reproduce it.
+rr_retire=$(grep -c 'GdxMemoRetire(' "${BRIDGE_SRC}" || true)
+rr_publish=$(grep -c 'GdxMemoPublish<' "${BRIDGE_SRC}" || true)
+rr_acquire=$(grep -c 'GdxMemoAcquire();' "${BRIDGE_SRC}" || true)
+# 5 fills, 5 probes; the helpers' own definitions do not match these patterns.
+if [ "${rr_retire}" -lt 5 ] || [ "${rr_publish}" -lt 5 ]; then
+    rr_fail="${rr_fail} a [brfast] memo fill no longer publishes payload-before-key (GdxMemoRetire x${rr_retire}, GdxMemoPublish x${rr_publish}, expected >= 5 each);"
+fi
+if [ "${rr_acquire}" -lt 5 ]; then
+    rr_fail="${rr_fail} a [brfast] memo probe no longer takes GdxMemoAcquire() after reading the publication word (x${rr_acquire}, expected >= 5);"
+fi
+# The publication words may be READ freely but may only be WRITTEN through the two helpers, so a
+# reintroduced `e.filled = 1;` beside the keys fails the build rather than quietly restoring the
+# old order. `[^=]` keeps the probes' `== ` comparisons out.
+if grep -qE '(e\.filled|memo->valid|memo->count)[[:space:]]*=[^=]' "${BRIDGE_SRC}"; then
+    rr_fail="${rr_fail} a [brfast] memo publication word is stored directly instead of through GdxMemoRetire/GdxMemoPublish (key-before-payload is back);"
+fi
+if ! grep -qE '^static inline int GdxMemoOrder\(\)' "${BRIDGE_SRC}" ||
+   ! grep -qE '^extern "C" int gdx_bridge_memoorder\(void\)' "${BRIDGE_SRC}"; then
+    rr_fail="${rr_fail} the [native] memoorder lever or its receipt accessor is gone;"
 fi
 for rr_tbl in gHostRanges gRawN64Ranges gLoadedAssetSegments; do
     if ! grep -qE "^[[:space:]]*${rr_tbl}\.reserve\(" "${BRIDGE_SRC}"; then
@@ -426,7 +409,7 @@ done
 if [ -n "${rr_fail}" ]; then
     record "bridge cross-thread invariants" FAIL "${rr_fail# }"
 else
-    record "bridge cross-thread invariants" PASS "atomic version+epoch+rgba16-generation via bump helpers, render-thread segment publish deferred, 3 walk-scanned tables reserved, 6 brfast memos owner-latched"
+    record "bridge cross-thread invariants" PASS "atomic version+epoch+rgba16-generation via bump helpers, render-thread segment publish deferred, 3 walk-scanned tables reserved, 6 brfast memos owner-latched (per site) + 5 publishing payload-before-key"
 fi
 
 # ------------------------------------------------------- schedule invariants --
@@ -585,6 +568,20 @@ else
     record "test: gdx3ds_dynlod_host_tests" FAIL "compile failed"
 fi
 
+# gdx3ds_heapcfg_host_tests — libctru's heap-split formula (port/3ds/include/gdx3ds_heapcfg.h),
+# checked against the three [mem-budget] grants the guest actually printed. The formula was
+# transcribed by hand from a disassembly of the libctru archive this port links, and the whole
+# Old 3DS budget — including "the shipped build is ~19 MB short on memtype 0" — rests on that
+# transcription, so it gets a test rather than a citation. Header-only: no TU to compile in.
+if cc -O1 -Wall -Wextra \
+      "${ROOT}/port/3ds/test/gdx3ds_heapcfg_host_tests.c" \
+      -I"${ROOT}/port/3ds/include" \
+      -o "${HOST_TEST_DIR}/heapcfg_host_tests"; then
+    run_host_test "gdx3ds_heapcfg_host_tests" "${HOST_TEST_DIR}/heapcfg_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_heapcfg_host_tests" FAIL "compile failed"
+fi
+
 # gdx3ds_fs_host_smoke — stream D's SD/O2R/zipshim smoke test; needs a scratch
 # CWD because "sdmc:" is an ordinary directory to the host
 # (mirrors port/3ds/assets/CMakeLists.txt:45).
@@ -603,6 +600,126 @@ if cc -O1 \
     run_host_test "gdx3ds_fs_host_smoke" "${HOST_TEST_DIR}/fs_host_smoke" "${HOST_TEST_DIR}/smoke-cwd"
 else
     record "test: gdx3ds_fs_host_smoke" FAIL "compile failed"
+fi
+
+# gdx_disk_stream_host_tests — B11c, the SD-backed 64DD block reader (port/gdx_disk_stream.cpp)
+# plus B11m, the .dcrc identity-cache sidecar (port/gdx_disk_dcrc.cpp, case 9), which needs no
+# image at all -- only a scratch directory.
+# against a SYNTHETIC disk image. tools/dev/mkdisk64.py builds a structurally correct
+# 64,931,840-byte .ndd -- real zone/LBA geometry out of the decomp's own libleo tables, a
+# parseable system area, an empty formatted MFS volume -- whose payload is deterministic seeded
+# filler and which contains NO GAME CONTENT of any kind. That is the whole point: the reader,
+# the LBA arithmetic, the cache, the eviction path, the CRC pass and every refusal path are
+# gated here with nothing copyrighted in the tree and no dump required.
+#
+# The image is ~62 MB and takes ~10 s to generate, so it is CACHED in the build dir and rebuilt
+# only when it or its manifest is missing. Deleting build-3ds/host-tests/diskimg/ forces it.
+DISKIMG_DIR="${HOST_TEST_DIR}/diskimg"
+DISKIMG="${DISKIMG_DIR}/synth.ndd"
+DISKMAN="${DISKIMG}.manifest.json"
+DISKTRUNC="${DISKIMG_DIR}/synth-trunc.ndd"
+mkdir -p "${DISKIMG_DIR}"
+DISKIMG_OK=1
+if [ ! -f "${DISKIMG}" ] || [ ! -f "${DISKMAN}" ] || [ ! -f "${DISKTRUNC}" ] || \
+   [ "${ROOT}/tools/dev/mkdisk64.py" -nt "${DISKMAN}" ]; then
+    if python3 "${ROOT}/tools/dev/mkdisk64.py" build "${DISKIMG}" --seed 20260924 \
+            > "${HOST_TEST_DIR}/mkdisk64.log" 2>&1 &&
+       python3 "${ROOT}/tools/dev/mkdisk64.py" truncate "${DISKIMG}" "${DISKTRUNC}" --bytes 0x100000 \
+            >> "${HOST_TEST_DIR}/mkdisk64.log" 2>&1; then
+        :
+    else
+        DISKIMG_OK=0
+        echo "FAIL: mkdisk64.py — last lines:" >&2
+        tail -8 "${HOST_TEST_DIR}/mkdisk64.log" >&2
+        record "test: gdx_disk_stream_host_tests" FAIL "synthetic image generation failed"
+    fi
+fi
+if [ "${DISKIMG_OK}" -eq 1 ]; then
+    if c++ -O1 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+          "${ROOT}/port/tests/gdx_disk_stream_tests.cpp" \
+          "${ROOT}/port/gdx_disk_stream.cpp" \
+          "${ROOT}/port/gdx_block_cache.cpp" \
+          "${ROOT}/port/gdx_disk_dcrc.cpp" \
+          -o "${HOST_TEST_DIR}/disk_stream_tests"; then
+        DS_LOG="${HOST_TEST_DIR}/gdx_disk_stream_host_tests.log"
+        # argv[5] is the scratch root case 9 builds its throwaway sidecar tree under; it never
+        # touches the source tree or any SD card.
+        if "${HOST_TEST_DIR}/disk_stream_tests" "${DISKIMG}" "${DISKMAN}" "${DISKTRUNC}" \
+                "${ROOT}/port/gen/EkAssetBindings.c" "${HOST_TEST_DIR}" > "${DS_LOG}" 2>&1; then
+            echo "PASS: gdx_disk_stream_host_tests  ($(tail -1 "${DS_LOG}"))"
+            record "test: gdx_disk_stream_host_tests" PASS "$(tail -1 "${DS_LOG}")"
+        else
+            echo "FAIL: gdx_disk_stream_host_tests — last lines:" >&2
+            tail -20 "${DS_LOG}" >&2
+            record "test: gdx_disk_stream_host_tests" FAIL "see ${DS_LOG#${ROOT}/}"
+        fi
+    else
+        record "test: gdx_disk_stream_host_tests" FAIL "compile failed"
+    fi
+fi
+
+# mame2ndd_host_tests — B11i, the MAME/Ares <-> .ndd converter (tools/dev/mame2ndd.py).
+#
+# Two halves of this conversion were already in the tree (leo64dd_python reads the MAME
+# physical layout; mkdisk64.py implements the .ndd geometry from leo_tbl.c) and nobody had
+# joined them as a committed, tested tool -- so every conversion this project ran was an
+# ad-hoc scratch script and ekcart §8 had to file the resulting image's CRC-64 as
+# unexplained. The gate is in two parts, and NEITHER needs game content:
+#
+#   selftest   geometry only, no files. Cross-checks the two INDEPENDENT in-tree
+#              transcriptions of the block-size walk for every LBA of every disk type,
+#              re-runs mkdisk64's four self-validations, and proves the MAME placement is
+#              in range, injective and complete -- including on a disk with a defective
+#              track, which shifts the physical mapping while the .ndd layout must not move.
+#   roundtrip  .ndd -> MAME -> .ndd over the SYNTHETIC image generated above, asserted
+#              byte-identical. That is the strong direction: it says the physical walk
+#              addresses every LBA exactly once, at the right size, with nothing dropped,
+#              duplicated or shifted. (The other direction cannot be the identity -- 8.064%
+#              of a MAME image is spare surface no LBA maps to; `coverage` measures it.)
+if [ "${DISKIMG_OK}" -eq 1 ]; then
+    M2N_LOG="${HOST_TEST_DIR}/mame2ndd_host_tests.log"
+    if python3 "${ROOT}/tools/dev/mame2ndd.py" selftest > "${M2N_LOG}" 2>&1 &&
+       python3 "${ROOT}/tools/dev/mame2ndd.py" roundtrip "${DISKIMG}" >> "${M2N_LOG}" 2>&1 &&
+       grep -q "^mame2ndd: roundtrip .ndd -> MAME -> .ndd  IDENTICAL$" "${M2N_LOG}"; then
+        M2N_SUM="$(grep -h "checks," "${M2N_LOG}" | tr '\n' ' ')"
+        echo "PASS: mame2ndd_host_tests  (${M2N_SUM})"
+        record "test: mame2ndd_host_tests" PASS "${M2N_SUM}"
+    else
+        echo "FAIL: mame2ndd_host_tests — last lines:" >&2
+        tail -20 "${M2N_LOG}" >&2
+        record "test: mame2ndd_host_tests" FAIL "see ${M2N_LOG#${ROOT}/}"
+    fi
+else
+    record "test: mame2ndd_host_tests" FAIL "synthetic image generation failed"
+fi
+
+# gdx_o2r_stream_host_tests — C4d, the byte source under the audio_table diet
+# (port/gdx_o2r_stream.cpp + the shared port/gdx_block_cache.cpp that diskstream's own 526
+# checks above also gate). Every archive it reads is written by the test itself, byte by byte:
+# no .o2r, no ROM, no dump.
+#
+# What it is here to catch is not a crash. `audio_blob/audio_table` is 10.25 MB of VADPCM
+# waveform reached only through AudioLoad_DmaSampleData, so a window placed a few bytes off
+# changes not one pixel and no frame hash anywhere can see it -- covfinish declined to add an
+# audio census family for exactly that reason. Case 6 puts 11 bytes of extra field in the LOCAL
+# zip header and none in the central one, so a locator that computes the data offset from the
+# central directory fails the gate instead of shipping shifted audio.
+if c++ -O1 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+      "${ROOT}/port/tests/gdx_o2r_stream_tests.cpp" \
+      "${ROOT}/port/gdx_o2r_stream.cpp" \
+      "${ROOT}/port/gdx_block_cache.cpp" \
+      -o "${HOST_TEST_DIR}/o2r_stream_tests"; then
+    O2R_LOG="${HOST_TEST_DIR}/gdx_o2r_stream_host_tests.log"
+    if "${HOST_TEST_DIR}/o2r_stream_tests" "${HOST_TEST_DIR}" > "${O2R_LOG}" 2>&1; then
+        echo "PASS: gdx_o2r_stream_host_tests  ($(tail -1 "${O2R_LOG}"))"
+        record "test: gdx_o2r_stream_host_tests" PASS "$(tail -1 "${O2R_LOG}")"
+    else
+        echo "FAIL: gdx_o2r_stream_host_tests — last lines:" >&2
+        tail -20 "${O2R_LOG}" >&2
+        record "test: gdx_o2r_stream_host_tests" FAIL "see ${O2R_LOG#${ROOT}/}"
+    fi
+else
+    record "test: gdx_o2r_stream_host_tests" FAIL "compile failed"
 fi
 
 # gdx_machines_harness — native machine-mesh differential tests (tools/native/

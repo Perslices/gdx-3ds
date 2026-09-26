@@ -279,6 +279,13 @@ _QUIT_TICK_RE = re.compile(r"\[fh\] init\b[^\n]*\bquit_at_tick=(\d+)")
 _FH_TAG_RE = re.compile(r"\[fh\][^\n]*\btag=(\S+)")
 _AUTOTEST_RE = re.compile(r"\[autotest\] SHOT captured -> autotest/([^_\s.]+)")
 AUTO_TAG = "auto"
+# The SCHEDULE tag, logged by the replay layer before the dump is requested
+# (gdx_input_rec.c). It survives [debug] shots=0, which the two capture receipts
+# above do not: that lever returns from gdx_request_frame_dump before either is
+# emitted (port/n64_gfx_bridge.cpp:9913). See SHOTS_OFF_RECEIPT.
+_REC_SHOT_RE = re.compile(r"\[rec\] SHOT '([^']+)' at tick \d+")
+# The guest's own one-shot receipt that the BMP writes are off for this run.
+SHOTS_OFF_RECEIPT = "[debug] shots=0"
 
 
 def quit_at_tick(log_text):
@@ -363,6 +370,20 @@ def shots_seen(log_text):
     return seen
 
 
+def shots_disabled(log_text):
+    """True iff the guest logged that [debug] shots=0 skipped every BMP write."""
+    return SHOTS_OFF_RECEIPT in log_text
+
+
+def shots_reached(log_text):
+    """SHOT labels the replay REACHED, from the schedule tag rather than a capture.
+
+    This is the honest completion evidence under [debug] shots=0: the lever keeps the
+    replay's structure and its tags and skips only the write, so the schedule can still
+    be asserted in full while the capture cannot."""
+    return {m.group(1) for m in _REC_SHOT_RE.finditer(log_text)}
+
+
 def completion(block, log_text, max_frame=None, emu_alive_at_end=None):
     """Did the staged replay run to completion? -> dict for the manifest + result line.
 
@@ -391,7 +412,14 @@ def completion(block, log_text, max_frame=None, emu_alive_at_end=None):
     if cut is not None and schedule:
         expected = [l for t, l in schedule if t <= cut]
 
-    seen = shots_seen(log_text)
+    # [debug] shots=0 (default 1) skips the BMP write on the main thread, which is what
+    # makes a timing run uncontaminated -- 12 of 12 sub-40fps beats in the B38 hardware run
+    # were immediately preceded by a dump. It also silences BOTH capture receipts, so
+    # scoring such a run on captures marks every one of them FAIL with shots=0/N while the
+    # replay in fact ran to its last tick. Fall back to the schedule tag the lever
+    # deliberately preserves: the schedule is still asserted in full, only the capture is not.
+    shots_off = shots_disabled(log_text)
+    seen = shots_reached(log_text) if shots_off else shots_seen(log_text)
     got = [l for l in expected if l in seen]
     missing = [l for l in expected if l not in seen]
     quit_receipt = QUIT_RECEIPT in log_text
@@ -399,6 +427,7 @@ def completion(block, log_text, max_frame=None, emu_alive_at_end=None):
 
     info.update({"shots_expected": len(expected), "shots_seen": len(got),
                  "missing_shots": missing, "end_receipt": ended,
+                 "shots_disabled": shots_off,
                  "last_tick": block.get("last_tick")})
 
     problems = []
@@ -416,8 +445,9 @@ def completion(block, log_text, max_frame=None, emu_alive_at_end=None):
         elif want is not None and max_frame is None:
             problems.append("no frame counter, cannot prove tick %d was reached" % want)
     if missing:
-        problems.append("%d of %d SHOT(s) never captured: %s"
-                        % (len(missing), len(expected), ", ".join(missing[:6])))
+        problems.append("%d of %d SHOT(s) never %s: %s"
+                        % (len(missing), len(expected),
+                           "reached" if shots_off else "captured", ", ".join(missing[:6])))
     if emu_alive_at_end is False and not (quit_receipt or ended):
         problems.append("the emulator exited before the run was over and did not quit "
                         "via replay_quit — the core died")

@@ -30,7 +30,19 @@ git -C decomp apply ../port/3ds/patches/decomp-native-machines-rebuilt.patch
 git -C decomp apply ../port/3ds/patches/decomp-port-title-demo-audio-pin.patch
 git -C decomp apply ../port/3ds/patches/decomp-native-fx-shim.patch
 git -C decomp apply ../port/3ds/patches/decomp-3ds-mainprof-checkpoints.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-ilp32.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-heap-ilp32.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-deadlock.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-rdram-size-knob.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-residency-seam.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-async-guards.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-ek-diskcourse-decline.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-load-census.patch
 ```
+
+(The six entries above `decomp-3ds-ek-diskcourse-decline.patch` were missing from this list
+while `tools/ci-3ds.sh`'s `PATCH_LIST` already carried them; `PATCH_LIST` is the source of
+truth and this block is now back in sync with it.)
 
 `tools/ci-3ds.sh` applies exactly this list, idempotently, and FAILS if a `*.patch` turns up
 in this directory that its `PATCH_LIST` does not know about.
@@ -453,3 +465,232 @@ changes. Total EK BSS: 21.59 MB → 15.45 MB.
 
 **Affects only `GDX_EXPANSION_KIT=ON`.** `audio/disk/` is excluded from the shipped (EK=OFF)
 source list, so the patch changes no byte of the default build.
+
+## decomp-3ds-disk-audio-deadlock.patch (B11 — the EK boot deadlock)
+
+Two changes in the Expansion Kit's disk audio library, both port-only (`#ifdef PORT`) and both
+in files `GdxGameSources.cmake` excludes from the shipped (EK=OFF) source list, so **no byte of
+the default build changes**. Full measurement: `docs/research/native/ekdeadlock-progress.md`.
+
+**1. `src/audio/disk/lib/load.c` — `AudioLoad_Dma` must complete the request it declines.**
+Two early returns (`gAudioCtx.resetTimer > 16`, and `default:` for any medium that is not
+`MEDIUM_CART` or `MEDIUM_DISK_DRIVE`) issue no transfer and post nothing to `reqQueue`. Every
+caller then blocks in `osRecvMesg(reqQueue, ..., OS_MESG_BLOCK)` on a queue nobody will post to.
+On console that is unreachable — the ROM library's media are all `MEDIUM_CART` — but the EK
+tables are `MEDIUM_LBA` throughout, and the measured EK boot parks the **dedicated audio
+producer thread** on `gAudioCtx.syncDmaQueue`. Because that thread holds `sAudioCtxMutex` across
+its whole tick, the game fiber then blocks forever in `AudioThread_QueueCmd` on a *host* mutex
+the cooperative scheduler cannot see, and the entire game freezes in the boot-logo window. The
+patch posts the completion, zeroes the destination (deterministic silence rather than heap
+garbage read back as a sequence script — the same thing the 3DS `osEPiStartDma` shim does on a
+failed segment read) and emits a capped receipt, because a no-op DMA completion is a missing
+asset and must not be silent. This is the policy `port/n64_leo.c:79` already states for the
+layer below.
+
+**2. `src/audio/disk/lib/seqplayer.c` — a NULL channel must not be "valid".**
+`IS_SEQUENCE_CHANNEL_VALID(ptr)` only excludes `&gAudioCtx.sequenceChannelNone`, so a NULL
+channel passes it and `AudioSeq_SequenceChannelDisable` writes through address 0. Measured on
+the EK boot as 122 unmapped accesses at `channel->finished`/`enabled`, `layers[0..3]`
+(0x50..0x5C) and the four `notePool` list heads (0x88..0xB8). Azahar logs those and carries on;
+console hardware data-aborts. `AudioSeq_SequencePlayerDisableChannels` now skips NULL with a
+capped receipt.
+
+## decomp-3ds-rdram-size-knob.patch (C4g — the RDRAM arena size stops being three constants)
+
+`port/n64_rdram.h`'s `GDX_RDRAM_SIZE` is now `-DGDX_3DS_RDRAM_MB=N` (default 16, the shipped
+value). Two decomp TUs carried the same 16 MB as their own literal and would not have followed
+it:
+
+- `src/sys/dma.c` defined `GDX_DMA_RDRAM_SIZE ((size_t)0x1000000u)` with a comment saying it
+  "must match GDX_RDRAM_SIZE in n64_rdram.h" — a convention, enforced by nothing.
+- `src/game/object.c`'s `GDX_RecordAssetWrite` wrote the literal inline with
+  `/* GDX_RDRAM_SIZE */` beside it.
+
+Both are **upper-bound range tests on a destination pointer** (`dst < gdx_rdram + SIZE`), so a
+stale 16 MB against a smaller arena admits pointers past the end of the buffer and records DMA
+over bytes the process does not own. Both now read `GDX_RDRAM_SIZE_BYTES`, which
+`port/3ds/CMakeLists.txt` puts on the command line for every TU, with an `#ifndef` fallback to
+`0x1000000u` so a host build that never defines it compiles exactly what it compiled before.
+
+No behaviour change at the default size: the macro expands to the same constant.
+
+## decomp-3ds-disk-residency-seam.patch (B11d — the last two `gdx_disk_buffer` indexers)
+
+Two one-line-shaped changes in the Expansion Kit's 64DD path, both inside existing `#ifdef PORT`
+blocks and both in files `GdxGameSources.cmake` excludes from the shipped (EK=OFF) source list,
+so **no byte of the default build changes**. Full measurement:
+`docs/research/native/ekdrive-progress.md`.
+
+They are rows 4 and 5 of `diskstream`'s residency census. Every other row was a port file; these
+two are the reason `[debug] disk_stream=2` was an explicit refusal rather than a mode. Both go
+through the same new seam in `port/disk_buffer.cpp`:
+
+```c
+int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst); /* resident, else stream */
+int gdx_disk_image_available(void);                                           /* either source live */
+```
+
+**1. `src/sys/disk/disk_drive_dd.c` — `DiskDrive_LoadData`'s DD-course record read.**
+`bcopy(gdx_disk_buffer + phys, vram, diskSize)` becomes `gdx_disk_image_read(phys, diskSize, vram)`.
+The bounds check moves inside the seam, which also **leaves `vram` untouched on refusal**, so the
+existing zero-fill arm still owns the "nothing readable at this handle" case instead of the read
+half-writing one.
+
+**2. `src/sys/disk/disk_mount_dd.c` — the MFS byte-order pass's mount test.**
+`gdx_disk_buffer == NULL` becomes `!gdx_disk_image_available()`. In `disk_stream=2` the pointer is
+null while a disk **is** mounted, so the old test would have skipped the pass, left `gMfsRamArea`
+big-endian, and `Mfs_GetDirectoryIndex` would never have matched `MFS_FILE_ATTR_DIRECTORY` — the
+editors' file picker comes up empty and `Mfs_SaveFile` bails with `N64DD_NOT_FOUND`, both
+silently. That is the exact failure the pass was written to prevent, so the test had to follow it.
+
+## decomp-3ds-disk-audio-async-guards.patch (B11d — two guards in `AudioLoad_AsyncLoadInner`)
+
+`src/audio/disk/lib/load.c`, inside `#ifdef PORT`, in an EK-only source file
+`GdxGameSources.cmake` excludes from the shipped (EK=OFF) list — **no byte of the default build
+changes**. Applies after `decomp-3ds-disk-audio-deadlock.patch`, which touches the same file.
+
+`ekdeadlock` fixed `AudioLoad_SyncLoadInner`: its `switch (cachePolicy)` has no `default:` arm,
+so a table entry whose `cachePolicy` is outside 0..4 leaves `ramAddr` **uninitialised** and the
+load runs against a stack value. **`AudioLoad_AsyncLoadInner` has the identical switch and was
+not fixed.** With no disk mounted the EK audio tables are garbage — ekdeadlock measured
+`cachePolicy=13`, `medium=0x5F` on exactly this boot — and `cachePolicy` is a *signed* `s8`, so
+a negative value also indexes the compiler's jump table out of range.
+
+Measured, not inferred: a no-disk EK boot crashed at guest frame ~69 with
+`ExceptionRaised(UndefinedInstruction, pc=0x0010B480)`, which `addr2line` resolves to
+`AudioLoad_AsyncLoadInner` — the switch dispatch. It varies **by binary**, not by run, which is
+what a garbage table read plus an uninitialised stack slot looks like: one build of this branch
+booted the no-disk path cleanly every time and the next two died every time.
+
+**THE GUARD MUST PRECEDE THE SWITCH**, and that is a measurement too. Written after the switch
+first — which is where `ekdeadlock` put the sync twin's — the crash simply moved from
+`0x0010B480` to `0x0010B4B8` and stayed: the fault is in the jump-table dispatch, which a guard
+placed after the switch never reaches. `ekdeadlock`'s `AudioLoad_SyncLoadInner` guard has the
+same shape and therefore the same latent exposure; nobody has seen it fire, and it is
+deliberately left alone here rather than edited in passing.
+
+The patch refuses the load with a capped receipt, the way every allocation failure inside the
+switch already does, and **posts nothing**: an async load that was never started must not report
+a completion its caller would read as data (`port/n64_leo.c:79`'s policy).
+
+**Guard 2 — a NULL load table, and this is the one the crash was actually about.** Moving guard 1
+before the switch did not stop it: the PC moved again, and the disassembly settles it —
+
+```
+10b4d8:  lsl  r6, r6, #4        @ r6 = realId * 16
+10b4dc:  ldr  r3, [r6, #20]     @ table->entries[realId].size, with NO base register
+10b4e0:  udf  #0                @ GCC's trap for a block it proved undefined
+```
+
+`AudioLoad_GetLoadTable` **returns NULL** for any `tableType` outside its three cases — its own
+`default:` arm, `load.c:896` — and every caller here dereferences the result unchecked. GCC takes
+that at its word: on the null path it constant-folds the base away and terminates the block with
+a literal `udf #0`. So the no-disk EK boot is **not** hanging and **not** taking a NULL data
+abort; it is executing the compiler's trap for a path the source told it was impossible. The
+patch honours the contract the callee already states.
+
+Measured working: with the guard in, the same no-disk boot logs
+`[audio-disk] AsyncLoad REFUSED null load table type/id/realId a=00000087 b=00000089 c=00000089`
+— `tableType = 0x87`, nowhere near `SEQUENCE_TABLE`/`FONT_TABLE`/`SAMPLE_TABLE` — and the run's
+`ExceptionRaised` count goes from **1020 to 0**. Where a `tableType` of 0x87 comes from is NOT
+answered here and is worth someone's time: it is a caller argument, not a value read off the
+disk, so something upstream is passing garbage.
+
+`AudioLoad_SyncLoadInner` dereferences the same possibly-null table and has the same shape of
+guard after rather than before its switch. Both are **filed, not fixed** — editing ekdeadlock's
+patch in passing is not this track's call.
+
+
+## decomp-3ds-ek-diskcourse-decline.patch (B11j — the RECORDS cup-row hard freeze)
+
+**The bug, on real hardware.** In the EK build with no 64DD disk image, selecting a cup on the
+RECORDS cup row froze the console outright: no fault, no Luma dump, the last frame held.
+`gLeoDriveConnectionState == 0` correctly bounces the cursor off the two SELECT MODE editor
+slots (`main_menu.c:203`), and the cup row had no equivalent guard.
+
+**Which cups, measured rather than assumed.** `src/game/course_gadgets.c`'s
+`courseIndex >= COURSE_EDIT_1` arm covers courses **24..47** — the EDIT cup
+(`COURSE_EDIT_1..6` = 24..29) **and both DD cups** (30..41, starting at `COURSE_SILENCE_3`).
+Only `COURSE_X_1` (48) and above take the branches above it. So cup options **10, 11 and 12
+are all disk-backed**; an earlier draft of this patch guarded option 10 only, on the assumption
+that the DD cups were cart-ROM backed through `gRomSegmentPairs[5]`, and an emulator run
+falsified it by firing the decline at `courseIndex 30`.
+
+**Where it hangs.** Landing the cursor on the bottom cup row arms `CourseModel_Init`, whose
+async preview loader calls `func_80702448(cup * 6)`; selecting it reaches `Course_Load`. Both
+take that arm, where:
+
+1. `DiskDrive_LoadData(SEGMENT_DISK_START(silence_3) + diskCourseIndex, ...)` runs with no
+   image. `src/sys/disk/disk_drive_dd.c`'s PORT arm **zero-fills** `vram` when the handle is
+   unmapped or the seam refuses — by design, the documented "nothing readable here" case.
+2. The validation immediately below then fails (`creatorId != CREATOR_NINTENDO`), and the
+   decomp does what the retail drive did: paint error 9 and **halt** —
+   `func_8070F8A4(-1, 9); while (true) {}`.
+
+On a 64DD that halt is recoverable: the drive shows the error and the user swaps the disk. On
+a 3DS it parks the main game fiber forever with no fault, which is exactly the freeze reported
+— and exactly the class `port/n64_leo.c:79` already names: *"an error return that never posts
+parks that thread forever."*
+
+**Measured, one binary each, same replay and lever set**
+(`tools/dev/replays/ek-editcup.gdxrec`, `[debug] disk_stream=0`, no image):
+
+| build | result |
+|---|---|
+| before (`3cb24c89e61f7350`) | `RESULT TIMEOUT frame=3453 complete=False shots=3/7`, and **466 consecutive `[watchdog]` beats reading `frame=3453(+0) fiber=5`** while `aud=` keeps climbing — a spinning game fiber, not a parked one |
+| after (`8ed8427899fa08fd`) | `RESULT PASS frame=3991 fatals=0 complete=True shots=7/7`, with `[b11] [cupsel] no drive: disk cup row bounced from/to/mode a=00000000 b=00000000 c=00008013` |
+
+**What this patch does**, all of it inside `#if defined(EXPANSION_KIT) && defined(PORT)` arms
+so the shipped (EK=OFF) build preprocesses identically — a measurement, not an argument: see
+`docs/research/native/nddconv-progress.md` §4.
+
+- `src/overlays/course_select/course_select.c` — **the decline.** With no drive the cup cursor
+  bounces off the whole bottom row (`gCupSelectOption >= 10`) and returns to where it came
+  from, exactly as `main_menu.c:203` bounces `MODE_COURSE_EDIT`. Applied both in the input arm
+  of `CourseSelect_Update` and in `CourseSelect_Init`, which can otherwise *restore* the cursor
+  onto a disk cup from a `gLastRecordsCourseIndex` saved in a session that had a drive.
+- `src/game/course_gadgets.c` — **the anti-hang, twice over.** The head of both COURSE_EDIT
+  arms (`Course_Load` and `func_80702448`) declines with `gLeoDriveConnectionState == 0`,
+  **before** the destructive read; and all four `while (true) {}` parks become a logged
+  decline, so a mounted image whose course data does not validate also cannot freeze the
+  console. The non-PORT arm keeps the retail halt verbatim.
+
+**The decline is a plain `return` that leaves `COURSE_CONTEXT()->courseData` UNTOUCHED** — the
+same contract `gdx_disk_image_read` and `gdx_disk_stream_read` already state: on refusal the
+destination keeps its old bytes rather than new wrong ones. The caller then builds its preview
+from the previously loaded (valid) course. `Course_GenerateRandomCourse()` was tried here first
+and is **not** safe: it is the X-cup generator, and calling it for a DD-cup preview
+(`courseIndex 30`) killed the guest immediately after the receipt printed. Measured, not
+assumed — that run is `20260926-021935-editcup-fixed4`.
+
+**Every decline reports through `gdx_ek_note`**, the always-on sink. This arm previously
+emitted only `PRINTF` (compiled out) and `gdx_cki` (rides `GDX_GATE_TRACE`, which nothing on
+3DS sets) — `ekdrive` §2's "two silences", which is why the freeze left no tail. Note that
+`func_8070F8A4`'s own `[leo-fault]` lines ride `gdx_cki` too and therefore did not print
+either, in the control run or on the console.
+
+**Deliberate divergence, stated:** with a disk mounted and a genuinely corrupt course, the
+retail build halts and this one declines with a receipt and a zero-filled course. That second
+arm is **not exercised** — it needs a mounted-but-invalid image. A 3DS has no 64DD front panel
+and no way to release a parked fiber.
+
+## decomp-3ds-disk-audio-load-census.patch (`[audioload]`, audioasync track)
+
+Phase attribution for the EXPANSION KIT producer tick, in `src/audio/disk/lib/{load,heap,thread}.c`.
+Nine nested scopes -- `AudioThread_ProcessCmds`, `AudioHeap_Init`, `AudioLoad_ProcessLoads`,
+`AudioLoad_SyncLoadSample`, `AudioLoad_RelocateFontAndPreloadSamples`,
+`AudioLoad_PreloadSamplesForFont`, `AudioLoad_SyncDiskDrive`, `AudioLoad_SyncDma` and the port's
+`gdx_audio_convert_font` -- each bracketed by `gdx_aload_begin()` / `gdx_aload_end()`
+(port/n64_sched.c, contract in port/gdx_audio_load_census.h).
+
+Why: `audioring` settled that the EK producer blocks INSIDE one tick rather than losing the core,
+but not WHICH call spends the time, and the obvious answer is not safe to assume -- audioring's
+emulator runs produced 1.2 s ticks with **zero** `AudioLoad_DiskDrive ENTER` lines, so the cost
+there is not the 64DD read. The scopes NEST, so their totals overlap on purpose: the nesting is
+what localises the cost (`cmds` > `heapinit` > `preload` > `disk`).
+
+Off by default (`[debug] audioload`, and `[debug] audioload_ms` for the per-tick report
+threshold). With it off each scope costs one `int` compare and reads no clock. Raw externs rather
+than an `#include` because `port/3ds/game/CMakeLists.txt` deliberately keeps `port/` off the
+decomp target's include path; the site ids are duplicated in each TU and the canonical list with
+its rationale is `port/gdx_audio_load_census.h`.

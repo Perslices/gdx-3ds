@@ -1,0 +1,135 @@
+--- a/src/audio/disk/lib/load.c
++++ b/src/audio/disk/lib/load.c
+@@ -797,6 +797,26 @@
+                 break;
+         }
+ 
++#ifdef PORT
++        /* B11: the switch above has no default arm, so a table entry whose cachePolicy is
++           outside 0..4 leaves ramAddr UNINITIALISED and the load below runs against a stack
++           value. Measured on the EK boot with no disk: cachePolicy and medium both garbage
++           (medium 0x5F), ramAddr walking through the program image. Fail the load instead,
++           the same way every allocation failure above already does. */
++        if ((u32) cachePolicy > 4u) {
++            extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b,
++                                    unsigned int c, unsigned int d);
++            static s32 sBadPolicyLogs = 0;
++            if (sBadPolicyLogs < 8) {
++                sBadPolicyLogs++;
++                gdx_ek_note("[audio-disk] SyncLoad REFUSED bad cachePolicy table/id/policy/medium",
++                            (unsigned int) tableType, (unsigned int) realId,
++                            (unsigned int) cachePolicy, (unsigned int) medium);
++            }
++            *didAllocate = false;
++            return NULL;
++        }
++#endif
+         *didAllocate = true;
+         if (medium == MEDIUM_LBA) {
+             AudioLoad_SyncDiskDrive(romAddr, ramAddr, size, (s16) table->header.diskLba);
+@@ -1379,11 +1399,64 @@
+     AudioLoad_DiskDrive(startLba, adjustedDevAddr, ramAddr, size);
+ }
+ 
++#ifdef PORT
++/* B11 / docs/research/native/ekdeadlock-progress.md -- THE EK BOOT DEADLOCK.
++ *
++ * AudioLoad_Dma has two early returns that issue no transfer and post NOTHING. Every caller
++ * that reaches them (AudioLoad_SyncDma, AudioLoad_DmaSlowCopy, AudioLoad_AsyncDma...) then
++ * blocks in osRecvMesg(retQueue, ..., OS_MESG_BLOCK) on a queue that nobody will ever post to.
++ *
++ * On console that is unreachable: every medium in the ROM library's tables is MEDIUM_CART, which
++ * the switch handles, and the PI manager always completes. In the EXPANSION KIT build it is not:
++ * audio/disk/audio_tables.c is MEDIUM_LBA for all 23 sequences and every DD sample bank, and the
++ * table alias lookup reads `medium` from entries[id] while size/romAddr come from entries[realId]
++ * (AudioLoad_SyncLoadInner), so a non-CART, non-DISK_DRIVE medium does reach the default arm.
++ *
++ * When it does, the thread that parks is the DEDICATED AUDIO PRODUCER (port/gdx_audio_thread.cpp),
++ * which holds sAudioCtxMutex across its entire tick. The game fiber then blocks forever in
++ * AudioThread_QueueCmd's gdx_audio_ctx_lock() -- a HOST mutex the cooperative scheduler cannot
++ * see -- so __osRunningThread stays on the game fiber, nothing yields, and the whole game
++ * freezes in the boot-logo window. Measured: gAudioCtx.syncDmaQueue, 50M+ spin-yields and
++ * climbing, [tt] byte-identical across hundreds of watchdog beats.
++ *
++ * This is exactly the policy port/n64_leo.c:79 already adopted one layer down ("an error return
++ * that never posts parks that thread forever. Console code never hits these paths, the port
++ * can."): post the completion so the caller unblocks, and say so.
++ *
++ * It deliberately does NOT touch ramAddr. Zero-filling the destination was tried and is WRONG:
++ * when the medium is unrecognised the whole request is untrustworthy, and the measured EK boot
++ * reaches here with medium 0x5F and a ramAddr that walks 0x223C00 upward -- inside the .text /
++ * .rodata image, not the audio heap (AudioLoad_SyncLoadInner leaves ramAddr uninitialised when a
++ * garbage table entry gives a cachePolicy outside 0..4). A "helpful" bzero there scribbles over
++ * the program, which is how the first attempt at this fix turned its own receipt string into
++ * "(null)". Post and report; never write through a pointer the caller derived from data we have
++ * just said we cannot load. */
++static void AudioLoad_PortCompleteNoDma(OSIoMesg* mesg, OSMesgQueue* reqQueue, void* ramAddr,
++                                        size_t size, s32 medium, const char* why) {
++    extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c,
++                            unsigned int d);
++    static s32 sNoDmaLogs = 0;
++
++    if (sNoDmaLogs < 8) {
++        sNoDmaLogs++;
++        gdx_ek_note(why, (unsigned int) medium, (unsigned int) size,
++                    (unsigned int) (uintptr_t) ramAddr, (unsigned int) (uintptr_t) reqQueue);
++    }
++    if (reqQueue != NULL) {
++        osSendMesg(reqQueue, (OSMesg) mesg, OS_MESG_NOBLOCK);
++    }
++}
++#endif
++
+ s32 AudioLoad_Dma(OSIoMesg* mesg, u32 priority, s32 direction, uintptr_t devAddr, void* ramAddr, size_t size,
+                   OSMesgQueue* reqQueue, s32 medium, const char* dmaFuncType) {
+     OSPiHandle* handle;
+ 
+     if (gAudioCtx.resetTimer > 16) {
++#ifdef PORT
++        AudioLoad_PortCompleteNoDma(mesg, reqQueue, ramAddr, size, medium,
++                                    "[audio-disk] no-DMA completion (resetTimer>16) med/size/ram/q");
++#endif
+         return -1;
+     }
+ 
+@@ -1397,6 +1470,10 @@
+             break;
+ 
+         default:
++#ifdef PORT
++            AudioLoad_PortCompleteNoDma(mesg, reqQueue, ramAddr, size, medium,
++                                        "[audio-disk] no-DMA completion (unhandled medium) med/size/ram/q");
++#endif
+             return 0;
+     }
+ 
+--- a/src/audio/disk/lib/seqplayer.c
++++ b/src/audio/disk/lib/seqplayer.c
+@@ -437,6 +437,27 @@
+ 
+     for (i = 0; i < ARRAY_COUNT(seqPlayer->channels); i++) {
+         channel = seqPlayer->channels[i];
++#ifdef PORT
++        /* B11 (docs/research/native/ekdeadlock-progress.md): IS_SEQUENCE_CHANNEL_VALID only
++           excludes &gAudioCtx.sequenceChannelNone, so a NULL channel passes it and
++           AudioSeq_SequenceChannelDisable writes through address 0 -- measured on the EK boot as
++           122 unmapped writes at channel->finished/enabled plus reads at layers[0..3] (0x50..0x5C)
++           and the four notePool list heads (0x88..0xB8). Azahar tolerates those accesses and the
++           game runs on; console hardware data-aborts. A player whose channels were never
++           allocated has nothing to disable. */
++        if (channel == NULL) {
++            extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c,
++                                    unsigned int d);
++            static s32 sNullChanLogs = 0;
++            if (sNullChanLogs < 6) {
++                sNullChanLogs++;
++                gdx_ek_note("[audio-disk] NULL channel in DisableChannels seq/chan/enabled/finished",
++                            (unsigned int) seqPlayer->seqId, (unsigned int) i,
++                            (unsigned int) seqPlayer->enabled, (unsigned int) seqPlayer->finished);
++            }
++            continue;
++        }
++#endif
+         if (IS_SEQUENCE_CHANNEL_VALID(channel) == 1) {
+             AudioSeq_SequenceChannelDisable(channel);
+         }

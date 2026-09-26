@@ -72,6 +72,18 @@ static size_t  gdx_rdram_bump     = 0;
 size_t         gdx_rdram_arena_start = 0;
 static size_t  gdx_rdram_persist_top = 0;
 static size_t  gdx_rdram_staging_base = 0;
+#ifdef GDX_MEMPROBE
+/* Highest bump cursor ever reached. gdx_rdram_mode_reset rewinds gdx_rdram_bump at every mode
+   transition, so the LIVE cursor systematically under-reports what the arena had to hold: the
+   high-water is the number a smaller arena has to survive. */
+static size_t  gdx_rdram_bump_hwm = 0;
+static size_t  gdx_rdram_alloc_fail = 0;
+#define GDX_RDRAM_NOTE_BUMP() do { if (gdx_rdram_bump > gdx_rdram_bump_hwm) { gdx_rdram_bump_hwm = gdx_rdram_bump; } } while (0)
+#define GDX_RDRAM_NOTE_FAIL() do { gdx_rdram_alloc_fail++; } while (0)
+#else
+#define GDX_RDRAM_NOTE_BUMP() do { } while (0)
+#define GDX_RDRAM_NOTE_FAIL() do { } while (0)
+#endif
 GfxPool*       gdx_gfxpool        = NULL;
 
 static size_t Gdx_RomOffset(u32 addr) {
@@ -306,10 +318,13 @@ void gdx_gfxpool_racer_mtx_layout(size_t* outBody, size_t* outSecond, size_t* ou
 void* gdx_rdram_alloc_raw(size_t size, size_t align) {
     size_t base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
     if (base + size > gdx_rdram_persist_top) {
-        gdx_dbg_logf("[rdram] FATAL: arena exhausted\n");
+        GDX_RDRAM_NOTE_FAIL();
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted, want %d align %d bump %d persistTop %d size %d\n",
+                     (int)size, (int)align, (int)gdx_rdram_bump, (int)gdx_rdram_persist_top, (int)GDX_RDRAM_SIZE);
         gdx_host_abort();
     }
     gdx_rdram_bump = base + size;
+    GDX_RDRAM_NOTE_BUMP();
     return gdx_rdram + base;
 }
 
@@ -322,12 +337,16 @@ void* gdx_rdram_alloc_raw(size_t size, size_t align) {
 void* gdx_rdram_persist_alloc_raw(size_t size, size_t align) {
     size_t base;
     if (size > gdx_rdram_persist_top) {
-        gdx_dbg_logf("[rdram] FATAL: arena exhausted (persist)\n");
+        GDX_RDRAM_NOTE_FAIL();
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted (persist), want %d bump %d persistTop %d size %d\n",
+                     (int)size, (int)gdx_rdram_bump, (int)gdx_rdram_persist_top, (int)GDX_RDRAM_SIZE);
         gdx_host_abort();
     }
     base = (gdx_rdram_persist_top - size) & ~(align - 1u);
     if (base < gdx_rdram_bump) {
-        gdx_dbg_logf("[rdram] FATAL: arena exhausted (persist)\n");
+        GDX_RDRAM_NOTE_FAIL();
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted (persist collided), want %d bump %d persistTop %d size %d\n",
+                     (int)size, (int)gdx_rdram_bump, (int)gdx_rdram_persist_top, (int)GDX_RDRAM_SIZE);
         gdx_host_abort();
     }
     gdx_rdram_persist_top = base;
@@ -374,11 +393,73 @@ void* gdx_rdram_peek_raw(size_t size, size_t align) {
 
     base = (gdx_rdram_bump + (align - 1u)) & ~(align - 1u);
     if (base + size > gdx_rdram_persist_top) {
-        gdx_dbg_logf("[rdram] FATAL: arena exhausted (peek)\n");
+        GDX_RDRAM_NOTE_FAIL();
+        gdx_dbg_logf("[rdram] FATAL: arena exhausted (peek), want %d bump %d persistTop %d size %d\n",
+                     (int)size, (int)gdx_rdram_bump, (int)gdx_rdram_persist_top, (int)GDX_RDRAM_SIZE);
         gdx_host_abort();
     }
     return gdx_rdram + base;
 }
+
+#ifdef GDX_MEMPROBE
+/* Highest NON-ZERO byte in [0, limit), +1. The buffer is calloc'd at init, so every non-zero
+   byte is a byte something wrote -- through the allocators or not. Scans backwards a word at a
+   time and stops at the first hit, so the cost is (limit - answer), i.e. the size of the
+   untouched tail, which is exactly the number this probe exists to find. Reports at most a
+   4-byte over-estimate (the word's last byte rather than the non-zero byte inside it), which is
+   deliberate: an occupancy census must never round DOWN.
+
+   Blind spot, stated: a write of 0x00 into virgin space is invisible to it. That is why slot 4
+   (the allocator high-water) is reported beside it -- the pair disagreeing is the signal. */
+static size_t gdx_rdram_scan_nonzero_below(size_t limit) {
+    size_t i;
+    if (gdx_rdram == NULL || limit == 0) {
+        return 0;
+    }
+    if (limit > GDX_RDRAM_SIZE) {
+        limit = GDX_RDRAM_SIZE;
+    }
+    i = limit & ~(size_t)3u;
+    while (i >= 4u) {
+        i -= 4u;
+        if (*(const unsigned int*)(const void*)(gdx_rdram + i) != 0u) {
+            return i + 4u;
+        }
+    }
+    return 0;
+}
+
+/* Defined in n64_gfx_bridge.cpp under the same GDX_MEMPROBE guard; 0 when the bridge was not
+   built with it. Declared here rather than in a header because it exists only for this probe. */
+extern unsigned int gdx_gfx_probe_rdram_phys_hi(void);
+
+void gdx_rdram_probe_stats(size_t* out) {
+    if (out == NULL) {
+        return;
+    }
+    out[0] = GDX_RDRAM_SIZE;
+    out[1] = gdx_rdram_staging_base;
+    out[2] = gdx_rdram_arena_start;
+    out[3] = gdx_rdram_bump;
+    out[4] = gdx_rdram_bump_hwm;
+    out[5] = gdx_rdram_persist_top;
+    out[6] = gdx_rdram_scan_nonzero_below(gdx_rdram_persist_top);
+    out[7] = gdx_rdram_scan_nonzero_below(gdx_rdram_arena_start);
+    out[8] = (size_t)gdx_gfx_probe_rdram_phys_hi();
+    out[9] = gdx_rdram_alloc_fail;
+}
+#else
+void gdx_rdram_probe_stats(size_t* out) {
+    int i;
+    if (out == NULL) {
+        return;
+    }
+    for (i = 0; i < GDX_RDRAM_PROBE_SLOTS; i++) {
+        out[i] = 0;
+    }
+    out[0] = GDX_RDRAM_SIZE;
+}
+#endif /* GDX_MEMPROBE */
 
 /* Console Arena_StartInit resets the arena at every game-mode
    transition; the port shim was a no-op, leaking all mode-scoped allocations.
@@ -990,6 +1071,25 @@ static int gdx_activate_course_edit_segment9(void) {
     }
     if (diagEnabled) {
         gdx_dbg_logf("[seg9diag] activate_course_edit fill precheckFailed=%d fillOk=%d\n", precheckFailed, fillOk);
+    }
+
+    /* B11d: an ALWAYS-ON receipt, because this is the single point the whole track turns on.
+     * Reaching GAMEMODE_COURSE_EDIT at all requires gLeoDriveConnectionState != 0, and
+     * filling segment 9 requires the disk bytes -- which in disk_stream=2 arrive through
+     * gdx_disk_image_read with `diskBuffer` NULL. The [seg9diag] lines above ride
+     * gdx_dev_gate_log_file(), i.e. the GDX_LOG env var, which a 3DS guest has no way to set:
+     * that is ekdeadlock's "every FATAL breadcrumb rode a dev gate nothing on 3DS sets" trap,
+     * and a receipt nobody can read is not a receipt. One line per boot. */
+    {
+        extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c,
+                                unsigned int d);
+        static int sCourseEditFillLogs = 0;
+        if (sCourseEditFillLogs < 2) {
+            sCourseEditFillLogs++;
+            gdx_ek_note("[courseedit] seg9 fill precheckFailed/fillOk/required/diskBuffer",
+                        (unsigned int)precheckFailed, (unsigned int)fillOk,
+                        (unsigned int)required, (unsigned int)(uintptr_t)gdx_disk_buffer);
+        }
     }
 
     if (precheckFailed || !fillOk) {

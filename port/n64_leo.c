@@ -25,6 +25,105 @@ extern unsigned char* gdx_disk_buffer;
 extern unsigned int gdx_disk_size;
 extern int gdx_disk_load(void);
 
+/* B11c -- the SD stream. gdx_disk_stream.h is declarations only (no includes of its own, and
+   only unsigned int / unsigned long long / void* in its signatures), so it is safe inside
+   this decomp-headers-only TU. gdx_disk_stream_mode() is 0 unless `[debug] disk_stream`
+   armed a mount, so with the lever absent every function below keeps exactly the shape and
+   the instruction sequence it had. */
+#include "gdx_disk_stream.h"
+extern int gdx_disk_stream_mode(void);
+extern int gdx_disk_stream_verify_enabled(void);
+extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c,
+                        unsigned int d);
+
+/* VERIFY MODE. Serve the read both ways and compare. This is the single most useful thing a
+   user's real dump can do on its first boot: it proves the block reader byte-for-byte
+   against the memcpy path it replaces, over whatever access pattern the game actually
+   produces, with no test to write and no expected-output file. Logging is capped -- a
+   systematic mismatch would otherwise emit one line per LEO read. */
+static unsigned int sStreamVerifyOk = 0;
+static unsigned int sStreamVerifyBad = 0;
+static int sStreamVerifyLogs = 0;
+
+unsigned int gdx_disk_stream_verify_ok(void) {
+    return sStreamVerifyOk;
+}
+
+unsigned int gdx_disk_stream_verify_bad(void) {
+    return sStreamVerifyBad;
+}
+
+/* Reads `bytes` at file `offset` into `buffer` from whichever source is armed. Returns 1 on
+   success, 0 on refusal -- and ON REFUSAL `buffer` IS NOT WRITTEN. That is the contract
+   gdx_disk_stream_read states, and the reason it is stated out loud: an error return that
+   scribbles over the caller's buffer is precisely how ekdeadlock's first attempt at the
+   AudioLoad_Dma fix overwrote its own receipt string inside the program image. */
+static int gdx_leo_fetch(u32 offset, u32 bytes, void* buffer) {
+    if (gdx_disk_stream_mode() <= 0) {
+        if (gdx_disk_buffer == NULL) {
+            return 0;
+        }
+        bcopy(gdx_disk_buffer + offset, buffer, bytes);
+        return 1;
+    }
+    if (!gdx_disk_stream_read(offset, bytes, buffer)) {
+        return 0;
+    }
+    if (gdx_disk_stream_verify_enabled() && gdx_disk_buffer != NULL &&
+        (unsigned long long) offset + bytes <= (unsigned long long) gdx_disk_size) {
+        /* The resident bytes are the reference here only because mode 1 keeps
+           gdx_disk_save_apply's output in the buffer while the stream composes the same
+           journal through its overlay. A mismatch therefore means the reader disagrees with
+           the memcpy path, which is exactly what this mode exists to find. The caller still
+           gets the STREAMED bytes either way; the counter carries the verdict. */
+        const unsigned char* residentBytes = gdx_disk_buffer + offset;
+        const unsigned char* streamedBytes = (const unsigned char*) buffer;
+        u32 i;
+        for (i = 0; i < bytes; i++) {
+            if (residentBytes[i] != streamedBytes[i]) {
+                sStreamVerifyBad++;
+                if (sStreamVerifyLogs < 12) {
+                    sStreamVerifyLogs++;
+                    gdx_ek_note("[diskstream] VERIFY MISMATCH off/len/idx/resident", offset, bytes,
+                                i, (unsigned int) residentBytes[i]);
+                }
+                return 1;
+            }
+        }
+        sStreamVerifyOk++;
+    }
+    return 1;
+}
+
+/* Periodic receipt cadence. 512 served reads is roughly one line per few seconds of EK disk
+   traffic -- often enough that a run shows the hit rate settling, rare enough that it cannot
+   itself become the cost.
+
+   B11d: it is now a LEVER (`[debug] disk_stream_report`, default 512, 0 = only the mount
+   line), because 512 turned out to be larger than a whole menu-to-editor session's LEO read
+   count -- so the measurement run that was supposed to size the cache produced exactly one
+   receipt, taken at the mount, before any of the traffic it was meant to measure. A cadence
+   you cannot lower is a cadence that can hide the thing you are measuring. */
+extern void gdx_disk_stream_report(void);
+extern int gdx_disk_stream_report_reads(void);
+static unsigned int sStreamReadsSinceReport = 0;
+
+static void gdx_leo_stream_tick(void) {
+    int every;
+    if (gdx_disk_stream_mode() <= 0) {
+        return;
+    }
+    every = gdx_disk_stream_report_reads();
+    if (every <= 0) {
+        return;
+    }
+    if (++sStreamReadsSinceReport < (unsigned int) every) {
+        return;
+    }
+    sStreamReadsSinceReport = 0;
+    gdx_disk_stream_report();
+}
+
 /* Durable disk-save sidecar (port/disk_savefile.cpp): records the exact dirty byte
    range of every disk write so it survives to the next boot without mutating the
    pristine .ndd. Raw extern -- this decomp TU cannot include the host header. */
@@ -44,10 +143,25 @@ s32 LEO_country_code = 0;
 
 LEODiskID leoBootID = { 0 };
 
+/* B11d: `disk` is NULL in mode 2 (stream-only, no resident buffer). Both reads below are tiny
+   and fixed-position, so they go through the residency seam rather than through the pointer --
+   one byte of the system area and one LEODiskID at physical LBA 14. A refused read leaves the
+   globals exactly as they were rather than seeding the LBA math from garbage. */
+extern int gdx_disk_image_read(unsigned int offset, unsigned int length, void* dst);
+
 void gdx_leo_on_disk_loaded(const unsigned char* disk) {
     s32 offset;
+    unsigned char sysByte5 = 0;
+
+    if (disk != NULL) {
+        sysByte5 = disk[5];
+    } else if (!gdx_disk_image_read(5u, 1u, &sysByte5)) {
+        gdx_ek_note("[leo] disk type byte unreadable; LEO layer stays inactive", 0u, 0u, 0u, 0u);
+        return;
+    }
+
     /* 64DD system area, byte 0x05: disk type (0-6) in the disk ID. */
-    LEOdisk_type = disk[5] & 0xF;
+    LEOdisk_type = sysByte5 & 0xF;
     if (LEOdisk_type > 6) {
         LEOdisk_type = 0;
     }
@@ -58,7 +172,11 @@ void gdx_leo_on_disk_loaded(const unsigned char* disk) {
     /* The N64 IPL normally populates leoBootID before the game boots.
        Since we bypass the IPL, we must populate it here from the disk ID block (LBA 14). */
     if (LeoLBAToByte(0, 14, &offset) == LEO_ERROR_GOOD) {
-        bcopy(disk + offset, &leoBootID, sizeof(LEODiskID));
+        if (disk != NULL) {
+            bcopy(disk + offset, &leoBootID, sizeof(LEODiskID));
+        } else {
+            gdx_disk_image_read((unsigned int) offset, (unsigned int) sizeof(LEODiskID), &leoBootID);
+        }
     }
 }
 
@@ -80,13 +198,17 @@ static void LeoPostDone(LEOCmd* cmdBlock, OSMesgQueue* mq) {
    checking the return value — an error return that never posts parks that
    thread forever. Console code never hits these paths, the port can. */
 static void LeoPostError(LEOCmd* cmdBlock, OSMesgQueue* mq, s32 error, u32 lba, u32 nLBAs) {
-    extern void gdx_cki(const char* s, int v);
+    /* B11: this used to log through gdx_cki, which rides the GDX_GATE_TRACE dev gate that
+     * NOTHING on 3DS ever sets -- so every failed disk read in the EK build was silent, and the
+     * garbage it leaves in the caller's buffer surfaced later as a NULL sequence-script read.
+     * gdx_ek_note is the always-on sink. Capped, and only ever reached when a read already
+     * failed. */
+    extern void gdx_ek_note(const char* what, unsigned int a, unsigned int b, unsigned int c,
+                            unsigned int d);
     static int sLeoErrLogs = 0;
     if (sLeoErrLogs < 12) {
         sLeoErrLogs++;
-        gdx_cki("[leo] READ/WRITE ERROR code", error);
-        gdx_cki("[leo] READ/WRITE ERROR lba", (int)lba);
-        gdx_cki("[leo] READ/WRITE ERROR nLBAs", (int)nLBAs);
+        gdx_ek_note("[leo] READ/WRITE ERROR code/lba/nLBAs", (unsigned int)error, lba, nLBAs, 0u);
     }
     if (cmdBlock != NULL) {
         cmdBlock->header.status = LEO_STATUS_CHECK_CONDITION;
@@ -101,7 +223,19 @@ u32 LeoDriveExist(void) {
        gLeoDriveConnectionState = LeoDriveExist()), so this is the first disk touch and
        has to drive the idempotent image load. "A drive with a disk exists" here means
        "a disk image is available". */
-    return gdx_disk_load() ? 1u : 0u;
+    const u32 present = gdx_disk_load() ? 1u : 0u;
+    /* B11d: THE receipt for gLeoDriveConnectionState. sys_main.c assigns this return value
+       straight into it, and main_menu.c:222 bounces the cursor off COURSE EDIT and CREATE
+       MACHINE whenever it is 0 -- so this one number decides whether the editors are
+       reachable at all. sys_main's own GDX_CKI(EK3_drive_state) rides the GDX_GATE_TRACE dev
+       gate that nothing on 3DS ever sets (ekdeadlock's "two silences"), so it has never
+       printed on this platform. Capped at the two calls the boot actually makes. */
+    static int sDriveLogs = 0;
+    if (sDriveLogs < 4) {
+        sDriveLogs++;
+        gdx_ek_note("[leo] LeoDriveExist -> gLeoDriveConnectionState", present, 0u, 0u, 0u);
+    }
+    return present;
 }
 
 /* Signatures must match PR/leo.h exactly (OSMesg* cmdBuf, s32 cmdMsgCnt): GCC rejects the
@@ -125,10 +259,14 @@ s32 LeoClearQueue(void) {
 }
 
 s32 LeoTestUnitReady(LEOStatus* status) {
+    /* B11d: "a disk is present" is a question about EITHER source. In mode 2 there is no
+       resident buffer and the drive is still ready. */
+    extern int gdx_disk_image_available(void);
+    const int ready = gdx_disk_image_available();
     if (status != NULL) {
-        *status = (gdx_disk_buffer != NULL) ? LEO_STATUS_GOOD : LEO_STATUS_CHECK_CONDITION;
+        *status = ready ? LEO_STATUS_GOOD : LEO_STATUS_CHECK_CONDITION;
     }
-    return (gdx_disk_buffer != NULL) ? LEO_ERROR_GOOD : LEO_ERROR_DRIVE_NOT_READY;
+    return ready ? LEO_ERROR_GOOD : LEO_ERROR_DRIVE_NOT_READY;
 }
 
 /* System-area size at the front of an SDK-format .ndd: the first 0x18 physical LBAs
@@ -143,7 +281,11 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
     s32 offset = 0;
     s32 bytes = 0;
 
-    if (gdx_disk_buffer == NULL) {
+    /* "A disk is mounted" now means EITHER source is live: the resident buffer, or the SD
+       stream. Today mode 1 always has both, so this reads the same as it always did; it is
+       written this way so that B11d's mode 2 (stream-only, no resident buffer) does not have
+       to come back and re-find this guard. */
+    if (gdx_disk_buffer == NULL && gdx_disk_stream_mode() <= 0) {
         LeoPostError(cmdBlock, mq, LEO_ERROR_DRIVE_NOT_READY, LBA, nLBAs);
         return LEO_ERROR_DRIVE_NOT_READY;
     }
@@ -167,13 +309,30 @@ s32 LeoReadWrite(LEOCmd* cmdBlock, s32 direction, u32 LBA, void* buffer, u32 nLB
     }
 
     if (direction == OS_READ) {
-        bcopy(gdx_disk_buffer + offset, buffer, bytes);
+        /* B11c: the seam. With the stream armed this is an SD read through the block cache
+           plus the journal overlay; without it, the original bcopy out of the resident image.
+           A refusal posts an error and copies NOTHING, rather than handing the caller a
+           half-filled buffer it will read as data. */
+        if (!gdx_leo_fetch((u32) offset, (u32) bytes, buffer)) {
+            LeoPostError(cmdBlock, mq, LEO_ERROR_UNRECOVERED_READ_ERROR, LBA, nLBAs);
+            return LEO_ERROR_UNRECOVERED_READ_ERROR;
+        }
+        gdx_leo_stream_tick();
     } else {
         /* Writes land in the in-memory image only; the dirty range goes to the durable
            sidecar (port/disk_savefile.cpp) so it can be replayed over a freshly loaded
-           pristine image next boot. The user's .ndd is never touched. */
-        bcopy(buffer, gdx_disk_buffer + offset, bytes);
+           pristine image next boot. The user's .ndd is never touched -- which is also why
+           the stream can serve reads straight off the file: the journal is the ONLY place a
+           64DD write exists, and gdx_disk_save_overlay replays it into every streamed read.
+           The invalidate is what makes the next read of this range re-compose rather than
+           return a cache block filled before the write. */
+        if (gdx_disk_buffer != NULL) {
+            bcopy(buffer, gdx_disk_buffer + offset, bytes);
+        }
         gdx_disk_save_mark_dirty((unsigned int) offset, buffer, (unsigned int) bytes);
+        if (gdx_disk_stream_mode() > 0) {
+            gdx_disk_stream_invalidate((unsigned int) offset, (unsigned int) bytes);
+        }
     }
 
     LeoPostDone(cmdBlock, mq);
@@ -200,9 +359,14 @@ s32 LeoSpdlMotor(LEOCmd* cmdBlock, LEOSpdlMode mode, OSMesgQueue* mq) {
 s32 LeoReadDiskID(LEOCmd* cmdBlock, LEODiskID* vaddr, OSMesgQueue* mq) {
     s32 offset = 0;
     if (vaddr != NULL) {
-        if (gdx_disk_buffer != NULL && LeoLBAToByte(0, 14, &offset) == LEO_ERROR_GOOD) {
-            bcopy(gdx_disk_buffer + offset, vaddr, sizeof(*vaddr));
-        } else {
+        /* Physical LBA 14. LeoLBAToByte(0, 14) gives 14 * 0x4D08 with no system-area bias
+           because every system-area block is a zone-0 block, so the logical offset of 14
+           blocks and the file offset of physical LBA 14 are the same number. */
+        if (LeoLBAToByte(0, 14, &offset) != LEO_ERROR_GOOD ||
+            !gdx_leo_fetch((u32) offset, (u32) sizeof(*vaddr), vaddr)) {
+            /* Zeroing here is safe and is NOT the pattern ekdeadlock warns about: `vaddr` is
+               the caller's own LEODiskID, not a pointer derived from unloadable disk data,
+               and a zero disk ID is what the original code already produced with no disk. */
             bzero(vaddr, sizeof(*vaddr));
         }
     }

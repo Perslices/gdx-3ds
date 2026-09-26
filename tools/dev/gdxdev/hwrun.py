@@ -150,7 +150,13 @@ def completion(text, expected_shots, boot_text=None):
     inside `text`. Looking for it there scored a slice with 49/49 SHOTs and a `[rec] end`
     as "the replay never loaded".
     """
-    seen = shots_seen(text)
+    # [debug] shots=0 silences BOTH capture receipts (it returns from
+    # gdx_request_frame_dump before either is emitted), so scoring a timing slice on
+    # captures marks it FAIL with shots=0/N while the replay ran to its last tick. The
+    # lever preserves the `[rec] SHOT` schedule tag on purpose; score on that instead, so
+    # the schedule is still asserted in full and only the capture is not.
+    shots_off = replay.shots_disabled(text)
+    seen = replay.shots_reached(text) if shots_off else shots_seen(text)
     expected = list(expected_shots or [])
     missing = [s for s in expected if s not in seen]
     ended = replay.END_RECEIPT in text
@@ -164,9 +170,10 @@ def completion(text, expected_shots, boot_text=None):
         problems.append("no %r receipt — the replay did not reach its end"
                         % replay.END_RECEIPT)
     if missing:
-        problems.append("%d of %d SHOT(s) never captured: %s"
-                        % (len(missing), len(expected), ", ".join(missing[:6])))
-    return {"replay_armed": armed, "end_receipt": ended,
+        problems.append("%d of %d SHOT(s) never %s: %s"
+                        % (len(missing), len(expected),
+                           "reached" if shots_off else "captured", ", ".join(missing[:6])))
+    return {"replay_armed": armed, "end_receipt": ended, "shots_disabled": shots_off,
             "shots_expected": len(expected), "shots_seen": len([s for s in expected
                                                                 if s in seen]),
             "missing_shots": missing,

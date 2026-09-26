@@ -23,6 +23,13 @@
 
 #include "disk_savefile.h"
 #include "port_log.h"
+#ifdef EXPANSION_KIT
+#include "gdx_disk_stream.h"   /* B11c: the streamed-read overlay reports its own byte count */
+#ifdef GDX_PLATFORM_3DS
+/* Namespace scope on purpose: a linkage specification is ill-formed at block scope. */
+extern "C" const char* gdx3ds_fs_base_path(void);
+#endif
+#endif
 #include "libultraship/bridge/consolevariablebridge.h" /* one-shot DD-format CVar (Workshop menu) */
 
 #include <cstdint>
@@ -148,7 +155,26 @@ uint64_t getU64(const unsigned char* p) {
 /* --- path resolution (mirrors gdx_ghost_io.c) ------------------------------- */
 
 bool executableDirectory(std::string& out) {
-#ifdef _WIN32
+#if defined(EXPANSION_KIT) && defined(GDX_PLATFORM_3DS)
+    /* B11c, the same bug gdx_exe_dir had (see port/disk_buffer.cpp): a 3dsx has no executable
+     * path, so the "." below put the .gdd sidecar under the launch CWD -- which on a netloader
+     * push is not the data directory, and which would then disagree with the .dcrc sidecar
+     * disk_buffer.cpp writes beside it. Both now resolve to sdmc:/3ds/gdiffuser/saves/.
+     *
+     * The EXPANSION_KIT half of the guard is there so this TU, which IS in the shipped 3DS
+     * build, preprocesses byte-identically without it. Nothing outside the 64DD disk-save path
+     * calls this function, and that path exists only in an EK build, so the guard costs no
+     * correctness -- but if a non-EK caller is ever added, it wants this arm too. */
+    const char* base = gdx3ds_fs_base_path();
+    if (base == nullptr || base[0] == '\0') {
+        return false;
+    }
+    out = base;
+    while (!out.empty() && (out.back() == '/' || out.back() == '\\')) {
+        out.pop_back();   /* savesDirectory() appends its own separator */
+    }
+    return true;
+#elif defined(_WIN32)
     char path[MAX_PATH];
     DWORD n = GetModuleFileNameA(nullptr, path, (DWORD)sizeof(path));
     if (n == 0 || n >= sizeof(path)) {
@@ -341,6 +367,60 @@ unsigned long long gdx_disk_crc64(const unsigned char* data, unsigned long long 
     return crc64(data, (size_t)length);
 }
 
+#ifdef EXPANSION_KIT
+/* B11c. The CRC policy (see the long comment in port/disk_buffer.cpp): this sidecar's source
+ * fingerprint and the loader's identity fingerprint are THE SAME CRC-64 OVER THE SAME BYTES,
+ * and gdx_disk_finalize's own comment already says so -- it accepted the duplicate because a
+ * second 62 MB pass is "a few milliseconds" on a desktop. Streaming makes the second pass
+ * 61.9 MB of SD reads, which is the cost streaming exists to remove. So the loader hands its
+ * value over instead, and the invariant it rests on is the one gdx_disk_finalize already
+ * asserts in prose: nothing between the two points mutates the pristine buffer.
+ *
+ * ONE-SHOT on purpose. The preset is consumed by the next gdx_disk_save_init and cleared, so
+ * a second mount with no preset falls back to computing its own rather than silently
+ * inheriting the first disk's fingerprint -- which would key one disk's saves to another.
+ *
+ * Whole block is #ifdef EXPANSION_KIT: this TU is in the SHIPPED 3DS build, and the shipped
+ * build must preprocess byte-identically. */
+static uint64_t g_presetSourceHash = 0;
+static bool g_havePresetSourceHash = false;
+
+void gdx_disk_save_set_source_hash(unsigned long long crc) {
+    g_presetSourceHash = (uint64_t) crc;
+    g_havePresetSourceHash = true;
+}
+
+/* Replays the journal's dirty ranges over freshly read base bytes. This is what makes a
+ * STREAMED read equal to what the resident image would have returned after
+ * gdx_disk_save_apply(): the user's .ndd is never written, so the only place a 64DD write
+ * exists is here. Same clipping rules as gdx_disk_save_apply, plus the read window. */
+void gdx_disk_save_overlay(unsigned int offset, unsigned int length, void* dst) {
+    if (!g_active || dst == nullptr || length == 0 || g_ranges.empty()) {
+        return;
+    }
+    const uint64_t rs = offset;
+    const uint64_t re = (uint64_t) offset + length;
+    unsigned int rewritten = 0;
+    for (const DirtyRange& r : g_ranges) {
+        const uint64_t ds = r.offset;
+        const uint64_t de = ds + r.data.size();
+        if (de <= rs) {
+            continue;
+        }
+        if (ds >= re) {
+            break; /* g_ranges is sorted by offset, so nothing later can overlap */
+        }
+        const uint64_t s = (ds > rs) ? ds : rs;
+        const uint64_t e = (de < re) ? de : re;
+        memcpy((unsigned char*) dst + (s - rs), r.data.data() + (s - ds), (size_t) (e - s));
+        rewritten += (unsigned int) (e - s);
+    }
+    if (rewritten != 0) {
+        gdx_disk_stream_note_overlay(rewritten);
+    }
+}
+#endif /* EXPANSION_KIT */
+
 void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, unsigned int size) {
     g_active = false;
     g_ranges.clear();
@@ -354,11 +434,27 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
      * read as ok in the Workshop panel. */
     g_lastFlushOk = true;
 
+#ifdef EXPANSION_KIT
+    /* B11d -- disk_stream=2 mounts the image with NO resident buffer, so `pristine` is null
+     * and yet a disk is mounted. The fingerprint that keys this sidecar is then the one
+     * gdx_disk_finalize preset from the streamed CRC-64 over the same bytes, so the journal
+     * stays keyed to the right disk. Without a preset there is nothing to fingerprint FROM,
+     * and keying a journal to the wrong disk is a data-loss hazard -- so that case still
+     * disables the sidecar, exactly as a missing image always did. */
+    const bool streamedMount = (pristine == nullptr && size != 0 && g_havePresetSourceHash);
+    if (!streamedMount)
+#endif
     if (pristine == nullptr || size == 0) {
         gdx_port_logf("[disk-save] no disk image; durable disk save disabled\n");
         return;
     }
 
+#ifdef EXPANSION_KIT
+    if (g_havePresetSourceHash) {
+        g_sourceHash = g_presetSourceHash;
+        g_havePresetSourceHash = false;
+    } else
+#endif
     g_sourceHash = crc64(pristine, size);
 
     std::string dir;

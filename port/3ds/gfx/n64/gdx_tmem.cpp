@@ -471,17 +471,76 @@ bool Interp::TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTextur
     if (!admitted) {
         return false;
     }
+    /* [memotear] B54: this load is admitted and is about to skip. If fault injection is armed
+       it is forced stale HERE -- after admission, before either test -- so the two arms below
+       are the code that has to catch it. See TmemInjectStaleness. */
+    const bool injected = (mTmemFault != 0) && TmemInjectStaleness(base, cls, src, readBytes);
     /* The class the STAMP was taken under has to be the class being tested now; the seam
        re-derives the live class and refuses a mismatch, and this is the stored half of it. */
     if (mRdp.tmem_span_src_cls[base] != static_cast<uint8_t>(cls)) {
         mStats.tmemStale++;
+        if (injected) {
+            mStats.tmemFaultCaught++;
+        }
         return false;
     }
     if (gdx_gfx_tmem_source_unchanged(src, readBytes, cls, mRdp.tmem_span_src_stamp[base]) == 0) {
         mStats.tmemStale++;
+        if (injected) {
+            mStats.tmemFaultCaught++;
+        }
         return false;
     }
+    if (injected) {
+        /* The gate skipped a load that was deliberately made stale. That is the B54 failure and
+           it is counted, not asserted, so one occurrence does not take the run down with it --
+           the gate is `missed == 0` on the receipt, and the frame hashes beside it. */
+        mStats.tmemFaultMissed++;
+    }
     mStats.tmemSkipGen++;
+    return true;
+}
+
+/* [memotear] NEXT.md B54 -- FAULT INJECTION for the tmemskip refusal arm.
+ *
+ * tmemblock gated tmemskip green over 412,326 corpus skips with `stale=0`, which reads as a
+ * clean invalidation argument and is in fact the opposite: it means the corpus never drove the
+ * gate to say STALE even once, so nothing outside the host test has ever executed the refusal.
+ * An arm that is never taken is not evidence, and `tmemskip` is default 0 partly because of it.
+ *
+ * This forces the world stale on every Nth load that would otherwise have skipped, alternating
+ * the two mechanisms the gate is supposed to catch:
+ *
+ *   0  THE SOURCE GENERATION MOVED. Driven through the bridge's own bump/dirty-range plumbing
+ *      (gdx_gfx_tmem_fault_move_generation), not by corrupting the stored stamp, so what runs
+ *      is the invalidation path rather than a comparison. Returns 0 for STABLE and UNKNOWN,
+ *      which have no generation arm at all -- see the seam's comment -- and the injector then
+ *      falls through to the class mechanism rather than counting a fault it did not cause.
+ *   1  THE CLASS CHANGED UNDER THE SPAN. The stored class is moved to another admitted class,
+ *      which is what a range registered as native-RGBA16 after the first load looks like.
+ *
+ * Both are conservative: a refusal re-mirrors, which is exactly what tmemskip=0 does on every
+ * load, so an injected run must draw the same pixels as the tmemskip=0 run. That is the second
+ * half of the gate and the reason the injector never touches the SOURCE BYTES: mutating those
+ * would change the picture, and then "the frame still draws correctly" could not be asserted. */
+bool Interp::TmemInjectStaleness(uint16_t base, unsigned cls, uintptr_t src, uint32_t readBytes) {
+    mTmemFaultTick++;
+    if (mTmemFault <= 0 || (mTmemFaultTick % static_cast<uint32_t>(mTmemFault)) != 0) {
+        return false;
+    }
+    /* Alternate the mechanisms so one run exercises both arms. */
+    const bool wantGeneration = ((mTmemFaultTick / static_cast<uint32_t>(mTmemFault)) & 1u) == 0u;
+    if (wantGeneration && gdx_gfx_tmem_fault_move_generation(src, readBytes, cls) != 0) {
+        mStats.tmemFaultGen++;
+        return true;
+    }
+    /* Class mechanism -- also the fallback for STABLE/UNKNOWN, which have no generation. Pick a
+       class that is NOT the live one and is still a value the stored half can legitimately
+       hold, so the arm under test is the mismatch and not a malformed enum. */
+    const uint8_t other = (cls == GDX_TMEMSRC_NATIVE) ? static_cast<uint8_t>(GDX_TMEMSRC_STABLE)
+                                                      : static_cast<uint8_t>(GDX_TMEMSRC_NATIVE);
+    mRdp.tmem_span_src_cls[base] = other;
+    mStats.tmemFaultCls++;
     return true;
 }
 

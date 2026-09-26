@@ -168,8 +168,17 @@ add_executable(G-Diffuser
 if(GDX_EXPANSION_KIT)
     # All four files reference EK-only symbols (gdx_ek_assets_fill, machine_create labels, EK
     # overlay .data), so they must not build in US-only configs.
-    target_sources(G-Diffuser PRIVATE disk_buffer.cpp gen/EkTranslatedOverrides.c
-                                      gdx_ek_strings.c gen/EkTranslatedStrings.c)
+    # gdx_block_cache.cpp is the cache gdx_disk_stream.cpp used to hold in its own file
+    # statics; C4d lifted it out so the 3DS audio_table stream could share it rather than be a
+    # second LRU. The desktop exe needs it wherever gdx_disk_stream.cpp is built.
+    target_sources(G-Diffuser PRIVATE disk_buffer.cpp gdx_disk_stream.cpp gdx_block_cache.cpp
+                                      gdx_disk_dcrc.cpp   # B11m: the .dcrc identity-cache sidecar
+                                      gen/EkTranslatedOverrides.c
+                                      gdx_ek_strings.c gen/EkTranslatedStrings.c
+                                      # B11m: the English text pack. EkTranslatedTextPack.c is
+                                      # generated and .gitignore'd; it is EMPTY unless
+                                      # tools/gen_ek_text_pack.py was run with a translated image.
+                                      gdx_ek_text_pack.c gen/EkTranslatedTextPack.c)
     # shims.c guards its US-only Leo stubs on this define.
     target_compile_definitions(G-Diffuser PRIVATE EXPANSION_KIT=1)
 endif()
@@ -633,8 +642,10 @@ if(GDX_BUILD_JP)
 
     if(GDX_EXPANSION_KIT)
         # EK-only symbols — see the matching US-target comment above.
-        target_sources(G-Diffuser-JP PRIVATE disk_buffer.cpp gen/EkTranslatedOverrides.c
-                                             gdx_ek_strings.c gen/EkTranslatedStrings.c)
+        target_sources(G-Diffuser-JP PRIVATE disk_buffer.cpp gdx_disk_dcrc.cpp
+                                             gen/EkTranslatedOverrides.c
+                                             gdx_ek_strings.c gen/EkTranslatedStrings.c
+                                             gdx_ek_text_pack.c gen/EkTranslatedTextPack.c)
         target_compile_definitions(G-Diffuser-JP PRIVATE EXPANSION_KIT=1)
     endif()
 
