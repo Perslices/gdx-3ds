@@ -273,7 +273,10 @@ jobs:
         if: matrix.target.name != 'n3ds'
         run: |
           set -e
-          cmake --build "build-3ds-${{ matrix.target.name }}" --target G-Diffuser-3DS --parallel 4
+          # No --target here: the .3dsx is a side output of the default ("all") target
+          # (ctr_create_3dsx's custom target is not a dependency of G-Diffuser-3DS itself),
+          # same as the gate's own build-3ds build above.
+          cmake --build "build-3ds-${{ matrix.target.name }}" --parallel 4
           cmake --build "build-3ds-${{ matrix.target.name }}" --target G-Diffuser-3DS-cia --parallel 4
 
       - name: .cia for n3ds (same build tree the gate used, no reconfigure)
