@@ -120,11 +120,14 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re
 
+          # tools/build-3ds.sh maps each target name to its own CMake flags (O3DS,
+          # Expansion Kit, the CIA unique ID/title tag, GDX_ALLOW_JP_INPUTS) --
+          # the matrix only needs to say which targets and what to call them.
           all_targets = [
-              {"name": "o3ds",    "suffix": "O3DS",    "cmake_flags": "-DGDX_3DS_O3DS=ON"},
-              {"name": "n3ds",    "suffix": "N3DS",    "cmake_flags": ""},
-              {"name": "o3ds-ek", "suffix": "O3DS-EK", "cmake_flags": "-DGDX_3DS_O3DS=ON -DGDX_3DS_EXPANSION_KIT=ON"},
-              {"name": "n3ds-ek", "suffix": "N3DS-EK", "cmake_flags": "-DGDX_3DS_EXPANSION_KIT=ON"},
+              {"name": "o3ds",    "suffix": "O3DS"},
+              {"name": "n3ds",    "suffix": "N3DS"},
+              {"name": "o3ds-ek", "suffix": "O3DS-EK"},
+              {"name": "n3ds-ek", "suffix": "N3DS-EK"},
           ]
           by_name = {t["name"]: t for t in all_targets}
 
@@ -260,89 +263,37 @@ jobs:
       # One gate, run once per target against its own checkout: vendored-LUS MANIFEST.sha256 ->
       # the 52 decomp patches (idempotent; an unlisted patch file is a hard FAIL) -> the full
       # host-test suite -> configure + full + incremental 3DS build of the SHIPPED (New 3DS,
-      # non-EK) config into build-3ds/. For the n3ds target that build dir already IS the
-      # artifact; the other three targets configure a second, flag-specific build dir below,
-      # against the same (already-patched) decomp/ checkout.
+      # non-EK) config into build-3ds/. tools/build-3ds.sh below configures its own
+      # build-3ds-<target>/ dir regardless of target, so this stays purely a correctness gate.
       - name: Vendored-LUS manifest, decomp patches, host tests, shipped 3DS build (the gate)
         run: tools/ci-3ds.sh --jobs 4
 
-      - name: Configure the target-specific build (o3ds / *-ek only; n3ds reuses the gate's build-3ds)
-        if: matrix.target.name != 'n3ds'
-        run: |
-          set -e
-          cmake -S . -B "build-3ds-${{ matrix.target.name }}" -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
-            -DGDX_PLATFORM_3DS=ON -DCMAKE_BUILD_TYPE=Release \
-            ${{ matrix.target.cmake_flags }}
-
-      - name: Build the target-specific .3dsx + .cia (o3ds / *-ek only)
-        if: matrix.target.name != 'n3ds'
-        run: |
-          set -e
-          # No --target here: the .3dsx is a side output of the default ("all") target
-          # (ctr_create_3dsx's custom target is not a dependency of G-Diffuser-3DS itself),
-          # same as the gate's own build-3ds build above.
-          cmake --build "build-3ds-${{ matrix.target.name }}" --parallel 4
-          cmake --build "build-3ds-${{ matrix.target.name }}" --target G-Diffuser-3DS-cia --parallel 4
-
-      - name: .cia for n3ds (same build tree the gate used, no reconfigure)
-        if: matrix.target.name == 'n3ds'
-        run: cmake --build build-3ds --target G-Diffuser-3DS-cia --parallel 4
-
-      - name: ccache stats
+      - name: ccache stats (after the gate)
         if: always()
         run: ccache --show-stats | head -20
 
-      - name: Collect, rename, zip
+      # tools/build-3ds.sh maps the target name to its CMake flags, builds the .3dsx/.elf/.cia
+      # into build-3ds-<target>/, and drops the renamed, checksummed, zipped result in
+      # dist/3ds/ -- the same script a contributor runs locally, so the release zip layout
+      # has exactly one implementation.
+      - name: Build + package (tools/build-3ds.sh)
         run: |
           set -e
-          SUFFIX="${{ matrix.target.suffix }}"
-          NAME="G-Diffuser-3DS-${SUFFIX}"
-          if [ "${{ matrix.target.name }}" = "n3ds" ]; then
-            BUILD_DIR=build-3ds
-          else
-            BUILD_DIR="build-3ds-${{ matrix.target.name }}"
-          fi
-          SRC="${BUILD_DIR}/port/3ds"
+          tools/build-3ds.sh "${{ matrix.target.name }}" --jobs 4 --zip "${GDX_VER}"
+          ls -la dist/3ds
 
-          mkdir -p out zippkg/3ds
-          cp "${SRC}/G-Diffuser-3DS.3dsx" "out/${NAME}.3dsx"
-          cp "${SRC}/G-Diffuser-3DS.cia"  "out/${NAME}.cia"
-          cp "${SRC}/G-Diffuser-3DS.elf"  "out/${NAME}.elf"
+      - name: ccache stats (after the build)
+        if: always()
+        run: ccache --show-stats | head -20
 
-          CONSOLE_LINE="Old 3DS / Old 2DS"
-          case "$SUFFIX" in
-            N3DS|N3DS-EK) CONSOLE_LINE="New 3DS / New 2DS XL" ;;
-          esac
-          EK_LINE=""
-          case "$SUFFIX" in
-            *-EK)
-              EK_LINE=$'\nThis is the Expansion Kit title: it installs alongside the normal game and needs the\n64DD disk image too. Put your own .ndd dump at:\n  3ds/gdiffuser/media/\n'
-              ;;
-          esac
-
-          cp "out/${NAME}.3dsx" "zippkg/3ds/${NAME}.3dsx"
-          cp "out/${NAME}.cia"  "zippkg/${NAME}.cia"
-          printf '%s\n' \
-            "G-Diffuser 3DS -- ${SUFFIX} build (v${GDX_VER})" \
-            "Console: ${CONSOLE_LINE}" \
-            "" \
-            "Two ways to run it:" \
-            "  * Homebrew Launcher: copy 3ds/${NAME}.3dsx to the SD card's /3ds/ folder, then launch it" \
-            "    from the Homebrew Launcher." \
-            "  * HOME menu: install ${NAME}.cia with your usual CIA installer (needs CFW)." \
-            "" \
-            "Either way, this .3dsx/.cia is the ENGINE ONLY. It reads your own F-Zero X dump: run" \
-            "tools/prebake/prebake.py from the repository (with gdx-extract, built by this same release)" \
-            "against your own cartridge/ROM dump, then copy the two files it writes onto the SD card at:" \
-            "  3ds/gdiffuser/" \
-            "${EK_LINE}" \
-            "No game data is included in this download." \
-            > "zippkg/README.txt"
-          ( cd zippkg && zip -q -r "../out/${NAME}-v${GDX_VER}.zip" README.txt 3ds "${NAME}.cia" )
-          rm -rf zippkg
-
-          cd out && sha256sum "${NAME}".3dsx "${NAME}".cia "${NAME}".elf "${NAME}-v${GDX_VER}.zip" > "SHA256SUMS-${SUFFIX}" && cat "SHA256SUMS-${SUFFIX}"
+      # SHA256SUMS and BUILD-INFO.txt are fixed names -- rename per target before upload so
+      # the `combine` job's merge-multiple download doesn't let one target's file silently
+      # overwrite the other three's.
+      - name: Rename the per-run manifest files so four targets' artifacts can coexist
+        run: |
+          set -e
+          mv "dist/3ds/SHA256SUMS" "dist/3ds/SHA256SUMS-${{ matrix.target.suffix }}"
+          mv "dist/3ds/BUILD-INFO.txt" "dist/3ds/BUILD-INFO-${{ matrix.target.suffix }}.txt"
 
       - name: CI logs (on failure)
         if: failure()
@@ -352,12 +303,14 @@ jobs:
           path: |
             build-3ds*/ci-*.log
             build-3ds*/host-tests/*.log
+            build-3ds-*.configure.log
+            build-3ds-*.build.log
           if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
           name: G-Diffuser-3DS-${{ matrix.target.suffix }}
-          path: out/*
+          path: dist/3ds/*
           if-no-files-found: error
 
   combine:
