@@ -1,6 +1,6 @@
 # G-Diffuser 3DS port — dated timeline from repository evidence
 
-**Scope.** F-Zero X N64 decomp (G-Diffuser, libultraship runtime) ported to New Nintendo 3DS. Evidence = git history of `~/Code/G-Diffuser` (all branches; worktrees under `~/code/gdx-3ds/*`) plus the research docs in the most complete worktree, `bridgecache/` (branch `feat/3ds-hwtest4`, the integration tip at `35df5e2`, 2026-09-03 13:26). Compiled 2026-09-03.
+**Scope.** F-Zero X N64 decomp (G-Diffuser, libultraship runtime) ported to New Nintendo 3DS. Evidence = this project's own git history (all branches, across its working checkouts) plus the research docs in the most complete checkout (branch `feat/3ds-hwtest4`, the integration tip at `35df5e2`, 2026-09-03 13:26). Compiled 2026-09-03.
 
 **Conventions.**
 - Dates are git author/committer dates (local, -0400) unless marked "(doc date)". **Doc-internal dates run ahead of git in September:** `RESUME-2026-09-04.md` is titled "2026-09-03 evening", `RESUME-2026-09-05.md` "2026-09-04 late", `locked60-round3.md` says "2026-09-04" but was committed 2026-09-02 (`57acdab`), `renderthread-progress.md` M7 says "2026-09-05" but was committed 2026-09-03 (`e45410f`). Git dates are treated as authoritative.
@@ -174,7 +174,7 @@ Grep hits for the requested words are saved in `scratchpad/setbacks-grep.txt` (1
 
 ---
 
-## 5. Code size (tip = `feat/3ds-hwtest4` @ `35df5e2`, worktree `bridgecache/`; `wc -l` on .c/.cpp/.h/.pica/.cmake)
+## 5. Code size (tip = `feat/3ds-hwtest4` @ `35df5e2`; `wc -l` on .c/.cpp/.h/.pica/.cmake)
 
 | Measure | Lines |
 |---|---|
@@ -188,9 +188,9 @@ Grep hits for the requested words are saved in `scratchpad/setbacks-grep.txt` (1
 | `git diff --numstat main...HEAD` outside `port/3ds` and `docs` (bridge, sched, tools, CMake…) | +5,285 / −625 |
 | **Patch stack** `port/3ds/patches/`: **48** `.patch` files (38 `lus-*` + 10 `decomp-*`) | **+4,685 / −547** lines (lus +3,423; decomp +1,262; largest: `lus-tmem-span-store` +242, `lus-3ds-triloop-packed-vbo` +296, `lus-trect-census` +362, `lus-tmem2-tmemfast` +281, `decomp-3ds-rom-audio-port` +707) |
 | Patch count over time | 9 (2026-08-14 `1665219`) → 11 (08-20 `7d74244`) → 14 (08-20 night) → 21 (08-21 `a4629d6`) → 36 (08-27) → 42 (08-28/09-01 brief) → 47 (09-02 round-2 brief) → 48 (09-03) |
-| Research docs | 52 `.md/.html` in `bridgecache/docs/research/` (696 KB) + `atlas-progress.md`, `dspcensus-progress.md`, `gputransform-report.md`, `tunnel-roof-depth-clip-analysis.md`, cidocs `README.md` in other worktrees; plus images (`livery2-fixed-drive*.png`, `skywedge3/*.bmp`, `gputransform-ab/*.png`, `stereo-anchor-t92-eyes.png`) |
+| Research docs | 52 `.md/.html` in this checkout's `docs/research/` (696 KB) + `atlas-progress.md`, `dspcensus-progress.md`, `gputransform-report.md`, `tunnel-roof-depth-clip-analysis.md`, cidocs `README.md` in other checkouts; plus images (`livery2-fixed-drive*.png`, `skywedge3/*.bmp`, `gputransform-ab/*.png`, `stereo-anchor-t92-eyes.png`) |
 
-Git counts: 98 `feat/3ds-*` branches (+ `feat/3ds` integration = 99; 100 local branches incl. `main`); 417 commits since 2026-08-11 (of 496 in `--all`); **250 commits touch `port/3ds/`**; 101 touch `port/3ds/patches/`; 150 touch `docs/research/`; 255 commit subjects mention "3ds". 96 git worktrees under `~/code/gdx-3ds/`. Submodules: `libultraship` (Zorkats fork) `7bca0e2`, `decomp` `f7fd0fd`, `fzerox-expansion-kit` `6cd71e6`, `torch` `c1bdc6f` — patches are applied to submodule working trees, never committed to the submodules ("patch-as-pure-delta").
+Git counts: 98 `feat/3ds-*` branches (+ `feat/3ds` integration = 99; 100 local branches incl. `main`); 417 commits since 2026-08-11 (of 496 in `--all`); **250 commits touch `port/3ds/`**; 101 touch `port/3ds/patches/`; 150 touch `docs/research/`; 255 commit subjects mention "3ds". 96 git worktrees used across the project. Submodules: `libultraship` (Zorkats fork) `7bca0e2`, `decomp` `f7fd0fd`, `fzerox-expansion-kit` `6cd71e6`, `torch` `c1bdc6f` — patches are applied to submodule working trees, never committed to the submodules ("patch-as-pure-delta").
 
 Patch list (apply order per `port/3ds/patches/README.md`): lus-newlib-portability, lus-resource-cache-cap, lus-device-path-archives, lus-3ds-settimg-low-address, lus-3ds-hud-tall-atlas-extent, lus-texcache-content-hash-span, lus-3ds-hud-speedtex-hash-span, lus-3ds-fog-exact-params, lus-3ds-texcache-resource-stable-key, lus-3ds-settimg-resolution-memo, lus-s7-raw-instance-dispatch, lus-s7-geo-diag-gate, lus-s7-tri-state-memo, lus-3ds-primenv-flush, lus-prof-sections, lus-flat-dispatch, lus-vtx-mtx-hoist, lus-profop, lus-tmem-diag-race-latch, lus-tmem-span-store, lus-tmem-same-content-skip, lus-texrect-run-memo, lus-texrect-viewport-hoist, lus-3ds-livery-ident, lus-traffic-pipesync-noop, lus-traffic-tri-memo-whitelist, lus-traffic-vtx-clipmask, lus-3ds-shade-alpha-ccmux, lus-currentdir-reset-churn, lus-cc-key-uninit-shader-id, lus-crowd2-tilestate-value-gate, lus-3ds-triloop-packed-vbo, lus-tri2-phase-census, lus-trifast-tri-memo-pack, lus-tmem2-tmemfast, lus-trect-census, lus-trectbatch-atlas, lus-renderthread-texcache-owner; decomp-ilp32, decomp-port-segment-bzero, decomp-3ds-dma-low-address, decomp-port-audio-specwait-yield, decomp-race-cull-diagnostics, decomp-3ds-sky-overscan-deadend-note, decomp-3ds-machineselect-gradient-coalesce, decomp-3ds-rom-audio-port, decomp-port-course-select-state-reset, decomp-port-rival-detail.
 
@@ -259,3 +259,46 @@ Patch list (apply order per `port/3ds/patches/README.md`): lus-newlib-portabilit
 | `port/3ds/gfx/STEREO.md` | 2026-08-14/27 | Stereo foundation status: dual targets, slider gate, per-eye draw over the same VBO, exact clip-space off-axis shift (iod 12 px, convergence 0.25); remaining work list. |
 | `README-3DS.md` | 2026-08-28 | Release README: "~50–60 fps typical"; features, legal, known issues. |
 | `port/3ds/gfx/STATUS.md`, `port/3ds/README*` | — | **Not present** in any worktree (`docs/STATUS.md` exists but is the desktop status as of 2026-07-31). |
+
+---
+
+## 7. Addendum: the native fork (2026-09-07 → 2026-10-19), compiled 2026-10-19
+
+**Scope.** This addendum covers the second phase of the port: the native-renderer fork, Old 3DS support,
+the 64DD Expansion Kit shipping on console, and the bottom-screen dashboard — the work that turns the
+v0.9.0 New-3DS-only release into v1.0.0. Evidence is the git history of the native-fork worktree (branch
+`native/main`) plus its own `docs/research/native/*.md` (199 files as of this compile). Unlike section 1-6
+above, this period's day-by-day account is **not** backed by archived session transcripts in this worktree
+(the raw census and per-session fps data that fed the original New 3DS pages is also gone — see the post-
+mortem build script's own note on that); every claim below is sourced to a commit, a tag, or a doc, not to
+a quoted session.
+
+- **First native-fork commit:** 2026-09-07 (a feasibility/plan commit dated the same day as the plan
+  document itself). **Commits reachable from the native integration branch, 2026-09-07 → 2026-10-19
+  (re-run the morning of 10-19, so the day-of count is a lower bound):** 1,599.
+  **Feature branches cut for this phase:** 187 (`native/*`), the large majority merged back by release.
+- **Commits per day** (native integration branch, `git log --since=2026-09-07 --until=2026-10-20 --date=short`,
+  re-run 2026-10-19 morning):
+  09-12 45, 09-13 34, 09-17 42, 09-20 18, 09-23 317, 09-24 122, 09-25 8, 09-26 84, 09-27 31, 09-29 127,
+  09-30 120, 10-01 163, 10-02 95, 10-03 20, 10-07 78, 10-08 139, 10-15 79, 10-16 31, 10-17 26, 10-18 11,
+  10-19 9. Gaps (09-13→09-17, 09-20→09-23, 09-27→09-29, 10-03→10-07, **10-08→10-15**) are rate-limit or
+  session pauses; the 10-08→10-15 gap is the longest of the whole project and follows the Old 3DS
+  performance campaign's final hardware card.
+- **Phase 0 (09-07 → 09-23):** dev-loop upgrade (network control/log link to the console, replacing the SD
+  sneakernet; a Linux/arm64 reference-render container; input-recorder determinism) and the first renderer
+  tier (an owned F3DEX2 interpreter replacing libultraship's, 10,466 lines) plus the native race-frame paths
+  for track, machines, sky, HUD and effects. Source: `docs/research/native/00-master-plan.md` through
+  `09-fx-integration-plan.md` (all dated 2026-09-07), `hwlink-progress.md`.
+- **Phase 1, the Old 3DS campaign (09-24 → 10-08):** see `source-perf-data.md` §3 and the post-mortem's
+  `old-3ds.html` for the full per-card numbers; this addendum does not repeat them.
+- **Phase 2, shipping it (10-08 → 10-19):** Expansion Kit save/title separation (own CIA title
+  `000400000FF3D600`, own save `saves/fzerox-ek.sav`); the bottom-screen dashboard (`docs/research/native/
+  nibottom-plan.md`, `nibottom-progress.md` — three placement modes shipped, a fourth fully-custom layout
+  editor designed and shelved 10-18); a measured Old 3DS memory ceiling (`o3ds-memory-ceiling.md`, 10-16); an
+  audio-crackle hypothesis tested and refuted (`audiofix-progress.md`, 10-16); a New 3DS title-screen freeze
+  root-caused and fixed on real hardware, not the emulator (`n3ds-cmdbuf-freeze.md`, commits `14eccfe2`
+  through `403c241a`, 10-18); disk streaming and Japanese-input defaults for every 3DS build (commit
+  `c99682f3`, 10-19).
+- **Research docs:** 199 `.md` files under `docs/research/native/` as of this compile (`ls docs/research/
+  native/*.md | wc -l`), plus evidence subfolders for several of them. Not individually catalogued here;
+  the ones this addendum and the post-mortem's new chapters draw from are named inline above.

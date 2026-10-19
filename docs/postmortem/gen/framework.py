@@ -1,13 +1,17 @@
 """Shared layout, style and SVG chart helpers for the G-Diffuser 3DS post-mortem pages."""
 import html
+import re
 
 PAGES = [
     ("index.html", "Overview", "What was built, in one screen"),
     ("author.html", "Author's notes", "The one page written by a human"),
-    ("timeline.html", "Every step", "The 24-day chronology"),
-    ("road-to-60.html", "Road to 60", "The performance campaign, round by round"),
+    ("timeline.html", "Every step", "The chronology, New 3DS to v1.0.0"),
+    ("road-to-60.html", "Road to 60", "The New 3DS performance campaign, round by round"),
+    ("native.html", "The native fork", "Why it exists, and what it changed"),
+    ("old-3ds.html", "Old 3DS", "The road to a real 60 at 268 MHz"),
+    ("boundaries.html", "Pushing the boundaries", "Against our New 3DS build and against the field"),
     ("difficulties.html", "Difficulties", "What fought back, and how it was beaten"),
-    ("frontier.html", "Frontier", "Why this is innovative, bold, and new"),
+    ("frontier.html", "Frontier", "What this port does that others in its position haven't"),
     ("agentic.html", "Agentic workflow", "How the fleet was run, and how the ship was steered"),
     ("cost.html", "Cost", "Tokens, dollars, subagents"),
 ]
@@ -123,20 +127,49 @@ def esc(s):
     return html.escape(str(s), quote=True)
 
 
+# Single source of truth for the project's headline date range, so the live site (nav(), below)
+# and the PDF cover (build_pdf.py) cannot drift apart on their own copies of these dates.
+DATE_RANGE = "New 3DS 2026-08-11 → 09-03 · Native fork 2026-09-07 → 10-19"
+
+
 def nav(current):
     items = []
     for f, t, s in PAGES:
         on = ' class="on"' if f == current else ""
         items.append(f'<li><a href="{f}"{on}><b>{esc(t)}</b><span>{esc(s)}</span></a></li>')
-    return ('<nav class="rail"><div class="brand">G-Diffuser<br>on New 3DS</div>'
-            '<div class="sub">Post-mortem · F-Zero X, 2026-08-11 → 2026-09-03</div>'
+    return ('<nav class="rail"><div class="brand">G-Diffuser<br>on 3DS</div>'
+            f'<div class="sub">Post-mortem · F-Zero X<br>{DATE_RANGE.replace(" · ", "<br>")} (v1.0.0)</div>'
             '<ol>' + "".join(items) + '</ol>'
             '<div class="foot">Sources: git history, docs/research, session transcripts, hardware logs. '
-            '<a href="https://github.com/cruxxxxxx/gdx-3ds">Repository</a> · <a href="G-Diffuser-3DS-postmortem.pdf">PDF</a></div></nav>')
+            '<a href="https://github.com/cruxxxxxx/gdx-3ds">Repository</a> · <a href="G-Diffuser-3DS-postmortem.pdf">PDF</a><br>'
+            'Sourcing evidence (raw, not reader-facing) — full detail through the New 3DS chapter (v0.9.0), plus a native-fork addendum: '
+            '<a href="source-timeline.md">source-timeline.md</a>, '
+            '<a href="source-perf-data.md">source-perf-data.md</a></div></nav>')
+
+
+def number_eyebrow(idx, body):
+    """Pages carry a numbered eyebrow ("03 · Road to 60"); keep the number in step with PAGES."""
+    return re.sub(r'<p class="eyebrow">\d\d · ', f'<p class="eyebrow">{idx + 1:02d} · ', body, count=1)
+
+
+def reframe(current, old_html):
+    """Re-wrap an already-rendered page in the current navigation, for pages whose raw inputs no longer exist.
+
+    Strips everything from the first prev/next footer onward, not just that footer itself: a page can
+    carry content appended *after* its footer on a previous build (e.g. road-to-60.html's continuation
+    note), and an end-of-string-anchored strip would miss that on every subsequent rebuild, duplicating
+    it forever. page() below adds a fresh footer, and callers that append their own trailing content do
+    so after reframe() returns, so this must remove the old footer and anything that followed it.
+    """
+    title = html.unescape(re.search(r'<title>(.*?)</title>', old_html, re.S).group(1))
+    body = re.search(r'<main>(.*)</main>', old_html, re.S).group(1)
+    body = re.sub(r'<div class="next">.*', '', body, flags=re.S)
+    return page(current, title, body)
 
 
 def page(current, title, body):
     idx = [f for f, _, _ in PAGES].index(current)
+    body = number_eyebrow(idx, body)
     prev_ = PAGES[idx - 1] if idx > 0 else None
     next_ = PAGES[idx + 1] if idx + 1 < len(PAGES) else None
     nx = ""

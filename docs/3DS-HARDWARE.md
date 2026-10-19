@@ -1,298 +1,365 @@
-# Running G-Diffuser on a real Nintendo 3DS
+# Running G-Diffuser on a Nintendo 3DS
 
-Everything you need to boot the port on hardware, and what to report back from the
-first run. Emulator (Azahar) flow is covered by `tools/prebake/README.md`; this page
-is the console-side companion.
+A player's guide: pick a build, get the assets onto an SD card, launch it, and tune the
+settings that matter. This page covers real hardware. The same prebaked archives (§3) also
+work with the Azahar emulator; running Azahar itself isn't covered in this release's docs.
 
-## 1. Requirements
+## 1. What you need
 
 | What | Why |
 |---|---|
-| **New Nintendo 3DS / New 2DS** (any region) | The port targets the New3DS CPU profile: 804 MHz + L2 cache. The `.cia` requests these in its exheader (`SystemModeExt 124MB`, `CpuSpeed 804MHz`, `EnableL2Cache`); on an Old3DS it would run at 268 MHz and is expected to be unplayably slow. Old3DS is untested and unsupported for now. |
-| **Luma3DS >= 10.1.1** (custom firmware, boot9strap) | Homebrew execution + signature patches for the test-signed `.cia`, and a DSP/audio path new enough for the ndsp backend. Follow <https://3ds.hacks.guide> if the console is stock. |
-| **SD card with a few hundred MB free** | `fzerox.o2r` is tens of MB; logs and saves are small. |
-| **`sdmc:/3ds/dspfirm.cdc`** (DSP firmware dump) | Required for ANY audio. See section 4 — without it the game runs, but silent. |
-| **Your own F-Zero X US rev0 ROM, pre-baked on a PC** | The console never sees the ROM; you bake `fzerox.o2r`/`gdiffuser.o2r` once with `tools/prebake` (see its README) and copy them over. |
+| **A Nintendo 3DS, 2DS, New 3DS, or New 2DS XL** | Any of them works — see §2 for which build to pick. |
+| **Luma3DS >= 10.1.1** (custom firmware, boot9strap) | Homebrew execution, signature patches for the test-signed `.cia`, and audio support new enough for this game's sound to work. Follow <https://3ds.hacks.guide> if the console is stock. |
+| **A way to run homebrew**: the Homebrew Launcher — reached from the Rosalina menu (always available under Luma) or a HOME-menu shortcut — for `.3dsx`, or **FBI** to install a `.cia` | Either works — see §5 for the install steps. If you don't already have FBI, get it from Universal-Updater or <https://github.com/Steveice10/FBI/releases>. |
+| **An SD card with a few hundred MB free** | The game's archives are tens of MB; an Expansion Kit disk image is ~65 MB; saves and logs are small. |
+| **`sdmc:/3ds/dspfirm.cdc`** (a DSP firmware dump) | Required for any audio. See §7 — without it the game runs, but silent. |
+| **A PC with Python 3.8 or newer installed** | Needed once, to prebake your game assets — see §3. |
+| **The `gdx-extract` tool** (downloaded separately) | A small PC-side extractor the prebake script drives — see §3 for where to get it. |
+| **Your own F-Zero X (US) ROM**, pre-baked on a PC | The console never touches the ROM itself; see §3. |
+| **(Optional) a 64DD F-Zero X Expansion Kit disk image**, if you want the Expansion Kit build | See §6. |
 
-## 2. Choose an entry point: `.3dsx` or `.cia`
+## 2. Pick a build
 
-Both are built from the same ELF and share saves, config, and logs — pick either
-(or use both; they coexist).
+G-Diffuser 3DS ships as four builds:
 
-**`.3dsx` — Homebrew Launcher** (recommended for the first run; trivially updatable):
+| Build | Console | Content | File names |
+|---|---|---|---|
+| **O3DS** | Old 3DS / 2DS | F-Zero X | `G-Diffuser-3DS-O3DS.3dsx` / `.cia` |
+| **N3DS** | New 3DS / New 2DS XL | F-Zero X | `G-Diffuser-3DS-N3DS.3dsx` / `.cia` |
+| **O3DS-EK** | Old 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-O3DS-EK.3dsx` / `.cia` |
+| **N3DS-EK** | New 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-N3DS-EK.3dsx` / `.cia` |
 
-1. Copy `build-3ds/port/3ds/G-Diffuser-3DS.3dsx` to `sdmc:/3ds/`.
-2. Launch the Homebrew Launcher (on Luma any entry point works, e.g. the bundled
-   one on Rosalina > Miscellaneous or the HOME-menu title) and start G-Diffuser.
+A few things worth knowing before you pick:
 
-**`.cia` — installed HOME-menu title** (target `G-Diffuser-3DS-cia`; needs
-makerom + bannertool, see `port/3ds/packaging/README.md`):
+- Old vs. New 3DS is a compile-time memory layout choice, not a quality setting — the console
+  model is detected at startup either way, so an Old-3DS build still runs at full New-3DS
+  settings if launched on a New 3DS. The reverse isn't true: **don't run the New 3DS build on
+  an Old 3DS** — it assumes more RAM than an Old 3DS has, and is expected to fail at or soon
+  after launch (see §12).
+- The Expansion Kit (EK) adds the 64DD course editor (COURSE EDIT) and machine creator (CREATE
+  MACHINE), using the retail F-Zero X 64DD disk. It's a separate build of the whole game, not an
+  add-on — see §6 for what you need to supply and what happens if you don't.
+- Vanilla and Expansion Kit builds install side by side (different HOME-menu titles, different
+  save files) and share one SD-card folder for everything else — so if you're unsure, download
+  both builds for your console; they share settings and don't conflict.
 
-1. Copy `build-3ds/port/3ds/G-Diffuser-3DS.cia` anywhere on the SD card.
-2. On the console open **FBI** > `SD` > navigate to the file > `Install CIA`.
-3. G-Diffuser appears on the HOME menu (title ID `000400000FF3D500`). Uninstall via
-   FBI > `Titles` if ever needed.
+If a build isn't available as a ready download, anyone with the devkitPro toolchain can build
+all four from source instead (§14).
 
-The `.cia` is test-signed (standard homebrew practice); Luma's sigpatches make it
-install and boot like any title. It will not install on a stock console.
+## 3. Prebake the game's assets on a PC (required, every build)
 
-## 3. SD card layout
+The 3DS never reads your ROM directly, and nothing in the repository or the release download
+contains game data. Instead, you convert your own legally-owned F-Zero X ROM into two archive
+files **once, on a PC**, and copy them to the SD card. The same two archives work for every one
+of the four builds above. You'll also need the `gdx-extract` tool for your PC's OS — download it
+from the project's latest release page (see `tools/prebake/README.md` step 2) and pass its path
+as `--extractor`:
+
+```sh
+python3 tools/prebake/prebake.py --rom /path/to/fzerox-us-rev0.z64 --extractor /path/to/gdx-extract
+```
+
+Full requirements, the Windows walkthrough, and troubleshooting: `tools/prebake/README.md`.
+
+## 4. SD card layout
 
 ```
 sdmc:/
 ├── 3ds/
-│   ├── G-Diffuser-3DS.3dsx        (if using the Homebrew Launcher route)
+│   ├── G-Diffuser-3DS-<BUILD>.3dsx       (if using the Homebrew Launcher — §5)
+│   ├── dspfirm.cdc                       (§7 — DSP firmware dump, required for audio)
 │   └── gdiffuser/
-│       ├── fzerox.o2r             (from tools/prebake — REQUIRED)
-│       ├── gdiffuser.o2r          (from tools/prebake — engine archive)
-│       ├── gdiffuser.ini          (optional, section 5)
-│       ├── log.txt                (written by the port when debug.filelog=1)
-│       └── saves/                 (created by the game; back this up)
-└── dspfirm.cdc                    (section 4 — actually at sdmc:/3ds/dspfirm.cdc)
+│       ├── fzerox.o2r                    (from §3 — REQUIRED; without it the game won't boot)
+│       ├── gdiffuser.o2r                 (from §3 — always generate both together; without it
+│       │                                  the game still boots but engine/UI assets are missing)
+│       ├── gdiffuser.ini                 (optional settings — §9-§10; the game writes this itself)
+│       ├── media/
+│       │   └── baserom.jp.ek.ndd         (Expansion Kit builds only — §6; or baserom.translated.ek.ndd)
+│       ├── saves/                        (created by the game; back this up)
+│       │   ├── fzerox.sav
+│       │   ├── fzerox-ek.sav             (Expansion Kit builds)
+│       │   ├── baserom.jp.ek.ndd.gdd     (Expansion Kit disk sidecars — see §6)
+│       │   └── baserom.jp.ek.ndd.dcrc    (same two sidecars, see §6)
+│       ├── log.txt                       (vanilla build's log — §13)
+│       ├── log-EK.txt                    (Expansion Kit build's log)
+│       └── crash.txt / crash-EK.txt      (only if `[debug] crashdump = 1`, default off — §10)
 ```
 
-Produce the `3ds/gdiffuser/` archives with `tools/prebake` on your PC
-(`python3 tools/prebake/prebake.py --rom fzerox-us-rev0.z64 --build-dir build`),
-then merge the staged `dist/sdmc/3ds/` folder into the SD card's `3ds/` folder —
-full details and archive validation gates in `tools/prebake/README.md`.
+`<BUILD>` is whichever of O3DS / N3DS / O3DS-EK / N3DS-EK you downloaded. The vanilla and
+Expansion Kit builds read and write the same `gdiffuser/` folder, so there's only ever one of
+each shared file even if you have both builds installed. The `.gdd`/`.dcrc` sidecar names above
+are exact examples for the Japanese retail disk — they always take your disk image's full
+filename (including its `.ndd` extension) and add `.gdd` or `.dcrc` to the end of it.
 
-## 4. Audio prerequisite: dump `dspfirm.cdc` (once)
+## 5. Install: `.3dsx` or `.cia`
 
-The ndsp backend needs the console's DSP firmware blob at `sdmc:/3ds/dspfirm.cdc`.
-Nintendo does not ship it as a file, so you dump it from your own console once:
+Both come from the same build and share saves, settings, and logs — use either one, or both.
 
-1. Install/launch **DSP1** (homebrew, available in the Universal-Updater store or
-   from <https://github.com/zoogie/DSP1/releases>).
-2. Press **B** ("Dump DSP firmware"); it writes `sdmc:/3ds/dspfirm.cdc`. Exit.
+**`.3dsx` — Homebrew Launcher** (simplest; just a file copy):
 
-**Symptom without it:** the game boots and plays normally but is completely
-silent. The backend logs `[audio-out] ndspInit FAILED rc=0x........` and the boot
-sequence logs `audio output NULL SINK — game will be SILENT ...` (svc debug
-channel, `log.txt` with `debug.filelog=1`, and the bottom-screen console with
-`debug.console=1`) and degrades to a null sink that keeps engine timing intact —
-so silence means "check dspfirm.cdc" first, not "audio is broken".
+1. Copy `G-Diffuser-3DS-<BUILD>.3dsx` to `sdmc:/3ds/`.
+2. Open the Homebrew Launcher (any entry point works under Luma — the Rosalina menu's, or a
+   HOME-menu shortcut) and start it from the list.
 
-**Azahar/Citra needs the file too.** libctru loads the DSP component only from
-`sdmc:/3ds/dspfirm.cdc`, and that lookup happens inside the emulated app as well
-— so copy the same dump into the emulator's **virtual SD** at `3ds/dspfirm.cdc`
-(Azahar: Emulation > Configure > System > open the SD root, or the
-`sdmc/` directory under Azahar's user folder). Without it Azahar is exactly as
-silent as an undumped console. (Earlier docs claimed emulators don't need the
-file; that was wrong.)
+**`.cia` — installed HOME-menu title** (lets you launch it like any other game):
 
-**Triage receipts:** set `debug.diag_audio = 1` for a ~5 s periodic `[audio-out]`
-line (chunks submitted / played / nonzero, producer push totals, a sample OR that
-stays `0x0000` only if the game pushed pure silence). Set
-`debug.audio_testtone = 1` to replace all game audio with a 440 Hz sine at the
-output stage: tone audible = output path works (suspect game/audio content);
-still silent = ndsp/DSP path broken.
+1. Copy `G-Diffuser-3DS-<BUILD>.cia` anywhere on the SD card.
+2. On the console, open **FBI** → browse to the file → **Install CIA**.
+3. The game appears on the HOME menu. The vanilla build is named "G-Diffuser"; the Expansion
+   Kit build is named "G-Diffuser EK" and shows an "EXPANSION KIT" banner, so they're easy to
+   tell apart if you install both. Uninstall later via FBI → **Titles** if you ever want to.
 
-## 5. `sdmc:/3ds/gdiffuser/gdiffuser.ini` (optional)
+The `.cia` is test-signed, which is standard for homebrew — Luma's signature patches let it
+install and run like a normal title. It will not install on a stock (non-CFW) console.
 
-All keys with their defaults; omit the file entirely for defaults. `#`/`;` start
-comments; keys and section names are case-insensitive.
+## 6. Expansion Kit: supplying the disk
+
+No prebake step for this one — copy your disk image to the SD card as-is.
+
+The O3DS-EK and N3DS-EK builds need a 64DD F-Zero X disk image to unlock the course editor and
+machine creator. You supply your own; nothing in the repository or the download contains one.
+
+Rename your dump to exactly one of these two names and put it at the matching path — the game
+looks for both and prefers the English one:
+
+- `sdmc:/3ds/gdiffuser/media/baserom.translated.ek.ndd` — the fan English translation (preferred
+  when found)
+- `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` — the Japanese retail disk (the only retail
+  version of this disk) — it works out of the box, no setting to change.
+
+**Playing without a disk image works fine.** The Expansion Kit build still boots and plays the
+normal game — COURSE EDIT and CREATE MACHINE on the main menu just don't open. The log records
+`[leo] no disk image found; Expansion Kit modes stay disabled`, which is expected, not an error,
+if you haven't supplied a disk yet.
+
+Either must be the full, untrimmed 64DD image, about 64.9 MB. A smaller file (anything under
+60 MB) is rejected outright as truncated — that usually means a bad or partial download/dump.
+
+**Streamed, not loaded into RAM.** The disk is read directly off the SD card as you play, not
+copied into memory, so it costs almost no extra RAM on either console.
+
+**First boot is slower.** The very first time a disk image is mounted, the game reads the whole
+file once to fingerprint it — budget about a minute. It saves that fingerprint next to your
+saves, e.g. `sdmc:/3ds/gdiffuser/saves/baserom.jp.ek.ndd.dcrc` — your disk image's exact
+filename with `.dcrc` appended — so every later boot skips the wait. If you ever need to force
+a re-check, delete that exact file.
+
+Two sidecar files live next to your saves — they're not the same thing:
+
+| File | What it is | Safe to delete? |
+|---|---|---|
+| **`.dcrc`** | The one-time disk fingerprint described above. | Yes, any time — the game just re-checks the disk and writes a fresh one on the next boot. |
+| **`.gdd`** | Your own Expansion Kit edits: custom courses from COURSE EDIT, machines from CREATE MACHINE, and anything else that writes to the disk during play. The disk image itself (your `.ndd`) is never modified, so this file is where that content actually lives. | No — **back it up along with `saves/`**. Delete it (or lose it) and your custom courses and machines are gone, even though the disk image is untouched. |
+
+## 7. Audio: dumping `dspfirm.cdc` (one-time, every console)
+
+The audio backend needs the console's own DSP firmware, which Nintendo does not ship as a
+downloadable file — you dump it from your own console once:
+
+1. Install and launch **DSP1** (homebrew; Universal-Updater, or
+   <https://github.com/zoogie/DSP1/releases>).
+2. Press **B** ("Dump DSP firmware"). It writes `sdmc:/3ds/dspfirm.cdc`. Exit.
+
+**Symptom without it:** the game boots and plays normally but is completely silent.
+
+## 8. Controls
+
+Slide/drift is N64 **Z** (left) and **R** (right) — N64 **L** is never read in-race. **Boost** is
+a fresh N64 **B** press, available after lap 1. **Brake** is N64 **C-DOWN**, held.
+
+| 3DS input | N64 input | Effect |
+|---|---|---|
+| Circle Pad | Control Stick | steer |
+| A | A | accelerate |
+| B | B | boost (after lap 1); back out of menus |
+| Y | B | same as boost (a duplicate — see `y_maps_to_b` in §10) |
+| X | Z | slide/drift left |
+| L | Z | slide/drift left |
+| R | R | slide/drift right |
+| ZL / ZR *(New 3DS)* | B | boost |
+| C-Stick *(New 3DS)* | C buttons | camera; C-Stick down also brakes |
+| D-Pad | D-Pad | menus; steers too if the IN tab's D-PAD setting is FULL or RAMP |
+| START | START | pause / confirm |
+
+Attacks work as on the original N64 game: double-tap L or R (or X) for a side attack, or hold
+one of L/R and double-tap the other for a spin attack. Holding L and R together cancels a drift.
+ZL/ZR and the C-Stick only exist on New 3DS; on Old 3DS, boost stays on B/Y and slide-left on X.
+Old 3DS has no C-Stick, so there is no default **Brake** button at all on that console — open
+the IN tab (§9.1) and bind Brake to a button before you play.
+
+**Every one of these is remappable.** The bottom screen's IN tab (§9) lets you tap any game
+action and press a new 3DS button for it, independently of the table above.
+
+## 9. The bottom screen
+
+Outside the Homebrew Launcher or FBI menus, the bottom screen is G-Diffuser's own console. It has
+two faces:
+
+**During a race — DASH.** A live race readout (lap, position, speed, energy). Tap the small
+**MODE** chip, or press **SELECT**, to cycle through three layouts:
+
+1. classic — every readout stacked on the top screen, same as the original game
+2. split — some readouts move to the bottom screen
+3. all-on-bottom — the whole HUD moves to the bottom screen, top screen stays clean
+
+In 2–4 player races the HUD always stays on the top screen (the bottom screen doesn't have room
+to share four players' worth of readouts).
+
+**Outside a race — the idle view.** A checkerboard backdrop with the G-Diffuser logo, so the
+bottom screen doesn't sit blank at menus.
+
+Either view has a **DEBUG** button in the bottom-left corner that hands the bottom screen over to
+the settings console described below (one of that console's own tabs happens to also be named
+**DBG** — don't confuse the two). Tapping the tab bar's **DASH**/**RACE** entry (or holding
+**SELECT**) brings DASH/the idle view back.
+
+**The settings console.** A row of tabs across the top:
+
+| Tab | What it's for |
+|---|---|
+| **STA** | A quick status readout (memory headroom, build id) — nothing to change here. |
+| **DSP** | Display (display settings — not to be confused with the dspfirm.cdc DSP firmware from §7): border mode and rival detail — see §9.1. |
+| **3D** | Stereoscopic 3D depth, if you use the 3D slider — see §9.1. |
+| **AUD** | Master volume. |
+| **IN** | Steering feel, D-Pad steering, and button remapping — see §9.1. |
+| **LG** | A scrollable copy of the on-device log, handy without pulling the SD card. |
+| **AB** | Build / version information. |
+
+(A **DBG** tab with low-level renderer toggles also exists, for diagnosing problems rather than
+everyday play — see `DIAGNOSTICS.md` if you're asked to use it.)
+
+### 9.1 Settings worth knowing about
+
+- **Border mode (DSP tab):** four choices — AUTHENTIC (the original's letterboxed borders),
+  **FULL-BLEED** (the default; the scene fills the whole 400×240 screen), ZOOM, and HYBRID.
+  Full-bleed and hybrid can show a sliver of empty sky at the very edges in some scenes, since
+  the original backdrops were painted for the narrower 4:3 view — authentic mode doesn't have
+  this, at the cost of the black bars it was always drawn with.
+- **Rival detail (DSP tab):** NATIVE / REDUCED / MINIMAL / LOW (NATIVE by default) — simplifies
+  distant rival machines for more fps in big fields. An AUTO toggle on the same tab raises the
+  cut automatically in a crowded race and relaxes it when the field thins out; whatever you pick
+  by hand is treated as the floor it won't go below.
+- **Stereoscopic 3D (3D tab):** off by default. There's no console-UI toggle to turn it on —
+  set `[stereo] enabled = 1` in `gdiffuser.ini` (§10) and relaunch. (The experimental `n60`
+  performance preset, §10, turns this on as a side effect — check it if 3D shows up
+  unexpectedly.) Once enabled, on New 3DS, depth (IOD) and convergence become live steppers on
+  the 3D tab while the 3D slider is up. Slider down (or `enabled = 0`) renders identically to 2D.
+- **Steering feel (IN tab):** circle-pad deadzone, range, and response curve, plus whether the
+  D-Pad can steer (off / full / ramps up while held) — all four are live steppers with a pad
+  readout so you can see the effect immediately.
+- **Button remapping (IN tab):** tap any action in the list, then press the 3DS button you want
+  it bound to; a RESET DEFAULTS option is on the same tab.
+
+Everything above except `[stereo] enabled` is saved back to `gdiffuser.ini` automatically — you
+never have to hand-edit the file unless you want to set something before first boot, or turn on
+3D. See §10 for the ini keys directly.
+
+## 10. `gdiffuser.ini` — the keys worth setting by hand
+
+Lives at `sdmc:/3ds/gdiffuser/gdiffuser.ini`. It's plain text (`#`/`;` start comments, section
+and key names aren't case-sensitive), and you can omit it entirely — everything below has a
+sensible default. Most of these sync automatically from the console UI (§9.1); the rest — and
+anything you want to set before first boot — go here by hand.
 
 ```ini
 [input]
-deadzone = 16      ; circle-pad units ignored around center (raw range ~±156)
-range = 145        ; circle-pad units mapping to full N64 stick deflection (±80)
-y_maps_to_b = 1    ; 3DS Y acts as N64 B (accelerate comfortably with A+Y)
-curve = 0          ; 0 linear, 1 soft, 2 softer (response curve after the deadzone)
-dpad_steer = 0     ; 0 off, 1 full (D-pad = full stick), 2 ramp (grows while held)
-                   ; all four are live steppers in the INPUT tab with a pad readout
+deadzone = 16      ; circle-pad units ignored around centre
+range = 145         ; circle-pad units mapped to full stick deflection
+curve = 0           ; 0 linear, 1 soft, 2 softer
+dpad_steer = 0      ; 0 off, 1 full (D-pad = full stick), 2 ramp (grows while held)
+y_maps_to_b = 1      ; 3DS Y also boosts, alongside B (so A+Y accelerate+boost is comfortable)
+
+[display]
+border_mode = 1     ; 0 authentic, 1 full-bleed (default), 2 zoom, 3 hybrid
 
 [audio]
-lle = 0            ; 1 = route audio tasks through the cxd4 RSP LLE interpreter.
-                   ; TEST ONLY: expected to blow the New3DS CPU budget; HLE (0)
-                   ; is the supported synthesis path (port/3ds/audio/AUDIO_NOTES.md)
+master_volume = 100 ; 0-100
+
+[stereo]
+enabled = 0          ; OFF by default; set to 1 and reboot to turn on 3D — not a console-UI toggle
+iod = 12             ; depth, 0-40 px; default 12; live on the 3D tab once enabled above
+convergence = 0.25   ; 0.00-0.90; default 0.25; live on the 3D tab once enabled above
+
+[perf]
+preset = auto        ; auto | o3ds | n60 — see note below
+draw_distance = 100  ; percent, 40-100
+rival_detail = 0     ; 0 native, 1 reduced, 2 minimal, 3 low (floor for the AUTO toggle)
+rival_detail_auto = 1 ; 1 = auto-raise the cut in crowded races (default); 0 = always use rival_detail as a fixed level
 
 [debug]
-console = 0        ; 1 = text console on the bottom screen (boot steps, warnings)
-diag_audio = 0     ; 1 = periodic [audio-out] output-path receipts every ~5 s
-                   ;     (see section 4 "Triage receipts")
-audio_testtone = 0 ; 1 = 440 Hz sine replaces ALL game audio at the output stage
-                   ;     (bisects game-content vs output-plumbing silence)
-filelog = 0        ; 1 = mirror boot/watchdog/fatal tracer lines to
-                   ;     sdmc:/3ds/gdiffuser/log.txt (truncated each boot)
-filelog_max_kb = 256 ; log size cap (1-8192); logging stops at the cap with a marker
-heap_watch = 8     ; MB above the 60 s heap baseline that triggers a [heap-watch]
-                   ;     line + memory census in the log; 0 disables
-heap_watch_step = 4 ; MB between further triggers
-heap_watch_arm = 0 ; 1 = first trigger also arms the live allocation histogram
-                   ;     (for long stress sessions; costs a little per frame once armed)
-pads = 1           ; DEV ONLY. Number of controller ports to report (1-4). The 3DS has one
-                   ;     pad, so 2-4 spoof the extra ports and mirror port 1 into them
-                   ;     (mirroring happens in port/input_bridge.c, after the scripted-input
-                   ;     injector, so a .gdxrec replay drives all of them). It exists because
-                   ;     the decomp gates VS Battle on the port count, which makes the
-                   ;     split-screen render paths unreachable — and untestable — with one
-                   ;     pad. 1 is the hardware behaviour, byte for byte. Receipt: [input] pads=
-
-[native]           ; the native renderer levers (read once at boot; 0 = the exact prior path)
-all = 0            ; master for the TIER-2 levers only (machines, track, fx_sink, fx_sprites,
-                   ;     fx_hud): 1 = each of those that is 0/absent reads as 1 (a lever set to
-                   ;     2 keeps verify). Never touches interp.
-interp = 0         ; Tier 1 own interpreter (1 on); always explicit, `all` does not imply it.
-                   ;     Carries the Tier-2 hooks (track/fx markers, machine meshes), so
-                   ;     interp=1 all=1 is a valid combination
-machines = 0       ; retained machine meshes (1 on)
-track = 0          ; course tessellator marker replay (1 on, 2 verify: stock drawn + hashed)
-fx_sink = 0        ; effects sprite marker replay, one native draw per material run
-                   ;     (1 on, 2 verify); receipts [fx] with fxcensus=1
-fx_sprites = 0     ; with fx_sink: fold prim/env colour changes into the vertex colour where
-                   ;     the shader carries them per vertex (fewer draws; split= receipt)
-fx_hud = 0         ; the same prim/env fold applied inside the interpreter's own 2D batches
-                   ;     (HUD digits, stars, markers stop splitting on every prim colour).
-                   ;     Inert under interp=1: the owned walker has no fold yet (pixel-neutral)
-fxcensus = 0       ; 1 = [fx] per-class sprite/tri/draw census every 64th Racer_Draw
-trkcensus = 0      ; 1 = [trk] course census (see track)
-interp_verify = 0  ; 1 = run BOTH interpreters over every job and compare the packed batches
-                   ;     field by field ([nverify]). Slow; a correctness tool, not a play mode
-cpuclip = 1        ; the owned interpreter clips triangles on the CPU the way LUS does.
-                   ;     0 = let the PICA clip (fewer draws, different pixels — the tunnel A/B)
-blendflush = 1     ; the owned interpreter flushes its batch before a blend-alpha change, so
-                   ;     alpha compare uses the register in force at the primitive (LUS parity)
-texinval = 1       ; the owned interpreter honours the queued texture-cache invalidations
-                   ;     (gdx_rdram_mode_reset's arena-rewind clear, minimap.c's per-race
-                   ;     address delete). 0 = the pre-fix behaviour: they never reach it
-texhash_ci = 1     ; content-key the CI4/CI8/RGBA32 classes (decoded source span + the live
-                   ;     TLUT bytes). 0 = key them by address alone, so a recycled address
-                   ;     serves the previous course's decode
-machines_walk_only = 0 ; 1 = replay the baked mesh back through the interpreter's own
-                   ;     vertex/triangle path. A stepping stone, kept as a bisect
-machines_verify = 0    ; 1 = per draw, walk pass drawn+captured vs native pass captured with
-                   ;     GPU submit suppressed, triangle streams compared bit-exact
-machines_mask = ffffffff ; hex per-slot mask (bit i = machine slot i, 30 slots) — bisect
-machines_lod_mask = 1f   ; hex per-LOD mask (bit l = LOD l+1)
+console = 0          ; 1 = open the settings console on the bottom screen at boot
+filelog = 0           ; 1 = mirror the boot/warning/crash log to sdmc:/3ds/gdiffuser/log.txt
+filelog_max_kb = 1024 ; log size cap (1-8192); logging stops at the cap with a marker
+crashdump = 0        ; 1 = write a crash dump (crash.txt / crash-EK.txt) if the game faults;
+                     ; default off — see §13 for bug reports
 ```
 
-The boot log states every lever once, as RESOLVED (the `all` master already applied):
-`[native] all= interp= machines= track= fx_sink= fx_sprites= fx_hud= fx=<bitmask> ...
-(resolved: all=tier2 only, interp explicit; ...)`, and the interpreter path once:
-`[native] interp= path=lus|owned ... hooks=`. The DBG tab shows the same state on its
-NATIVE rows.
+**A note on `[perf] preset`.** `auto` (the default) quietly applies a reduced-detail profile
+*only on Old 3DS* — the New 3DS default is the stock, full-detail settings either way. There's
+also an experimental `n60` profile for a 60 fps New 3DS race. It hasn't crashed in testing, but a
+steady 60 fps isn't confirmed on hardware yet — try it, don't rely on it. `n60` also turns on
+stereo 3D (`[stereo] enabled = 1`) as part of its bundled defaults — set `enabled = 0` explicitly
+afterward if you don't want that. An explicit `[perf]` key you set yourself always wins over
+whatever the preset would have picked.
 
-## 6. Controls
+A few Expansion-Kit-only and diagnostic-only ini keys aren't reproduced here, since normal play
+never needs them — see `NATIVE-RENDERER.md` §2 / `DIAGNOSTICS.md` if a bug report ever asks you
+to set one.
 
-In-race semantics verified against the decomp (`decomp/src/game/racer.c`): the
-slide/drift pair is N64 **Z + R** (Z = left, R = right; N64 L is not read
-in-race at all), **boost** is a fresh N64 **B** press (after lap 1), and
-**brake** is N64 **C-DOWN** held.
+## 11. Known issues
 
-| 3DS input   | N64 input | In-game effect |
-|---|---|---|
-| Circle pad  | Stick     | steer (tilt up/down on stick Y) |
-| A           | A         | accelerate |
-| B           | B         | boost (tap, after lap 1); menus: back |
-| Y           | B         | same as B (duplicate; disable with `input.y_maps_to_b = 0`) |
-| X           | Z         | slide left / attacks (Old3DS-reachable Z) |
-| L           | Z         | slide/drift left |
-| R           | R         | slide/drift right |
-| ZL          | B         | boost (New3DS) |
-| ZR          | B         | boost (New3DS) |
-| C-stick     | C buttons | camera; C-stick down doubles as brake (New3DS) |
-| D-pad       | D-pad     | menus; steers too when INPUT tab DPAD is FULL or RAMP |
-| START       | START     | pause / confirm |
-| SELECT      | —         | reserved |
+- A rare, cosmetic speed-readout spike (briefly showing an impossible number, around 826 KPH) can
+  appear right at a finish line. It's a display glitch, not a race-affecting bug.
+- Short audio gaps can occur during loading transitions.
+- The Old 3DS has a firm memory ceiling — some heavy content may be tight on headroom. If
+  something crashes only on Old 3DS and not New 3DS, that's the most likely reason.
+- Hardware testing has covered the normal range of play, but not every mode on every console
+  model yet — if you hit something that looks wrong, see §12.
 
-Attacks work like the N64 original through the mapping: double-tap L or R (or X)
-for a side attack; hold one of L/R and double-tap the other for a spin attack.
-Holding L and R together cancels the drift, as on N64 Z+R. ZL/ZR and the C-stick only
-exist on New3DS; on Old3DS boost stays on B/Y and slide-left on X. N64 L is
-deliberately unmapped — nothing in-race reads it.
-
-## 7. Known issues / expectations (first hardware pass)
-
-- **Frame rate on hardware is unmeasured.** In the Azahar-based M1 bring-up the
-  port runs around ~26 fps in-race after the texture-cache fix; emulator numbers
-  do not transfer to the real GPU/CPU, in either direction. Expect anything.
-- **Residual texture-animation cache misses** (~1-3 uploads/frame while driving)
-  are known and budgeted; visible impact should be none.
-- **Attract mode occasionally fails to start** after abnormal emulator teardowns
-  in testing; not yet reproduced under normal boots. If the title screen sits
-  forever without demo playback, note it (see telemetry below).
-- **No ImGui menus / ghost browser / Discord** — dropped by design on 3DS; the
-  INI above is the whole configuration surface.
-- The **bottom screen** is the debug console (when enabled) — no touch UI yet.
-
-### First-run telemetry — what to report back
-
-Boot once with `debug.console = 1` and `debug.filelog = 1`, play a race (or get
-as far as it goes), quit (or power off after a hang/crash), then copy
-`sdmc:/3ds/gdiffuser/log.txt` off the SD card and report:
-
-1. **Console + firmware**: model (N3DS/N3DS XL/N2DS), Luma version, system fw.
-2. **How far it got**: HOME/HBL > logo > menus > race, and the LAST `[G-Diffuser-3DS]`
-   boot step in `log.txt` if it stopped early.
-3. **The `[watchdog]` lines** from `log.txt` — one per 5 s; the `frame=N(+delta)`
-   deltas are the effective fps × 5 (e.g. `+130` ≈ 26 fps). Note the delta while
-   sitting in menus vs. mid-race.
-4. **Audio**: sound OK / silent + whether the `ndspInit failed` line is present.
-5. **Any `[fatal]` / `[fatal-trace]` lines** (these are the crash tracers) and
-   whether Luma's exception screen appeared (photo of it if so).
-6. **Visuals**: anything obviously wrong (missing geometry, wrong colors, fog),
-   ideally with a photo — plus whether attract mode starts on its own.
-7. `log.txt` attached whole (it is capped at 256 KB).
-
-## 8. Troubleshooting quick table
+## 12. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| "WARNING: no archive mounted" / instant exit to HBL | archives missing/misplaced | check `sdmc:/3ds/gdiffuser/fzerox.o2r` exact path; re-run prebake (its golden gate catches bad bakes) |
-| Boots but silent | no DSP dump | section 4 (DSP1 > B) |
-| `.cia` won't install in FBI | stock console / no sigpatches | Luma3DS required (section 1) |
-| Hang/crash with blank screens | — | enable `debug.filelog=1`, reproduce, pull `log.txt`; the watchdog + fatal tracers name the stuck stage |
-| Luma exception screen | crash in guest/port code | photo the screen (PC + LR), grab `log.txt`, report both |
+| Instant exit back to the Homebrew Launcher, or "no archive mounted" | `fzerox.o2r` missing or misplaced (`gdiffuser.o2r` missing alone won't cause this — it only logs a warning) | Check `sdmc:/3ds/gdiffuser/` has both files; re-run the prebake tool (§3) — it refuses to produce a bad archive. |
+| Boots but completely silent | no DSP firmware dump, or Luma3DS older than 10.1.1 (see §1) | §7 — DSP1, press B; update Luma3DS if it's old. |
+| `.cia` won't install in FBI | stock console, or Luma not installed | Luma3DS is required — §1. |
+| EK build's COURSE EDIT / CREATE MACHINE won't open | no Expansion Kit disk image found | §6 — check the path and exact file name; look for `[leo] no disk image found` in the log. |
+| Disk image present but still not detected | wrong filename | §6 — rename it to exactly `baserom.jp.ek.ndd` or `baserom.translated.ek.ndd`. |
+| First boot of an EK disk is slow (~1 min) | expected — the one-time disk fingerprint pass | Nothing to fix; later boots are fast. |
+| EK disk image rejected as truncated | the `.ndd` is incomplete (under 60 MB) | Re-dump/re-download it; it should be about 64.9 MB. |
+| Crashes / black screen right after launch | wrong build for the console (ran the New 3DS build on an Old 3DS) | Use the O3DS/O3DS-EK build instead — its memory layout assumes more RAM than an Old 3DS has — §2. |
+| No 3D even with the slider up | 3D is off by default and needs an ini edit | Set `[stereo] enabled = 1` in `gdiffuser.ini` (§10) and relaunch — there's no in-game toggle for this one. |
+| Blank/frozen screen, or a hang | — | Set `[debug] filelog = 1`, reproduce, then pull `log.txt` (or `log-EK.txt`) — §13. |
+| Luma shows its red/pink exception screen | a crash in the game or port code | Photograph the screen (it shows the PC/LR registers), then follow §13 for a bug report. |
 
-## 9. Building from source
+## 13. Logs and bug reports
 
-Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MSYS2 shell.
+Logs live at `sdmc:/3ds/gdiffuser/log.txt` (vanilla build) or `log-EK.txt` (Expansion Kit
+build), and are only written when `[debug] filelog = 1` is set (§10) — set it before
+reproducing a problem. The file is capped at `filelog_max_kb` (1024 KB by default) and is
+overwritten fresh each boot.
 
-1. **Toolchain.** Install devkitPro with the `3ds-dev` group (devkitARM, libctru, citro3d,
-   3dstools), plus `cmake` 3.24+ and Python 3 with `pyyaml` and `pillow`. `dkp-pacman -S 3ds-dev`
-   gets the console side. For the `.cia` you also need `makerom` and `bannertool`, on PATH or dropped into `tools/3ds-bin/` (`port/3ds/packaging/README.md` says where to get them); without them only the `.3dsx` target is generated.
-2. **Clone with submodules.** The 3DS build needs exactly two: the decompilation and the
-   Expansion Kit reference. It does **not** need `libultraship` — the slice of it the 3DS
-   compiles is vendored in-tree at `port/3ds/vendor/lus/` with every 3DS patch already folded
-   in (`port/3ds/vendor/lus/PROVENANCE.md`). `libultraship` and `torch` are only for the
-   desktop build and the extractor, so a 3DS-only checkout can skip them:
-   ```sh
-   git clone https://github.com/cruxxxxxx/gdx-3ds.git
-   cd gdx-3ds
-   git submodule update --init decomp torch
-   ```
-   Building an Expansion Kit target (`-DGDX_3DS_EXPANSION_KIT=ON`, i.e. `O3DS-EK`/`N3DS-EK`)
-   additionally needs `fzerox-expansion-kit`: its asset generator reads that submodule's
-   `assets/yaml/jp/` and `tools/patch.py` at configure time, with no prebaked fallback.
-   ```sh
-   git submodule update --init decomp torch fzerox-expansion-kit
-   ```
-   (`git clone --recurse-submodules` still works and just fetches more than any one lane uses.)
-3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
-   deltas are the 52 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
-   tree in the order listed in `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that
-   idempotently and then builds:
-   ```sh
-   export DEVKITPRO=/opt/devkitpro
-   tools/ci-3ds.sh            # patches + host tests + 3DS build; --emu adds an Azahar boot smoke
-   ```
-   It picks up Ninja and ccache automatically when they are on PATH (`--no-ninja` /
-   `--no-ccache` force the fallbacks) and prints a `[time] configure=… full=… incr=…` line.
-   Manual equivalent: the `git -C decomp apply ...` lines from the patches README, then
-   ```sh
-   cmake -S . -B build-3ds -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/3DS.cmake \
-         -DGDX_PLATFORM_3DS=ON -DCMAKE_BUILD_TYPE=Release
-   cmake --build build-3ds --target G-Diffuser-3DS_3dsx -j8     # Homebrew Launcher build
-   cmake --build build-3ds --target G-Diffuser-3DS-cia -j8      # HOME menu build (needs makerom)
-   ```
-   Artifacts: `build-3ds/port/3ds/G-Diffuser-3DS.3dsx` and `.cia`. The `.elf` next to them is
-   what `addr2line` wants when reading a crash or heap-watch address out of `log.txt`.
-4. **Assets** are a separate, PC-side step from your own ROM dump: `tools/prebake/README.md`.
-   The extractor it needs is a release download for Windows, macOS and Linux, so this step
-   needs Python only. Nothing in this build embeds game data.
+If you're filing a bug report, please include:
 
-The GitHub Actions workflow `.github/workflows/release-3ds.yml` does all of the above on every
-tag: the extractor on three OSes and the console artifacts in the devkitPro container.
+1. **Console + firmware**: model (Old 3DS/2DS, New 3DS/New 2DS XL), Luma version.
+2. **Which build**: O3DS / N3DS / O3DS-EK / N3DS-EK, and `.3dsx` or `.cia`.
+3. **How far it got**: menus, a race, a specific mode — and the last line of `log.txt` if it
+   stopped partway.
+4. **The whole log file** (`log.txt` or `log-EK.txt`) — it's small enough to attach in full.
+5. **A photo of Luma's exception screen**, if one appeared.
+6. **A photo or description of anything visually wrong**, if that's the issue.
+7. **If you turned on `[debug] crashdump = 1` before the crash**, also attach `crash.txt`/
+   `crash-EK.txt` (see §10; full setup, and the Old-3DS caveat if no file appears, are in
+   `DIAGNOSTICS.md`).
 
-The build id shown on the STAT tab is `<branch>@<short sha>` of the checkout it came from.
+## 14. Building from source
 
+You don't need this to play — it's only for building the console binary yourself instead of
+downloading it. One command, once devkitPro is installed, builds and names the output exactly
+like a downloaded release:
+
+```sh
+tools/build-3ds.sh <o3ds|n3ds|o3ds-ek|n3ds-ek|all>
+```
+
+Full toolchain setup and step-by-step instructions: `docs/BUILDING.md`.

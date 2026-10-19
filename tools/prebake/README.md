@@ -1,5 +1,8 @@
 # tools/prebake — PC-side asset pre-bake for the 3DS port
 
+This entire page runs on your PC (Windows/macOS/Linux) — nothing here runs
+on the 3DS.
+
 The Nintendo 3DS build never runs Torch, Python, or first-boot extraction on
 device (no CPU/RAM budget for it, and no portlibs). Instead, you bake the
 asset archives **once on your PC** with this tool and copy them to the SD
@@ -7,15 +10,25 @@ card. The 3DS then mounts them read-only from
 `sdmc:/3ds/gdiffuser/` (see `port/3ds/assets/gdx3ds_fs_sd.c`).
 
 This tool does not reimplement extraction: it drives the **existing desktop
-flow** — the deterministic `gdx-extract` (trimmed Torch) that the desktop
-port's first boot spawns — with the exact same arguments, then applies the
-same validation gates first boot applies (ROM SHA-1 in, archive golden
+flow** — the deterministic `gdx-extract` (trimmed Torch) — with the same
+arguments and validation gates first boot uses (ROM SHA-1 in, archive golden
 SHA-256/entry-count out).
 
 ## What you need
 
-1. **This repository**, with submodules:
-   `git submodule update --init --recursive`
+1. **This repository**, cloned with `git` (not GitHub's "Download ZIP" button
+   — a zip download omits submodule content, so `decomp/` lands empty and
+   the extractor step below fails). With the `decomp` submodule initialized:
+
+   ```
+   git clone https://github.com/cruxxxxxx/gdx-3ds.git
+   cd gdx-3ds
+   git submodule update --init decomp
+   ```
+
+   (`torch` is only needed if you're building `gdx-extract` yourself — see
+   the "build it yourself" steps below. Skip it if you're using the
+   downloaded extractor.)
 2. **`gdx-extract`**, the extractor binary. Easiest: download
    `gdx-extract-<your OS>.zip` from the
    [latest release](https://github.com/cruxxxxxx/gdx-3ds/releases/latest)
@@ -34,7 +47,10 @@ SHA-256/entry-count out).
 
    The binary lands in `build-extract/install/bin/`. (A full desktop build's
    `--build-dir build` also works, as before.)
-3. **Your F-Zero X US rev0 cartridge dump**, big-endian (`.z64`).
+3. **Your F-Zero X US rev0 cartridge dump**, big-endian (`.z64`) — the
+   cartridge ROM, a separate file from any 64DD Expansion Kit disk image.
+   This tool does not process the disk image at all; see "Expansion Kit"
+   below.
    - SHA-1 must be `5f658e88ffa9de23cba6986a8fd3d3a90d7b4340`.
    - JP, PAL, rev1, and byte-swapped (`.v64`/`.n64`) dumps are rejected with
      a diagnosis; byte-swapped dumps can be converted to `.z64` first
@@ -50,7 +66,10 @@ python3 tools/prebake/prebake.py --rom /path/to/fzerox-us-rev0.z64 --extractor /
 ### Windows, step by step
 
 1. Install Python 3 from python.org (tick "Add python.exe to PATH").
-2. Clone the repository (Git for Windows), or download it as a zip and unpack it.
+2. Install [Git for Windows](https://git-scm.com/download/win) and clone the
+   repository with git (not the "Download ZIP" button — see "What you need"
+   above): `git clone https://github.com/cruxxxxxx/gdx-3ds.git`, then
+   `cd gdx-3ds` and `git submodule update --init decomp`.
 3. Download `gdx-extract-windows-x64.zip` from the latest release and unzip it,
    for example to `C:\gdx\gdx-extract.exe`.
 4. In PowerShell, from the repository folder:
@@ -59,9 +78,8 @@ python3 tools/prebake/prebake.py --rom /path/to/fzerox-us-rev0.z64 --extractor /
    python tools\prebake\prebake.py --rom C:\path\to\fzerox-us-rev0.z64 --extractor C:\gdx\gdx-extract.exe
    ```
 
-5. Copy the contents of `dist\sdmc\` onto the SD card (it mirrors the card's
-   `3ds\gdiffuser\` layout). The console binary is a separate download from the
-   same release; nothing here needs Visual Studio, MSYS2 or devkitPro.
+5. Copy `dist\sdmc\` onto the SD card — see "Copy to the SD card" below.
+   Nothing in this page needs Visual Studio, MSYS2, or devkitPro.
 
 Options:
 
@@ -77,13 +95,15 @@ Options:
 
 **Why some entries are stored.** The 3DS preloads `audio_blob/audio_table`
 (10.7 MB, deflate saves only 9%) and `segment_blob/common_assets_compressed`
-(2.5 MB of MIO0 data, 26%) at every boot; inflating them is CPU-bound (~4 s
-on a New 3DS spare core, longer on the syscore) and the title music's sample
-load can block on it, which is audible as a boot hiccup
-(`docs/research/bootaudio2-progress.md`). Stored, the preload is a plain SD
-read. The archive grows ~1.65 MB (15.5 -> 17.2 MB). The golden gate applies
-to the extractor's output before this step; the installed archive keeps the
-same entry order, names, sizes and CRCs, only the two entries' method changes.
+(2.5 MB of MIO0 data, 26%) at every boot. Inflating them is CPU-bound (~4 s
+on a New 3DS's spare core, longer on the syscore) and the title music's
+sample load can block on it, which is audible as a boot hiccup. Stored, the
+preload is a plain SD read instead.
+
+The archive grows ~1.65 MB (15.5 -> 17.2 MB). The golden gate still applies
+to the extractor's raw output, before this step; the installed archive keeps
+the same entry order, names, sizes and CRCs — only the two entries'
+compression method changes.
 
 The script:
 
@@ -117,27 +137,39 @@ dist/sdmc/
 ```
 
 Copy the `3ds/` folder onto the **root** of your SD card, merging with the
-existing `3ds/` homebrew folder. Then install/launch `G-Diffuser-3DS.3dsx`
-via the Homebrew Launcher as usual.
+existing `3ds/` homebrew folder. Then get the `G-Diffuser-3DS-*.3dsx` or
+`.cia` that matches your console and content — see the table in the main
+[README](../../README.md#download) (e.g. an Old 3DS with the Expansion Kit
+disk wants the O3DS-EK build):
+
+- **`.3dsx`**: copy it to `sdmc:/3ds/` and launch it from the Homebrew Launcher.
+- **`.cia`**: install it with [FBI](https://github.com/Steveice10/FBI/releases)
+  from the HOME menu (needs Luma3DS and sigpatches), then launch it from there.
+
+First time doing either? See `docs/3DS-HARDWARE.md` for the full walkthrough.
 
 Saves are created by the game at `sdmc:/3ds/gdiffuser/saves/` — back that
 folder up if you reformat the card. The ROM itself is **not** copied to the
 SD card and is not needed on device.
 
-## Mount semantics on device (for porters)
+(Porters: how the two archives mount and resolve collisions on device is
+architecture-level detail, not a prebake concern — see `docs/ARCHITECTURE.md`.)
 
-`gdx3ds_fs_sd.c` mirrors the desktop mount behavior
-(`port/main.cpp findArchivePaths` + libultraship `ArchiveManager`):
-archives mount in the order `gdiffuser.o2r`, `fzerox.o2r`, and the **last
-mounted archive wins** duplicate record keys (ArchiveManager overwrites its
-hash→archive map per file), so `fzerox.o2r` shadows `gdiffuser.o2r` on
-collisions — identical to the PC.
+## Expansion Kit: this tool doesn't bake your disk image
 
-## Not yet covered (post-MVP)
+If you're using an Expansion Kit build (`o3ds-ek` / `n3ds-ek` — whether you
+downloaded it or built it yourself), this script's job doesn't change, and
+that's the point: you still only need it for the ROM above. The 64DD disk
+image is handled completely differently from the ROM: the console **streams
+it directly from `sdmc:/3ds/gdiffuser/media/`** at runtime, reading it in
+small blocks as needed rather than loading it whole. There is no pre-bake,
+archive, or golden check for it. Just copy your own disk dump there yourself
+— see `docs/3DS-HARDWARE.md` §4 ("SD card layout") for the exact filename;
+this tool never touches it.
 
-- **Expansion Kit / 64DD (`.ndd`, `n64ddipl.o2r`, `fzerox-disk.o2r`)**: the
-  3DS MVP is cartridge content only (`docs/research/3ds-port-plan.md`,
-  stream D). The prebake tool will grow `--ndd` / IPL steps when the device
-  side mounts them.
-- **JP profile**: experimental on desktop, no validated golden; excluded
-  here until one exists.
+## Not yet covered
+
+- **JP ROM profile**: experimental on desktop, no validated golden; excluded
+  here until one exists. This is separate from Japanese *disk* content —
+  the only retail Expansion Kit disk is Japanese, and 3DS builds accept it
+  by default (see `docs/BUILDING.md`, `GDX_ALLOW_JP_INPUTS`).

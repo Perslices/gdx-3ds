@@ -1,0 +1,110 @@
+{
+ "_source": "Frozen 2026-10-08 from the rendered New 3DS post-mortem pages (index.html tiles and table, timeline.html chart titles, agentic.html and cost.html tiles). The original inputs (census.json, page-data.json, git-3ds-log.txt, user-prompts.txt in session 8a63b51b's scratchpad) no longer exist; these are the values that were rendered from them, not recomputed.",
+ "D": {
+  "subagents": "147",
+  "workflow_agents": "1,103",
+  "worktrees": "96",
+  "branches": "98",
+  "workflows": "10",
+  "prompts": "223",
+  "active_days": "15",
+  "sd_mentions": "36",
+  "memory_lines": "591",
+  "patches": "48",
+  "patches_decomp": "10",
+  "patches_lus": "38",
+  "loc_port3ds": "15,039",
+  "loc_all": "25,009",
+  "commits_3ds": "250",
+  "final_median": "59.6",
+  "final_p10": "51.4",
+  "final_cap": "53%",
+  "tokens_total_h": "3.17 B",
+  "cost_a_h": "$4,280",
+  "cost_b_h": "$4,974",
+  "headline_rows": [
+   [
+    "08-14 first race (emulator)",
+    "12–20",
+    "–",
+    "–"
+   ],
+   [
+    "08-21 first hardware run",
+    "48–50",
+    "–",
+    "–"
+   ],
+   [
+    "08-28 release-grade build",
+    "~51",
+    "~40 (crowds, MINIMAL)",
+    "–"
+   ],
+   [
+    "09-02 Round 1: Mainline before the campaign",
+    "51.3",
+    "39.2",
+    "9%"
+   ],
+   [
+    "09-02 Round 2: Bridge memos (brfast)",
+    "57.2",
+    "46.6",
+    "29%"
+   ],
+   [
+    "09-02 Round 3: HUD atlas · triangle memo · TMEM · audio",
+    "56.0",
+    "48.0",
+    "32%"
+   ],
+   [
+    "09-02 Round 4: Render thread on core 2 (pipe)",
+    "57.6",
+    "44.6",
+    "14%"
+   ],
+   [
+    "09-03 Round 5: Ahead mode · bridge on main · auto rival detail",
+    "59.6",
+    "51.4",
+    "53%"
+   ]
+  ]
+ },
+ "commits_per_day": {
+  "2026-08-11": 2,
+  "2026-08-12": 18,
+  "2026-08-13": 25,
+  "2026-08-14": 19,
+  "2026-08-15": 2,
+  "2026-08-20": 50,
+  "2026-08-21": 53,
+  "2026-08-22": 0,
+  "2026-08-23": 0,
+  "2026-08-27": 38,
+  "2026-08-28": 9,
+  "2026-08-31": 0,
+  "2026-09-01": 14,
+  "2026-09-02": 107,
+  "2026-09-03": 14
+ },
+ "prompts_per_day": {
+  "2026-08-11": 6,
+  "2026-08-12": 0,
+  "2026-08-13": 15,
+  "2026-08-14": 36,
+  "2026-08-15": 3,
+  "2026-08-20": 10,
+  "2026-08-21": 46,
+  "2026-08-22": 4,
+  "2026-08-23": 2,
+  "2026-08-27": 20,
+  "2026-08-28": 11,
+  "2026-08-31": 3,
+  "2026-09-01": 7,
+  "2026-09-02": 24,
+  "2026-09-03": 24
+ }
+}

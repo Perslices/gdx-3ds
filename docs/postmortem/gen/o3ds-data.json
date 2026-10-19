@@ -1,0 +1,262 @@
+{
+ "_source": "Old 3DS chapter data, compiled 2026-10-08 from docs/research/native (NEXT.md C4-C8, n60-design.md, n60-progress.md, hwprof-progress.md, r60-research.md, per-agent progress docs), this project's own hardware-test logs, and git history. Every figure below is copied from one of those; 'fps' values derived from a frame time are 1000/ms and are marked 'derived'. Times are local (EDT).",
+ "cards": [
+  {
+   "date": "09-28",
+   "name": "Shipped build (RDRAM 16)",
+   "what": "The released New 3DS build, unchanged, installed as a CIA",
+   "hw": "Dies in the boot preload: <code>[fatal] operator new failed size=175844 heapFree=32424</code>. Console answers <code>memtype=0</code>, heap grant 24 MiB (25,165,824 B)",
+   "src": "hw-first-boot-0928; NEXT.md C4a",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "09-29",
+   "name": "First boot (RDRAM 8)",
+   "what": "<code>-DGDX_3DS_RDRAM_MB=8</code>, <code>audio_stream=1</code>, <code>tex_upload_kb=512</code>; legacy interpreter (<code>native all=0</code>)",
+   "hw": "Boots and races. Wall p50 96.0 ms (p10 88.7, p90 111.3); GPU busy 3.6 ms; <code>oth</code> 37.3 ms. User: \"it ran ! at like 9fps\"",
+   "src": "hw-rdram8-0929; NEXT.md C4f",
+   "fps2d": 10.4,
+   "fps3d": null
+  },
+  {
+   "date": "09-29",
+   "name": "C4 run 1: O3DS profile",
+   "what": "<code>-DGDX_3DS_O3DS=ON</code> (RDRAM 8 MiB + 16 MiB linear pin: 38.9 MB heap), owned interpreter <code>all=1 interp=1</code>",
+   "hw": "GP wall 88 ms (11.3 fps), TT/menu 43.7 ms; <code>aud</code> 25.8 ms = audio-lock wait, confirmed on hardware",
+   "src": "hw-c4run1-0929",
+   "fps2d": 11.3,
+   "fps3d": null
+  },
+  {
+   "date": "09-29",
+   "name": "C4 run 2: narrow audio lock",
+   "what": "<code>audio_ctx_narrow=1</code>",
+   "hw": "<code>aud</code> 25.8 → 0.2 ms; race wall 67.8 ms (14.7 fps), light scenes 40 ms",
+   "src": "hw-c4run2-0929",
+   "fps2d": 14.7,
+   "fps3d": null
+  },
+  {
+   "date": "09-29",
+   "name": "Wave 2: HOME + audio SIMD",
+   "what": "HOME bisect builds; <code>audio_simd</code> verify",
+   "hw": "HOME freeze root cause isolated (bottom backlight session); 7/7 HOME resumes with screen on; <code>audio_simd</code> verify 391/0/0, 0 mismatches on silicon",
+   "src": "hw-wave2-0929",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "09-29",
+   "name": "Wave 3: frameskip + O3DS preset",
+   "what": "<code>frameskip=auto</code>, <code>preset=o3ds</code>, <code>gpuxf=1</code>, DrawProbe calibration CIA",
+   "hw": "Logic 57–60 ticks/s (game at full speed for the first time); drawn 19–28 fps in races. User: \"playable but nausea inducing\". DrawProbe: 10.9 µs CPU per draw, 14 Mtri/s",
+   "src": "hw-wave3-0929",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "09-29",
+   "name": "REL1",
+   "what": "All C5 stage-1 levers + O3DS code generation (cold <code>-Os</code>, hot-first order)",
+   "hw": "Boot crash, deterministic. Four-title bisect: cold <code>-Os</code> crashes, stock and <code>-O2</code>+order boot",
+   "src": "hw-rel1-fail, hw-rel1b-fail, hw-rel1crash-bisect",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "09-30",
+   "name": "REL2",
+   "what": "Stock codegen, <code>frameskip=steady</code>, HUD/machine/track retained paths",
+   "hw": "Boots. Race ~15 fps rendered (steady stuck at D=4), rw50 26–35 ms, \"lots of awkward hitching\": synchronous SD log flushes of 26–270 ms on main",
+   "src": "hw-rel2; NEXT.md C4q",
+   "fps2d": 15,
+   "fps3d": null
+  },
+  {
+   "date": "09-30",
+   "name": "REL3",
+   "what": "Every exact lever on, async file log, overlap kick",
+   "hw": "\"no hitches, steadier\"; steady mostly D=3 (20 fps rendered), rw50 24–36 ms",
+   "src": "hw-rel3-run1, hw-rel3-run2",
+   "fps2d": 20,
+   "fps3d": null
+  },
+  {
+   "date": "09-30",
+   "name": "HWPROF B",
+   "what": "PMU counters (<code>c5pmu</code>) and the r60 probe",
+   "hw": "Render CPI 4.34, 43.6% of cycles in instruction-fetch stalls; probe CPI 1.06 at 16 KB of hot code, 4.10 at 24 KB, 5.62 at 32 KB",
+   "src": "hw-hwprof-B; hwprof-progress.md §10",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "10-01",
+   "name": "REL4",
+   "what": "+ pose replay (C6), compact HUD/sky emitter",
+   "hw": "20 rendered + 20 replayed images/s, 1.3 ms per replay, but sky jitter, black tearing edges, giant fx triangles. 26.8 ms CPU per rendered frame. User: \"we should go for a real 60!\"",
+   "src": "hw-rel4; n60-design.md §0",
+   "fps2d": 20,
+   "fps3d": null
+  },
+  {
+   "date": "10-01",
+   "name": "n60-m1 (NRR milestone 1)",
+   "what": "Native race renderer: HUD, track, machines, sky; <code>nrr_direct=2</code> verify run",
+   "hw": "Hard freeze at race start. Cause: verify mode's state save/restore rolled back libctru's live GX queue (the emulator's GSP completes synchronously and cannot show it)",
+   "src": "hw-n60m1-V; n60-progress.md",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "10-02",
+   "name": "n60-card2",
+   "what": "All seven NRR categories (+ shadows, fx, dressing), GX-queue fix",
+   "hw": "RUN V: 199,472 draws verified, bad=0, float24 max 0.011 px. RUN C: TT \"silk 60 fps\"; GP W median 14.2 ms = 57.3 fps outside log-flush windows (51.9 fps all windows), harsh hitch every ~1/5 lap",
+   "src": "hw-n60card2-V, hw-n60card2-C; n60gp",
+   "fps2d": 57.3,
+   "fps3d": null
+  },
+  {
+   "date": "10-02",
+   "name": "n60-card3",
+   "what": "Never-blocking log, <code>frameskip=race0</code>, save fix, swap gate, texture fixes, HUD memo, native tunnel joins and decorations",
+   "hw": "Race median 16.5 ms, 0 race hitches; save persisted across a power cycle. User: \"omg it ran amazing!\"",
+   "src": "hw-n60card3; n60-progress.md",
+   "fps2d": 60,
+   "fps3d": null
+  },
+  {
+   "date": "10-03",
+   "name": "interim legacy 3D",
+   "what": "card-3 build + <code>[stereo] enabled=1</code> (NRR refused stereo, legacy path)",
+   "hw": "Black sky: the NRR sky consumed the section but could not draw under stereo",
+   "src": "hw-interim3d; n60-progress.md",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "10-03",
+   "name": "n60-3d",
+   "what": "Stereo on the NRR: one frame body, resubmitted for the right eye with a per-eye uniform",
+   "hw": "No glitches; 3D race ~19.8 ms vs 16.5 ms 2D (frame-begin GPU wait 6.6 vs 3.3 ms) → 33 ms quantum, cost guard flapping, ~40 fps",
+   "src": "hw-n60-3d",
+   "fps2d": null,
+   "fps3d": 40
+  },
+  {
+   "date": "10-03",
+   "name": "n60-3d2",
+   "what": "Right eye interleaved per submitted chunk",
+   "hw": "2D 60 in GP and TT. 3D \"40s and 50s\": every race tripped the guard in the intro; steady 3D GP ≈ 48–57 fps",
+   "src": "hw-n60-3d2",
+   "fps2d": 60,
+   "fps3d": 52,
+   "est3d": true
+  },
+  {
+   "date": "10-07",
+   "name": "n60-3d3",
+   "what": "End-mode swap pacing in 3D, intro HUD fix, 1 Hz menu refresh fix, launch variants",
+   "hw": "Mute City 3D ~60 in end mode (hold 1 on 250–255 of 256 frames); Silence and Sand Ocean heavier (work 16–18 ms)",
+   "src": "hw-n60-3d3",
+   "fps2d": null,
+   "fps3d": 60,
+   "est3d": true
+  },
+  {
+   "date": "10-08",
+   "name": "n60-3d4",
+   "what": "+ track merge, per-draw diet, prewarm, HUD compile, FINISH mesh, <code>lcd_vram=1</code>",
+   "hw": "Crash at boot on all three variants, no log: LCD framebuffers in VRAM, which the CIA maps read-only for the CPU",
+   "src": "hw-n60-3d4; n60-progress.md",
+   "fps2d": null,
+   "fps3d": null
+  },
+  {
+   "date": "10-08",
+   "name": "card 4 (VRAM fix)",
+   "what": "Same build, two levers off in the SD ini",
+   "hw": "3D GP courses 12–16: race windows hold 1 on 245–256 of 256 frames at work ≈15.5 ms → ≈59–60 fps. VERIFY variant bad=0. Heavy windows only on the post-race results table",
+   "src": "hw-n60-3d4b1",
+   "fps2d": null,
+   "fps3d": 59.5
+  }
+ ],
+ "cats": {
+  "names": [
+   "hud",
+   "trk",
+   "mach+mesh",
+   "sky",
+   "dress",
+   "fx",
+   "shd",
+   "misc",
+   "fend"
+  ],
+  "rel4": [
+   5.14,
+   4.13,
+   4.05,
+   3.02,
+   1.71,
+   1.16,
+   0.5,
+   0.82,
+   0.56
+  ],
+  "card3": [
+   3.17,
+   1.35,
+   1.09,
+   0.4,
+   0.81,
+   0.64,
+   0.27,
+   0.86,
+   0.46
+  ],
+  "tick_rel4": {
+   "logic": 1.51,
+   "dlb": 0.84,
+   "oth": 1.25
+  },
+  "tick_card3": {
+   "logic": 1.58,
+   "dlb": 1.15,
+   "oth": 1.4
+  }
+ },
+ "cpi_probe": [
+  [
+   "16 KB",
+   1.06
+  ],
+  [
+   "24 KB",
+   4.1
+  ],
+  [
+   "32 KB",
+   5.62
+  ]
+ ],
+ "agents": {
+  "subagents": 95,
+  "depth1": 49,
+  "depth2": 44,
+  "depth3": 2,
+  "prompts": 97,
+  "hw_logsets": 27,
+  "peak_inflight_coord": 9,
+  "peak_active_10min": 18,
+  "tokens_total": "5.83 B",
+  "api_calls": "17,930",
+  "output_logged": "1.08 M",
+  "n60_branches": 36,
+  "o3ds_branches_total": 82,
+  "n60lead_commits": 335
+ }
+}

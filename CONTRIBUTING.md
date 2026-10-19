@@ -1,16 +1,18 @@
 # Contributing to G-Diffuser
 
-Thanks for wanting to help. G-Diffuser is a native PC port of F-Zero X built on the
+Thanks for wanting to help. G-Diffuser is a native source port of F-Zero X built on the
 [inspectredc/fzerox](https://github.com/inspectredc/fzerox) matching decompilation and
-[libultraship](https://github.com/Kenix3/libultraship).
+[libultraship](https://github.com/Kenix3/libultraship), targeting PC (Windows/Linux, see
+[`README-G-Diffuser.md`](README-G-Diffuser.md)) and the Nintendo 3DS (see
+[`README.md`](README.md)).
 
-Two things about this project are unusual, and both will cost you time if you find them out the hard
-way:
+Two things here are unusual, and will cost you time if you don't know them going in:
 
 - **`decomp/` is a matching decompilation.** Your change has to work on PC *and* leave the retail
   build byte-identical. The PC build cannot tell you when you have broken the second one.
-- **There is no CI on this repository.** Your local build is the only check that runs. (`decomp/`
-  has its own CI, and it checks something different.)
+- **There is no CI that checks pull requests.** Your local build is the only check that runs on a
+  change. (Tagged releases do build through CI — see [Releases](#releases). `decomp/` has its own
+  CI too, and it checks something different.)
 
 Read [Things that will bite you](#things-that-will-bite-you) before you touch `decomp/`.
 
@@ -25,7 +27,10 @@ describe it, attach a log, and say which file reproduces it — do not attach th
 
 ## Building
 
-Full prerequisites and commands are in the [README](README.md#building). The short version:
+### PC (Windows / Linux)
+
+Full prerequisites and commands are in [`README-G-Diffuser.md`](README-G-Diffuser.md#building).
+The short version:
 
 | | |
 | --- | --- |
@@ -33,11 +38,27 @@ Full prerequisites and commands are in the [README](README.md#building). The sho
 | **Windows** | Visual Studio 2022, CMake 3.24+, Python 3 |
 | **Linux** | CMake 3.24+, Ninja, a C++20 compiler, Python 3, and libultraship's dependencies from your distribution |
 
-**Python 3 is required, not optional.** `port/CMakeLists.txt:9` is
+### Nintendo 3DS
+
+`tools/build-3ds.sh <o3ds|n3ds|o3ds-ek|n3ds-ek|all>` configures and builds with devkitPro, and
+collects the result in `dist/3ds/`. Full prerequisites, the four build targets, and the underlying
+CMake flags: [`README.md`](README.md#building-from-source) and
+[`docs/BUILDING.md`](docs/BUILDING.md). The `libultraship` submodule is not needed for this lane —
+the sources the console compiles are vendored in-tree at `port/3ds/vendor/lus/`.
+
+### Python
+
+**PC builds need Python 3, not optionally.** `port/CMakeLists.txt:8` is
 `find_package(Python3 COMPONENTS Interpreter REQUIRED)` — configure fails outright without an
 interpreter, because build-time generators run during the build. Those generators also import
 **PyYAML** and **Pillow** (`python3-yaml` and `python3-pil` on Debian-likes); CMake cannot check
 for them, so a missing one surfaces mid-build as a `ModuleNotFoundError`.
+
+**3DS builds need no Python at all** for the plain `o3ds` / `n3ds` targets. `port/CMakeLists.txt`
+(the file above) is PC-only — the root `CMakeLists.txt` branches into `port/3ds/` instead and
+never configures it for a 3DS build. Only the `o3ds-ek` / `n3ds-ek` targets need Python 3 +
+PyYAML, checked inside the `GDX_3DS_EXPANSION_KIT` guard in `port/3ds/game/CMakeLists.txt` —
+matching what [`README.md`](README.md#building-from-source) already says.
 
 Two things routinely trip people up on Windows:
 
@@ -51,10 +72,9 @@ Two things routinely trip people up on Windows:
 
 ### 1. Prove the binary actually contains it
 
-A build that exits 0 is not evidence that your change was compiled. This project has been bitten by
-exactly this — twice in one day: an exe timestamped 34 seconds after an 8,000-line file was saved
-(the file was never recompiled), and a `build && copy` chain that deployed a **stale** binary because
-the copy ran even though the build had failed.
+A build that exits 0 is not evidence that your change was compiled. This project has shipped a
+stale binary before, from a silently-skipped recompile and from a `build && copy` chain that
+copied after a failed build.
 
 The discipline that came out of it:
 
@@ -108,18 +128,11 @@ lines in `gdiffuser-run.log`.
 The one **hard contract** is `sim_hz`: it must hold ≈ 59.9. That is the simulation clock, and a
 change that drags it below ~59 has broken game speed no matter what the frame counter says —
 the symptom is the whole game running in slow motion, which is easy to miss on a frame-rate readout
-that still looks healthy. `presents/s` may legitimately vary with load; `sim_hz` may not. The field
-glossary is in [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md).
+that still looks healthy. `presents/s` may legitimately vary with load; `sim_hz` may not.
 
-Two facilities help when a bug is visual rather than numeric: `GDX_CAPTURE_WINDOW=<start>:<count>`
-dumps real presented frames to BMP for pixel-diffing, and `gdxwin-modes.txt` records which game mode
-was live at which present index, so you can aim the window at the screen you care about.
-
-The port can also replay recorded pad input (`GDX_INPUT_SCRIPT=<file>`; the format is documented at
-the top of `port/gdx_input_script.c`). It is useful for reproducing a fiddly sequence exactly, but
-treat its results with suspicion unless the script proves it reached the screen it claims to test —
-`LOG` lines fire whether or not the preceding `WAITMODE` succeeded, so a run that never left the
-menus will still print the marker saying it raced.
+Frame-capture and pad-script replay tooling — including a gotcha with `GDX_INPUT_SCRIPT`'s `LOG`
+lines firing even when the preceding `WAITMODE` never succeeded — are covered in the field
+glossary at [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md).
 
 ### 4. If you touched an asset recipe under `decomp/assets/yaml/`
 
@@ -154,8 +167,8 @@ examples:
 #define GDX_CK(x) gdx_ck(#x)      /* line 40: PORT   */
 
 /* decomp/src/overlays/course_edit/191080.c — translated-disk labels fall back to the JP string */
-#define GDX_EK_LABEL(bound, jp) ((bound)[0] != 0 ? (u8*) (bound) : (u8*) (jp))  /* line 32: PORT   */
-#define GDX_EK_LABEL(bound, jp) ((u8*) (jp))                                     /* line 115: retail */
+#define GDX_EK_LABEL(bound, jp) ((bound)[0] != 0 ? (u8*) (bound) : (u8*) (jp))  /* line 25: PORT   */
+#define GDX_EK_LABEL(bound, jp) ((u8*) (jp))                                     /* line 69: retail */
 ```
 
 Whatever the helper yields in its inert state must equal what retail sees unconditionally.
@@ -181,18 +194,13 @@ python tools/gen_asset_bindings.py --profile us/rev0 --out /tmp/AssetBindings.fr
 diff /tmp/AssetBindings.fresh.c port/gen/AssetBindings.c
 ```
 
-To show what is at stake — the fixup table for segment 8 today:
-
-| | Rows |
-| --- | --- |
-| Tracked `AssetBindings.c` | **76** |
-| Freshly generated | **63** |
-
-The generator emits one coarse 32-bit-word-swap row per model. The tracked file **splits** thirteen
-of those into a word-swap row for the display-list part plus a *vertex* fixup row (16-byte stride)
-for the vertex block — same start offset, same total span, correct treatment for each half. A blind
-regenerate would word-swap those vertex blocks as plain 32-bit words and corrupt every vertex in
-thirteen models. Across the whole table that is 1776 tracked rows versus 1763 generated.
+To show what is at stake — segment 8's fixup table: the generator emits one coarse
+32-bit-word-swap row per model, but the tracked file **splits** some of those into a word-swap row
+for the display-list part plus a *vertex* fixup row (16-byte stride) for the vertex block — same
+start offset, same total span, correct treatment for each half. A blind regenerate would
+word-swap those vertex blocks as plain 32-bit words and corrupt every vertex they touch. In short:
+the generator currently undercounts rows because it can't tell a vertex block from a
+display-list block — always diff before replacing, never force-overwrite.
 
 `--force-overwrite` exists and obliges you to re-apply every hand edit yourself.
 
@@ -268,7 +276,8 @@ carry their own `.clang-format`; `port/` does not.
 
 | You want to | Read |
 | --- | --- |
-| Build it, run it, report a bug | [`README.md`](README.md) |
+| Build it, run it, report a bug (3DS) | [`README.md`](README.md) |
+| Build it, run it, report a bug (PC) | [`README-G-Diffuser.md`](README-G-Diffuser.md) |
 | Find which file owns a subsystem | [`port/README.md`](port/README.md) |
 | Turn on logging, or find the switch that shows your bug | [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) |
 | Understand the architecture | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
@@ -297,7 +306,7 @@ bump lands last.
 **Outside pull requests are welcome.** The practical route:
 
 1. **For anything non-trivial, open an issue first** at
-   [github.com/Zorkats/G-Diffuser/issues](https://github.com/Zorkats/G-Diffuser/issues) and say what
+   [github.com/cruxxxxxx/gdx-3ds/issues](https://github.com/cruxxxxxx/gdx-3ds/issues) and say what
    you intend to change. This is a port with sharp invariants (matching, byte order, the
    `PORT`-pairing rule) — two paragraphs of intent can save you a rewritten branch. Typo-level fixes
    can skip straight to a PR.
@@ -311,9 +320,9 @@ bump lands last.
 5. **Say how you verified it.** Which tests ran, which script route, what the telemetry showed —
    and if you could not verify something, say that plainly. An honest "untested on Linux" costs
    nothing; a silent one costs the maintainer an evening.
-6. **Review** is by the maintainer ([@Zorkats](https://github.com/Zorkats)). This is a one-person
-   project reviewed in spare time — expect days, not hours, and expect questions about evidence
-   rather than style.
+6. **Review** is by the maintainer ([@cruxxxxxx](https://github.com/cruxxxxxx)). This is a
+   one-person project reviewed in spare time — expect days, not hours, and expect questions about
+   evidence rather than style.
 
 **Discussion venue:** GitHub Issues, for now. There is no Discord or forum yet.
 
@@ -324,11 +333,10 @@ bump lands last.
 attach it to the GitHub release. Publishing stays a deliberate human step.
 
 The workflow builds inside an `ubuntu:22.04` container with pinned dependency versions. That is
-not fussiness. v1.0.0 was built by hand on a rolling distribution and inherited three defects that
-were invisible on the machine that produced it, each one reported separately by a different user:
-it demanded a glibc newer than most systems had, it declared an `x86-64-v4` CPU requirement for
-instructions it never executed, and it linked shared libraries that shipped nowhere. Pinning the
-build environment is what prevents all three.
+not fussiness: an earlier hand-built Linux release (the PC port's own desktop `v1.0.0`, built
+before this workflow existed) demanded a newer glibc, an unneeded CPU feature, and libraries not
+present on users' systems — three defects invisible on the machine that produced it, each reported
+separately by a different user. Pinning the build environment is what prevents all three.
 
 `tools/check_linux_abi.py` enforces that, and `tools/package_linux.sh` refuses to write a tarball
 until it passes. Run it against any Linux build before you hand it to anyone:
@@ -341,13 +349,17 @@ It reports the glibc floor, the CPU level the loader will demand, and any depend
 have to already be installed on the user's machine. Ceilings live in its `--help`; raising one is
 a decision about which distributions you are dropping, so change it deliberately.
 
-Windows releases are still built and packaged by hand, from the static `build/x64` tree — the
-dynamic `build_x64` tree produces an executable that needs eight DLLs beside it.
+**Windows releases are built by CI too.** Push a `v*` tag, or run the *Release (Windows)* workflow
+manually; it packages from the static `build/x64` tree (the dynamic `build_x64` tree produces an
+executable that needs eight DLLs beside it) and runs `tools/check_windows_deps.py` to prove the
+zip is DLL-self-contained before anyone can download it — the same discipline as the Linux
+workflow above, not a hand-built, hand-packaged process.
 
 ## Reporting a bug
 
-Bug reports do not need any of the above. The README has the
-[reporting checklist](README.md#reporting-a-bug) — platform and renderer, which build, ROM region,
-repro steps, `gdiffuser-run.log`, and `gdiffuser-crash.txt` if the game crashed.
+Bug reports do not need any of the above. Each platform's README has its own checklist:
+[3DS](README.md#reporting-a-bug) (which of the four builds, your console model, `log.txt` /
+`log-EK.txt`, `crash*.txt`) or [PC](README-G-Diffuser.md#reporting-a-bug) (platform and renderer,
+ROM region, repro steps, `gdiffuser-run.log`, and `gdiffuser-crash.txt` if the game crashed).
 
-And, once more: **no ROMs, no disk images, no IPL dumps, no generated `fzerox.o2r`.**
+Reminder: **no game files, ever** — see [No game files. Ever.](#no-game-files-ever).
