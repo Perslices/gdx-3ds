@@ -76,6 +76,9 @@ void gdx_input_rec_poll(unsigned long tick, GdxInputPad* pad, int gameMode);
 // A SHOT was armed for this tick by another injector stage (autoinput / script): the recorder
 // appends "SHOT <label>" to the current tick's line.
 void gdx_input_rec_note_shot(const char* label);
+/* C5TICK: 1 if the next replay line (the next tick's input) carries a SHOT (or the replay is armed
+ * but not started); 0 when no replay runs. Read-ahead + seek back. */
+int gdx_input_rec_peek_shot(void);
 
 #ifdef __cplusplus
 }

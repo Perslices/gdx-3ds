@@ -51,12 +51,17 @@
 #include "gdx3ds_os.h"
 #include "gdx3ds_config.h"
 #include "gdx3ds_filelog.h"
+#include "gdx3ds_boot_trail.h" /* n60boot */
+#include "gdx3ds_gfx_split.h"  /* n60boot: per-screen LCD memory */
+#include "gdx3ds_vram_guard.h" /* n60boot */
 #include "gdx3ds_input_map.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #include <3ds.h>
+
+#include "gdx3ds_hwprof.h" /* hwprof2 [hwflush] / flush_svc */
 #include <citro3d.h> /* HOMEFIX2: C3D_Fini in the teardown below */
 
 /* Standard N64 OSContPad button bitmask -- identical in the decomp (PR/os_cont.h) and LUS
@@ -333,6 +338,51 @@ int gdx_port_mirror_count(void) {
     return sFakePads;
 }
 
+/* n60gpu + n60boot: [native] lcd_vram (default 0) puts the TOP screen's framebuffers in VRAM:
+ * the PPF display transfers of every frame (one per eye) then write VRAM instead of the linear
+ * heap (FCRAM), and the top LCD scans out of VRAM. Same transfer, same bytes: pixel-identical.
+ *   0  both screens in the linear heap (gfxInitDefault)
+ *   1  top in VRAM, bottom in the linear heap. The bottom screen is drawn by the CPU (launch
+ *      prompt, fps HUD, menu, console) and the CIA maps VRAM READ-ONLY: n60-3d4's
+ *      gfxInit(..., true) put the bottom in VRAM too and died at the first consoleInit.
+ *   2  TEST ONLY: both screens in VRAM (n60-3d4's layout), for the VRAM guard's gate; the
+ *      guard ([debug] vram_guard) catches the first bottom CPU writer.
+ * gfx_split.c (vendored libctru gfx.c) makes the per-screen choice possible. */
+static const char* LcdPlace(gfxScreen_t screen) {
+    return gdx3ds_gfx_screen_in_vram(screen) ? "VRAM" : "linear";
+}
+
+/* "top fb0=0x1f300000 fb1=0x1f38ca00 VRAM" -- both buffers, each one's own memory. */
+static void FormatScreenPlacement(gfxScreen_t screen, char* out, size_t cap) {
+    const void* fb0 = NULL;
+    const void* fb1 = NULL;
+    gdx3ds_gfx_framebuffer_pair(screen, &fb0, &fb1);
+    snprintf(out, cap, "%s fb0=%p(%s) fb1=%p(%s)", screen == GFX_TOP ? "top" : "bottom", fb0,
+             gdx3ds_gfx_addr_in_vram(fb0) ? "VRAM" : "linear", fb1, gdx3ds_gfx_addr_in_vram(fb1) ? "VRAM" : "linear");
+}
+
+static void InitLcdFramebuffers(void) {
+    int lcdVram = gdx3ds_config_get_int("native", "lcd_vram", 0);
+    if (lcdVram < 0 || lcdVram > 2) {
+        lcdVram = 0;
+    }
+    gdx3ds_boot_trail_f("[boot] gfxInit: lcd_vram=%d asks top=%s bottom=%s", lcdVram, lcdVram != 0 ? "VRAM" : "linear",
+                        lcdVram == 2 ? "VRAM" : "linear");
+    gdx3ds_gfx_init_split(GSP_BGR8_OES, GSP_BGR8_OES, lcdVram != 0, lcdVram == 2);
+    char top[96];
+    char bottom[96];
+    char line[288];
+    FormatScreenPlacement(GFX_TOP, top, sizeof(top));
+    FormatScreenPlacement(GFX_BOTTOM, bottom, sizeof(bottom));
+    snprintf(line, sizeof(line), "[lcdvram] init lcd_vram=%d top=%s bottom=%s | %s | %s | vram free %luK linear free %luK",
+             lcdVram, LcdPlace(GFX_TOP), LcdPlace(GFX_BOTTOM), top, bottom, (unsigned long)(vramSpaceFree() / 1024u),
+             (unsigned long)(linearSpaceFree() / 1024u));
+    gdx3ds_boot_trail(line);
+    if (&gdx_dbg_logf != NULL) {
+        gdx_dbg_logf("%s\n", line);
+    }
+}
+
 int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
     /* Config first: input tuning below and other streams' keys must be readable before
      * any subsystem init. Missing file is fine -- defaults hold. (main_3ds.cpp calling
@@ -359,7 +409,7 @@ int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
     }
     gdx3ds_input_load_binds(); /* MENU: compiled defaults + persisted bind_* overrides */
 
-    gfxInitDefault();
+    InitLcdFramebuffers();
     /* Top screen: double-buffered so the game never draws into the scanout buffer.
      * Format stays the gfxInitDefault() default (BGR8); stream A owns the real surface
      * format decision via gdx3ds_gfx. */
@@ -368,6 +418,8 @@ int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
     if (gdx3ds_config_get_bool("debug", "console", 0)) {
         /* Dev aid only: text console on the bottom screen (which the contract otherwise
          * reserves untouched). Off by default. */
+        gdx3ds_vram_guard_bottom_cpu_write("debug console (console=1)");
+        gdx3ds_boot_trail("[boot] consoleInit(GFX_BOTTOM) for [debug] console=1");
         consoleInit(GFX_BOTTOM, NULL);
     }
 
@@ -423,6 +475,69 @@ void gdx3ds_os_window_shutdown(void) {
     gfxExit();
 }
 
+/* C5 STAGE 0 [c5cat] (port/3ds/gdx3ds_mainprof.h): the per-present framebuffer cache flush gets
+ * its own timing bucket (swp=). Weak: not every target links the main-thread clock. */
+extern int gdx3ds_c5cat_enter(int cat) __attribute__((weak));
+extern void gdx3ds_c5cat_leave(int prev) __attribute__((weak));
+
+/* C5 Stage 4 frame tail, `[debug] swp_lean = N` (default 0 = stock gfxFlushBuffers every present).
+ * gfxFlushBuffers is two GSPGPU_FlushDataCache IPCs per present (~0.4 ms on the Old 3DS, hw-rel2
+ * swp=). The CPU never writes the top framebuffer (the GPU display transfer does), and the bottom
+ * console changes about once a second. N >= 2: flush the bottom framebuffer every N presents and
+ * the top one every 64 (for the verbose-only CPU reader of the top buffer in main_3ds.cpp). */
+#define SWP_LEAN_TOP_EVERY 64u
+static int sSwpLeanEvery = -1;
+static unsigned sSwpPresents = 0;
+
+static int SwpLeanEvery(void) {
+    if (sSwpLeanEvery < 0 && gdx3ds_config_loaded()) {
+        const int n = gdx3ds_config_get_int("debug", "swp_lean", 0);
+        sSwpLeanEvery = n >= 2 ? n : 0;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "[overlap] swp_lean=%d (bottom every %d presents, top every %u)\n",
+                 sSwpLeanEvery, sSwpLeanEvery, sSwpLeanEvery != 0 ? SWP_LEAN_TOP_EVERY : 1u);
+        gdx3ds_filelog_write(msg, strlen(msg));
+    }
+    return sSwpLeanEvery > 0 ? sSwpLeanEvery : 0;
+}
+
+static void FlushScreenFramebuffer(gfxScreen_t screen) {
+    u16 width = 0;
+    u16 height = 0;
+    u8* fb = gfxGetFramebuffer(screen, GFX_LEFT, &width, &height);
+    if (fb != NULL) {
+        const u32 bpp = gspGetBytesPerPixel(gfxGetScreenFormat(screen));
+        if (gdx3ds_hws_gsp_flush_kind != NULL) {
+            gdx3ds_hws_gsp_flush_kind(fb, (u32)width * height * bpp, GDX3DS_HWFL_SWAP); /* hwprof2 */
+        } else {
+            GSPGPU_FlushDataCache(fb, (u32)width * height * bpp);
+        }
+    }
+}
+
+static void SwapFlushLean(unsigned every) {
+    sSwpPresents++;
+    if ((sSwpPresents % every) == 0) {
+        FlushScreenFramebuffer(GFX_BOTTOM);
+    }
+    if ((sSwpPresents % SWP_LEAN_TOP_EVERY) == 0) {
+        FlushScreenFramebuffer(GFX_TOP);
+    }
+}
+
+static void SwapFlushBuffersTimed(void) {
+    const int prev = (&gdx3ds_c5cat_enter != NULL) ? gdx3ds_c5cat_enter(12 /* SWAP */) : -1;
+    const int leanEvery = SwpLeanEvery();
+    if (leanEvery > 0) {
+        SwapFlushLean((unsigned)leanEvery);
+    } else {
+        gfxFlushBuffers();
+    }
+    if (prev >= 0) {
+        gdx3ds_c5cat_leave(prev);
+    }
+}
+
 int gdx3ds_os_window_swap(void) {
     /* NO gfxSwapBuffers() here — the citro3d backend owns top-screen presentation.
      * C3D_FrameEnd queues a display transfer of its render target into the top
@@ -439,7 +554,7 @@ int gdx3ds_os_window_swap(void) {
      * backend's StartFrame already paces the loop against vblank. A second wait
      * here after every C3D_FrameEnd quantized each frame down an extra vblank
      * (measured ~18fps ceiling on 1-draw frames); the harness omits it too. */
-    gfxFlushBuffers();
+    SwapFlushBuffersTimed();
     /* APT: deliberately NO aptMainLoop() here any more (the hardware power-off crash
      * fix). This function runs inside Interpreter::EndFrame — including the bridge's
      * mid-dispatch DrawAndRunGraphicsCommands path — and aptMainLoop() performs the

@@ -42,6 +42,14 @@ int gdxtrk_state(void* slot, int kind);
 int gdxtrk_vertex(void* slot, const void* vtx, int n, int v0, int advanced);
 int gdxtrk_dl(void* slot, const void* dl, int advanced);
 int gdxtrk_modify(void* slot, int vtx, int where, uint32_t val, int advanced);
+/* [native] track_resident (C5 Stage 3c, decomp-native-track-resident-bake.patch): Course_Init
+ * calls this once the chunks exist (the load-time bake); Course_Draw calls gdxtrk_draw_enter at
+ * its top (the [trkcat] game-side clock). Both are no-ops unless their levers are on. */
+void gdxtrk_course_loaded(void);
+void gdxtrk_draw_enter(void);
+/* n60 [native] nrr_trk (decomp-native-nrr-trk.patch, gfx/nrr/gdx3ds_nrr_trk.h): Course_Draw's walk
+ * by the lean walk; 1 = done (the stock loop is skipped). */
+int gdxtrk_nrr_walk(void* groups, void* groupsEnd);
 
 /* ---- real GBI emitters (port/3ds/game/gdx3ds_track_gbi.c) ---- */
 void gdxtrk_gbi_vertex(void* g, const void* v, int n, int v0);

@@ -593,6 +593,31 @@ void gdx_mprof_ck(int step) {
 #endif
 }
 
+/* C5 STAGE 0 (3DS, port/3ds/gdx3ds_mainprof.h [c5cat]): the decomp's GDX_C5CAT scene markers
+   (decomp-3ds-c5cat-markers.patch, race.c / racer.c) write their G_NOOP only when this says the
+   3DS per-category clock is armed. Off-3DS it is always 0, so the display list never changes. */
+int gdx_c5cat_armed(void) {
+#if defined(GDX_PLATFORM_3DS)
+    extern int gdx3ds_c5cat_armed(void);
+    extern int gdx3ds_overlap_markers_armed(void); /* C5 Stage 4: the kicks ride the same markers */
+    extern int gdx3ds_replay_markers_armed(void);  /* C6: the sky category (scroll patch) */
+    extern int gdx3ds_gpucensus_markers_armed(void); /* n60gpu: [debug] gpucensus attributes draws by category */
+    return gdx3ds_c5cat_armed() || gdx3ds_overlap_markers_armed() || gdx3ds_replay_markers_armed() ||
+           gdx3ds_gpucensus_markers_armed();
+#else
+    return 0;
+#endif
+}
+
+int gdx_c5sub_armed(void) {
+#if defined(GDX_PLATFORM_3DS)
+    extern int gdx3ds_c5sub_armed(void);
+    return gdx3ds_c5sub_armed();
+#else
+    return 0;
+#endif
+}
+
 void gdx_cki(const char* s, int v) {
     if (!gdx_trace_enabled()) return;
     gdx_port_logf("%s=%d (0x%x)\n", s, v, (unsigned) v);
@@ -816,7 +841,18 @@ void gdx_transition_step_begin(void) {
 
 // Records the elapsed time since the previous mark (or since gdx_transition_step_begin()) under
 // `label`. Call once per GMI_* checkpoint reached inside the timed A..F range.
+/* n60atlas [debug] course_force (port/3ds/gdx3ds_autodrive.c): a census lever that picks the race's
+ * course at the mode-init checkpoint. Weak: absent on every other platform. */
+#if defined(__3DS__)
+extern void gdx3ds_course_force_hook(const char* label) __attribute__((weak));
+#endif
+
 void gdx_transition_step_mark(const char* label) {
+#if defined(__3DS__)
+    if (gdx3ds_course_force_hook != NULL) {
+        gdx3ds_course_force_hook(label);
+    }
+#endif
 #ifdef _WIN32
     LARGE_INTEGER now;
     double ms;
@@ -1340,7 +1376,15 @@ int gdx_audio_disk_step_bytes(void) {
     return sStepBytes;
 }
 
-int gdx_audio_produce_one_tick(void) {
+/* C4I: the producer tick in its two phases, so gdx_audio_thread.cpp can hold sAudioCtxMutex
+ * across only the phase that needs it (`[debug] audio_ctx_narrow`, default 0). SETUP is
+ * Audio_SetupCreateTask -- the command-ring drain, the sequence/bank state machines, the
+ * loads: everything that touches gAudioCtx and the threadCmdBuf ring the game fiber's
+ * AudioThread_QueueCmd writes. SYNTH is gdx_audio_lle_run over the ABI command list SETUP
+ * just built: it reads only that list, the sample banks and DMEM, never the ring. Returns the
+ * task (opaque) for SYNTH, or NULL when there is nothing to synthesise (the tick is then
+ * already closed). gdx_audio_produce_one_tick below is exactly SETUP + SYNTH. */
+void* gdx_audio_produce_tick_setup(void) {
     /* Audio_SetupCreateTask, NOT AudioThread_CreateTask. The wrapper
        (decomp/src/audio/disk/external.c:2703) is the game's whole per-tick audio frame — the EK
        sequence/bank load state-machine pump, the BGM fade/pause routines and
@@ -1351,7 +1395,7 @@ int gdx_audio_produce_one_tick(void) {
     GdxAudioTaskView* task;
 
     if (!gAudioContextInitialized) {
-        return 0;
+        return NULL;
     }
 
     /* [audio-reset] one-line receipt (bisect-era force removed): AudioLoad_SyncInitSeqPlayer
@@ -1393,14 +1437,26 @@ int gdx_audio_produce_one_tick(void) {
         gdx_aload_tick_end();
         gdx_watch_audio_stage = 0;
         gdx_watch_audio_tick_exit++;
-        return 0;
+        return NULL;
     }
+    return task;
+}
 
+void gdx_audio_produce_tick_synth(void* taskOpaque) {
+    GdxAudioTaskView* task = (GdxAudioTaskView*) taskOpaque;
     gdx_watch_audio_stage = 2;
     gdx_audio_lle_run(task->task.t.data_ptr, (unsigned int) task->task.t.data_size);
     gdx_aload_tick_end();
     gdx_watch_audio_stage = 0;
     gdx_watch_audio_tick_exit++;
+}
+
+int gdx_audio_produce_one_tick(void) {
+    void* task = gdx_audio_produce_tick_setup();
+    if (task == NULL) {
+        return 0;
+    }
+    gdx_audio_produce_tick_synth(task);
     return 1;
 }
 
@@ -1463,6 +1519,30 @@ void osSpTaskStartGo(OSTask* tp) {
     }
 #if defined(GDX_PLATFORM_3DS)
     gdx3ds_mprof_note_task((unsigned long) tp->t.data_size); /* [mprof] dl= load proxy */
+    /* FRAMESKIP (port/3ds/gdx3ds_frameskip.h, [debug] frameskip, default 0): a SKIP iteration
+       acks the task without rendering it -- SP + DP done, exactly what the game's frame
+       protocol waits for. Only the bridge prepare + interpreter walk + citro3d submit are
+       dropped; the DL was already built by the game and is simply never read. */
+    {
+        extern int gdx3ds_frameskip_drop_task(void);
+        /* C5TICK (port/3ds/gdx3ds_c5tick.h, [debug] dl_hollow, default 0): a display list the
+           game built HOLLOW (a skipped tick: only the draw code that changes game state ran)
+           must never be walked. It always arrives on a dropped tick; if it ever did not, drop
+           it anyway and count the leak. */
+        extern int gdx3ds_c5tick_take_hollow_task(void);
+        extern void gdx3ds_c5tick_note_leak(void);
+        const int hollowTask = gdx3ds_c5tick_take_hollow_task();
+        int dropTask = gdx3ds_frameskip_drop_task();
+        if (hollowTask && !dropTask) {
+            gdx3ds_c5tick_note_leak();
+            dropTask = 1;
+        }
+        if (dropTask) {
+            osSendMesg(&gMainThreadMesgQueue, (OSMesg)(uintptr_t)EVENT_MESG_SP, OS_MESG_NOBLOCK); /* SP done */
+            osSendMesg(&D_800DCAC8, (OSMesg)(uintptr_t)0x2A, OS_MESG_NOBLOCK);                  /* DP done */
+            return;
+        }
+    }
     /* RENDER THREAD (port/3ds/gdx3ds_renderthread.cpp, docs/research/renderthread-audit.md):
        the fork. 0 = killswitch off (render inline below, byte-identical); 1 = executed to
        completion on core 2 (sync mode: post SP + DP as before); 2 = in flight (pipe mode: SP

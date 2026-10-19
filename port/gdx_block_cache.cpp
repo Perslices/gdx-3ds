@@ -21,6 +21,20 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(GDX_PLATFORM_3DS)
+#include "3ds/include/gdx3ds_hitch.h" // HITCH: SD reads (the audio stream) per frame + in flight
+#define GDX_BC_HITCH_BEGIN() (gdx3ds_hitch_aud_inflight = 1)
+#define GDX_BC_HITCH_END(bytes)                                   \
+    do {                                                          \
+        gdx3ds_hitch_aud_inflight = 0;                            \
+        gdx3ds_hitch_add(GDX_HITCH_EV_AUD_SD_READ, 1u);           \
+        gdx3ds_hitch_add(GDX_HITCH_EV_AUD_SD_BYTES, (uint32_t) (bytes)); \
+    } while (0)
+#else
+#define GDX_BC_HITCH_BEGIN() ((void) 0)
+#define GDX_BC_HITCH_END(bytes) ((void) (bytes))
+#endif
+
 #define GDX_BLOCK_CACHE_DEFAULT_BLOCK_LOG2 14u /* 16 KiB */
 
 namespace {
@@ -48,6 +62,7 @@ bool fillSlot(GdxBlockCache* c, unsigned int set, unsigned int way, unsigned int
         c->stats.blockEvictions++;
     }
     c->slots[idx].valid = 0;
+    c->blockFills++;
     /* WORKING-SET MAP (`ekdrive`, B11d; see gdx_block_cache_unique_blocks). Marked HERE, on
      * the fill path, so it counts distinct blocks the FILE had to serve and never the hit
      * path. Marked before the fseek rather than after the fread deliberately: a block that
@@ -63,7 +78,9 @@ bool fillSlot(GdxBlockCache* c, unsigned int set, unsigned int way, unsigned int
     if (fseek(fh(c), (long) off, SEEK_SET) != 0) {
         return false;
     }
+    GDX_BC_HITCH_BEGIN();
     const size_t got = fread(dst, 1, want, fh(c));
+    GDX_BC_HITCH_END(got);
     c->stats.hostReads++;
     c->stats.hostBytes += got;
     if (got != want) {
@@ -134,6 +151,101 @@ const unsigned char* getBlock(GdxBlockCache* c, unsigned int block, bool count) 
     }
     touch(c, set, victim);
     return c->data + (size_t) (base + victim) * c->blockBytes;
+}
+
+bool blockResident(const GdxBlockCache* c, unsigned int block) {
+    const unsigned int base = (block & c->setMask) * GDX_BLOCK_CACHE_WAYS;
+    for (unsigned int w = 0; w < GDX_BLOCK_CACHE_WAYS; w++) {
+        if (c->slots[base + w].valid && c->slots[base + w].block == block) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A read-ahead candidate prefetchBlock would decline without I/O: past the window or the file. */
+bool outsidePrefetchRange(const GdxBlockCache* c, unsigned int block) {
+    const unsigned long long off = (unsigned long long) block << c->blockLog2;
+    return off >= (unsigned long long) c->base + c->span || off >= (unsigned long long) c->fileSize;
+}
+
+/* Speculatively fills `block` if it is inside the window and not already cached. Returns 1
+ * when a fill actually happened. Never called from inside a read's prove/copy walk -- see the
+ * SAFETY note in the header -- so it may evict freely. A block already present is left
+ * completely alone, LRU included: promoting it on a guess would reorder the set on no
+ * evidence. */
+bool prefetchBlock(GdxBlockCache* c, unsigned int block) {
+    const unsigned long long off = (unsigned long long) block << c->blockLog2;
+    if (off >= (unsigned long long) c->base + c->span || off >= (unsigned long long) c->fileSize) {
+        return false;
+    }
+    const unsigned int set = block & c->setMask;
+    const unsigned int base = set * GDX_BLOCK_CACHE_WAYS;
+    for (unsigned int w = 0; w < GDX_BLOCK_CACHE_WAYS; w++) {
+        if (c->slots[base + w].valid && c->slots[base + w].block == block) {
+            return false;
+        }
+    }
+    unsigned int victim = 0;
+    bool haveInvalid = false;
+    for (unsigned int w = 0; w < GDX_BLOCK_CACHE_WAYS; w++) {
+        if (!c->slots[base + w].valid) {
+            victim = w;
+            haveInvalid = true;
+            break;
+        }
+    }
+    if (!haveInvalid) {
+        unsigned char bestAge = 0;
+        for (unsigned int w = 0; w < GDX_BLOCK_CACHE_WAYS; w++) {
+            if (c->slots[base + w].age >= bestAge) {
+                bestAge = c->slots[base + w].age;
+                victim = w;
+            }
+        }
+    }
+    if (!fillSlot(c, set, victim, block)) {
+        return false;
+    }
+    c->prefetchFills++;
+    touch(c, set, victim);
+    return true;
+}
+
+/* Called once per SERVED read, after its bytes are out. Decides whether this read continues a
+ * sequential stream and, if it just stepped into a new block, fetches the next `readAhead`.
+ *
+ * The slot table is what makes this work on audio: several voices walk several samples at
+ * once, so "the previous read ended where this one starts" is only true per-stream. A read
+ * that matches no slot claims one round-robin and prefetches NOTHING -- one read is not a
+ * trend, and speculating on first touch is how a cache turns a scattered pattern into twice
+ * the card traffic. */
+void noteSequential(GdxBlockCache* c, unsigned int firstBlock, unsigned int lastBlock) {
+    for (unsigned int i = 0; i < GDX_BLOCK_CACHE_SEQ_SLOTS; i++) {
+        if (!c->seqValid[i]) {
+            continue;
+        }
+        const unsigned int tail = c->seqTail[i];
+        if (firstBlock != tail && firstBlock != tail + 1u) {
+            continue;
+        }
+        if (lastBlock > tail) {
+            /* The stream crossed a block boundary: the next blocks are the ones it is about
+             * to want. Stop at the first block prefetchBlock declines -- already resident
+             * (an earlier crossing fetched the run), outside the window, or unreadable. */
+            for (unsigned int k = 1; k <= c->readAhead; k++) {
+                if (!prefetchBlock(c, lastBlock + k)) {
+                    break;
+                }
+            }
+        }
+        c->seqTail[i] = lastBlock;
+        return;
+    }
+    const unsigned int slot = c->seqNext % GDX_BLOCK_CACHE_SEQ_SLOTS;
+    c->seqNext = (unsigned char) ((slot + 1u) % GDX_BLOCK_CACHE_SEQ_SLOTS);
+    c->seqTail[slot] = lastBlock;
+    c->seqValid[slot] = 1;
 }
 
 } // namespace
@@ -236,6 +348,17 @@ int gdx_block_cache_open(GdxBlockCache* c, const char* path, unsigned int base,
     c->touched = touched;
     c->touchedBytes = touchedBytes;
     c->uniqueBlocks = 0;
+    c->blockFills = 0;
+    c->prefetchFills = 0;
+    /* Re-clamp: a consumer may set read-ahead before it knows how big the cache will be. */
+    if (c->readAhead > blocks / 4u) {
+        c->readAhead = blocks / 4u;
+    }
+    /* readAhead deliberately SURVIVES an open: like the overlay hook it is a property of the
+     * consumer, installed once, not of a particular mount. The stream slots do not. */
+    memset(c->seqTail, 0, sizeof(c->seqTail));
+    memset(c->seqValid, 0, sizeof(c->seqValid));
+    c->seqNext = 0;
     memset(&c->stats, 0, sizeof(c->stats));
     snprintf(c->path, sizeof(c->path), "%s", path);
     return 1;
@@ -257,6 +380,11 @@ void gdx_block_cache_close(GdxBlockCache* c) {
     c->touched = nullptr;
     c->touchedBytes = 0;
     c->uniqueBlocks = 0;
+    c->blockFills = 0;
+    c->prefetchFills = 0;
+    memset(c->seqTail, 0, sizeof(c->seqTail));
+    memset(c->seqValid, 0, sizeof(c->seqValid));
+    c->seqNext = 0;
     c->fileSize = 0;
     c->base = 0;
     c->span = 0;
@@ -351,7 +479,37 @@ int gdx_block_cache_read(GdxBlockCache* c, unsigned int offset, unsigned int len
     }
     c->stats.reads++;
     c->stats.readBytes += length;
+    if (c->readAhead != 0u) {
+        noteSequential(c, firstBlock, lastBlock);
+    }
     return 1;
+}
+
+int gdx_block_cache_would_fill(const GdxBlockCache* c, unsigned int offset, unsigned int length) {
+    if (c == nullptr || c->file == nullptr || length == 0u) {
+        return 0;
+    }
+    if (offset < c->base ||
+        (unsigned long long) offset + length > (unsigned long long) c->base + c->span) {
+        return 0; /* refused without I/O */
+    }
+    const unsigned int firstBlock = offset >> c->blockLog2;
+    const unsigned int lastBlock = (offset + length - 1u) >> c->blockLog2;
+    for (unsigned int b = firstBlock; b <= lastBlock; b++) {
+        if (!blockResident(c, b)) {
+            return 1;
+        }
+    }
+    for (unsigned int k = 1; k <= c->readAhead; k++) {
+        const unsigned int b = lastBlock + k;
+        if (outsidePrefetchRange(c, b)) {
+            break;
+        }
+        if (!blockResident(c, b)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void gdx_block_cache_invalidate(GdxBlockCache* c, unsigned int offset, unsigned int length) {
@@ -392,7 +550,9 @@ int gdx_block_cache_read_uncached(GdxBlockCache* c, unsigned int offset, unsigne
         c->stats.refusals++;
         return 0;
     }
+    GDX_BC_HITCH_BEGIN();
     const size_t got = fread(dst, 1, length, fh(c));
+    GDX_BC_HITCH_END(got);
     c->stats.hostReads++;
     c->stats.hostBytes += got;
     if (got != length) {
@@ -400,6 +560,34 @@ int gdx_block_cache_read_uncached(GdxBlockCache* c, unsigned int offset, unsigne
         return 0;
     }
     return 1;
+}
+
+void gdx_block_cache_set_readahead(GdxBlockCache* c, unsigned int blocks) {
+    if (c == nullptr) {
+        return;
+    }
+    /* Capped at 8, and never more than a quarter of the cache: a read-ahead that can fill
+     * more than a quarter of the ways on its own is not a hint, it is a sequential reader
+     * pretending to be a cache, and it would evict the very set it just walked. */
+    if (blocks > 8u) {
+        blocks = 8u;
+    }
+    if (c->blocks != 0u && blocks > c->blocks / 4u) {
+        blocks = c->blocks / 4u;
+    }
+    c->readAhead = blocks;
+}
+
+unsigned int gdx_block_cache_readahead(const GdxBlockCache* c) {
+    return (c != nullptr) ? c->readAhead : 0u;
+}
+
+unsigned long long gdx_block_cache_prefetch_fills(const GdxBlockCache* c) {
+    return (c != nullptr) ? c->prefetchFills : 0ull;
+}
+
+unsigned long long gdx_block_cache_fills(const GdxBlockCache* c) {
+    return (c != nullptr) ? c->blockFills : 0ull;
 }
 
 void gdx_block_cache_note_overlay(GdxBlockCache* c, unsigned int bytes) {
@@ -432,6 +620,8 @@ void gdx_block_cache_reset_stats(GdxBlockCache* c) {
             memset(c->touched, 0, c->touchedBytes);
         }
         c->uniqueBlocks = 0;
+        c->blockFills = 0;
+        c->prefetchFills = 0;
     }
 }
 
@@ -453,15 +643,21 @@ const char* gdx_block_cache_format_stats(const GdxBlockCache* c, char* buf, unsi
        failed to hold. Those two, not hit%%, are what choose a cache size: a cache at or above
        wsKB cannot re-fetch, and one below it re-fetches by exactly how badly the access
        pattern re-visits. */
+    /* refetch is counted off FILLS, not misses, so read-ahead cannot make it lie: a
+       speculative fill is still the card serving a block, and a block fetched twice is a
+       re-fetch whichever path asked for it. With readAhead == 0, blockFills == blockMisses
+       and this is the identical number every earlier receipt printed. */
     const unsigned long long refetch =
-        (c->stats.blockMisses > c->uniqueBlocks) ? (c->stats.blockMisses - c->uniqueBlocks) : 0ull;
+        (c->blockFills > c->uniqueBlocks) ? (c->blockFills - c->uniqueBlocks) : 0ull;
     snprintf(buf, bufSize,
              "reads=%llu readKB=%llu hit=%llu miss=%llu hit%%=%u evict=%llu hostKB=%llu "
-             "ovlKB=%llu refused=%llu uniqBlk=%llu wsKB=%llu refetch=%llu cacheKB=%u blockKB=%u",
+             "ovlKB=%llu refused=%llu uniqBlk=%llu wsKB=%llu refetch=%llu fills=%llu pf=%llu "
+             "ra=%u cacheKB=%u blockKB=%u",
              c->stats.reads, c->stats.readBytes / 1024ull, c->stats.blockHits,
              c->stats.blockMisses, hitPct, c->stats.blockEvictions, c->stats.hostBytes / 1024ull,
              c->stats.overlayBytes / 1024ull, c->stats.refusals,
              c->uniqueBlocks, (c->uniqueBlocks * c->blockBytes) / 1024ull, refetch,
+             c->blockFills, c->prefetchFills, c->readAhead,
              gdx_block_cache_bytes(c) / 1024u, c->blockBytes / 1024u);
     return buf;
 }

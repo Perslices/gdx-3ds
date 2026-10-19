@@ -32,17 +32,30 @@
 #include "fast/Fast3dWindow.h"
 
 #include "gfx/gdx3ds_native_cfg.h"
+#include "gfx/gdx3ds_replay.h" // C6 [replay]: pose-replay "60 Hz motion" ([native] replay)
 #include "gdx3ds_audio.h"
 #include "gdx3ds_config.h"
+#include "gdx3ds_preset_n60.h"
 #include "gdx3ds_filelog.h" // H-HARDWARE: SD sink for the tracers (svc goes nowhere on hardware)
 #include "gdx3ds_fps_hud.h" // FPS-HUD: bottom-screen counter (debug.fps, default ON)
 #include "gdx3ds_mainprof.h" // MAINPROF: [mprof] main-thread section profiler ([debug] mainprof)
 #include "gdx3ds_menu.h"    // MENU: v1 bottom-screen touch menu ([menu] enabled, default ON)
+#include "gdx3ds_crash.h"     // REL1CRASH: [crash] ARM11 exception handler + svcBreak tracer
 #include "gdx3ds_membudget.h" // O3DS BUDGET: [mem-budget] + [mem-res] census ([debug] membudget)
 #include "gdx_audio_diet.h"   // C4d: audio_table diet + census ([debug] audio_stream / audiodiet)
+#include "gdx_ndsp_hash.h"   // [debug] ndsphash: the content-addressed render digest
+#include "gdx_audio_mix_census.h" // [debug] audiomix: the mix-bus headroom census
 #include "gdx3ds_cov.h"     // COVERAGE: [cov] per-frame feature census ([debug] cov)
+#include "gdx3ds_hitch.h"   // HITCH: per-frame hitch receipt ([debug] hitch)
+#include "gdx3ds_spike.h"   // n60st3: frame-spike attribution ([debug] spike_ms)
 #include "gdx3ds_oracle.h"  // ORACLE: true frame capture + [fh] receipts (after EndFrame)
 #include "gdx3ds_dynlod.h"  // ORACLE: dynlod tier pin under .gdxrec replay
+#include "gdx3ds_frameskip.h" // FRAMESKIP (C4l): 60 Hz logic, skipped renders ([debug] frameskip)
+#include "gdx3ds_core1probe.h" // N60TICK: core-1 probe ([debug] core1_probe)
+#include "gdx3ds_tickahead.h"  // N60TICK4: [debug] tick_ahead (Old 3DS: host on core 1, render on core 0)
+#include "gdx3ds_launch.h"     // N60LAUNCH: launch variants ([debug] launch_variants)
+#include "gdx3ds_boot_trail.h" // n60boot: crash-proof boot trail (boot.txt, DEFAULT ON)
+#include "gdx3ds_c5tick.h" // C5TICK: dlb split, write-set check, hollow skipped ticks ([debug] dl_hollow)
 #include "gdx_input_rec.h"  // ORACLE: .gdxrec record/replay ([debug] input_record / input_replay)
 #include "gdx_determinism.h" // ORACLE: Math_Rand seeds / boot-hold tick pin ([debug] rand_seed1 ...)
 #include "gdx3ds_fs.h"
@@ -81,12 +94,15 @@ void gdx_vi_present_fallback(void);
 void gdx_controller_poll(void);
 unsigned long long gdx_input_tick(void); // ORACLE: input tick (input_bridge.c)
 int gdx_input_game_mode(void);           // ORACLE: GET_MODE(gGameMode) (input_bridge.c)
+unsigned int gdx_gstate_hash(int* outRacers); // GSTATE: simulated-state digest (decomp_port.c)
+unsigned int gdx3ds_gstate_ext_hash(unsigned int* audioCmds); // C5TICK: game/gdx3ds_c5tick_game.c
 void gdx_fixed_aspect_tick(void);
 void gdx_rdram_init(void);
 void gdx_register_host_range(void* ptr, size_t size);
 void gdx_register_main_module_range(void);
 void gdx_disk_save_tick(void);
 void gdx_disk_save_flush(void);
+void gdx_sram_flush_pending(unsigned int timeoutMs, const char* why); // N60SAVE: [debug] sram_async
 int  GdxSegmentSourcePreload(uint32_t romBase);
 int  GdxSegmentSourcePayload(uint32_t romBase, void** outPayload, uint32_t* outSize);
 int  GdxSegmentSourcePreallocPayload(uint32_t romBase, void** outPayload, uint32_t* outCap);
@@ -100,6 +116,8 @@ void gdx_boot_warm_asset_segments(void);
 int  gdx3ds_audio_prime2_enabled(void);
 int  gdx3ds_audio_prime2_preload_core(void);
 int  gdx3ds_audio_grant_syscore(void);
+int  gdx3ds_audio_producer_core(void); // O3DSHOME: core-1 receipt at suspend
+int  gdx3ds_audio_drain_core(void);    // O3DSHOME: core-1 receipt at suspend
 void gdx3ds_audio_set_main_phase(const char* tag);
 void gdx3ds_audio_note_preload_core(int core);
 void gdx3ds_audio_note_preload_running(int running);
@@ -225,6 +243,24 @@ static int sAptHookFirst = 1; // [debug] apt_hook_first (default 1): re-arm our 
 static int sAptJoinMs = 1200;  // [debug] apt_join_ms (0 = unbounded, pre-HOMEFIX2 behaviour)
 static int sAptDspHook = 1;    // [debug] apt_dsp_hook (default 1): receipt around ndspFinalize
 static int sAptDspPark = 0;    // [debug] apt_dsp_park (default 0): also park audio in that hook
+// O3DSHOME (docs/research/native/o3dshome-progress.md, NEXT.md C4j): on the Old 3DS the audio
+// and preload threads live on core 1 under an APT_SetAppCpuTimeLimit grant -- 60% by default as
+// of N60SYSCORE60 (audiofix-progress.md, card n60-3d13; was 30% before that hardware A/B), which
+// turns on the kernel's core-1 preemption for every sysmodule thread (GSP, DSP, FS, NS all run
+// there). No New 3DS run ever held that grant (`syscore=0%` in every N3DS restore receipt), and
+// it is the one HOME-path difference between the models that is ours. [debug] apt_syscore_drop
+// (default 1) lowers the share to the 5% floor for the time we are suspended/asleep; restore
+// step 1 (aptRestoreCpuState) re-applies whatever percent was actually granted at init
+// (gdx3ds_audio_syscore_limit_percent(), not a hardcoded literal), so this already tracks the
+// new 60% default with no further change here. Model-gated: it acts only on an Old 3DS that
+// holds a grant, so a New 3DS never executes it.
+static int sAptSyscoreDrop = 1;
+// O3DSHOME3: [debug] apt_watch_file (default 1). 0 = while an APT transition is in progress,
+// the watchdog's receipts go to svc only once the "apt inactive" line has been written, so our
+// process issues no SD writes while the HOME menu loads (the boot-bisect G3 split).
+static int sAptWatchFile = 1;
+static volatile int sAptWatchFileMuted = 0;
+static const u32 kAptSyscoreFloorPct = 5; // APT:SetApplicationCpuTimeLimit accepts 5..89
 
 static unsigned long aptMsSince(uint64_t tick) {
     return (unsigned long)((svcGetSystemTick() - tick) / (uint64_t)CPU_TICKS_PER_MSEC);
@@ -245,18 +281,63 @@ static unsigned long aptMsSince(uint64_t tick) {
 //   ends after "WAKE observed", no "[apt] restore" -> GSPGPU_AcquireRight / RestoreVramSysArea
 //                                                 or citro3d's ONRESTORE hook (runs before ours)
 //   "CLOSE order pending" then nothing          -> the close path: see the [exit] chain
+// O3DSHOME: the largest gap between two suspended-mode polls since the last printed watch
+// line. The poll asks for 100 ms at priority 0x18 on core 0; a gap far above that says our own
+// core-0 threads were starved (by the HOME menu or a system wedge), not that main was.
+static void aptWatchTrackGap(uint64_t now, uint64_t* lastTick, unsigned long* maxGapMs) {
+    if (*lastTick != 0) {
+        const unsigned long gap = (unsigned long)((now - *lastTick) / (uint64_t)CPU_TICKS_PER_MSEC);
+        if (gap > *maxGapMs) {
+            *maxGapMs = gap;
+        }
+    }
+    *lastTick = now;
+}
+
+// O3DSHOME: the core-1 half of the watch line. c1=<drain parked>/<producer parked> (-1 = no
+// such thread), pre=<preload worker running>, pct=<syscore share we hold>, lag=<max poll gap>,
+// sysFreeK=<free KiB in the SYSTEM region, where the HOME menu allocates>. svc + static reads
+// only: no heap, no IPC, legal from the watchdog while main sits inside libctru.
+static void aptWatchAppendCore1(char* out, size_t cap, unsigned long maxGapMs) {
+    int drainParked = -1;
+    int producerParked = -1;
+    int preloadRunning = 0;
+    gdx3ds_audio_park_state(&drainParked, &producerParked, &preloadRunning);
+    std::snprintf(out, cap, " c1=%d/%d pre=%d pct=%d lag=%lums sysFreeK=%lu", drainParked, producerParked,
+                  preloadRunning, gdx3ds_audio_syscore_limit_percent(), maxGapMs,
+                  (unsigned long)(osGetMemRegionFree(MEMREGION_SYSTEM) / 1024u));
+}
+
+// O3DSHOME3: one watch receipt out. With [debug] apt_watch_file=0 the first line that sees
+// the app inactive (the jump went through) is the last one written to the SD; later lines
+// reach svc only, so the HOME menu loads with no SD traffic from us.
+static void aptWatchEmit(const char* msg, int active) {
+    svcOutputDebugString(msg, strlen(msg));
+    if (sAptWatchFileMuted) {
+        return;
+    }
+    if (!sAptWatchFile && !active) {
+        sAptWatchFileMuted = 1;
+    }
+    gdx3ds_filelog_write(msg, strlen(msg));
+    gdx3ds_filelog_flush();
+}
+
 static void aptWatchTick(void) {
     static int lastState = 0;
     static int lastActive = -1;
     static int lastGpu = -1;
     static int lastClose = -1;
     static uint64_t lastBeatTick = 0;
+    static uint64_t lastTickTick = 0;
+    static unsigned long maxGapMs = 0;
     const int state = sAptState;
     const int active = aptIsActive() ? 1 : 0;
     const int gpu = gspHasGpuRight() ? 1 : 0;
     const int close = aptShouldClose() ? 1 : 0;
-    char msg[224];
+    char msg[320];
     if (state == 0) {
+        sAptWatchFileMuted = 0; // transition over: the SD sink is ours again
         if (lastState != 0) {
             std::snprintf(msg, sizeof(msg),
                           "[apt] watch: transition complete t=+%lums active=%d gpu=%d close=%d",
@@ -267,15 +348,22 @@ static void aptWatchTick(void) {
         }
         lastState = 0;
         lastActive = lastGpu = lastClose = -1;
+        lastTickTick = 0;
+        maxGapMs = 0;
         return;
     }
     const uint64_t now = svcGetSystemTick();
+    aptWatchTrackGap(now, &lastTickTick, &maxGapMs);
     const char* why = nullptr;
+    const char* alsoGpu = "";
     if (lastState == 0) {
         why = "entered";
     } else if (active != lastActive) {
         why = active ? "WAKE observed (main past the APT wait; AcquireRight/RestoreVramSysArea/restore hook next)"
                      : "apt inactive (jump handed to the HOME menu)";
+        if (lastGpu >= 0 && gpu != lastGpu) {
+            alsoGpu = gpu ? " +gpu right acquired" : " +gpu right released";
+        }
     } else if (gpu != lastGpu) {
         why = gpu ? "gpu right acquired" : "gpu right released";
     } else if (close != lastClose) {
@@ -285,13 +373,15 @@ static void aptWatchTick(void) {
     }
     if (why != nullptr) {
         lastBeatTick = now;
-        std::snprintf(msg, sizeof(msg),
-                      "[apt] watch %s state=%d t=+%lums active=%d gpu=%d close=%d rtIdle=%d frameOpen=%d",
-                      why, state, aptMsSince(sAptStateTick), active, gpu, close, gdx3ds_rt_idle(),
-                      gdx3ds_gfx_frame_active());
-        svcOutputDebugString(msg, strlen(msg));
-        gdx3ds_filelog_write(msg, strlen(msg));
-        gdx3ds_filelog_flush();
+        int n = std::snprintf(msg, sizeof(msg),
+                              "[apt] watch %s%s state=%d t=+%lums active=%d gpu=%d close=%d rtIdle=%d frameOpen=%d",
+                              why, alsoGpu, state, aptMsSince(sAptStateTick), active, gpu, close,
+                              gdx3ds_rt_idle(), gdx3ds_gfx_frame_active());
+        if (n > 0 && (size_t)n < sizeof(msg)) {
+            aptWatchAppendCore1(msg + n, sizeof(msg) - (size_t)n, maxGapMs);
+        }
+        maxGapMs = 0;
+        aptWatchEmit(msg, active);
     }
     lastState = state;
     lastActive = active;
@@ -327,7 +417,43 @@ static void watchdogThreadMain(void*) {
             nextBeat = now + beatTicks;
         }
         const uint32_t frame = sWatchFrame;
+        // HAZARD CRUMBS (native/n3dsfix, docs/research/native/hw-n60-3d7-analysis.md): the
+        // New3DS attract-demo freeze near frame ~6900-7100 silences even this beat, which can
+        // only mean the watchdog thread itself never reaches its own log call -- and the one
+        // thing between the beat gate above and that log call is mallinfo(), which takes
+        // newlib's shared heap-allocator lock. If some other thread is stuck WHILE HOLDING that
+        // lock (e.g. mid malloc/free during the course-4 [trkres] bake/adopt burst that lines up
+        // with this freeze window every time), mallinfo() blocks here forever and the beat line
+        // never prints -- indistinguishable, from the SD/[net] log alone, from the watchdog
+        // thread itself being gone. These two durable (synchronously flushed, so they survive
+        // a freeze one line later) crumbs bracket the one call that can do that: if "pre" shows
+        // up on the next hardware freeze but "post" never does, mallinfo()/the heap lock is the
+        // smoking gun; if neither shows up, the watchdog thread was already stuck earlier than
+        // this (rule out the heap lock, look at aptWatchTick() or the beat gate instead).
+        // [debug] hazard_crumbs (default 0): zero cost unless armed for a hardware capture.
+        static int sHazardCrumbsOn = -1;
+        if (sHazardCrumbsOn < 0) {
+            sHazardCrumbsOn = gdx3ds_config_get_int("debug", "hazard_crumbs", 0) != 0 ? 1 : 0;
+        }
+        if (sHazardCrumbsOn) {
+            char hz[96];
+            int hn = std::snprintf(hz, sizeof(hz), "[hzc] watchdog pre-mallinfo beat=%lu frame=%lu\n",
+                                   (unsigned long)(beat + 1), (unsigned long)frame);
+            if (hn > 0) {
+                gdx3ds_filelog_write(hz, (size_t)hn);
+                gdx3ds_filelog_flush();
+            }
+        }
         struct mallinfo mi = mallinfo();
+        if (sHazardCrumbsOn) {
+            char hz[64];
+            int hn = std::snprintf(hz, sizeof(hz), "[hzc] watchdog post-mallinfo beat=%lu\n",
+                                   (unsigned long)(beat + 1));
+            if (hn > 0) {
+                gdx3ds_filelog_write(hz, (size_t)hn);
+                gdx3ds_filelog_flush();
+            }
+        }
         const unsigned long used = (unsigned long)mi.uordblks;
         if (used > sHeapHwm) {
             sHeapHwm = used;
@@ -392,7 +518,9 @@ static void watchdogThreadMain(void*) {
         }
         if (n > 0) {
             svcOutputDebugString(msg, n);
-            gdx3ds_filelog_write(msg, (size_t)n); // sink is thread-safe (recursive lock)
+            if (!sAptWatchFileMuted) {
+                gdx3ds_filelog_write(msg, (size_t)n); // sink is thread-safe (recursive lock)
+            }
         }
         // [tt] park-state companion line: which queue each game fiber is blocked on. Racy
         // cross-thread reads of scheduler state (diagnostic only, same contract as the
@@ -403,11 +531,126 @@ static void watchdogThreadMain(void*) {
             tn += gdx_tt_dump_threads(ttmsg + tn, (int)sizeof(ttmsg) - tn);
             if (tn > 0) {
                 svcOutputDebugString(ttmsg, tn);
-                gdx3ds_filelog_write(ttmsg, (size_t)tn);
+                if (!sAptWatchFileMuted) {
+                    gdx3ds_filelog_write(ttmsg, (size_t)tn);
+                }
             }
         }
         lastFrame = frame;
     }
+}
+
+static void logStep(const char* s);
+
+// n60hwdiag (port/3ds/gfx/nrr/gdx3ds_nrr_crumb.h): durable breadcrumbs + the boot-cycling NRR bisect.
+extern "C" void gdx3ds_nrr_crumb_boot_select(void);
+extern "C" void gdx3ds_nrr_crumb_boot_receipt(void);
+
+// nihudtop Phase 3: dev-only CUSTOM top-screen mask lever ([debug] hud_custom_top_mask/
+// hud_custom_active). port/3ds/gdx3ds_hudtop_custom.c is compiled as C; a linkage-specification
+// is namespace-scope only in C++, so this is declared here (file scope), not inside main().
+extern "C" void gdx3ds_hudtop_custom_init(void);
+
+// ---------------------------------------------------------------------------------------------
+// O3DSHOME3 — ini-driven bisect variants for the Old 3DS HOME freeze (NEXT.md C4j, SOLVED:
+// docs/research/native/o3dshomefix-progress.md). `[debug] bisect_force = G1..G6` forces a named
+// lever set through gdx3ds_config_override (RAM only, never written back by the menu). The
+// hold-a-button-at-launch selector this started as NEVER caught a hold on the real console
+// (wave-2 card: every run logged `variant=none`), so it was removed; the ini path is what stays.
+// ---------------------------------------------------------------------------------------------
+struct BisectOverride {
+    const char* section;
+    const char* key;
+    const char* value;
+};
+
+struct BisectVariant {
+    const char* name;
+    const char* summary;
+    const BisectOverride* overrides;
+};
+
+static const BisectOverride kBisectG1[] = {
+    {"debug", "audio_ndsp", "0"}, {nullptr, nullptr, nullptr}};
+static const BisectOverride kBisectG2[] = {
+    {"debug", "audio_ndsp", "0"}, {"debug", "audio_syscore", "0"}, {nullptr, nullptr, nullptr}};
+static const BisectOverride kBisectG3[] = {
+    {"debug", "audio_ndsp", "0"}, {"debug", "audio_syscore", "0"}, {"debug", "console", "0"},
+    {"debug", "fps", "0"},        {"menu", "enabled", "0"},        {"menu", "lcd", "0"},
+    {"menu", "screen_off", "0"},  {"debug", "gputrace", "0"},      {"debug", "mainprof", "0"},
+    {"debug", "apt_watch_file", "0"}, {nullptr, nullptr, nullptr}};
+static const BisectOverride kBisectG4[] = {
+    {"debug", "audio_ndsp", "0"}, {"debug", "audio_syscore", "0"}, {"debug", "console", "0"},
+    {"debug", "fps", "0"},        {"menu", "enabled", "0"},        {"menu", "lcd", "0"},
+    {"menu", "screen_off", "0"},  {"debug", "gputrace", "0"},      {"debug", "mainprof", "0"},
+    {"debug", "apt_watch_file", "0"}, {"native", "all", "0"},      {"native", "interp", "0"},
+    {nullptr, nullptr, nullptr}};
+static const BisectOverride kBisectG5[] = {
+    {"menu", "lcd", "0"}, {"menu", "screen_off", "0"}, {nullptr, nullptr, nullptr}};
+static const BisectOverride kBisectG6[] = {
+    {"debug", "apt_watch_file", "0"}, {nullptr, nullptr, nullptr}};
+
+static const BisectVariant kBisectVariants[] = {
+    {"G1", "no DSP (audio_ndsp=0)", kBisectG1},
+    {"G2", "G1 + nothing on core 1 (audio_syscore=0)", kBisectG2},
+    {"G3", "G2 + no bottom console/menu/HUD/LCD, no gputrace/mainprof, no SD writes in HOME", kBisectG3},
+    {"G4", "G3 + native renderer off (native all=0 interp=0)", kBisectG4},
+    {"G5", "ini + never touch gsp::Lcd/backlight (menu lcd=0 screen_off=0)", kBisectG5},
+    {"G6", "ini + no SD writes while in HOME (apt_watch_file=0)", kBisectG6},
+};
+
+static const BisectVariant* sBisectVariant = nullptr;
+
+static const BisectVariant* bisectVariantForName(const char* name) {
+    for (const BisectVariant& variant : kBisectVariants) {
+        if (name != nullptr && strcasecmp(name, variant.name) == 0) {
+            return &variant;
+        }
+    }
+    return nullptr;
+}
+
+static void bisectApplyOverrides(const BisectVariant* variant) {
+    for (const BisectOverride* o = variant->overrides; o->key != nullptr; o++) {
+        gdx3ds_config_override(o->section, o->key, o->value);
+    }
+}
+
+static void bisectSelectAtBoot(void) {
+    sBisectVariant = bisectVariantForName(gdx3ds_config_get_string("debug", "bisect_force", nullptr));
+    if (sBisectVariant != nullptr) {
+        bisectApplyOverrides(sBisectVariant);
+    }
+}
+
+// After the filelog is up: silent unless a variant is forced, then one line per lever.
+static void bisectLogReceipt(void) {
+    if (sBisectVariant == nullptr) {
+        return;
+    }
+    char msg[224];
+    std::snprintf(msg, sizeof(msg), "[bisect] variant=%s (debug.bisect_force) -- %s", sBisectVariant->name,
+                  sBisectVariant->summary);
+    logStep(msg);
+    for (const BisectOverride* o = sBisectVariant->overrides; o->key != nullptr; o++) {
+        std::snprintf(msg, sizeof(msg), "[bisect]   forced [%s] %s = %s", o->section, o->key, o->value);
+        logStep(msg);
+    }
+}
+
+// n60lead: a key the config tables could not hold used to be dropped silently (multiple cards lost
+// launch-variant keys at the old 128 cap). Loud now: boot trail + log, once per checkpoint.
+static void logConfigOverflow(const char* where) {
+    const char* first = "";
+    const int n = gdx3ds_config_overflow(&first);
+    if (n == 0) {
+        return;
+    }
+    char msg[200];
+    std::snprintf(msg, sizeof(msg), "[config] OVERFLOW at %s: %d key(s) DROPPED (table %d/%d, first %s) -- "
+                  "those settings are NOT applied", where, n, gdx3ds_config_entry_count(),
+                  gdx3ds_config_entry_capacity(), first);
+    logStep(msg);
 }
 
 static void logStep(const char* s) {
@@ -417,6 +660,46 @@ static void logStep(const char* s) {
     std::printf("[G-Diffuser-3DS] %s\n", s);
     svcOutputDebugString(s, strlen(s));
     gdx3ds_filelog_write(s, strlen(s)); // hardware fallback: sdmc log (debug.filelog=1)
+    gdx3ds_boot_trail_file(s);          // n60boot: durable while the boot trail is open
+}
+
+// GSTATE (NEXT.md C4p): the gate for VISUAL-ONLY levers. [fh] hashes pixels, so a lever that
+// only changes what is drawn diverges on every race frame and [fh] cannot say whether the
+// race itself changed. `[debug] gstate_every = N` (DEFAULT 0 = off) emits the simulated-state
+// digest (gdx_gstate_hash: RNG streams, logic frame counter, every racer's physics and race
+// progress -- never the draw-side LOD fields) every N host frames, keyed by the input tick, so
+// two runs of one replay compare with a join on tick=. Main thread, after the game update.
+static int sGstateEvery = -1;
+static int sGstateExt = 0; // C5TICK [debug] gstate_ext: append ext= (default 0: the line is unchanged)
+
+static void gstateTick(unsigned long frameNum) {
+    if (sGstateEvery < 0) {
+        sGstateEvery = gdx3ds_config_get_int("debug", "gstate_every", 0);
+        sGstateExt = gdx3ds_config_get_int("debug", "gstate_ext", 0) != 0;
+        if (sGstateEvery > 0) {
+            logStep(sGstateExt ? "[gstate] init: simulated-state digest armed ([debug] gstate_every), "
+                                 "+ ext= draw-reachable state ([debug] gstate_ext)"
+                               : "[gstate] init: simulated-state digest armed ([debug] gstate_every)");
+        }
+    }
+    if (sGstateEvery <= 0 || (frameNum % (unsigned long)sGstateEvery) != 0) {
+        return;
+    }
+    int racers = 0;
+    const unsigned int hash = gdx_gstate_hash(&racers);
+    char line[160];
+    int n = std::snprintf(line, sizeof(line), "[gstate] frame=%lu tick=%llu mode=%d racers=%d hash=%08x",
+                          frameNum, gdx_input_tick(), gdx_input_game_mode(), racers, hash);
+    if (sGstateExt && n > 0 && n < (int)sizeof(line)) {
+        // C5TICK: the draw-reachable state hash= cannot see (audio command stream, intro timer,
+        // clear countdown, racer visibility bits + soundEffectFlags); port/3ds/game/gdx3ds_c5tick_game.c.
+        unsigned int audioCmds = 0;
+        const unsigned int ext = gdx3ds_gstate_ext_hash(&audioCmds);
+        n += std::snprintf(line + n, sizeof(line) - (size_t)n, " ext=%08x acmd=%u", ext, audioCmds);
+    }
+    if (n > 0) {
+        gdx3ds_filelog_write(line, (size_t)n); // one line per call: the filelog adds the newline
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -557,18 +840,28 @@ static void aptAudioResume(void) {
 
 // Cause #4: the HOME menu draws on the bottom screen; if the touch menu's [OFF] holds the
 // backlight down, hand it back lit and re-apply the saved state on the way back.
-static void aptBacklightForHome(void) {
-    if (gdx3ds_menu_backlight_off()) {
-        gdx3ds_menu_force_backlight(1);
-        aptLogReceipt("[apt] bottom backlight on for HOME menu (menu screen-off saved)");
-    }
+// O3DSHOMEFIX (C4j): gsp::Lcd sessions are now short-lived (gdx3ds_menu.c), so none of ours is
+// open across the jump; the receipt says so on every transition (held=1 would be the hazard).
+static void aptLcdReceipt(const char* phase, const char* what, int menuOff, int rc) {
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+                  "[apt] %s gsp::Lcd: session held=%d menu screen-off=%d -> %s (rc=0x%08lX)", phase,
+                  gdx3ds_menu_lcd_session_open(), menuOff, what, (unsigned long)(unsigned)rc);
+    aptLogReceipt(msg);
 }
 
-static void aptBacklightRestore(void) {
-    if (gdx3ds_menu_backlight_off()) {
-        gdx3ds_menu_force_backlight(0);
-        aptLogReceipt("[apt] bottom backlight off re-applied (menu screen-off)");
-    }
+static void aptBacklightForHome(const char* phase) {
+    const int menuOff = gdx3ds_menu_backlight_off();
+    const int rc = menuOff ? gdx3ds_menu_force_backlight(1) : 0;
+    aptLcdReceipt(phase, menuOff ? "bottom backlight ON for the HOME menu" : "backlight untouched (already on)",
+                  menuOff, rc);
+}
+
+static void aptBacklightRestore(const char* phase) {
+    const int menuOff = gdx3ds_menu_backlight_off();
+    const int rc = menuOff ? gdx3ds_menu_force_backlight(0) : 0;
+    aptLcdReceipt(phase, menuOff ? "bottom backlight OFF re-applied (menu screen-off)" : "backlight untouched",
+                  menuOff, rc);
 }
 
 // Cause #5: NS re-applies the exheader clock (268 MHz for hbldr) and drops the app's
@@ -581,19 +874,75 @@ static void aptRestoreCpuState(void) {
     }
     const int pct = gdx3ds_audio_syscore_limit_percent();
     Result rc = 0;
+    u32 foundPct = 0;
     if (pct > 0) {
+        APT_GetAppCpuTimeLimit(&foundPct); // O3DSHOME: what NS / the suspend drop left us
         rc = APT_SetAppCpuTimeLimit((u32)pct);
     }
-    char msg[112];
-    std::snprintf(msg, sizeof(msg), "[apt] cpu state re-applied (speedup=%d syscore=%d%% rc=0x%08lX)",
-                  isNew3ds ? 1 : 0, pct, (unsigned long)rc);
+    char msg[144];
+    std::snprintf(msg, sizeof(msg), "[apt] cpu state re-applied (speedup=%d syscore=%d%% rc=0x%08lX found=%lu%%)",
+                  isNew3ds ? 1 : 0, pct, (unsigned long)rc, (unsigned long)foundPct);
     aptLogReceipt(msg);
 }
 
+// O3DSHOME: which of our threads sit on core 1 and whether they parked, sampled on main after
+// the audio park -- the "per-thread state of the core-1 threads at suspend" receipt. Unnumbered
+// (a distinct label, never a step), so homefix-progress.md's step table still decodes a log.
+static void aptCore1Receipt(const char* phase) {
+    int drainParked = -1;
+    int producerParked = -1;
+    int preloadRunning = 0;
+    gdx3ds_audio_park_state(&drainParked, &producerParked, &preloadRunning);
+    bool isNew3ds = false;
+    APT_CheckNew3DS(&isNew3ds);
+    char msg[224];
+    std::snprintf(msg, sizeof(msg),
+                  "[apt] %s core1: model=%s syscore=%d%% drain core=%d parked=%d hle core=%d parked=%d "
+                  "preload running=%d sysFreeK=%lu",
+                  phase, isNew3ds ? "new3ds" : "old3ds", gdx3ds_audio_syscore_limit_percent(),
+                  gdx3ds_audio_drain_core(), drainParked, gdx3ds_audio_producer_core(), producerParked,
+                  preloadRunning, (unsigned long)(osGetMemRegionFree(MEMREGION_SYSTEM) / 1024u));
+    aptLogReceipt(msg);
+}
+
+// O3DSHOME: drop the syscore share to the floor while suspended (see sAptSyscoreDrop). Old 3DS
+// with a held grant only; every other configuration returns before touching APT.
+static void aptSyscoreDropForSuspend(const char* phase) {
+    const int grantedPct = gdx3ds_audio_syscore_limit_percent();
+    if (!sAptSyscoreDrop || grantedPct <= (int)kAptSyscoreFloorPct) {
+        return;
+    }
+    bool isNew3ds = false;
+    APT_CheckNew3DS(&isNew3ds);
+    if (isNew3ds) {
+        return;
+    }
+    u32 beforePct = 0;
+    const Result getRc = APT_GetAppCpuTimeLimit(&beforePct);
+    const Result setRc = APT_SetAppCpuTimeLimit(kAptSyscoreFloorPct);
+    char msg[224];
+    std::snprintf(msg, sizeof(msg),
+                  "[apt] %s syscore share %lu%% -> %lu%% (get rc=0x%08lX set rc=0x%08lX, "
+                  "debug.apt_syscore_drop=1; restore step 1 re-applies %d%%) t=+%lums",
+                  phase, (unsigned long)beforePct, (unsigned long)kAptSyscoreFloorPct, (unsigned long)getRc,
+                  (unsigned long)setRc, grantedPct, aptMsSince(sAptStateTick));
+    aptLogReceipt(msg);
+}
+
+// N60SAVE: bounded waits for an in-flight [debug] sram_async write (HOMEFIX lesson: every
+// suspend-side wait is bounded). A pending write is then done synchronously: one 32 KB file.
+static const unsigned kSramSuspendWaitMs = 300;
+static const unsigned kSramExitWaitMs = 1000;
+
 // Suspend side (HOME/POWER and lid sleep share it; only HOME lights the bottom panel).
 static void aptSuspendSteps(const char* phase, bool forHomeMenu) {
+    // N60SAVE: a queued save must not wait out the HOME menu (the console may be powered off
+    // from there). No-op unless [debug] sram_async=1 queued something.
+    aptStepReceipt(phase, 0, "sram flush");
+    gdx_sram_flush_pending(kSramSuspendWaitMs, phase);
     aptStepReceipt(phase, 1, "render thread park");
     aptRenderThreadPark(phase);
+    gdx3ds_core1probe_suspend(phase); // N60TICK: probe worker parked, granted share back (one int test off)
     aptStepReceipt(phase, 2, "audio park");
     aptAudioSuspend();
     aptStepReceipt(phase, 3, "net suspend");
@@ -607,9 +956,13 @@ static void aptSuspendSteps(const char* phase, bool forHomeMenu) {
                           "SOC IPC may still be in flight across ReleaseRight/JumpToHomeMenu");
         }
     }
+    aptCore1Receipt(phase);
+    aptSyscoreDropForSuspend(phase);
     if (forHomeMenu) {
         aptStepReceipt(phase, 4, "backlight for HOME menu");
-        aptBacklightForHome();
+        aptBacklightForHome(phase);
+    } else {
+        aptLcdReceipt(phase, "lid sleep: backlight left to the system", gdx3ds_menu_backlight_off(), 0);
     }
     char msg[192];
     std::snprintf(msg, sizeof(msg),
@@ -624,12 +977,13 @@ static void aptSuspendSteps(const char* phase, bool forHomeMenu) {
 static void aptRestoreSteps(const char* phase) {
     aptStepReceipt(phase, 1, "cpu state");
     aptRestoreCpuState();
+    gdx3ds_core1probe_resume(phase); // N60TICK: restart the probe window (one int test off)
     aptStepReceipt(phase, 2, "audio resume");
     aptAudioResume();
     aptStepReceipt(phase, 3, "net resume");
     gdx3ds_net_resume();
     aptStepReceipt(phase, 4, "backlight restore");
-    aptBacklightRestore();
+    aptBacklightRestore(phase);
     char msg[160];
     std::snprintf(msg, sizeof(msg), "[apt] %s hook done -> libctru (DSP wakeup), frame loop resumes t=+%lums",
                   phase, aptMsSince(sAptStateTick));
@@ -640,6 +994,7 @@ static void aptLifecycleHook(APT_HookType hook, void* param) {
     (void)param;
     switch (hook) {
         case APTHOOK_ONSUSPEND:
+            gdx3ds_replay_note_apt(); // C6: never replay across a suspend (VRAM/GPU state restored)
             aptStateSet(1);
             aptLogReceipt("[apt] suspend (HOME/POWER -> HOME menu)");
             aptSuspendSteps("suspend", true);
@@ -650,6 +1005,7 @@ static void aptLifecycleHook(APT_HookType hook, void* param) {
             aptStateSet(0);
             break;
         case APTHOOK_ONSLEEP:
+            gdx3ds_replay_note_apt();
             aptStateSet(2);
             aptLogReceipt("[apt] sleep (lid closed)");
             aptSuspendSteps("sleep", false);
@@ -693,6 +1049,31 @@ static aptHookCookie sAptHookCookie;
 // from a non-main thread, which is a behaviour change, and the receipt alone is what the next
 // hardware run needs.
 static dspHookCookie sDspHookCookie;
+// O3DSHOME: a second DSP hook registered BEFORE gdx3ds_audio_init, i.e. BEHIND ndsp's (LIFO),
+// so it runs right after ndspFinalize(true) returns on the suspend path and right after
+// ndspInitialize(true) on the wake path. Together with the head hook this brackets ndsp on the
+// main thread's own clock: a log with the head line and no tail line IS the DSP handshake.
+static dspHookCookie sDspTailHookCookie;
+
+static void dspTailHook(DSP_HookType hook) {
+    char msg[224];
+    switch (hook) {
+        case DSPHOOK_ONSLEEP:
+            std::snprintf(msg, sizeof(msg),
+                          "[apt] dsp sleep done (ndspFinalize returned, aptState=%d t=+%lums) -> "
+                          "DSP_UnloadComponent, ReleaseRight, JumpToHomeMenu next",
+                          sAptState, aptMsSince(sAptStateTick));
+            aptLogReceipt(msg);
+            break;
+        case DSPHOOK_ONWAKEUP:
+            std::snprintf(msg, sizeof(msg), "[apt] dsp wakeup done (ndspInitialize(true) returned t=+%lums)",
+                          aptMsSince(sAptStateTick));
+            aptLogReceipt(msg);
+            break;
+        default:
+            break;
+    }
+}
 
 static void dspLifecycleHook(DSP_HookType hook) {
     switch (hook) {
@@ -717,7 +1098,9 @@ static void dspLifecycleHook(DSP_HookType hook) {
             break;
         }
         case DSPHOOK_ONWAKEUP:
-            aptLogReceipt("[apt] dsp wakeup hook (ndspInitialize(true) done)");
+            // O3DSHOME: this head hook runs BEFORE ndsp's (LIFO), so ndspInitialize has not run
+            // yet; the old text said "done". dspTailHook prints the real "done".
+            aptLogReceipt("[apt] dsp wakeup hook (ndspInitialize(true) NEXT)");
             break;
         case DSPHOOK_ONCANCEL:
             aptLogReceipt("[apt] dsp cancel hook (close order while the DSP slept; [exit] chain expected)");
@@ -1069,6 +1452,9 @@ static void portLogSvcTap(const char* message) {
     }
 }
 
+// C4d/audiocache: [debug] audiodiet_report, frames between [audio-diet] receipts (0 = off).
+static int sAudioDietReportFrames = 0;
+
 // [mem-census]: heap attributed to its owners (see the comment at the periodic call site).
 // Main thread only. Reaches svc AND the sdmc filelog so hardware runs keep it.
 static void emitMemCensus(Ship::Context* ctx, unsigned long frameNum, const char* why) {
@@ -1135,11 +1521,13 @@ static void oracleInitDeterminismAndRec() {
     const int bootHold = gdx3ds_config_get_int("debug", "boot_hold_ticks", det ? 230 : 0);
     const int audioPin = gdx3ds_config_get_bool("debug", "det_audio", det);
     gdx_det_init(seed1Have, seed1, seed2Have, seed2, bootHold, audioPin);
+    const int titleDemo = audioPin ? gdx3ds_config_get_int("debug", "det_title_demo", 0) : 0; /* niview */
+    gdx_det_set_title_demo(titleDemo, gdx3ds_config_get_int("debug", "det_title_demo_len", 1500));
     {
         char msg[192];
-        int n = std::snprintf(msg, sizeof(msg), "[det] init det=%d seed1=%s%08x seed2=%s%08x boot_hold_ticks=%d audio=%d",
+        int n = std::snprintf(msg, sizeof(msg), "[det] init det=%d seed1=%s%08x seed2=%s%08x boot_hold_ticks=%d audio=%d title_demo=%d",
                               det, seed1Have ? "0x" : "none:", seed1, seed2Have ? "0x" : "none:", seed2, bootHold,
-                              audioPin);
+                              audioPin, titleDemo);
         if (n > 0) {
             svcOutputDebugString(msg, n);
             gdx3ds_filelog_write(msg, (size_t)n);
@@ -1202,6 +1590,9 @@ static void oracleInitDeterminismAndRec() {
 
 int main(int argc, char** argv) {
     svcOutputDebugString("main entered", 12);
+    // n60boot: FIRST, before config/gfxInit/the file log: boot.txt (one flushed write per
+    // milestone) + the main thread's exception handler for the boot window.
+    gdx3ds_boot_trail_open();
     gdx_port_log_tap = &portLogSvcTap;
     // Fatal-exit tracers (see above): name the killer in the Azahar log before teardown.
     std::set_terminate(&fatalTerminateHandler);
@@ -1215,7 +1606,16 @@ int main(int argc, char** argv) {
     //    debug.console=1) exists before any step that can hang; boot-trace order
     //    deviation from desktop is deliberate.
     logStep("gdx3ds_config_load");
+    gdx3ds_config_set_preset_resolver(&gdx3ds_preset_resolve); // n3ds: [perf] preset = n60 (defaults layer)
     gdx3ds_config_load(GDX3DS_CONFIG_DEFAULT_PATH);
+    gdx3ds_boot_trail_latch_config(); // n60boot: [debug] boot_trail=0 closes it here
+    logConfigOverflow("config load");
+    bisectSelectAtBoot(); // O3DSHOME3: before ANY lever is read
+    gdx3ds_nrr_crumb_boot_select(); // n60hwdiag: nrr_bisect_cycle forces this boot's NRR subset; names the log
+    // N60LAUNCH ([debug] launch_variants, default 0): launch_force / launch_cycle pick + apply the
+    // variant HERE, before every lever latch; the hold mode only arms its window (below) and
+    // defers the file log so it opens under the variant's name.
+    gdx3ds_launch_boot_early(&logStep);
 
     // S2 MALLOC-CRAWL: arm the allocation-size histogram if requested. env wins over the INI key so
     // a run can enable it without editing sdmc:/3ds/gdiffuser/gdiffuser.ini ([debug] section).
@@ -1246,14 +1646,41 @@ int main(int argc, char** argv) {
     // INI read above already proved the device works). Earlier logStep lines only reach
     // svc/console; everything from here lands in sdmc:/3ds/gdiffuser/log.txt when
     // debug.filelog=1.
-    gdx3ds_filelog_init();
+    if (!gdx3ds_launch_defers_filelog()) {
+        gdx3ds_filelog_init();
+        gdx3ds_boot_trail("[boot] file log open");
+    } else {
+        gdx3ds_boot_trail("[boot] file log deferred to the end of the launch window");
+    }
+    // REL1CRASH: CPU exception handler on this (main) thread and, via --wrap=threadCreate,
+    // on every thread created from here on; [debug] crashdump. First after the sink so a
+    // fault anywhere later leaves crash.txt + the unflushed log tail.
+    gdx3ds_crash_init();
+    gdx3ds_boot_trail("[boot] gdx3ds_crash_init done");
+    bisectLogReceipt();
+    {
+        // n3ds: the preset defaults layer, one line (absent = no preset, every default shipped).
+        const int presetKeys = gdx3ds_config_preset_count();
+        if (presetKeys > 0) {
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "[preset] %s: %d lever defaults from the built-in table (explicit ini keys win)",
+                          gdx3ds_config_get_string("perf", "preset", "?"), presetKeys);
+            gdx3ds_boot_trail(line);
+            std::strncat(line, "\n", sizeof(line) - std::strlen(line) - 1);
+            gdx3ds_filelog_write(line, std::strlen(line));
+        }
+    }
+    gdx3ds_nrr_crumb_boot_receipt(); // n60hwdiag: [nrrbisect] boot=/subset= + the first durable crumb
     // O3DS BUDGET: the grant receipt, as early as a sink exists for it. The grants are
     // fixed at __system_allocateHeaps (before main), so this is the whole truth about what
     // this console gave us -- and it prints BEFORE the ~10.7 MB audio_table preload below,
     // so a build that dies during that load still says what it was working with.
     gdx3ds_membudget_boot();
-    // HWLINK: dev link before the window so boot logSteps reach the host. [net] enabled=0
-    // (the default) makes this an immediate return — no SOC buffer, no thread, no receipt.
+    // HWLINK: dev link before the window so boot logSteps reach the host. [net] enabled's
+    // default is now conditional on the launch method (see gdx3ds_net.h/.c): off for a plain
+    // hbmenu/SD/CIA launch (immediate return -- no SOC buffer, no thread, no receipt), on when
+    // 3dslink's netloader launched us. An explicit ini `enabled` key always wins either way.
     gdx3ds_net_init(argc, argv);
     // APT lifecycle receipts (see aptLifecycleHook above): registered as early as the
     // filelog allows, so even a HOME/POWER press during boot leaves its trace.
@@ -1267,6 +1694,8 @@ int main(int argc, char** argv) {
     }
     sAptDspHook = gdx3ds_config_get_bool("debug", "apt_dsp_hook", 1) ? 1 : 0;
     sAptDspPark = gdx3ds_config_get_bool("debug", "apt_dsp_park", 0) ? 1 : 0;
+    sAptSyscoreDrop = gdx3ds_config_get_bool("debug", "apt_syscore_drop", 1) ? 1 : 0;
+    sAptWatchFile = gdx3ds_config_get_bool("debug", "apt_watch_file", 1) ? 1 : 0;
     if (R_FAILED(svcCreateEvent(&sWatchdogWake, RESET_ONESHOT))) {
         sWatchdogWake = 0; // watchdog falls back to plain sleeps (no early wake)
     }
@@ -1276,13 +1705,24 @@ int main(int argc, char** argv) {
     if (gdx3ds_os_window_init(&width, &height) != 0) {
         return 1;
     }
+    // N60LAUNCH hold mode: the prompt on the bottom screen, HID every vblank for launch_window_ms,
+    // then the variant's overrides and the deferred file log. Before the HUD takes the bottom
+    // screen and before audio/mainprof/core1probe latch their levers. No-op otherwise.
+    gdx3ds_launch_boot_window();
+    logConfigOverflow("launch variants");
+    gdx3ds_boot_trail("[boot] fps hud init");
     // FPS-HUD (debug.fps, default ON): owns the bottom-screen console + its reserved
     // top rows. Before the first post-window logStep so every console line scrolls in
     // the HUD's log window from the start.
     gdx3ds_fps_hud_init();
     // MENU (menu.enabled, default ON): takes over the bottom-screen layout (tab bar +
     // pages, fps line pinned as row 1); the HUD detects it and hands its line over.
+    gdx3ds_boot_trail("[boot] menu init");
     gdx3ds_menu_init();
+    // nihudtop Phase 3: dev-only CUSTOM top-screen mask lever ([debug] hud_custom_top_mask/
+    // hud_custom_active). Independent of the MENU/DASH init above; see the file's own header
+    // and the file-scope declaration near the top of this file.
+    gdx3ds_hudtop_custom_init();
     // ORACLE: capture oracle, determinism pins and the .gdxrec recorder/replayer — all before the
     // first controller poll (line 0 of a recording == tick 0) and before the game seeds its RNGs.
     gdx3ds_oracle_init();
@@ -1295,6 +1735,7 @@ int main(int argc, char** argv) {
 
     // 2. Developer gates (desktop parity has these first; safe after window).
     gdx_dev_gates_init_env();
+    gdx3ds_crash_breadcrumbs_arm(); // REL1CRASH: [debug] boot_breadcrumbs (default 0)
 
     // 3. SD filesystem.
     logStep("gdx3ds_fs_init");
@@ -1354,6 +1795,10 @@ int main(int argc, char** argv) {
 
     // 6. Audio: ndsp backend first (audio STATUS.md R6 ordering), then the dedicated
     //    audio thread (it waits for the decomp's gAudioContextInitialized internally).
+    // O3DSHOME: the tail DSP hook goes in BEFORE ndspInit so it lands behind ndsp's.
+    if (sAptDspHook) {
+        dspHook(&sDspTailHookCookie, dspTailHook);
+    }
     logStep("gdx3ds_audio_init");
     gdx3ds_audio_init(0);
     // HOMEFIX2: AFTER ndspInit (inside gdx3ds_audio_init) so dspHook's LIFO order puts our
@@ -1362,6 +1807,18 @@ int main(int argc, char** argv) {
     if (sAptDspHook) {
         dspHook(&sDspHookCookie, dspLifecycleHook);
         logStep("[apt] dsp hook armed ahead of ndsp's (debug.apt_dsp_hook=1)");
+        logStep("[apt] dsp tail hook armed behind ndsp's (ndspFinalize/ndspInitialize bracketed)");
+    }
+    {
+        bool isNew3ds = false;
+        APT_CheckNew3DS(&isNew3ds);
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+                      "[apt] o3dshome: model=%s syscore=%d%% apt_syscore_drop=%d (acts=%d) audio_syscore=%d",
+                      isNew3ds ? "new3ds" : "old3ds", gdx3ds_audio_syscore_limit_percent(), sAptSyscoreDrop,
+                      (sAptSyscoreDrop && !isNew3ds) ? 1 : 0,
+                      gdx3ds_config_get_bool("debug", "audio_syscore", 1) ? 1 : 0);
+        logStep(msg);
     }
     {
         // AUDIOFIX: the null-sink degrade used to be invisible outside the (default-off)
@@ -1381,8 +1838,16 @@ int main(int argc, char** argv) {
     logStep("GDiffuser_LoadAllAssets");
     GDiffuser_LoadAllAssets();
 
-    logStep("gdx_sched_init");
-    gdx_sched_init();
+    // N60TICK4 ([debug] tick_ahead, default 0; gdx3ds_tickahead.h): mode 1 runs everything from
+    // bootproc on (the frame loop, every game fiber, the teardown) on a host thread created on
+    // core 1, so the fibers are converted there; the boot steps below stay on core 0.
+    const int tickAheadMode = gdx3ds_tickahead_boot();
+    bool schedInited = false;
+    if (tickAheadMode != GDX3DS_TICKAHEAD_CORE1) {
+        logStep("gdx_sched_init");
+        gdx_sched_init();
+        schedInited = true;
+    }
 
     logStep("gdx_init_rom");
     {
@@ -1437,14 +1902,48 @@ int main(int argc, char** argv) {
         const std::string o2rGame = o2rBase + "fzerox.o2r";
         const std::string o2rMod = o2rBase + "gdiffuser.o2r";
         const char* o2rPaths[2] = { o2rGame.c_str(), o2rMod.c_str() };
+        // [ndsphash] ([debug] ndsphash, default 0): arm the content-addressed render digest
+        // here, beside the diet it exists to gate. It must be armed BEFORE the audio producer
+        // thread runs its first tick, and this block already sits on that side of the boot.
+        gdx_ndsphash_init();
+        // [audiomix] ([debug] audiomix, default 0): the mix-bus headroom census, armed on the
+        // same side of the boot and for the same reason -- it counts every bus accumulate
+        // inside the HLE, so it must exist before the producer's first tick.
+        gdx_audiomix_init();
         GdxAudioDietConfig dietCfg = {};
         dietCfg.stream = gdx3ds_config_get_int("debug", "audio_stream", 0);
         dietCfg.verify = gdx3ds_config_get_int("debug", "audio_stream_verify", 0);
         dietCfg.census = gdx3ds_config_get_int("debug", "audiodiet", 0);
-        dietCfg.cacheKb = (unsigned)gdx3ds_config_get_int("debug", "audio_stream_cache_kb", 512);
+        // audiocache: DEFAULT 512 -> 1024. `audiodiet` sized 512 KiB off a lane sweep whose
+        // own miss count said 80% of misses were irreducible first-touch; the user's hardware
+        // receipt says otherwise -- `refetch=291` of `miss=495` against a `wsKB=3264` working
+        // set in a 512 KiB cache, i.e. 59% of the card reads on the audio producer thread were
+        // blocks the cache had already held and dropped. On the lane, 512 -> 1024 takes
+        // refetch 18 -> 1, miss 90 -> 73 and hostKB 1440 -> 1168 for 512 KiB of heap, two runs
+        // a side, identical to the digit. See audiocache-progress.md section 3.
+        dietCfg.cacheKb = (unsigned)gdx3ds_config_get_int("debug", "audio_stream_cache_kb", 1024);
         dietCfg.blockKb = (unsigned)gdx3ds_config_get_int("debug", "audio_stream_block_kb", 16);
+        // C4d/audiocache: read-ahead for the audio cache. See gdx_audio_diet.h.
+        dietCfg.readAhead =
+            (unsigned)gdx3ds_config_get_int("debug", "audio_stream_readahead", 0);
+        sAudioDietReportFrames = gdx3ds_config_get_int("debug", "audiodiet_report", 0);
+        dietCfg.bootBypass = gdx3ds_config_get_int("debug", "audio_boot_bypass", 1);
+        dietCfg.bootBypassKb =
+            (unsigned)gdx3ds_config_get_int("debug", "audio_boot_bypass_kb", 64);
         const bool dietStreaming = gdx_audio_diet_init(&dietCfg, o2rPaths, 2) != 0;
         const size_t audioTableCount = (dietStreaming && !dietCfg.verify) ? 2u : 3u;
+        // A12b BOOT STALL ([debug] audio_boot_bypass, default 1; 0 = the unchanged path).
+        // The preload worker below exists so boot does not stall on the 10.7 MB audio_table
+        // archive read -- but the audio producer starts first and its font relocation asks
+        // for six small DMAs out of that very blob. gdx_segment_source's in-flight wait is
+        // all-or-nothing, so the producer sleeps out the whole read (measured: 1.30 s in one
+        // producer tick) while holding sAudioCtxMutex, which the GAME fiber takes in
+        // AudioThread_QueueCmd -- so the preload stalls the thing it was meant to unblock.
+        // Arming the bypass here lets those six reads come off the .o2r by fseek instead.
+        // Released by the worker once audio_table is resident; it self-disarms before that.
+        const bool bootBypass =
+            gdx_audio_diet_boot_bypass_arm(&dietCfg, o2rPaths, 2) != 0;
+        (void)bootBypass;
         // RACE-START-POLISH: the four segment_blob families the FIRST race load touches
         // first (bases from port/gen/AssetBindings.c sSegmentBlobMap). They were the last
         // synchronous SD reads left on the race-start path — measured right at race entry:
@@ -1479,6 +1978,10 @@ int main(int argc, char** argv) {
                     ++resident;
                 }
             }
+            // A12b: audio_table is resident now, so the bypass has already stopped being
+            // reached (gdx_segment_source's lock-free fast path serves every read from the
+            // published payload). Retract it and give back its file handle + cache.
+            gdx_audio_diet_boot_bypass_release();
             // Race-path gfx families need residency only (no host-range registration:
             // their bytes are consumed through GdxSegmentSourceRead into decoded
             // per-segment images, never resolved by low32 address). A first-touch read
@@ -1523,8 +2026,10 @@ int main(int argc, char** argv) {
             preloadCore = (preloadThread != nullptr) ? 2 : -1;
         }
         if (preloadThread == nullptr && !(prime2 && preloadPolicy == 0)) {
-            const bool syscoreGranted = preloadOffCore2 ? (gdx3ds_audio_grant_syscore() != 0)
-                                                        : R_SUCCEEDED(APT_SetAppCpuTimeLimit(30));
+            // O3DSHOME: both policies take the share through the audio module so
+            // [debug] audio_syscore=0 keeps the worker off core 1 too, and the percent is
+            // recorded for the restore hook (the direct call here never recorded it).
+            const bool syscoreGranted = gdx3ds_audio_grant_syscore() != 0;
             if (syscoreGranted) {
                 preloadThread = threadCreate(preloadWorker, nullptr, 16 * 1024, 0x30, 1, true);
                 preloadCore = (preloadThread != nullptr) ? 1 : -1;
@@ -1554,6 +2059,14 @@ int main(int argc, char** argv) {
     gdx3ds_audio_set_main_phase("warm");
     gdx_boot_warm_asset_segments();
 
+    // N60TICK4: the host body. With tick_ahead=1 it runs on the core-1 host thread and the main
+    // thread serves its APT pump (gdx3ds_tickahead_apt_main_loop); otherwise it runs right here.
+    // The body below is deliberately NOT re-indented (keeps merges with the frame-loop owners small).
+    auto hostMain = [&]() -> int {
+    if (!schedInited) {
+        logStep("gdx_sched_init (tick_ahead host thread)");
+        gdx_sched_init();
+    }
     logStep("bootproc — starting decomp game threads");
     gdx3ds_audio_set_main_phase("bootproc");
     bootproc();
@@ -1596,6 +2109,8 @@ int main(int argc, char** argv) {
         gdx3ds_oracle_after_endframe(); // ORACLE: frame N is complete once armed (FrameSync inside)
     };
     const int rtMode = gdx3ds_rt_init(&rtCb); // 0 off, 1 sync, 2 pipe, 3 ahead
+    gdx3ds_frameskip_init(rtMode); // FRAMESKIP: rtMode 0 only (the receipt says when refused)
+    gdx3ds_replay_init(rtMode);    // C6 [replay]: rtMode 0 + the owned interpreter (receipt says why not)
     // QUIET MODE (MENU-PERF): the recurring svc telemetry below (the every-64th "frame N"
     // heartbeat, the [present] scanout oracle, the [mem-census] line) is gated behind
     // `[debug] verbose = 1` (or `gputrace = 1`, so measurement runs need no extra key).
@@ -1630,6 +2145,9 @@ int main(int argc, char** argv) {
         // gdx3ds_mprof_frame_end below is partitioned into [mprof] buckets; the window
         // emit itself happens inside frame_end, i.e. outside every bucket.
         gdx3ds_mprof_frame_begin();
+        gdx3ds_hitch_frame_begin(); // HITCH: [debug] hitch per-frame receipt (one int test when off)
+        gdx3ds_spike_frame_begin(); // n60st3: [debug] spike_ms attribution (one int test when off)
+        gdx3ds_crash_breadcrumbs_frame((unsigned long)frameNum); // REL1CRASH: one int test when off
         if (rtMode != 0 && (rtMode != 3 || aptShouldJumpToHome() || aptShouldClose())) {
             // Frame boundary: the previous iteration's END (present) must have completed so
             // the APT pump runs with no C3D frame open and nothing queued (audit section 6).
@@ -1653,7 +2171,7 @@ int main(int argc, char** argv) {
             gdx3ds_mprof_leave(mpPrev);
         }
         gdx3ds_mprof_enter(GDX3DS_MPROF_APT);
-        if (!aptMainLoop() || gdx3ds_oracle_quit_requested()) {
+        if (!gdx3ds_tickahead_apt_main_loop() || gdx3ds_oracle_quit_requested()) { // N60TICK4: aptMainLoop()
             logStep("[apt] shutdown requested — leaving frame loop");
             gdx3ds_filelog_flush(); // receipt must survive even if teardown wedges
             break;
@@ -1667,6 +2185,7 @@ int main(int argc, char** argv) {
             int n = std::snprintf(hb, sizeof(hb), "frame %lu", (unsigned long)frameNum);
             svcOutputDebugString(hb, n);
         }
+        gdx3ds_boot_trail_frame((unsigned long)frameNum); // n60boot: crumbs, then the close
         ++frameNum;
         sWatchFrame = frameNum;
 #if GDX3DS_BOOT_TRACE
@@ -1680,6 +2199,12 @@ int main(int argc, char** argv) {
         w->HandleEvents();
         gdx_controller_poll();
         gdx_fixed_aspect_tick();
+        // FRAMESKIP (gdx3ds_frameskip.h): decided AFTER the poll (a replay SHOT arms there and
+        // vetoes the skip) and BEFORE vi_tick (the GFX task is submitted inside it). A skip
+        // iteration runs the whole logic tick; only the render + present below are dropped.
+        const bool skipRender = gdx3ds_frameskip_begin_iteration((unsigned long)frameNum) != 0;
+        gdx3ds_replay_iteration_begin((unsigned long)frameNum, skipRender ? 1 : 0); // C6: pool snapshot
+        gdx3ds_c5tick_begin_tick((unsigned long)frameNum, skipRender ? 1 : 0); // C5TICK: latch the hollow-build flag (default off)
 
         if (rtMode != 0) {
             // BEGIN first: gdx_vi_tick's osSendMesg dispatches the game fibers from host
@@ -1701,7 +2226,7 @@ int main(int argc, char** argv) {
         gdx3ds_mprof_enter(GDX3DS_MPROF_AUD);
         gdx_audio_thread_notify_frame();
 
-        if (rtMode == 0) {
+        if (rtMode == 0 && !skipRender) {
             GDX_HB("hb:start_frame", 4);
             gdx3ds_mprof_enter(GDX3DS_MPROF_BEG);
             w->StartFrame();
@@ -1726,23 +2251,38 @@ int main(int argc, char** argv) {
             GDX_HB("hb:dispatch", 5);
             gdx_dispatch();
         }
+        gdx3ds_frameskip_end_iteration((unsigned long)frameNum); // FRAMESKIP: disarm the task drop
         GDX_HB("hb:save_tick", 6);
         gdx3ds_mprof_enter(GDX3DS_MPROF_TAIL);
+        gdx3ds_spike_mark(GDX_SPIKE_MARK_SAVE0);
         gdx_disk_save_tick();
+        gdx3ds_spike_mark(GDX_SPIKE_MARK_SAVE1);
         // ORACLE: stamp this frame's (frame, tick, mode) before its EndFrame is issued.
         gdx3ds_oracle_frame_mark((unsigned long)frameNum, (unsigned long)gdx_input_tick() - 1u, gdx_input_game_mode());
         if (rtMode != 0) {
             GDX_HB("hb:end_frame", 7);
             gdx3ds_mprof_enter(GDX3DS_MPROF_END);
             gdx3ds_rt_frame_end(); // END: present fallback + EndFrame on the render thread
+        } else if (skipRender) {
+            gdx3ds_oracle_skip_frame(); // FRAMESKIP: nothing presented; keep the oracle's frame count
         } else {
             gdx3ds_mprof_enter(GDX3DS_MPROF_END);
             gdx_vi_present_fallback();
+            gdx3ds_frameskip_before_present(); // FRAMESKIP steady: hold to the slot's vblank
+            gdx3ds_replay_before_present();    // C6: a replayed frame's swap latches first
             GDX_HB("hb:end_frame", 7);
             w->EndFrame();
+            // C5 STAGE 0: the oracle's SHOT/[fh] readback is harness work, not the frame's end
+            // ([c5cat] fend); charge it to tail with the other telemetry.
+            gdx3ds_mprof_enter(GDX3DS_MPROF_TAIL);
             gdx3ds_oracle_after_endframe(); // ORACLE (rtMode 0 twin of the render-thread hook)
         }
         gdx3ds_mprof_enter(GDX3DS_MPROF_TAIL);
+        gdx3ds_spike_mark(GDX_SPIKE_MARK_POST0);
+        gdx3ds_replay_iteration_end((unsigned long)frameNum, skipRender ? 1 : 0); // C6: B's poses / A's signals
+        gdx3ds_core1probe_tick((unsigned long)frameNum); // N60TICK: [debug] core1_probe (one int test off)
+        gdx3ds_tickahead_frame_end((unsigned long)frameNum); // N60TICK4: [tickahead] window (one int test off)
+        gdx3ds_spike_mark(GDX_SPIKE_MARK_POST1);
 
         // Present-path oracle (m1-boot-debug): the top-screen framebuffers live on the
         // linear heap (gfxInitDefault), so the CPU can inspect what actually reaches
@@ -1792,6 +2332,28 @@ int main(int argc, char** argv) {
         if ((verboseTelemetry || gdx3ds_membudget_enabled()) && frameNum > 8 &&
             (frameNum & 255) == 2) {
             emitMemCensus(ctx.get(), (unsigned long)frameNum, "periodic");
+        }
+        // C4d/audiocache: [debug] audiodiet_report = FRAMES between [audio-diet] receipts,
+        // 0 = off (the receipt then rides the 256-frame mem-census cadence above and nothing
+        // here runs). 256 frames is ~10 s, which is coarser than the events that matter: the
+        // race-start announcement is a ~2 s burst of first-touch sample reads, and on a card
+        // every one of those is a seek on the audio producer thread. This makes that burst
+        // one grep instead of an inference.
+        //
+        // Deliberately emitted HERE, on the game thread, and not from the census hook inside
+        // gdx_audio_diet.cpp: gdx_port_logf writes the sdmc filelog, and doing that from the
+        // audio producer thread would add SD writes to the exact thread whose stalls are
+        // being measured -- an instrument that causes what it reports.
+        if (sAudioDietReportFrames > 0 && frameNum > 8 &&
+            (frameNum % (unsigned long long)sAudioDietReportFrames) == 3) {
+            char am[64];
+            const int an = std::snprintf(am, sizeof(am), "[audio-diet] at frame=%lu",
+                                         (unsigned long)frameNum);
+            if (an > 0) {
+                svcOutputDebugString(am, an);
+                gdx3ds_filelog_write(am, (size_t)an);
+            }
+            gdx_audio_diet_receipt();
         }
         // HWLINK: execute at most one pending control command on the MAIN thread (the net
         // thread only parses and posts). Idle cost is one file-static load.
@@ -1890,19 +2452,29 @@ int main(int argc, char** argv) {
         // FPS-HUD tick (main thread — the libctru console is not thread-safe): one
         // int test per frame when off, ~1 Hz repaint when on. gGameFrameCount is the
         // decomp's own logic-frame counter (same source as the [cadence] game= column).
+        gdx3ds_spike_mark(GDX_SPIKE_MARK_TELE1);
         gdx3ds_fps_hud_tick(gGameFrameCount);
         // MENU tick (same thread for the same reason): touch dispatch + repaint only
         // on change / ~1 Hz for live pages — no per-frame console traffic.
         gdx3ds_menu_tick();
+        gdx3ds_spike_mark(GDX_SPIKE_MARK_HUD1);
+        gstateTick((unsigned long)frameNum); // GSTATE: [debug] gstate_every (default off)
 
         GDX_HB("hb:pacer", 8);
         gdx_frame_pacer_tick();
+        // HITCH: score this iteration (reads its mprof buckets, so before frame_end folds them).
+        gdx3ds_hitch_frame_end((unsigned long)frameNum, skipRender ? 0 : 1);
+        gdx3ds_spike_frame_end((unsigned long)frameNum);
         // MAINPROF: close the frame, fold it into the window, and (on a window boundary)
         // emit the [mprof] receipt. Deliberately the last statement of the iteration: the
         // emit's own svc/filelog cost then lands in no bucket and cannot inflate the table,
         // and it can only ever happen at a window boundary on the host thread — never
         // inside a game fiber, so the replay's tick order is untouched.
+        gdx3ds_c5tick_end_tick((unsigned long)frameNum); // C5TICK: [c5dlb] / [c5tick] windows (default off)
         gdx3ds_mprof_frame_end((unsigned long)frameNum);
+        gdx3ds_hitch_after_frame((unsigned long)frameNum); // HITCH: buffered lines out, between iterations
+        gdx3ds_spike_after_frame((unsigned long)frameNum); // n60st3: buffered [spike] lines out
+        gdx3ds_filelog_frame_end((unsigned long)frameNum); // N60LOG: the [debug] receipt_every clock
 #undef GDX_HB
     }
 #undef verboseTelemetry
@@ -1927,6 +2499,11 @@ int main(int argc, char** argv) {
     }
     gdx_disk_save_flush();
     aptLogReceipt("[exit] disk_save_flush done");
+    // N60SAVE: [debug] sram_async -- anything the writer has not written yet goes out now, after at
+    // most kSramExitWaitMs for an in-flight write (no-op with the lever off: writes are synchronous).
+    gdx_sram_flush_pending(kSramExitWaitMs, "exit");
+    aptLogReceipt("[exit] sram_flush done");
+    gdx3ds_core1probe_shutdown(); // N60TICK: join the probe worker before the audio threads go
     aptLogReceipt("[exit] audio_thread_stop enter");
     gdx_audio_thread_stop(); // joins the HLE producer (its own park event; never wakes the drain)
     aptLogReceipt("[exit] audio_thread_stop done");
@@ -1956,6 +2533,9 @@ int main(int argc, char** argv) {
     // No-op unless RELOAD ran; degrades to a plain exit when hb:ldr is absent.
     gdx3ds_net_relaunch_if_requested();
     return 0;
+    }; // N60TICK4: end of hostMain
+    using HostMainFn = decltype(hostMain);
+    return gdx3ds_tickahead_run_host([](void* p) -> int { return (*static_cast<HostMainFn*>(p))(); }, &hostMain);
 }
 
 #else // !__3DS__ — host stub build (Phase 0 behavior retained)

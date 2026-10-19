@@ -23,8 +23,15 @@
  *
  * INI KEYS, all [debug], all default off:
  *   audio_stream        0 off | 1 stream audio_table from the .o2r instead of holding it
- *   audio_stream_cache_kb  default 512
+ *   audio_stream_cache_kb  default 1024 (was 512; see audiocache-progress.md section 3)
  *   audio_stream_block_kb  default 16
+ *   audio_stream_readahead blocks fetched past the end of a SEQUENTIAL read (0 = off).
+ *                       The synthesiser walks a sample's loop region forward in ~760-byte
+ *                       DMAs, so a 16 KiB block serves ~20 of them and the next block is a
+ *                       certain miss. `diskstream` section 3 named read-ahead as the right
+ *                       shape for audio; this is it. What it moves is the FILL COUNT, which
+ *                       is a card SEEK on the console and nearly free on an emulator lane --
+ *                       read `pf=` and `fills=` in the receipt, not milliseconds.
  *   audio_stream_verify 1 = serve every read BOTH ways and memcmp (needs the resident
  *                       payload too, so it costs memory rather than saving it -- it is the
  *                       proof, not the product)
@@ -53,6 +60,11 @@ typedef struct GdxAudioDietConfig {
     int census;        /* 0 / 1 / 2 */
     unsigned int cacheKb;
     unsigned int blockKb;
+    unsigned int readAhead;    /* blocks; 0 = off (audiocache) */
+    int bootBypass;            /* A12b: serve audio_table reads off the .o2r while the boot
+                                * preload of it is still in flight (default on; 0 = the
+                                * unchanged wait-for-residency path) */
+    unsigned int bootBypassKb; /* bypass cache, boot window only (default 64) */
 } GdxAudioDietConfig;
 
 /* Arms the census and, when cfg->stream is set, opens the stream over the first archive in
@@ -64,6 +76,30 @@ typedef struct GdxAudioDietConfig {
  * gdx_audio_diet_streaming() says which happened after the fact. */
 int gdx_audio_diet_init(const GdxAudioDietConfig* cfg, const char* const* paths,
                         unsigned int pathCount);
+
+/* A12b BOOT-WINDOW BYPASS (docs/research/native/bootstall-progress.md).
+ *
+ * THE STALL. With the C4d lever off (the shipped default) audio_blob/audio_table is preloaded
+ * whole by a background worker, and the audio producer's first six AudioLoad_SyncDma reads
+ * arrive while that 10.7 MB archive read is in flight. gdx_segment_source's in-flight wait is
+ * all-or-nothing, so the producer sleeps out the WHOLE read -- measured at 1.30 s in one
+ * producer tick -- holding sAudioCtxMutex, which the GAME fiber takes in AudioThread_QueueCmd.
+ * So a preload that exists to keep boot off the SD stalls boot anyway.
+ *
+ * THE FIX. Those six reads do not need residency: the consumer copies every byte through
+ * AudioLoad_DmaSampleData, and the entry is STORED in the .o2r. `arm` opens a small streaming
+ * window over it and registers it as gdx_segment_source's bypass, so a read arriving before
+ * the payload is published is served by fseek in milliseconds instead of waiting. It
+ * self-disarms the instant the loader publishes.
+ *
+ * Returns 1 when the bypass is armed. Returns 0 -- correctly, and not as a failure -- when
+ * cfg->bootBypass is 0, or when gdx_audio_diet_init() already armed the C4d stream (in which
+ * case audio_table is never preloaded and no in-flight wait exists to bypass). Call `release`
+ * once the preload worker has finished: it retracts the hook, waits out any reader inside it,
+ * closes the stream and prints the receipt. */
+int gdx_audio_diet_boot_bypass_arm(const GdxAudioDietConfig* cfg, const char* const* paths,
+                                   unsigned int pathCount);
+void gdx_audio_diet_boot_bypass_release(void);
 
 int gdx_audio_diet_streaming(void);  /* 1 = reads are served from the .o2r */
 int gdx_audio_diet_verifying(void);  /* 1 = both-ways compare is on */

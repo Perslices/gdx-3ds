@@ -1,0 +1,45 @@
+--- a/src/game/course.c
++++ b/src/game/course.c
+@@ -2610,6 +2610,12 @@
+     s32 var_s2;
+     Vtx* var_s3;
+ 
++    {
++        /* nicourse [native] ni_course (port/3ds/game/gdx3ds_course_game.c): the course preview's
++           vertex buffer is (re)written here; the generation in its markers keys the resident copy. */
++        extern void gdx_course_model_gen_bump(void);
++        gdx_course_model_gen_bump();
++    }
+     D_800F89E8 = 3000.0f;
+     var_s0 = arg0->courseSegments;
+     var_fs1 = 0.0f;
+--- a/src/overlays/course_select/course_model.c
++++ b/src/overlays/course_select/course_model.c
+@@ -127,6 +127,10 @@
+ extern s32 gCupType;
+ extern char gEditCupTrackNames[][9];
+ 
++/* nicourse [native] ni_course: the preview markers (port/3ds/game/gdx3ds_course_game.c). */
++extern Gfx* gdx_course_model_mark_begin(Gfx* gfx);
++extern void gdx_course_model_mark_end(Gfx* gfx, Vtx* vtx, s32 vtxCount);
++
+ // Track 3D Models
+ Gfx* func_i5_80115E64(Gfx* gfx) {
+     s32 i;
+@@ -176,10 +180,16 @@
+             }
+ #endif
+             gSPViewport(gfx++, &D_i5_80118FF0[D_800DCCFC][i]);
++            /* nicourse [native] ni_course (port/3ds/game/gdx3ds_course_game.c): two G_NOOP p=0x6B words
++               before the model's G_VTX / G_TRI2 run (its vertex buffer, counts and generation); the owned
++               walker draws the run from a GPU-resident copy and skips it. Written only while the lever is on. */
++            gfx = gdx_course_model_mark_begin(gfx);
+ #ifndef EXPANSION_KIT
+             gfx = Course_DrawModel(gfx, &D_i5_801197D0[i * 0xC00], D_801197B0[i]);
++            gdx_course_model_mark_end(gfx, &D_i5_801197D0[i * 0xC00], D_801197B0[i]);
+ #else
+             gfx = Course_DrawModel(gfx, &D_i5_801197D0[i * 0x900], D_801197B0[i]);
++            gdx_course_model_mark_end(gfx, &D_i5_801197D0[i * 0x900], D_801197B0[i]);
+ #endif
+         }
+     }

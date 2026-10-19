@@ -20,6 +20,19 @@ int gdx_rival_detail_level(void) {
     return 0;
 }
 
+/* port/3ds/patches/decomp-port-o3ds-scene-lod.patch adds a `gdx_track_draw_distance_pct()`
+ * call to Course_Draw, same shape as the hook above: only the 3DS defines it
+ * (port/3ds/gdx3ds_perf_preset.c, [perf] draw_distance). 100 leaves the far-cull scale
+ * untouched, which is the branch Course_Draw took before the patch. */
+int gdx_track_draw_distance_pct(void) {
+    return 100;
+}
+
+/* Same patch, same shape: 0 keeps Racer_Draw emitting LOD-6 machines exactly as stock. */
+int gdx_rival_lod6_skip(void) {
+    return 0;
+}
+
 /* ── GDX_EXPANSION_KIT=OFF only ─────────────────────────────────────────────────────────────
  *
  * The cartridge-only configuration (what the 3DS port builds, and what the reference renderer

@@ -19,6 +19,10 @@ extern "C" {
 /* G_NOOP marker: w0 = (G_NOOP<<24) | (p<<16) | runIndex, w1 = GdxTrkRecord*. */
 #define GDXTRK_MARKER_P_END 0x5A   /* replay runs[runIndex] here */
 #define GDXTRK_MARKER_P_START 0x5B /* verify mode: snapshot the vertex cache here */
+/* [native] track_retained (C5 Stage 3, gdx3ds_track_retained.cpp): the same run, replayed as
+ * GPU-transformed draws of the game's own vertices, eye-rebased (float24-safe). Same record,
+ * same run index; the render side falls back to the CPU replay per run or per triangle. */
+#define GDXTRK_MARKER_P_RETAINED 0x60
 
 enum { GDXTRK_OP_VTX = 1, GDXTRK_OP_MOD = 2, GDXTRK_OP_DL = 3 };
 
@@ -49,18 +53,36 @@ typedef struct GdxTrkReplayStats {
     uint32_t fallback;  /* tris that stayed in the interpreter batch (packing refused) */
     uint32_t verifyOk;
     uint32_t verifyBad;
+    /* [native] track_retained (0 unless the run went through the retained replay) */
+    uint32_t gpuDraws; /* indexed GPU-transform draws */
+    uint32_t gpuTris;  /* template tris handed to the PICA */
 } GdxTrkReplayStats;
 
 typedef struct GdxTrkRecord {
     uint32_t magic;
     uint32_t mode;  /* 1 native, 2 verify */
     uint32_t frame; /* gGameFrameCount the record belongs to */
+    int32_t course; /* gCourseIndex when the record began (receipts only; -1 = unknown) */
     uint32_t nOps;
     uint32_t nRuns;
     GdxTrkOp ops[GDXTRK_MAX_OPS];
     GdxTrkRun runs[GDXTRK_MAX_RUNS];
     GdxTrkReplayStats rp;
 } GdxTrkRecord;
+
+/* [trkcat] (c5s3c): the game-side walk's own clock (gdx3ds_track_sink.c writes, the render
+ * side's [trkcat] window reads and resets). Diagnostic only; unsynchronised across threads. */
+typedef struct GdxTrkWalkStats {
+    uint64_t cullTicks;      /* Course_Draw entry -> gdxtrk_begin (cull + grouping) */
+    uint64_t walkTicks;      /* gdxtrk_begin -> gdxtrk_end */
+    uint64_t recSampleTicks; /* the timed recorder calls */
+    uint32_t recSamples;
+    uint32_t recCalls;       /* every recorder call while armed */
+    uint32_t passes;
+    uint32_t ops;
+    uint32_t verts;
+} GdxTrkWalkStats;
+extern GdxTrkWalkStats gdxtrk_walk_stats;
 
 #ifdef __cplusplus
 }

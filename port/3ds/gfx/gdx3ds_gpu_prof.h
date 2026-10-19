@@ -192,6 +192,62 @@ static inline void gdx3ds_prof_exit(int sec, uint64_t t0, uint64_t childSnap) {
     gdx3ds_prof_child_ticks = childSnap + dt;
 }
 
+/* ------------------------------------------------------------------------------
+ * [oth] / [othx] — C4I: split [prof]'s oth= (docs/research/native/o3dsoth-progress.md).
+ * Same gate as [prof] (the latched debug.gputrace), same 64-frame window, emitted right
+ * after the [prof] line. Zero heap: static accumulators only.
+ *
+ *   [oth]  frame=N n=64 sp=… oth=… | fend=… tsk=… logic=… dlb=… aud=… lseg=… sla=…
+ *          seg=… dma=… vi=… disp=… end=… tail=… idle=… rest=… res=…
+ *
+ * A PARTITION of oth: fend + tsk + every named column + idle + rest + res == oth. How:
+ *   oth = proc − interp, proc ≈ build + fend (citro3d's CPU window = our build window
+ *   [fresh FrameBegin return, FrameEnd entry] + C3D_FrameEnd's own CPU part), and the
+ *   build window is cut into [mprof] buckets by reading the main-thread [mprof] clock
+ *   (gdx3ds_mainprof.h, which gputrace now also runs, receipt-less) at both window
+ *   edges. Interpreter::Run executes inside the `stask` bucket (Gfx_SetTask ->
+ *   osSpTaskStartGo -> gdx_gfx_run), so
+ *     fend  = proc − build: C3D_FrameEnd's CPU side (command-list finalize)
+ *     tsk   = window share of stask − (dsp+vtx+tri+imp+drw+mtx): the Run prologue/
+ *             epilogue outside the sections, the bridge's post-Run work, the task
+ *             epilogue and osSpTaskStartGo's SP/DP-done posts (and any fiber they wake
+ *             before its next checkpoint). Can be slightly negative: dsp includes Run's
+ *             pre-FrameBegin prologue, which lies outside the window.
+ *     logic … tail = the [mprof] bucket of that name, window share only. With
+ *             renderthread=0 the C3D frame stays open from Run to the host's EndFrame,
+ *             so everything main does in between is here.
+ *     idle  = [mprof] oth (nothing claimed the clock), rest = Σ the remaining buckets
+ *             (brm sub apt pace inp beg jdp jtop — ~0 when renderthread=0).
+ *     res   = oth − all of the above. ~0 when every frame was split (sp == n). A frame
+ *             is unsplit (its whole oth lands in res) when the C3D frame is owned by the
+ *             render thread (renderthread != 0) or spans two host iterations.
+ *
+ *   [othx] frame=N n=64 | vbo=ms/calls/KB tex=ms/calls/KB | lgM=ms/lines lgO=ms/lines
+ *          lgF=ms/count | actx=ms/contended/locks hold=ms/ticks syn=ms | tick=us
+ * CROSS-CUTS, nested inside the buckets above (NOT additive to [oth]):
+ *     vbo/tex  every GSPGPU_FlushDataCache in gfx_citro3d.cpp, timed: vbo =
+ *           FlushPendingVbo, tex = the texture upload/atlas flushes (those run inside Run,
+ *           i.e. in imp/tri, not in oth).
+ *     lgM/lgO  filelog write() cost (lock wait included) on the logical main thread /
+ *           on every other thread; lgF = the SD batch flushes inside those. Per-frame means.
+ *     actx  the game fiber's AudioThread_QueueCmd taking the audio ctx mutex
+ *           (port/gdx_audio_thread.cpp): ms blocked / contended locks / all locks, per
+ *           frame. It is nested in [oth] aud= (Audio_Update runs inside the C3D window
+ *           under renderthread=0), and in the emulator's Old 3DS lane it IS aud=.
+ *     hold  the producer's ticks holding that mutex: ms / ticks per frame. syn = the
+ *           HLE synthesis share of the tick (held unless `[debug] audio_ctx_narrow=1`).
+ *     tick  measured cost of one svcGetSystemTick (µs), calibrated once at arming: every
+ *           [prof] section pays two, so (nV+nT+nI+nD+nM+nRun)*2*tick is the profiler's
+ *           own share of the frame. */
+enum {
+    GDX3DS_PROF_GSP_VBO = 0,
+    GDX3DS_PROF_GSP_TEX,
+    GDX3DS_PROF_GSP_COUNT
+};
+extern uint64_t gdx3ds_prof_gsp_ticks[GDX3DS_PROF_GSP_COUNT];
+extern uint32_t gdx3ds_prof_gsp_calls[GDX3DS_PROF_GSP_COUNT];
+extern uint64_t gdx3ds_prof_gsp_bytes[GDX3DS_PROF_GSP_COUNT];
+
 #ifdef __cplusplus
 }
 #endif

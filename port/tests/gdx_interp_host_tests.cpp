@@ -16,6 +16,7 @@
 #include "gdx_dlsrc_bridge.h"
 #include "gdx_interp.h"
 #include "gdx_mock_backend.h"
+#include "gdx3ds_hud_record.h"
 
 /* ---- mock seam: a fixed set of host lists/data blocks, resolvable by low32 -------------- */
 struct MockRange {
@@ -65,6 +66,10 @@ static int gdx_test_timgmemo = 1;
 static int gdx_test_tmemskip = 0;
 static int gdx_test_tmemfault = 0;   /* [memotear] B54 fault injection */
 static int gdx_test_tmemcls = 0;
+/* o3dsinterp: [native] o3dsfast (shipping default 1) and trimemo (default 0). TestFastPathParity
+   runs one scene under every combination and requires byte-identical batches and uploads. */
+static int gdx_test_o3dsfast = 1;
+static int gdx_test_trimemo = 0;
 /* Mock generations, so a test can move one and prove the skip stops firing, and the class the
    mock seam reports for an in-range source (STABLE unless a test asks for another). */
 static uint64_t gdx_test_native_gen = 1;
@@ -93,6 +98,28 @@ int gdx_gfx_job_resolve_list(GdxGfxJob*, uint32_t raw, int hostTagged, uintptr_t
     out->isF3d = r->isF3d;
     return 1;
 }
+/* [native] dlmemo (c5dlmemo): the mock resolve is a pure function of the operand and the mock
+   tables never move, so every successful resolve is admissible and the key is constant. */
+static uint32_t gdx_test_memo_version = 1;
+int gdx_gfx_job_resolve_list_memo(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull, GdxDlSrcList* out,
+                                  int* memoOk, uint32_t* sniffCmds) {
+    *memoOk = 0;
+    *sniffCmds = 0;
+    if (gdx_gfx_job_resolve_list(job, raw, hostTagged, hostFull, out) == 0) {
+        return 0;
+    }
+    /* exercise the raw-class capture where it fits: a sniff that reads 5 commands */
+    *memoOk = (out->limit >= 64) ? 2 : 1;
+    *sniffCmds = (*memoOk == 2) ? 5u : 0u;
+    return 1;
+}
+void gdx_gfx_job_list_memo_key(GdxGfxJob*, GdxDlMemoKey* out) {
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 16; i++) {
+        out->seg[i] = gSegs[i];
+    }
+    out->tablesVersion = gdx_test_memo_version;
+}
 uintptr_t gdx_gfx_job_resolve_data(GdxGfxJob*, uint32_t raw, int hostTagged, uintptr_t hostFull, size_t need, int, uintptr_t) {
     const uintptr_t p = hostTagged ? ResolveLow32(static_cast<uint32_t>(hostFull)) : ResolveLow32(raw);
     const MockRange* r = FindRange(p);
@@ -116,11 +143,15 @@ uint32_t gdx_gfx_timg_class_epoch(void) {
 unsigned gdx_gfx_classify_host_ptr(unsigned long) {
     return 0;
 }
-int gdx_gfx_timg_is_resource(uint32_t, int, uintptr_t, size_t) {
-    return 0;
+/* [native] hud_retain: one mock range can be declared an o2r (immutable) resource. */
+static uintptr_t gdx_test_imm_lo = 0, gdx_test_imm_hi = 0;
+int gdx_gfx_timg_is_resource(uint32_t, int, uintptr_t p, size_t) {
+    return (p >= gdx_test_imm_lo && p < gdx_test_imm_hi) ? 1 : 0;
 }
-int gdx_gfx_texels_are_native_rgba16(uintptr_t, size_t) {
-    return 0;
+/* o3dsinterp: one mock range can be declared native-RGBA16 so the halfword-swap mirror runs. */
+static uintptr_t gdx_test_native_lo = 0, gdx_test_native_hi = 0;
+int gdx_gfx_texels_are_native_rgba16(uintptr_t p, size_t) {
+    return (p >= gdx_test_native_lo && p < gdx_test_native_hi) ? 1 : 0;
 }
 size_t gdx_gfx_readable_bytes(uintptr_t p) {
     const MockRange* r = FindRange(p);
@@ -187,17 +218,35 @@ int gdx_ninterp_census(void) {
 int gdx_ninterp_ownfold(void) {
     return gdx_test_ownfold;
 }
+int gdx3ds_tex_fast_enabled(void) {
+    /* N60TEX: GDX_TEST_TEX_FAST=1 runs every decode through the [debug] tex_fast table forms */
+    const char* env = getenv("GDX_TEST_TEX_FAST");
+    return env != nullptr && env[0] == '1';
+}
 int gdx_ninterp_palhash(void) {
     return 1;
 }
 long long gdx_ninterp_now(void) {
     return 0;
 }
+long long gdx_ninterp_hws_begin(void) {
+    return 0;
+}
+void gdx_ninterp_hws_end(int site, long long t0) {
+    (void)site;
+    (void)t0;
+}
 int gdx_ninterp_dspcensus(void) {
     return gdx_test_dspcensus;
 }
 int gdx_ninterp_timgmemo(void) {
     return gdx_test_timgmemo;
+}
+int gdx_ninterp_o3dsfast(void) {
+    return gdx_test_o3dsfast;
+}
+int gdx_ninterp_trimemo(void) {
+    return gdx_test_trimemo;
 }
 int gdx_ninterp_tmemskip(void) {
     return gdx_test_tmemskip;
@@ -995,6 +1044,220 @@ static void TestClipPolyBound() {
     printf("  [clip] polygon high-water %u of the 16-slot buffer\n", it.ClipPolyHw());
 }
 
+/* o3dsinterp (NEXT.md C4m): [native] o3dsfast + [native] trimemo must not move a single byte.
+ * One big-endian scene that reaches every rewritten path -- the clipper (a triangle every plane
+ * cuts), back-face culling, runs of same-state triangles (the memo's hit path), a sampler change
+ * and a shader-input change between them (its miss path), overlapping TMEM loads at three bases
+ * (the span store's retire + fill ranges), and a native-RGBA16 load whose 30-byte size leaves a
+ * 2-byte tail after the word-wise swap. Two frames, so the span store and the memo cross a task.
+ * Every lever combination must produce the same batches (vbo floats, aux, bound state, shader
+ * ids) and the same uploads as the historic code (o3dsfast=0 trimemo=0). */
+struct FastLeg {
+    std::vector<MockBatch> batches;
+    std::vector<MockUpload> uploads;
+    uint32_t memoHits, fullResolves, clipIn, swapBytes, spanWords, emitted, clipAllOut, clipHw;
+};
+static int gTestNicensus = 0; /* [debug] nicensus leg of RunFastScene */
+static FastLeg RunFastScene(int fast, int memo) {
+    gdx_test_o3dsfast = fast;
+    gdx_test_trimemo = memo;
+    static uint32_t mtx[16];
+    memset(mtx, 0, sizeof(mtx));
+    mtx[0] = 0x00010000u;
+    mtx[2] = 0x00000001u;
+    mtx[5] = 0x00010000u;
+    mtx[7] = 0x00000001u;
+    for (int i = 0; i < 16; i++) mtx[i] = gdxn::Bswap32(mtx[i]);
+    static gdxn::Vtx vtx[11];
+    memset(vtx, 0, sizeof(vtx));
+    const int16_t ob[11][3] = { { -1, -1, 0 },     { 1, -1, 0 },     { 1, 1, 0 },    { -1, 1, 0 },
+                                { -900, -700, 0 }, { 900, -700, 0 }, { 0, 900, 0 },  { 0, 0, 0 },
+                                { 900, 0, 0 },     { 950, 10, 0 },   { 920, 50, 0 } };
+    for (int v = 0; v < 11; v++) {
+        for (int k = 0; k < 3; k++) {
+            vtx[v].ob[k] = static_cast<int16_t>(gdxn::Bswap16(static_cast<uint16_t>(ob[v][k])));
+        }
+        vtx[v].tc[0] = static_cast<int16_t>(gdxn::Bswap16(static_cast<uint16_t>(v * 64)));
+        vtx[v].tc[1] = static_cast<int16_t>(gdxn::Bswap16(static_cast<uint16_t>(v * 32)));
+        vtx[v].cn[0] = static_cast<uint8_t>(40 * v);
+        vtx[v].cn[1] = 128;
+        vtx[v].cn[2] = static_cast<uint8_t>(255 - 30 * v);
+        vtx[v].cn[3] = 255;
+    }
+    static uint32_t dl[128];
+    int n = 0;
+    const auto cmd = [&](uint32_t w0, uint32_t w1) {
+        dl[n++] = w0;
+        dl[n++] = w1;
+    };
+    cmd(0xDA380003u, 0x06000000u);             /* MTX modelview load */
+    cmd(0xDA380007u, 0x06000000u);             /* MTX projection load */
+    cmd(0x0100B016u, 0x06000100u);             /* VTX n=11 v0=0 */
+    cmd(0xD7000002u, 0xFFFFFFFFu);             /* TEXTURE on, scale 1, tile 0 */
+    cmd(0xFC121824u, 0xFF33FFFFu);             /* combine (texel0) */
+    cmd(0xD9FFFFFFu, 0x00000004u);             /* SHADE */
+    cmd(0xFD10000Fu, 0x06000400u);             /* SETTIMG A: RGBA16 w=16 */
+    cmd(0xF5100000u, 0x07000000u);             /* SETTILE 7 tmem 0 */
+    cmd(0xF3000000u, 0x070FF800u);             /* LOADBLOCK 256 texels */
+    cmd(0xF5100800u, 0x00000000u);             /* SETTILE 0 line 4 tmem 0 */
+    cmd(0xF2000000u, 0x0003C03Cu);             /* SETTILESIZE 0: 16x16 */
+    cmd(0x06000204u, 0x00000406u);             /* TRI2 (0,1,2) (0,2,3) */
+    cmd(0x05020406u, 0x00000000u);             /* TRI1 (1,2,3) x3: same state */
+    cmd(0x05020406u, 0x00000000u);
+    cmd(0x05020406u, 0x00000000u);
+    cmd(0xD9FFFFFFu, 0x00000400u);             /* CULL_BACK */
+    cmd(0x05000204u, 0x00000000u);             /* (0,1,2) */
+    cmd(0x05040200u, 0x00000000u);             /* (2,1,0): the other winding, culled */
+    cmd(0xD9FFFBFFu, 0x00000000u);             /* clear CULL_BACK */
+    cmd(0x05080A0Cu, 0x00000000u);             /* (4,5,6): every plane cuts it */
+    cmd(0x05080A0Cu, 0x00000000u);
+    cmd(0x05101214u, 0x00000000u);             /* (8,9,10): wholly outside x<=w -> all-out */
+    cmd(0x050E0210u, 0x00000000u);             /* (7,1,8): straddles only the x<=w plane */
+    cmd(0xFD10000Eu, 0x06000800u);             /* SETTIMG B: w=15, the native-RGBA16 range */
+    cmd(0xF5100040u, 0x07000000u);             /* SETTILE 7 tmem 0x40 */
+    cmd(0xF3000000u, 0x0700E800u);             /* LOADBLOCK 15 texels = 30 bytes */
+    cmd(0xF5100840u, 0x00000000u);             /* SETTILE 0 line 4 tmem 0x40 */
+    cmd(0xF2000000u, 0x00038000u);             /* SETTILESIZE 0: 15x1 */
+    cmd(0x05000204u, 0x00000000u);
+    cmd(0x05000406u, 0x00000000u);
+    cmd(0xFD10000Fu, 0x06000400u);             /* A again, at tmem 0x20: overlaps both spans */
+    cmd(0xF5100020u, 0x07000000u);
+    cmd(0xF3000000u, 0x070FF800u);
+    cmd(0xF5100820u, 0x00000000u);
+    cmd(0xF2000000u, 0x0003C03Cu);
+    cmd(0x05000406u, 0x00000000u);
+    cmd(0x05020406u, 0x00000000u);
+    cmd(0xE3001201u, 0x00002000u);             /* othermode_h: bilerp -> sampler change */
+    cmd(0x05020406u, 0x00000000u);
+    cmd(0x05000204u, 0x00000000u);
+    cmd(0xF5100830u, 0x00000000u);             /* SETTILE 0 tmem 0x30: INSIDE the 0x20 span */
+    cmd(0x05000204u, 0x00000000u);             /* -> LoadedTexAt's interior-view arm */
+    cmd(0xFC127E24u, 0xFFFFF3F9u);             /* a second combiner */
+    cmd(0x05000204u, 0x00000000u);
+    cmd(0x05080A0Cu, 0x00000000u);
+    cmd(0xDF000000u, 0x00000000u);
+    for (int i = 0; i < n; i++) dl[i] = gdxn::Bswap32(dl[i]);
+    alignas(8) static uint8_t seg6[0x1000];
+    memset(seg6, 0, sizeof(seg6));
+    memcpy(seg6, mtx, 64);
+    memcpy(seg6 + 0x100, vtx, sizeof(vtx));
+    for (int i = 0; i < 512; i++) seg6[0x400 + i] = static_cast<uint8_t>(i * 7 + 3);
+    for (int i = 0; i < 64; i++) seg6[0x800 + i] = static_cast<uint8_t>(0xA0 + i * 5);
+    gRanges.clear();
+    Reg(dl, sizeof(dl), 8, true, false, true);
+    Reg(seg6, sizeof(seg6), 8, false, false, false);
+    gSegs[6] = reinterpret_cast<uintptr_t>(seg6);
+    gdx_test_native_lo = reinterpret_cast<uintptr_t>(seg6 + 0x800);
+    gdx_test_native_hi = gdx_test_native_lo + 64;
+    gRoot = reinterpret_cast<uintptr_t>(dl);
+    gRootBytes = static_cast<size_t>(n) * 4;
+    MockBackend mb;
+    FastLeg out;
+    {
+        gdxn::Interp it(&mb);
+        if (gTestNicensus != 0) {
+            it.NcSet(1);
+        }
+        for (int frame = 0; frame < 2; frame++) {
+            if (it.NcOn()) {
+                it.NcFrameBegin(gdxn::Interp::kNcSubs * 1 + 2); /* gp_race / racing */
+            }
+            it.RunFrame(nullptr, Cfg(), 0);
+            if (it.NcOn()) {
+                const uint32_t zero[9] = {};
+                it.NcFrameEnd(zero, zero, zero, 9);
+            }
+        }
+        if (it.NcOn()) {
+            it.NcDump("hosttest", 1.0);
+        }
+        const gdxn::Counters& st = it.Stats();
+        out.memoHits = st.triResolveMemo;
+        out.fullResolves = st.triResolveFull;
+        out.clipIn = st.triClipIn;
+        out.swapBytes = st.tmemSwapBytes;
+        out.spanWords = st.spanWords;
+        out.emitted = st.triEmitAll;
+        out.clipAllOut = st.triClipAllOut;
+        out.clipHw = it.ClipPolyHw();
+    }
+    out.batches = mb.batches;
+    out.uploads = mb.uploads;
+    gSegs[6] = 0;
+    gdx_test_native_lo = gdx_test_native_hi = 0;
+    gdx_test_o3dsfast = 1;
+    gdx_test_trimemo = 0;
+    return out;
+}
+
+static bool SameBatches(const FastLeg& a, const FastLeg& b) {
+    if (a.batches.size() != b.batches.size() || a.uploads.size() != b.uploads.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.batches.size(); i++) {
+        const MockBatch& x = a.batches[i];
+        const MockBatch& y = b.batches[i];
+        if (x.id0 != y.id0 || x.id1 != y.id1 || x.tex[0] != y.tex[0] || x.tex[1] != y.tex[1] ||
+            x.numTris != y.numTris || x.vbo.size() != y.vbo.size() || x.depthTest != y.depthTest ||
+            x.depthMask != y.depthMask || x.decal != y.decal || x.alpha != y.alpha ||
+            memcmp(x.vp, y.vp, sizeof(x.vp)) != 0 || memcmp(x.sc, y.sc, sizeof(x.sc)) != 0 ||
+            memcmp(&x.aux, &y.aux, sizeof(x.aux)) != 0 || memcmp(&x.primDepth, &y.primDepth, sizeof(float)) != 0 ||
+            memcmp(&x.alphaThr, &y.alphaThr, sizeof(float)) != 0 ||
+            memcmp(x.vbo.data(), y.vbo.data(), x.vbo.size() * sizeof(float)) != 0) {
+            printf("  [fastpath] batch %zu differs\n", i);
+            return false;
+        }
+    }
+    for (size_t i = 0; i < a.uploads.size(); i++) {
+        if (a.uploads[i].w != b.uploads[i].w || a.uploads[i].h != b.uploads[i].h ||
+            a.uploads[i].rgba != b.uploads[i].rgba) {
+            printf("  [fastpath] upload %zu differs\n", i);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void TestFastPathParity() {
+    const FastLeg ref = RunFastScene(0, 0);
+    CHECK(ref.clipIn > 0);      /* the clipper ran */
+    CHECK(ref.swapBytes >= 30); /* the native-RGBA16 mirror ran, with a 2-byte tail */
+    CHECK(ref.emitted > 8);
+    CHECK(ref.memoHits == 0);
+    CHECK(ref.clipAllOut >= 2); /* the wholly-outside triangle, both frames */
+    CHECK(!ref.batches.empty() && ref.uploads.size() >= 2);
+    const int legs[3][2] = { { 1, 0 }, { 0, 1 }, { 1, 1 } };
+    for (const auto& leg : legs) {
+        const FastLeg got = RunFastScene(leg[0], leg[1]);
+        const bool same = SameBatches(ref, got);
+        CHECK(same);
+        CHECK(got.spanWords == ref.spanWords);
+        CHECK(got.clipAllOut == ref.clipAllOut && got.clipHw == ref.clipHw);
+        if (leg[1] != 0) {
+            CHECK(got.memoHits > 0); /* the memo really hit, and hitting changed nothing */
+            CHECK(got.memoHits + got.fullResolves == ref.fullResolves);
+        }
+        printf("  [fastpath] o3dsfast=%d trimemo=%d: %zu batches, %zu uploads %s; resolves full=%u memo=%u\n",
+               leg[0], leg[1], got.batches.size(), got.uploads.size(), same ? "IDENTICAL" : "DIFFER",
+               got.fullResolves, got.memoHits);
+    }
+}
+
+/* [debug] nicensus is measurement only: the census leg of the fast scene draws the same batches
+ * and uploads, byte for byte, as the plain leg (the device proof is the fh/gstate pair in
+ * nicensus-progress.md). */
+static void TestNicensusParity() {
+    const FastLeg ref = RunFastScene(0, 0);
+    gTestNicensus = 1;
+    const FastLeg got = RunFastScene(0, 0);
+    gTestNicensus = 0;
+    const bool same = SameBatches(ref, got);
+    CHECK(same);
+    CHECK(got.emitted == ref.emitted && got.spanWords == ref.spanWords);
+    printf("  [nicensus] census leg: %zu batches, %zu uploads %s\n", got.batches.size(), got.uploads.size(),
+           same ? "IDENTICAL" : "DIFFER");
+}
+
 /* [tmemblock] the widened same-content skip ([native] tmemskip), built on TestRectTexture's
  * scene because that test already documents the shipping behaviour it changes: "second
  * identical frame: span same-content skip is gated off (raw source) -> a load, a cache HIT".
@@ -1256,6 +1519,801 @@ static void TestTmemFaultInjection() {
     gdx_test_src_cls = GDX_TMEMSRC_STABLE;
 }
 
+/* [native] hud_direct (C5 Stage 2b, docs/research/native/c5s2b-progress.md): one HUD run replayed
+ * through the 0x5E marker with the lever off, on and in verify, three frames each. The direct
+ * path defers every LOADBLOCK's TMEM copy as a debt, memoises the TMEM hash per source and emits
+ * the rectangles itself -- and must still draw the SAME batches (vertex floats, aux, state), make
+ * the same uploads, and leave TMEM and the span store byte-identical at the task end. The scene
+ * mixes textures of different sizes at TMEM 0 (a small load over a large one leaves the large
+ * one's tail as a partial debt), a flipped rectangle, a CI8 texture with its TLUT, prim colour
+ * changes between rectangles, a fill rectangle, and -- after the run, outside it -- a rectangle
+ * that samples TMEM no load in its own list wrote, so the debt must be paid to the stock bytes. */
+struct HudLeg {
+    std::vector<MockBatch> batches;
+    std::vector<MockUpload> uploads;
+    std::vector<uint8_t> tmem;
+    std::vector<uint16_t> spanBase;
+    uint32_t tmemCopies = 0;
+    char receipt[512] = {};
+};
+
+static GdxHudWord HudW(uint32_t w0, uint32_t w1) {
+    GdxHudWord w;
+    w.w0 = w0;
+    w.pad = 0;
+    w.w1 = w1;
+    w.w1hi = 0;
+    return w;
+}
+static GdxHudWord HudP(uint32_t w0, const void* p) {
+    GdxHudWord w = HudW(w0, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p)));
+    w.w1hi = gdxn::kHostTag;
+    return w;
+}
+
+static void HudNoop(void* user, uint32_t w0, uint32_t, gdxn::Interp* it) {
+    if (((w0 >> 16) & 0xFFu) == GDXHUD_MARKER_P) {
+        it->HudReplayRun(user, w0 & 0xFFFFu); /* the host pointer rides in `user` (w1 is 32-bit) */
+    }
+}
+
+static HudLeg RunHudScene(int direct, GdxHudRecord* rec, const W* root, size_t rootN, size_t poolTris = 0) {
+    gRoot = reinterpret_cast<uintptr_t>(root);
+    gRootBytes = rootN * 16;
+    HudLeg out;
+    MockBackend mb;
+    if (poolTris != 0) {
+        mb.pool.assign(poolTris * 3 * 12, 0.0f); /* GEOMLOSS pressure: batches cap (and split) early */
+    }
+    {
+        gdxn::Interp it(&mb);
+        it.RegisterNoopHook(HudNoop, rec);
+        it.HudSetDirect(direct);
+        for (int frame = 0; frame < 3; frame++) {
+            memset(rec->rp, 0, sizeof(rec->rp));
+            it.RunFrame(nullptr, Cfg(), 0);
+            it.HudDirectTaskEnd();
+        }
+        out.tmem.assign(it.RdpState().tmem, it.RdpState().tmem + sizeof(it.RdpState().tmem));
+        out.spanBase.assign(it.RdpState().tmem_span_base, it.RdpState().tmem_span_base + 512);
+        out.tmemCopies = it.Stats().tmemCopyBytes;
+        it.HudDirectFormat(out.receipt, sizeof(out.receipt), 3);
+    }
+    out.batches = mb.batches;
+    out.uploads = mb.uploads;
+    return out;
+}
+
+static void TestHudDirectParity() {
+    static uint8_t texA[16 * 16 * 2], texB[32 * 8 * 2], texC[8 * 8 * 2], texD[16 * 8], texE[8 * 8], pal[256 * 2];
+    for (unsigned i = 0; i < sizeof(texA); i++) texA[i] = static_cast<uint8_t>(i * 7 + 1);
+    for (unsigned i = 0; i < sizeof(texB); i++) texB[i] = static_cast<uint8_t>(i * 13 + 5);
+    for (unsigned i = 0; i < sizeof(texC); i++) texC[i] = static_cast<uint8_t>(i * 29 + 3);
+    for (unsigned i = 0; i < sizeof(texD); i++) texD[i] = static_cast<uint8_t>(i * 3 + 11);
+    for (unsigned i = 0; i < sizeof(texE); i++) texE[i] = static_cast<uint8_t>(i % 5);
+    for (unsigned i = 0; i < sizeof(pal); i++) pal[i] = static_cast<uint8_t>(i * 11 + 1);
+
+    static GdxHudRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.magic = GDXHUD_MAGIC;
+    uint32_t n = 0;
+    auto put = [&](GdxHudWord w) { rec.words[n++] = w; };
+    auto rect = [&](uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry, uint32_t st, uint32_t d, bool flip) {
+        put(HudW((flip ? 0xE5000000u : 0xE4000000u) | (lrx << 12) | lry, (ulx << 12) | uly));
+        put(HudW(0xE1000000u, st));
+        put(HudW(0xF1000000u, d));
+    };
+    /* texture group: SETTIMG, SETTILE 7, LOADBLOCK 7, SETTILE 0, SETTILESIZE 0 (gDPLoadTextureBlock) */
+    auto group = [&](uint32_t fmtSiz, const void* src, uint32_t lrs, uint32_t dxt, uint32_t renderFmtSiz,
+                     uint32_t line, uint32_t w, uint32_t h) {
+        put(HudP(0xFD000000u | fmtSiz, src));
+        put(HudW(0xF5000000u | fmtSiz, 0x07000000u));
+        put(HudW(0xF3000000u, 0x07000000u | (lrs << 12) | dxt));
+        put(HudW(0xF5000000u | renderFmtSiz | (line << 9), 0x00000000u));
+        put(HudW(0xF2000000u, ((w - 1) << 14) | ((h - 1) << 2)));
+    };
+    put(HudW(0xE3001001u, 0x00000000u));
+    put(HudW(0xFC119623u, 0xFF2FFFFFu)); /* (TEXEL0 - 0) * PRIM + 0, both cycles */
+    put(HudW(0xFA000000u, 0xFF8040FFu));
+    group(0x100000u, texA, 255, 0x800, 0x100000u, 4, 16, 16); /* RGBA16 16x16, 512 B */
+    rect(40, 40, 104, 104, 0, 0x04000400u, false);
+    put(HudW(0xFA000000u, 0x40FF80C0u));
+    rect(120, 40, 184, 104, 0, 0x04000400u, false);
+    group(0x100000u, texC, 63, 0x800, 0x100000u, 2, 8, 8); /* RGBA16 8x8, 128 B: A's tail stays owed */
+    rect(200, 40, 232, 72, 0, 0x04000400u, false);
+    rect(240, 40, 272, 72, 0, 0x04000400u, true);
+    group(0x100000u, texB, 255, 0x400, 0x100000u, 8, 32, 8); /* RGBA16 32x8 */
+    rect(40, 120, 168, 152, 0, 0x04000400u, false);
+    group(0x480000u, texD, 63, 0x800, 0x880000u, 2, 16, 8); /* IA8 16x8 loaded as 16b */
+    rect(40, 160, 104, 192, 0, 0x04000400u, false);
+    /* CI8 8x8 with a 256-entry TLUT at TMEM 256 */
+    put(HudP(0xFD100000u, pal));
+    put(HudW(0xF5000100u, 0x07000000u));
+    put(HudW(0xF0000000u, 0x073FC000u));
+    put(HudW(0xE3001001u, 0x00008000u));
+    group(0x500000u, texE, 31, 0x800, 0x480000u, 1, 8, 8);
+    rect(120, 160, 152, 192, 0, 0x04000400u, false);
+    put(HudW(0xE3001001u, 0x00000000u));
+    group(0x100000u, texC, 63, 0x800, 0x100000u, 2, 8, 8); /* texC again: memo + cache hit */
+    rect(160, 160, 192, 192, 0, 0x04000400u, false);
+    put(HudW(0xF7000000u, 0xF801F801u));
+    put(HudW(0xF6000000u | (300u << 12) | 230u, (280u << 12) | 220u)); /* fill rect, stock */
+    rec.nWords = n;
+    rec.runs[0].start = 0;
+    rec.runs[0].end = static_cast<uint16_t>(n);
+    rec.runs[0].kind = GDXHUD_KIND_HUD;
+    rec.runs[0].mode = 1;
+    rec.nRuns = 1;
+
+    /* The root: the marker, then a rectangle that re-reads TMEM words 32.. (texA's tail, still
+     * owed after texC's smaller load) with no load of its own -- the stock bytes or bust. */
+    static W root[16];
+    int r = 0;
+    root[r++] = Wv(0xE7000000u, 0);
+    root[r++] = Wv(0x005E0000u, 0);
+    root[r++] = Wv(0xF5100420u, 0x00000000u); /* SETTILE RGBA16 line 2 (16 B) tmem 32 tile 0 */
+    root[r++] = Wv(0xF2000000u, 0x0001C01Cu); /* SETTILESIZE 8x8 */
+    root[r++] = Wv(0xE4000000u | (60u << 12) | 60u, (20u << 12) | 20u);
+    root[r++] = Wv(0xE1000000u, 0);
+    root[r++] = Wv(0xF1000000u, 0x04000400u);
+    root[r++] = Wv(0xDF000000u, 0);
+    gRanges.clear();
+    Reg(root, sizeof(root), 16, false, false, true);
+    Reg(texA, sizeof(texA), 8, false, false, false);
+    Reg(texB, sizeof(texB), 8, false, false, false);
+    Reg(texC, sizeof(texC), 8, false, false, false);
+    Reg(texD, sizeof(texD), 8, false, false, false);
+    Reg(texE, sizeof(texE), 8, false, false, false);
+    Reg(pal, sizeof(pal), 8, false, false, false);
+    gdx_test_native_lo = reinterpret_cast<uintptr_t>(texB); /* texB is native-RGBA16: the swapped debt */
+    gdx_test_native_hi = gdx_test_native_lo + sizeof(texB);
+    const unsigned clsSaved = gdx_test_src_cls;
+    gdx_test_src_cls = GDX_TMEMSRC_DMA;
+
+    const HudLeg off = RunHudScene(0, &rec, root, static_cast<size_t>(r));
+    const HudLeg on = RunHudScene(1, &rec, root, static_cast<size_t>(r));
+    const HudLeg vfy = RunHudScene(2, &rec, root, static_cast<size_t>(r));
+    printf("  [hudd] on:  %s\n  [hudd] vfy: %s\n", on.receipt, vfy.receipt);
+    FastLeg a, b, c;
+    a.batches = off.batches;
+    a.uploads = off.uploads;
+    b.batches = on.batches;
+    b.uploads = on.uploads;
+    c.batches = vfy.batches;
+    c.uploads = vfy.uploads;
+    CHECK(!off.batches.empty() && off.uploads.size() >= 5);
+    CHECK(SameBatches(a, b));
+    CHECK(SameBatches(a, c));
+    CHECK(off.tmem == on.tmem && off.spanBase == on.spanBase);
+    CHECK(off.tmem == vfy.tmem && off.spanBase == vfy.spanBase);
+    CHECK(on.tmemCopies < off.tmemCopies);           /* the loads really were deferred */
+    CHECK(strstr(on.receipt, "stale=0 ses=0") != nullptr);
+    CHECK(strstr(vfy.receipt, "ses_bad=0") != nullptr);
+    CHECK(strstr(vfy.receipt, "rect=0/") == nullptr); /* the rectangle check really ran */
+    printf("  [hudd] off/on/verify: %zu batches, %zu uploads; tmem copies %u -> %u bytes\n", off.batches.size(),
+           off.uploads.size(), off.tmemCopies, on.tmemCopies);
+
+    /* Pool pressure: the batch caps at an odd triangle count, so a rectangle's two triangles land
+       in two batches (the second one packed again under the new batch's parameters), and later
+       begins are refused outright. Identical either way. */
+    for (size_t poolTris : { size_t(5), size_t(9), size_t(15) }) {
+        const HudLeg p0 = RunHudScene(0, &rec, root, static_cast<size_t>(r), poolTris);
+        const HudLeg p1 = RunHudScene(1, &rec, root, static_cast<size_t>(r), poolTris);
+        FastLeg x, y;
+        x.batches = p0.batches;
+        x.uploads = p0.uploads;
+        y.batches = p1.batches;
+        y.uploads = p1.uploads;
+        CHECK(SameBatches(x, y));
+        CHECK(p0.tmem == p1.tmem && p0.spanBase == p1.spanBase);
+        printf("  [hudd] pool %zu tris: %zu batches %s\n", poolTris, p0.batches.size(),
+               SameBatches(x, y) ? "IDENTICAL" : "DIFFER");
+    }
+
+    /* The source moves between the deferred load and the payment: the payment is counted STALE
+       (the tripwire), never silently taken as the old bytes. */
+    {
+        MockBackend mb;
+        gdxn::Interp it(&mb);
+        it.RegisterNoopHook(HudNoop, &rec);
+        it.HudSetDirect(1);
+        gRoot = reinterpret_cast<uintptr_t>(root);
+        gRootBytes = 2 * 16; /* the marker only: nothing reads TMEM before the task end */
+        memset(rec.rp, 0, sizeof(rec.rp));
+        it.RunFrame(nullptr, Cfg(), 0);
+        gdx_test_dma_gen++;
+        it.HudDirectTaskEnd();
+        char rc[512] = {};
+        it.HudDirectFormat(rc, sizeof(rc), 1);
+        CHECK(strstr(rc, "stale=0") == nullptr);
+        printf("  [hudd] moved source: %s\n", rc);
+    }
+    gdx_test_src_cls = clsSaved;
+    gdx_test_native_lo = gdx_test_native_hi = 0;
+}
+
+/* [native] dlmemo + deadsetup (c5dlmemo): Racer_Draw's effect-class setup lists with no instance,
+ * back to back -- the seven lists' command shapes as they are in hud_gfx (the o2r's OTR SETTIMG
+ * form spelled as a plain G_SETTIMG), four 512-byte loads of two textures at TMEM 0 -- then
+ * textured triangles that read every register the window leaves. Three frames per leg (the memo
+ * fills on the first, the window is planned on the next two). Every leg must draw the same
+ * batches and uploads as the plain walk and leave the same end state; the skip leg must really
+ * skip lists and loads, and the verify leg must find 0 mismatches. Then a mutation: the window's
+ * last list loses its combiner, so the earlier combiners stop being dead -- the planner must see
+ * it (same pixels again), and moving the memo's tables version must stop the memo hitting. */
+struct DeadLeg {
+    std::vector<MockBatch> batches;
+    std::vector<MockUpload> uploads;
+    uint32_t state[64];
+    unsigned stateN;
+    uint32_t ses[7];
+    uint32_t memoHits;
+};
+/* variant 0: the hud_gfx shapes. 1: the last list without its combiner (earlier combiners
+   come alive). 2: SMOKE loads 1 KB at TMEM word 0x80 (not the next load's range: live, and its
+   load tile's SETTILE is read by it). 3: a tail list after FALLX puts tiles 0/1 back to their
+   earlier values -- textures_changed then depends on FALLX's value-gated tile writes.
+   4: triangles are pending when the window opens. */
+/* midMutate: before the fourth frame FALLX's combiner becomes a sync -- a list the memo and the
+   plan cache both hold changes under them, and CSPARK's combiner comes alive. */
+static DeadLeg RunDeadScene(int dlmemo, int deadsetup, int variant, bool bumpVersion, bool midMutate = false) {
+    const bool mutate = variant == 1;
+    static uint32_t mtx[16];
+    memset(mtx, 0, sizeof(mtx));
+    mtx[0] = 0x00010000u;
+    mtx[2] = 0x00000001u;
+    mtx[5] = 0x00010000u;
+    mtx[7] = 0x00000001u;
+    for (int i = 0; i < 16; i++) mtx[i] = gdxn::Bswap32(mtx[i]);
+    static gdxn::Vtx vtx[4];
+    memset(vtx, 0, sizeof(vtx));
+    const int16_t ob[4][3] = { { -1, -1, 0 }, { 1, -1, 0 }, { 1, 1, 0 }, { -1, 1, 0 } };
+    for (int v = 0; v < 4; v++) {
+        for (int k = 0; k < 3; k++) {
+            vtx[v].ob[k] = static_cast<int16_t>(gdxn::Bswap16(static_cast<uint16_t>(ob[v][k])));
+        }
+        vtx[v].tc[0] = static_cast<int16_t>(gdxn::Bswap16(static_cast<uint16_t>(v * 64)));
+        vtx[v].tc[1] = static_cast<int16_t>(gdxn::Bswap16(static_cast<uint16_t>(v * 32)));
+        vtx[v].cn[0] = static_cast<uint8_t>(60 * v);
+        vtx[v].cn[1] = 128;
+        vtx[v].cn[2] = 200;
+        vtx[v].cn[3] = 255;
+    }
+    /* the seven setup lists, big-endian narrow, in segment 7 */
+    static uint32_t subs[8][72];
+    static uint32_t subOff[8];
+    uint32_t* all = &subs[0][0];
+    memset(subs, 0, sizeof(subs));
+    int list = 0, n = 0;
+    const auto cmd = [&](uint32_t w0, uint32_t w1) {
+        subs[list][n++] = w0;
+        subs[list][n++] = w1;
+    };
+    const auto end = [&]() {
+        cmd(0xDF000000u, 0);
+        subOff[list] = static_cast<uint32_t>(reinterpret_cast<uint8_t*>(&subs[list][0]) - reinterpret_cast<uint8_t*>(all));
+        list++;
+        n = 0;
+    };
+    /* EXPL */
+    cmd(0xD9FFFFFEu, 0); cmd(0xE7000000u, 0); cmd(0xE200001Cu, 0x00504240u); end();
+    /* DEBRIS */
+    cmd(0xD7000000u, 0x80008000u); cmd(0xE7000000u, 0); cmd(0xE200001Cu, 0x0F0A4000u);
+    cmd(0xFC65FECBu, 0x44FE7D3Eu); end();
+    /* FSPARK */
+    cmd(0xD9FFFFFFu, 0x00200000u); cmd(0xE7000000u, 0); cmd(0xE200001Cu, 0x00504240u);
+    cmd(0xFCFFFFFFu, 0xFFFE793Cu); end();
+    /* CSPARK: modes, a 512-byte load of texture A at TMEM 0, all eight tiles */
+    cmd(0xD9000000u, 0); cmd(0xD9FFFFFFu, 0x00000004u); cmd(0xE7000000u, 0); cmd(0xE3000A01u, 0);
+    cmd(0xE200001Cu, 0x00504240u); cmd(0xFC309A61u, 0x5536FF7Fu); cmd(0xE3000800u, 0); cmd(0xE2001E01u, 0);
+    cmd(0xE3001001u, 0); cmd(0xE3000C00u, 0x00080000u); cmd(0xE3001201u, 0x00002000u);
+    cmd(0xF5900000u, 0x00080200u); cmd(0xE6000000u, 0); cmd(0xFD900000u, 0x06000400u);
+    cmd(0xF3000000u, 0x000FF400u); cmd(0xE7000000u, 0);
+    for (uint32_t t = 0; t < 8; t++) {
+        cmd(0xF5800400u | (t * 0x40u), (t << 24) | 0x00080200u);
+        cmd(0xF2000000u, (t << 24) | 0x0007C07Cu);
+    }
+    end();
+    /* SMOKE: texture B, same range */
+    cmd(0xE7000000u, 0); cmd(0xFA000000u, 0xFFFFC8FFu);
+    if (variant == 2) {
+        cmd(0xF5900080u, 0x00080200u); cmd(0xE6000000u, 0);
+        cmd(0xFD900000u, 0x06000600u); cmd(0xF3000000u, 0x001FF400u); cmd(0xE7000000u, 0);
+    } else {
+        cmd(0xF5900000u, 0x00080200u); cmd(0xE6000000u, 0);
+        cmd(0xFD900000u, 0x06000600u); cmd(0xF3000000u, 0x000FF400u); cmd(0xE7000000u, 0);
+    }
+    cmd(0xF5800400u, 0x00080200u); cmd(0xF2000000u, 0x0007C07Cu); end();
+    /* PITFF: texture A, same range */
+    cmd(0xE7000000u, 0); cmd(0xFA000000u, 0xFF32C8FFu); cmd(0xFB000000u, 0x0064FFFFu);
+    cmd(0xF5900000u, 0x00080200u); cmd(0xE6000000u, 0); cmd(0xFD900000u, 0x06000400u);
+    cmd(0xF3000000u, 0x000FF400u); cmd(0xE7000000u, 0); cmd(0xF5800400u, 0x00080200u);
+    cmd(0xF2000000u, 0x0007C07Cu); end();
+    /* FALLX: texture B, same range; the combiner is the mutation's target */
+    cmd(0xD9000000u, 0); cmd(0xD9FFFFFFu, 0x00000004u); cmd(0xE7000000u, 0); cmd(0xE3001201u, 0x00002000u);
+    cmd(0xF5900000u, 0x00080200u); cmd(0xE6000000u, 0); cmd(0xFD900000u, 0x06000600u);
+    if (mutate) {
+        cmd(0xE7000000u, 0);
+    } else {
+        cmd(0xFC3087D3u, 0x0BF866AFu);
+    }
+    cmd(0xF3000000u, 0x000FF200u); cmd(0xE7000000u, 0); cmd(0xF5800800u, 0x00058160u);
+    cmd(0xF2000000u, 0x000FC0FCu); cmd(0xF5800900u, 0x01058160u); cmd(0xF2000000u, 0x010FC0FCu); end();
+    int nLists = 7;
+    if (variant == 3) {
+        /* tiles 0 and 1 back to the values they held before FALLX's post-load writes */
+        cmd(0xF5900000u, 0x00080200u); cmd(0xF2000000u, 0x0007C07Cu);
+        cmd(0xF5480035u, 0x010A5A5Au); cmd(0xF2004008u, 0x01123456u); end();
+        nLists = 8;
+    }
+    for (size_t i = 0; i < sizeof(subs) / 4; i++) all[i] = gdxn::Bswap32(all[i]);
+
+    static uint32_t dl[160];
+    int m = 0;
+    const auto rc = [&](uint32_t w0, uint32_t w1) {
+        dl[m++] = w0;
+        dl[m++] = w1;
+    };
+    rc(0xDA380003u, 0x06000000u);
+    rc(0xDA380007u, 0x06000000u);
+    rc(0x01004008u, 0x06000100u); /* VTX n=4 */
+    /* the parent leaves every register the window writes at a value the window does not, and a
+       256-byte span at TMEM word 0x20 inside the window's load range: a command the planner
+       wrongly drops leaves one of these behind */
+    if (variant == 4) {
+        /* triangles pending when the window opens: prim/env changes split the batch */
+        rc(0xD7000002u, 0xFFFFFFFFu);
+        rc(0x06000204u, 0x00000406u);
+    }
+    rc(0xD9FFFFFFu, 0x00FF3F0Fu);
+    rc(0xEF00F0F0u, 0x1234ABCDu);
+    rc(0xFC111111u, 0x22222222u);
+    rc(0xFA000000u, 0x11223344u);
+    rc(0xFB000000u, 0x55667788u);
+    rc(0xD7000A02u, 0x12344321u);
+    rc(0xFD900000u, 0x08000000u); /* the whole of TMEM from segment 8, every frame */
+    rc(0xF5900000u, 0x00000000u);
+    rc(0xF3000000u, 0x007FF400u);
+    rc(0xFD900000u, 0x06000800u);
+    rc(0xF5900020u, 0x00000000u);
+    rc(0xF3000000u, 0x0007F400u); /* 128 texels x 2 = 256 bytes at word 0x20 */
+    for (uint32_t t = 0; t < 8; t++) {
+        rc(0xF5480000u | (t * 0x30u + 5u), (t << 24) | 0x000A5A5Au);
+        rc(0xF2004008u, (t << 24) | 0x00123456u);
+    }
+    for (int k = 0; k < nLists; k++) {
+        rc(0x00620000u | static_cast<uint32_t>(10 + k), 0); /* [c5sub] marker between the lists */
+        rc(0xDE000000u, 0x07000000u | subOff[k]);
+    }
+    rc(0xD7000002u, 0xFFFFFFFFu); /* TEXTURE on, tile 0 */
+    rc(0x06000204u, 0x00000406u); /* TRI2 */
+    rc(0xFC121824u, 0xFF33FFFFu);
+    rc(0x06000204u, 0x00000406u);
+    rc(0xDF000000u, 0);
+    for (int i = 0; i < m; i++) dl[i] = gdxn::Bswap32(dl[i]);
+
+    alignas(8) static uint8_t seg6[0x1000];
+    memset(seg6, 0, sizeof(seg6));
+    memcpy(seg6, mtx, 64);
+    memcpy(seg6 + 0x100, vtx, sizeof(vtx));
+    for (int i = 0; i < 0x200; i++) {
+        seg6[0x400 + i] = static_cast<uint8_t>(i * 7 + 3);
+        seg6[0x600 + i] = static_cast<uint8_t>(0xF0 - i * 3);
+        seg6[0x800 + i] = static_cast<uint8_t>(0x5A ^ i);
+        seg6[0xA00 + i] = static_cast<uint8_t>(0x33 + i * 11);
+    }
+    alignas(8) static uint8_t seg8[0x1000];
+    for (int i = 0; i < 0x1000; i++) {
+        seg8[i] = static_cast<uint8_t>(0xC3 ^ (i * 13));
+    }
+    gRanges.clear();
+    Reg(dl, sizeof(dl), 8, true, false, true);
+    Reg(subs, sizeof(subs), 8, true, false, true);
+    Reg(seg6, sizeof(seg6), 8, false, false, false);
+    Reg(seg8, sizeof(seg8), 8, false, false, false);
+    gSegs[6] = reinterpret_cast<uintptr_t>(seg6);
+    gSegs[7] = reinterpret_cast<uintptr_t>(subs);
+    gSegs[8] = reinterpret_cast<uintptr_t>(seg8);
+    gRoot = reinterpret_cast<uintptr_t>(dl);
+    gRootBytes = static_cast<size_t>(m) * 4;
+    MockBackend mb;
+    DeadLeg out;
+    {
+        gdxn::Interp it(&mb);
+        it.SetDlMemo(dlmemo);
+        it.SetDeadSetup(deadsetup);
+        for (int frame = 0; frame < 5; frame++) {
+            if (bumpVersion) {
+                gdx_test_memo_version++;
+            }
+            /* segment 1 alternates like the double-buffered GfxPool: two memo generations, so
+               the plan built under one is reused under the other (word-for-word check) */
+            gSegs[1] = (frame & 1) != 0 ? 0x1000u : 0x2000u;
+            if (midMutate && frame == 3) {
+                for (int w = 0; w + 1 < 72; w += 2) {
+                    if (gdxn::Bswap32(subs[6][w]) == 0xFC3087D3u) {
+                        subs[6][w] = gdxn::Bswap32(0xE7000000u);
+                        subs[6][w + 1] = 0;
+                    }
+                }
+            }
+            it.RunFrame(nullptr, Cfg(), 0);
+        }
+        out.stateN = it.StateSnapshot(out.state, 64);
+        it.DeadSetSession(out.ses);
+        out.memoHits = it.DlMemoSessionHits();
+    }
+    out.batches = mb.batches;
+    out.uploads = mb.uploads;
+    gSegs[1] = gSegs[6] = gSegs[7] = gSegs[8] = 0;
+    return out;
+}
+
+static bool SameDeadLeg(const DeadLeg& a, const DeadLeg& b) {
+    FastLeg x, y;
+    x.batches = a.batches;
+    x.uploads = a.uploads;
+    y.batches = b.batches;
+    y.uploads = b.uploads;
+    return SameBatches(x, y) && a.stateN == b.stateN && memcmp(a.state, b.state, a.stateN * 4) == 0;
+}
+
+static void TestDeadSetup() {
+    for (int mut = 0; mut < 5; mut++) {
+        const int mutate = mut;
+        const DeadLeg ref = RunDeadScene(0, 0, mutate, false);
+        CHECK(!ref.batches.empty() && (mutate == 3 || !ref.uploads.empty())); /* 3 samples a load tile */
+        const DeadLeg memo = RunDeadScene(1, 0, mutate, false);
+        CHECK(SameDeadLeg(ref, memo));
+        CHECK(memo.memoHits >= 21); /* seven or eight lists, warm from the third frame (two generations) */
+        const DeadLeg skip = RunDeadScene(1, 1, mutate, false);
+        const bool same = SameDeadLeg(ref, skip);
+        CHECK(same);
+        CHECK(skip.ses[0] == 3);  /* one window per warm frame (frames 3-5) */
+        CHECK(skip.ses[6] == 2);  /* built once, then served from the plan cache -- frame 4 under
+                                     the other generation, through the word-for-word check */
+        CHECK(skip.ses[1] >= 2);  /* whole lists not entered */
+        CHECK(skip.ses[2] >= 20); /* dead commands */
+        CHECK(skip.ses[5] == 0);  /* trips */
+        const DeadLeg vfy = RunDeadScene(1, 2, mutate, false);
+        CHECK(SameDeadLeg(ref, vfy));
+        CHECK(vfy.ses[3] == 3 && vfy.ses[4] == 0);
+        printf("  [deadset] variant=%d: %zu batches %s; plans=%u skipped=%u dead=%u | verify ok=%u bad=%u | memo hits=%u\n",
+               mut, skip.batches.size(), same ? "IDENTICAL" : "DIFFER", skip.ses[0], skip.ses[1], skip.ses[2],
+               vfy.ses[3], vfy.ses[4], memo.memoHits);
+    }
+    /* a list changing under the memo and the plan cache */
+    {
+        const DeadLeg mref = RunDeadScene(0, 0, 0, false, true);
+        const DeadLeg mskip = RunDeadScene(1, 1, 0, false, true);
+        const DeadLeg mvfy = RunDeadScene(1, 2, 0, false, true);
+        CHECK(SameDeadLeg(mref, mskip));
+        CHECK(SameDeadLeg(mref, mvfy));
+        CHECK(mvfy.ses[4] == 0 && mskip.ses[5] == 0);
+        printf("  [deadset] list rewritten mid-run: %s; plans=%u reused=%u | verify ok=%u bad=%u\n",
+               SameDeadLeg(mref, mskip) ? "IDENTICAL" : "DIFFER", mskip.ses[0], mskip.ses[6], mvfy.ses[3], mvfy.ses[4]);
+    }
+    /* the tables version moving every frame: the memo must not hit, the walk is unchanged */
+    const DeadLeg ref = RunDeadScene(0, 0, 0, false);
+    const DeadLeg moved = RunDeadScene(1, 1, 0, true);
+    CHECK(moved.memoHits == 0);
+    CHECK(moved.ses[0] == 0);
+    CHECK(SameDeadLeg(ref, moved));
+}
+
+/* [native] hud_retain (c5hud3, docs/research/native/c5hud3-progress.md): several HUD runs
+ * replayed over six frames with retention off, on and in verify. From the second frame on the
+ * unchanged runs replay from their record (recorded backend calls, vertex floats, span stores,
+ * LRU touches, register effects) -- and every leg must draw the SAME batches, make the same
+ * uploads and leave TMEM and the span model byte-identical. Frame 3 moves one run's rectangle
+ * (a words miss), frame 4 rewrites one texture's bytes and moves the DMA generation (a source
+ * miss: the stale record must NOT replay), and one run loads a TLUT (not retainable: it always
+ * executes). A second scene squeezes the pool so a replay would not fit (a headroom miss). */
+struct RetainLeg {
+    std::vector<MockBatch> batches;
+    std::vector<MockUpload> uploads;
+    std::vector<uint8_t> tmem;
+    std::vector<uint16_t> spanBase;
+    char receipt[1024] = {};
+    char dreceipt[512] = {};
+    char hreceipt[512] = {}; /* [native] hudsky_emit ([hsx]) */
+};
+
+static RetainLeg RunRetainScene(int retain, GdxHudRecord* rec, const W* root, size_t rootN, int frames,
+                                void (*perFrame)(int frame, GdxHudRecord* rec), size_t poolTris = 0,
+                                int emit = 0) {
+    gRoot = reinterpret_cast<uintptr_t>(root);
+    gRootBytes = rootN * 16;
+    RetainLeg out;
+    MockBackend mb;
+    if (poolTris != 0) {
+        mb.pool.assign(poolTris * 3 * 12, 0.0f);
+    }
+    {
+        gdxn::Interp it(&mb);
+        it.RegisterNoopHook(HudNoop, rec);
+        it.HudSetDirect(1);
+        it.HudSetRetain(retain, 0);
+        it.HsxSetLevel(emit); /* [native] hudsky_emit (the mock backend runs no programs: the generic issue) */
+        for (int frame = 0; frame < frames; frame++) {
+            if (perFrame != nullptr) {
+                perFrame(frame, rec);
+            }
+            memset(rec->rp, 0, sizeof(rec->rp));
+            it.RunFrame(nullptr, Cfg(), 0);
+            it.HudDirectTaskEnd();
+            it.HudRetainTaskEnd();
+        }
+        out.tmem.assign(it.RdpState().tmem, it.RdpState().tmem + sizeof(it.RdpState().tmem));
+        out.spanBase.assign(it.RdpState().tmem_span_base, it.RdpState().tmem_span_base + 512);
+        it.HudRetainFormat(out.receipt, sizeof(out.receipt), static_cast<uint32_t>(frames));
+        it.HudDirectFormat(out.dreceipt, sizeof(out.dreceipt), static_cast<uint32_t>(frames));
+        it.HsxFormat(out.hreceipt, sizeof(out.hreceipt), static_cast<uint32_t>(frames));
+    }
+    out.batches = mb.batches;
+    out.uploads = mb.uploads;
+    return out;
+}
+
+static uint8_t gRetTexA[16 * 16 * 2], gRetTexB[32 * 8 * 2], gRetTexC[8 * 8 * 2], gRetTexE[8 * 8], gRetPal[256 * 2];
+static uint8_t gRetTexI[16 * 8 * 2]; /* an o2r (immutable) texture: its loads meet the same-content test */
+static uint32_t gRetMoveRun = 0, gRetMoveWord = 0; /* the rectangle frame 3 moves */
+static uint32_t gRetFillWord = 0, gRetPrimWord = 0;   /* the marker frame 2 moves and recolours; a prim value */
+static W* gRetRoot = nullptr;                          /* the root list: a prim depth set outside the runs */
+static int gRetDepthIdx = -1;
+
+static void RetainPerFrame(int frame, GdxHudRecord* rec) {
+    if (gRetRoot != nullptr && gRetDepthIdx >= 0) {
+        /* a prim depth that moves every frame, set outside the runs (the race's position markers
+         * do this): the runs' drains take it live, they do not miss on it */
+        gRetRoot[gRetDepthIdx].w1lo = static_cast<uint32_t>((frame * 1111) & 0x7FFF) << 16;
+    }
+    if (frame >= 2) {
+        rec->words[gRetFillWord].w1 ^= 0x003E003Eu; /* a marker changes colour ... */
+        rec->words[gRetFillWord + 1].w1 += 4u;      /* ... and moves down 1 px, every frame */
+        rec->words[gRetFillWord + 1].w0 += 4u;
+    }
+    if (frame >= 2) {
+        rec->words[gRetMoveWord].w1 += (4u << 12);     /* a rectangle moves 1 px right every frame */
+        rec->words[gRetMoveWord].w0 += (4u << 12);
+        rec->words[gRetMoveWord + 1].w1 += 0x00200000u; /* and its texture coordinates move */
+    }
+    if (frame == 6) {
+        gRetTexA[5] ^= 0x5Au; /* a texture changes under the same address ... */
+        gdx_test_dma_gen++;   /* ... and the DMA generation says so: a source miss */
+    }
+    if (frame == 8) {
+        rec->words[gRetPrimWord].w1 ^= 0x00FF0000u; /* a register value: a words miss */
+    }
+}
+
+static void TestHudRetainParity() {
+    for (unsigned i = 0; i < sizeof(gRetTexA); i++) gRetTexA[i] = static_cast<uint8_t>(i * 7 + 1);
+    for (unsigned i = 0; i < sizeof(gRetTexB); i++) gRetTexB[i] = static_cast<uint8_t>(i * 13 + 5);
+    for (unsigned i = 0; i < sizeof(gRetTexC); i++) gRetTexC[i] = static_cast<uint8_t>(i * 29 + 3);
+    for (unsigned i = 0; i < sizeof(gRetTexE); i++) gRetTexE[i] = static_cast<uint8_t>(i % 5);
+    for (unsigned i = 0; i < sizeof(gRetPal); i++) gRetPal[i] = static_cast<uint8_t>(i * 11 + 1);
+    for (unsigned i = 0; i < sizeof(gRetTexI); i++) gRetTexI[i] = static_cast<uint8_t>(i * 17 + 9);
+
+    static GdxHudRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.magic = GDXHUD_MAGIC;
+    uint32_t n = 0;
+    auto put = [&](GdxHudWord w) { rec.words[n++] = w; };
+    auto rect = [&](uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry, uint32_t st, uint32_t d, bool flip) {
+        put(HudW((flip ? 0xE5000000u : 0xE4000000u) | (lrx << 12) | lry, (ulx << 12) | uly));
+        put(HudW(0xE1000000u, st));
+        put(HudW(0xF1000000u, d));
+    };
+    auto group = [&](uint32_t fmtSiz, const void* src, uint32_t lrs, uint32_t dxt, uint32_t renderFmtSiz,
+                     uint32_t line, uint32_t w, uint32_t h) {
+        put(HudP(0xFD000000u | fmtSiz, src));
+        put(HudW(0xF5000000u | fmtSiz, 0x07000000u));
+        put(HudW(0xF3000000u, 0x07000000u | (lrs << 12) | dxt));
+        put(HudW(0xF5000000u | renderFmtSiz | (line << 9), 0x00000000u));
+        put(HudW(0xF2000000u, ((w - 1) << 14) | ((h - 1) << 2)));
+    };
+    auto endRun = [&](uint32_t start) {
+        GdxHudRun& r = rec.runs[rec.nRuns++];
+        r.start = static_cast<uint16_t>(start);
+        r.end = static_cast<uint16_t>(n);
+        r.kind = GDXHUD_KIND_HUD;
+        r.mode = 1;
+    };
+    /* run 0: modes, a texture, two rects with a prim change between them */
+    uint32_t s0 = n;
+    put(HudW(0xE3001001u, 0x00000000u));
+    put(HudW(0xFC119623u, 0xFF2FFFFFu));
+    put(HudW(0xFA000000u, 0xFF8040FFu));
+    group(0x100000u, gRetTexA, 255, 0x800, 0x100000u, 4, 16, 16);
+    rect(40, 40, 104, 104, 0, 0x04000400u, false);
+    gRetPrimWord = n;
+    put(HudW(0xFA000000u, 0x40FF80C0u));
+    rect(120, 40, 184, 104, 0, 0x04000400u, false);
+    endRun(s0);
+    /* run 1: a small texture over the large one's words, a flipped rect */
+    uint32_t s1 = n;
+    group(0x100000u, gRetTexC, 63, 0x800, 0x100000u, 2, 8, 8);
+    gRetMoveRun = rec.nRuns;
+    gRetMoveWord = n;
+    rect(200, 40, 232, 72, 0, 0x04000400u, false);
+    rect(240, 40, 272, 72, 0, 0x04000400u, true);
+    endRun(s1);
+    /* run 2: a native-RGBA16 texture */
+    uint32_t s2 = n;
+    group(0x100000u, gRetTexB, 255, 0x400, 0x100000u, 8, 32, 8);
+    rect(40, 120, 168, 152, 0, 0x04000400u, false);
+    endRun(s2);
+    /* run 3: fill rectangles (markers) of two colours */
+    uint32_t s3 = n;
+    put(HudW(0xF7000000u, 0xF801F801u));
+    put(HudW(0xF6000000u | (300u << 12) | 230u, (280u << 12) | 220u));
+    gRetFillWord = n;
+    put(HudW(0xF7000000u, 0x07C107C1u));
+    put(HudW(0xF6000000u | (270u << 12) | 200u, (260u << 12) | 190u));
+    endRun(s3);
+    /* run 4: CI8 with its TLUT (not retainable) */
+    uint32_t s4 = n;
+    put(HudP(0xFD100000u, gRetPal));
+    put(HudW(0xF5000100u, 0x07000000u));
+    put(HudW(0xF0000000u, 0x073FC000u));
+    put(HudW(0xE3001001u, 0x00008000u));
+    group(0x500000u, gRetTexE, 31, 0x800, 0x480000u, 1, 8, 8);
+    rect(120, 160, 152, 192, 0, 0x04000400u, false);
+    put(HudW(0xE3001001u, 0x00000000u));
+    endRun(s4);
+    /* run 5: texC again (cache hit, memo hit) */
+    uint32_t s5 = n;
+    group(0x100000u, gRetTexC, 63, 0x800, 0x100000u, 2, 8, 8);
+    rect(160, 160, 192, 192, 0, 0x04000400u, false);
+    endRun(s5);
+    /* runs 6 + 7: a texture loaded by one run and drawn by the next (a setup list between
+     * them in the game): the second run samples a span it did not store */
+    uint32_t s6 = n;
+    group(0x100000u, gRetTexA, 255, 0x800, 0x100000u, 4, 16, 16);
+    endRun(s6);
+    uint32_t s7 = n;
+    rect(200, 120, 232, 152, 0, 0x04000400u, false);
+    endRun(s7);
+    /* runs 8 + 9: the same immutable texture loaded by two runs in a row -- the second load's
+     * same-content test skips it (the span the first stored), the first one's stores */
+    uint32_t s8 = n;
+    group(0x100000u, gRetTexI, 127, 0x800, 0x100000u, 4, 16, 8);
+    rect(40, 200, 104, 232, 0, 0x04000400u, false);
+    endRun(s8);
+    uint32_t s9 = n;
+    group(0x100000u, gRetTexI, 127, 0x800, 0x100000u, 4, 16, 8);
+    rect(120, 200, 184, 232, 0, 0x04000400u, true);
+    endRun(s9);
+    /* run 10: a fill rectangle with ulx > lrx (an empty energy bar): it draws nothing and writes
+     * nothing, so the corner colours it leaves are the ones run 3's markers left */
+    uint32_t s10 = n;
+    put(HudW(0xF7000000u, 0x3E013E01u));
+    put(HudW(0xF6000000u | (100u << 12) | 20u, (104u << 12) | 20u));
+    endRun(s10);
+    rec.nWords = n;
+
+    static W root[48];
+    int r = 0;
+    root[r++] = Wv(0xFE000000u, 0x00100000u); /* SETZIMG / SETCIMG apart: the fill rects DRAW */
+    root[r++] = Wv(0xFF100000u, 0x00200000u);
+    gRetRoot = root;
+    gRetDepthIdx = r;
+    root[r++] = Wv(0xEE000000u, 0x00000000u); /* SETPRIMDEPTH, rewritten per frame */
+    for (uint32_t k = 0; k < rec.nRuns; k++) {
+        root[r++] = Wv(0xE7000000u, 0);
+        root[r++] = Wv(0x005E0000u | k, 0);
+        if (k == 2) {
+            root[r++] = Wv(0xFA000000u, 0x10203040u); /* a register write between two runs */
+        }
+    }
+    root[r++] = Wv(0xDF000000u, 0);
+    gRanges.clear();
+    Reg(root, sizeof(root), 16, false, false, true);
+    Reg(gRetTexA, sizeof(gRetTexA), 8, false, false, false);
+    Reg(gRetTexB, sizeof(gRetTexB), 8, false, false, false);
+    Reg(gRetTexC, sizeof(gRetTexC), 8, false, false, false);
+    Reg(gRetTexE, sizeof(gRetTexE), 8, false, false, false);
+    Reg(gRetPal, sizeof(gRetPal), 8, false, false, false);
+    Reg(gRetTexI, sizeof(gRetTexI), 8, false, false, false);
+    gdx_test_imm_lo = reinterpret_cast<uintptr_t>(gRetTexI);
+    gdx_test_imm_hi = gdx_test_imm_lo + sizeof(gRetTexI);
+    gdx_test_native_lo = reinterpret_cast<uintptr_t>(gRetTexB);
+    gdx_test_native_hi = gdx_test_native_lo + sizeof(gRetTexB);
+    const unsigned clsSaved = gdx_test_src_cls;
+    gdx_test_src_cls = GDX_TMEMSRC_DMA;
+
+    /* Each leg starts from the same words and texture bytes (the per-frame edits are undone). */
+    const GdxHudRecord pristine = rec;
+    uint8_t texA0[sizeof(gRetTexA)];
+    memcpy(texA0, gRetTexA, sizeof(texA0));
+    auto reset = [&]() {
+        rec = pristine;
+        memcpy(gRetTexA, texA0, sizeof(texA0));
+    };
+    const int kFrames = 10;
+    reset();
+    const RetainLeg off = RunRetainScene(0, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame);
+    reset();
+    const RetainLeg on = RunRetainScene(1, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame);
+    reset();
+    const RetainLeg vfy = RunRetainScene(2, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame);
+    printf("  [hudr] on:  %s\n  [hudr] vfy: %s\n", on.receipt, vfy.receipt);
+    FastLeg a, b, c;
+    a.batches = off.batches;
+    a.uploads = off.uploads;
+    b.batches = on.batches;
+    b.uploads = on.uploads;
+    c.batches = vfy.batches;
+    c.uploads = vfy.uploads;
+    CHECK(!off.batches.empty());
+    CHECK(SameBatches(a, b));
+    CHECK(SameBatches(a, c));
+    CHECK(off.tmem == on.tmem && off.spanBase == on.spanBase);
+    CHECK(off.tmem == vfy.tmem && off.spanBase == vfy.spanBase);
+    CHECK(strstr(on.receipt, "runs=11.00 hit=0.00") == nullptr); /* the unchanged runs really replayed */
+    CHECK(strstr(on.receipt, "src=0.00") == nullptr); /* the moved texture really missed */
+    CHECK(strstr(on.receipt, "words=0.00") == nullptr);
+    CHECK(strstr(on.receipt, "variant hit=0.00") == nullptr); /* the moved rects replayed from patched floats */
+    CHECK(strstr(on.receipt, "selfbad=0 ") != nullptr);
+    CHECK(strstr(vfy.receipt, "bad=0 ") != nullptr && strstr(vfy.receipt, "ses=0/") != nullptr);
+    CHECK(strstr(vfy.receipt, "vfy runs=0 ") == nullptr); /* the comparison really ran */
+    CHECK(strstr(on.dreceipt, "stale=0 ses=0") != nullptr);
+    printf("  [hudr] off/on/verify: %zu batches, %zu uploads %s\n", off.batches.size(), off.uploads.size(),
+           SameBatches(a, b) && SameBatches(a, c) ? "IDENTICAL" : "DIFFER");
+
+    /* [native] hudsky_emit (hudsky): the retained hits through the compiled plan (1) and the plan
+     * checked against the record on every exact hit (2) draw exactly what retention draws. */
+    reset();
+    const RetainLeg em1 = RunRetainScene(1, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame, 0, 1);
+    reset();
+    const RetainLeg em2 = RunRetainScene(1, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame, 0, 2);
+    printf("  [hsx] emit: %s\n  [hsx] vfy:  %s\n", em1.hreceipt, em2.hreceipt);
+    FastLeg e1, e2;
+    e1.batches = em1.batches;
+    e1.uploads = em1.uploads;
+    e2.batches = em2.batches;
+    e2.uploads = em2.uploads;
+    CHECK(SameBatches(a, e1));
+    CHECK(SameBatches(a, e2));
+    CHECK(off.tmem == em1.tmem && off.spanBase == em1.spanBase);
+    CHECK(off.tmem == em2.tmem && off.spanBase == em2.spanBase);
+    CHECK(strstr(em1.hreceipt, "hits=0.00") == nullptr); /* the plan really served hits */
+    CHECK(strstr(em2.hreceipt, "bad=0 ") != nullptr && strstr(em2.hreceipt, "vfy runs=0 ") == nullptr);
+    printf("  [hsx] off/emit/verify: %s\n", SameBatches(a, e1) && SameBatches(a, e2) ? "IDENTICAL" : "DIFFER");
+
+    /* Pool pressure: a replay that would not fit is refused (a headroom miss) and the run
+     * executes, splitting its batches exactly as the stock path does. */
+    for (size_t poolTris : { size_t(7), size_t(13), size_t(40) }) {
+        reset();
+        const RetainLeg p0 = RunRetainScene(0, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame, poolTris);
+        reset();
+        const RetainLeg p1 = RunRetainScene(1, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame, poolTris);
+        FastLeg x, y;
+        x.batches = p0.batches;
+        x.uploads = p0.uploads;
+        y.batches = p1.batches;
+        y.uploads = p1.uploads;
+        CHECK(SameBatches(x, y));
+        CHECK(p0.tmem == p1.tmem && p0.spanBase == p1.spanBase);
+        reset();
+        const RetainLeg pe = RunRetainScene(1, &rec, root, static_cast<size_t>(r), kFrames, RetainPerFrame, poolTris, 1);
+        FastLeg z;
+        z.batches = pe.batches;
+        z.uploads = pe.uploads;
+        CHECK(SameBatches(x, z)); /* [native] hudsky_emit under pool pressure */
+        CHECK(p0.tmem == pe.tmem && p0.spanBase == pe.spanBase);
+        printf("  [hudr] pool %zu tris: %zu batches %s | %s\n", poolTris, p0.batches.size(),
+               SameBatches(x, y) ? "IDENTICAL" : "DIFFER", p1.receipt);
+    }
+    reset();
+    gdx_test_src_cls = clsSaved;
+    gdx_test_native_lo = gdx_test_native_hi = 0;
+    gdx_test_imm_lo = gdx_test_imm_hi = 0;
+    gRetRoot = nullptr;
+    gRetDepthIdx = -1;
+}
+
 int main() {
     TestWalk();
     TestCC();
@@ -1269,6 +2327,11 @@ int main() {
     TestDecodeCeiling();
     TestVtxWindow();
     TestClipPolyBound();
+    TestFastPathParity();
+    TestNicensusParity();
+    TestDeadSetup();
+    TestHudDirectParity();
+    TestHudRetainParity();
     if (gFails == 0) {
         printf("=== ALL PASS (0 failures) ===\n");
         return 0;

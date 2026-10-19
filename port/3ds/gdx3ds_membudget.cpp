@@ -303,6 +303,39 @@ static void EmitTexUploadHighWater() {
               : 0ul);
 }
 
+#if GDX3DS_MEM_HWM_RECEIPT
+/* ---- [mem-hwm]: the true heap headroom, not the free list ---------------------------------
+ * COMPILED ONLY INTO MEMORY-KNOB BUILDS (GDX_3DS_O3DS / RDRAM / SIM / LINEAR, see
+ * port/3ds/CMakeLists.txt), so the shipped New 3DS build is the same translation it was.
+ *
+ * `heapFree=` everywhere else in this fork is mallinfo().fordblks: slack INSIDE the sbrk'd
+ * arena. It is not headroom. The headroom is what sbrk can still hand out -- heapGrant minus
+ * the arena -- and the number that bounds it is the arena's high-water, which a 256-frame
+ * census samples and can miss. newlib keeps that high-water itself (__malloc_max_sbrked_mem,
+ * updated inside malloc on every sbrk), so this line reads the exact peak rather than a
+ * sample of it. `spareMin` is therefore the smallest the unsbrk'd heap has ever been.
+ *
+ * libctru keeps no linear high-water, so `linFreeMin` is the minimum over census samples --
+ * a sampled bound, and said so by its name. */
+extern "C" {
+extern size_t __malloc_max_sbrked_mem; /* newlib mallocr.c: max_sbrked_mem */
+}
+
+static unsigned long sLinFreeMin = ~0ul;
+
+static void EmitHeapHighWater(unsigned long linGrant, unsigned long linFree) {
+    if (linFree < sLinFreeMin) {
+        sLinFreeMin = linFree;
+    }
+    const unsigned long heapGrant = (unsigned long)envGetHeapSize();
+    const unsigned long arenaHwm = (unsigned long)__malloc_max_sbrked_mem;
+    EmitF("[mem-hwm] arenaHwm=%lu heapGrant=%lu spareMin=%ld linGrant=%lu linFreeMin=%lu "
+          "linUsedMax=%lu",
+          arenaHwm, heapGrant, (long)heapGrant - (long)arenaHwm, linGrant, sLinFreeMin,
+          linGrant > sLinFreeMin ? linGrant - sLinFreeMin : 0ul);
+}
+#endif
+
 void gdx3ds_membudget_census(unsigned long frame, const char* why, const unsigned long gfx[8],
                              unsigned long lusBytes, unsigned long bigBytes) {
     if (!sEnabled) {
@@ -364,6 +397,10 @@ void gdx3ds_membudget_census(unsigned long frame, const char* why, const unsigne
           heapUsed > heapAttributed ? heapUsed - heapAttributed : 0ul,
           heapUsed != 0ul ? (heapAttributed * 100ul) / heapUsed : 0ul, bigBytes,
           imageBytes + bssBytes, linGrant > linFree ? linGrant - linFree : 0ul);
+
+#if GDX3DS_MEM_HWM_RECEIPT
+    EmitHeapHighWater(linGrant, linFree);
+#endif
 
     EmitTexUploadHighWater();
 

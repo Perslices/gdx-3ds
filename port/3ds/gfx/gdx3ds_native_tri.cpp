@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "gdx3ds_nativebatch.h"
+#include "gdx3ds_replay.h"
 #include "gdx3ds_stereo.h"
 
 extern "C" void gdx3ds_fog_note_params(int mul, int off, int exact);
@@ -189,6 +190,9 @@ TriResult FastTri(RunCtx& c, uint8_t a, uint8_t b, uint8_t d) {
     for (int i = 0; i < 3; i++) {
         float* out = out0 + i * kStride;
         const GdxSeamVertex* vv = v_arr[i];
+        if (gdx3ds_replay_rec) {
+            gdx3ds_replay_out_vtx(out, i == 0 ? a : (i == 1 ? b : d)); /* C6: the loaded slot */
+        }
         float z = vv->z, w = vv->w;
         if (ps.clip.zIsFrom0To1) {
             z = (z + w) / 2.0f;
@@ -380,8 +384,25 @@ bool DerivePrep(RunCtx& c) {
     return true;
 }
 
+/* [native] replay (C6): the triangle's matrix-state tag, from the vertices the seam loaded. */
+uint16_t ReplaySlotTag(uint8_t a, uint8_t b, uint8_t d) {
+    const uint16_t t = gdx3ds_replay_vtx_tag[a];
+    if (gdx3ds_replay_vtx_tag[b] != t || gdx3ds_replay_vtx_tag[d] != t) {
+        return GDX_REPLAY_TAG_UNKNOWN;
+    }
+    return t;
+}
+
 void Tri(RunCtx& c, uint8_t a, uint8_t b, uint8_t d) {
     c.stats_tris++;
+    if (gdx3ds_replay_rec) {
+        /* one pose per draw: a batch whose tag would change is drawn first */
+        const uint16_t tag = ReplaySlotTag(a, b, d);
+        if (Gdx_NativeBatchOpen() && tag != gdx3ds_replay_nb_tag) {
+            FlushNative(c);
+        }
+        gdx3ds_replay_nb_tag = tag;
+    }
     if (!c.needExact) {
         if (!c.prepValid && !DerivePrep(c)) {
             c.needExact = true;
@@ -390,6 +411,23 @@ void Tri(RunCtx& c, uint8_t a, uint8_t b, uint8_t d) {
         }
     }
     ExactTri(c, a, b, d);
+}
+
+void FlushBatchKeepState(RunCtx& c) {
+    if (Gdx_NativeBatchOpen()) {
+        if (c.verify) {
+            Gdx_NativeBatchDiscard(&c.verifyHash);
+        } else if (Gdx_NativeBatchFlush() != 0) {
+            c.stats_draws++;
+        }
+        Gdx_NativeBatchEnd();
+    }
+}
+
+InputResult EvalInput(const GdxSeamRegs& R, const uint8_t (*inputMap)[7], int j, int k, const GdxSeamVertex* v,
+                      const GdxSeamVertex* v1) {
+    const PackInput p = InputValue(R, inputMap, j, k, v, v1);
+    return { p.c, p.isShade };
 }
 
 void FlushNative(RunCtx& c) {

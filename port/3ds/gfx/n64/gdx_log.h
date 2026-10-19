@@ -7,7 +7,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-void gdxn_logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+/* hotcold: cold -- every call site's path is predicted unlikely and laid out off the hot blocks. */
+void gdxn_logf(const char* fmt, ...) __attribute__((format(printf, 1, 2), cold));
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,288 @@
+diff --git a/src/overlays/ovl_i3/hud.c b/src/overlays/ovl_i3/hud.c
+index 020c87b..48777e0 100644
+--- a/src/overlays/ovl_i3/hud.c
++++ b/src/overlays/ovl_i3/hud.c
+@@ -1115,12 +1115,32 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+ #ifdef PORT
+     int gdxWideHud;
+     int gdxWideSplitHud;
++    // nihudtop Phase 3: which of THIS function's own pieces may draw on the top screen this
++    // frame, 1P only (2-4P is always forced ALL_TOP -- gdx_hud_placement.h -- so cases 2/3/4
++    // below are untouched: every bit they'd ever test is set). One call, bits tested with plain
++    // `(mask >> bit) & 1u` at each piece below -- this function is on the race hot path, so the
++    // real per-frame cost is the call plus one AND/compare per piece, not a predicate call per
++    // piece. The bit positions mirror port/gdx_hud_placement.h's GDX_HUD_ELEM_* exactly (decomp/
++    // src has no port/ include path, so they are NOT #included -- a host test,
++    // port/tests/gdx_hud_placement_host_tests.c, pins the real enum's numeric values so a
++    // future reorder there fails loudly instead of silently mis-gating a piece here).
++    unsigned gdxTopMask1P;
++    enum {
++        kGdxHudBitTime = 1u << 0,
++        kGdxHudBitLap = 1u << 1,
++        kGdxHudBitInterval = 1u << 2,
++        kGdxHudBitEnergy = 1u << 3,
++        kGdxHudBitKoStars = 1u << 6,
++        kGdxHudBitLives = 1u << 7,
++        kGdxHudBitReverse = 1u << 8,
++    };
+     // Photo mode: bailing before any HUD command is safe because the follow-on overlays load
+     // their own render state, and Menus_Draw suppresses them with the same predicate.
+     {
+         extern int gdx_photo_mode_active(void);          // port/input_bridge.c
+         extern int gdx_widescreen_ui_active(void);       // port/input_bridge.c
+         extern int gdx_widescreen_split_ui_active(void); // port/input_bridge.c
++        extern unsigned gdx_hud_top_element_mask(int);    // port/gdx_hud_placement.c
+         if (gdx_photo_mode_active()) {
+             return gfx;
+         }
+@@ -1129,6 +1149,9 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+         gdxWideHud = gdx_widescreen_ui_active();
+         // Deliberately a separate CVar for split-screen; see gdx_widescreen_split_ui_active.
+         gdxWideSplitHud = gdx_widescreen_split_ui_active();
++        // Only ever consulted inside `case 1:` below; harmless (and free) to compute it
++        // unconditionally here, same as gdxWideHud/gdxWideSplitHud above.
++        gdxTopMask1P = gdx_hud_top_element_mask(1);
+     }
+ #endif
+ 
+@@ -1146,9 +1169,15 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+             gDPLoadTextureBlock(gfx++, aHudTimeTex, G_IM_FMT_RGBA, G_IM_SIZ_16b, 24, 16, 0, G_TX_NOMIRROR | G_TX_WRAP,
+                                 G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+ 
+-            gfx = Hud_DrawTimeRectangle(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitTime) {
++#endif
++                gfx = Hud_DrawTimeRectangle(gfx, 0, 0);
+ 
+-            gfx = Hud_DrawDeathRaceBest(gfx, 0, 0);
++                gfx = Hud_DrawDeathRaceBest(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ 
+             // Timer
+             gDPPipeSync(gfx++);
+@@ -1157,7 +1186,21 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+                                 G_TX_NOLOD, G_TX_NOLOD);
+             gDPSetTextureFilter(gfx++, G_TF_POINT);
+ 
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitTime) {
++                gfx = Hud_UpdatePlayerHudInfo(gfx, 0, 0);
++            } else {
++                /* TIME is off (CUSTOM mask only -- modes 0-2 never reach this branch, since
++                 * gdx_hud_top_suppressed already keeps the whole function from being called when
++                 * TIME would be off there): reproduce Hud_UpdatePlayerHudInfo's side effects
++                 * (lap-announcement bookkeeping + the 2nd-lap/final-lap voice lines) with no
++                 * drawing, same as the menus.c-level swap already does when ALL of Hud_DrawHud is
++                 * suppressed -- see that function's own comment just above it in this file. */
++                Hud_AdvanceLapAnnouncementsOnly(0);
++            }
++#else
+             gfx = Hud_UpdatePlayerHudInfo(gfx, 0, 0);
++#endif
+ 
+ #ifdef PORT
+             /* The lap-complete interval is center-native (base X=120); left inside the timer's
+@@ -1166,15 +1209,19 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+                 gSPClearExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_RIGHT);
+             }
+ #endif
+-            gfx = Hud_UpdateRaceIntervalInfo(gfx, 0, 0, 1.0f);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitInterval) {
++#endif
++                gfx = Hud_UpdateRaceIntervalInfo(gfx, 0, 0, 1.0f);
+ 
+-            // Best Lap Time
+-            gfx = Hud_DrawPracticeBestLap(gfx);
++                // Best Lap Time
++                gfx = Hud_DrawPracticeBestLap(gfx);
+ #ifdef PORT
+-            // No-op unless GAMEMODE_PRACTICE and the ShowLapDeltas CVar are both set.
+-            {
+-                extern Gfx* Hud_DrawPracticeLapDelta(Gfx* gfx);
+-                gfx = Hud_DrawPracticeLapDelta(gfx);
++                // No-op unless GAMEMODE_PRACTICE and the ShowLapDeltas CVar are both set.
++                {
++                    extern Gfx* Hud_DrawPracticeLapDelta(Gfx* gfx);
++                    gfx = Hud_DrawPracticeLapDelta(gfx);
++                }
+             }
+ #endif
+ #ifdef PORT
+@@ -1182,16 +1229,28 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+                 gSPSetExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_RIGHT);
+             }
+ #endif
+-            gfx = Hud_DrawDeathRaceTimer(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitTime) {
++#endif
++                gfx = Hud_DrawDeathRaceTimer(gfx, 0, 0);
+ 
+-            gfx = Hud_DrawDeathRaceBestTime(gfx, 0, 0);
++                gfx = Hud_DrawDeathRaceBestTime(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ 
+             // Energy Bar
+             gDPPipeSync(gfx++);
+             gDPLoadTextureBlock(gfx++, aHudEnergyTex, G_IM_FMT_RGBA, G_IM_SIZ_16b, 72, 16, 0, G_TX_NOMIRROR | G_TX_WRAP,
+                                 G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+ 
+-            gfx = Hud_DrawEnergyOutlineRectangle(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitEnergy) {
++#endif
++                gfx = Hud_DrawEnergyOutlineRectangle(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ 
+ #ifdef PORT
+             if (gdxWideHud) {
+@@ -1204,15 +1263,21 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+             gDPLoadTextureBlock(gfx++, aLapTex, G_IM_FMT_RGBA, G_IM_SIZ_16b, 16, 12, 0, G_TX_NOMIRROR | G_TX_WRAP,
+                                 G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+ 
+-            gfx = Hud_DrawLapRectangle(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitLap) {
++#endif
++                gfx = Hud_DrawLapRectangle(gfx, 0, 0);
+ 
+-            // Lap Counter
+-            gDPPipeSync(gfx++);
+-            gDPLoadTextureBlock(gfx++, aLapCounterSymbolsTex, G_IM_FMT_RGBA, G_IM_SIZ_16b, 8, 72, 0,
+-                                G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK,
+-                                G_TX_NOLOD, G_TX_NOLOD);
++                // Lap Counter
++                gDPPipeSync(gfx++);
++                gDPLoadTextureBlock(gfx++, aLapCounterSymbolsTex, G_IM_FMT_RGBA, G_IM_SIZ_16b, 8, 72, 0,
++                                    G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK,
++                                    G_TX_NOLOD, G_TX_NOLOD);
+ 
+-            gfx = Hud_DrawLapCounter(gfx, 0, 0);
++                gfx = Hud_DrawLapCounter(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ 
+ #ifdef PORT
+             if (gdxWideHud) {
+@@ -1220,21 +1285,39 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+                 gSPSetExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_RIGHT);
+             }
+ #endif
+-            gfx = Hud_DrawEnergyBar(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitEnergy) {
++#endif
++                gfx = Hud_DrawEnergyBar(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ 
+ #ifdef PORT
+             if (gdxWideHud) {
+                 gSPClearExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_RIGHT);
+             }
+ #endif
+-            gfx = Hud_DrawReverse(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitReverse) {
++#endif
++                gfx = Hud_DrawReverse(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ 
+ #ifdef PORT
+             if (gdxWideHud) {
+                 gSPSetExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_LEFT);
+             }
+ #endif
+-            gfx = Hud_DrawPlayerLives(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitLives) {
++#endif
++                gfx = Hud_DrawPlayerLives(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ #ifdef PORT
+             if (gdxWideHud) {
+                 gSPClearExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_LEFT);
+@@ -1247,7 +1330,13 @@ Gfx* Hud_DrawHud(Gfx* gfx) {
+                 gSPSetExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_RIGHT);
+             }
+ #endif
+-            gfx = Hud_DrawKOStars(gfx, 0, 0);
++#ifdef PORT
++            if (gdxTopMask1P & kGdxHudBitKoStars) {
++#endif
++                gfx = Hud_DrawKOStars(gfx, 0, 0);
++#ifdef PORT
++            }
++#endif
+ #ifdef PORT
+             if (gdxWideHud) {
+                 gSPClearExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_RIGHT);
+diff --git a/src/overlays/ovl_i3/menus.c b/src/overlays/ovl_i3/menus.c
+index 7f2e8d6..dc40ec5 100644
+--- a/src/overlays/ovl_i3/menus.c
++++ b/src/overlays/ovl_i3/menus.c
+@@ -5592,10 +5592,21 @@ Gfx* Menus_Draw(Gfx* gfx) {
+      * reasoning as gdxPhotoActive/gdxWideHud above (every guard below must pair with the same
+      * answer even if the lever flips mid-build). Both predicates already fold in the numPlayers>1
+      * force-ALL_TOP rule (gdx_hud_placement.h), so this call site never re-derives it. */
+-    extern int gdx_hud_top_suppressed(int numPlayers);     // port/input_bridge.c
+-    extern int gdx_hud_minimap_suppressed(int numPlayers); // port/input_bridge.c
++    extern int gdx_hud_top_suppressed(int numPlayers);     // port/gdx_hud_placement.c
++    extern int gdx_hud_minimap_suppressed(int numPlayers); // port/gdx_hud_placement.c
+     s32 gdxHudTopSuppressed = gdx_hud_top_suppressed(gNumPlayers);
+     s32 gdxHudMapSuppressed = gdx_hud_minimap_suppressed(gNumPlayers);
++    /* nihudtop Phase 3: RANK/SPEED/PORTRAITS are each gated at their OWN call site below rather
++     * than through Hud_DrawHud (which never draws them), so they get their own per-element
++     * answer here instead of reusing gdxHudTopSuppressed -- one call each, read-only in the
++     * per-racer loop below, same cost shape as gdxHudTopSuppressed/gdxHudMapSuppressed above. The
++     * element numbers mirror port/gdx_hud_placement.h's GDX_HUD_ELEM_* (not #included -- same
++     * reasoning as hud.c's own mirror comment; pinned by the same host test). */
++    extern int gdx_hud_element_on_top(int element, int numPlayers); // port/gdx_hud_placement.c
++    enum { kGdxHudElemRank = 4, kGdxHudElemSpeed = 5, kGdxHudElemPortraits = 9 };
++    s32 gdxHudPortraitsOnTop = gdx_hud_element_on_top(kGdxHudElemPortraits, gNumPlayers);
++    s32 gdxHudRankOnTop = gdx_hud_element_on_top(kGdxHudElemRank, gNumPlayers);
++    s32 gdxHudSpeedOnTop = gdx_hud_element_on_top(kGdxHudElemSpeed, gNumPlayers);
+ #endif
+ 
+     gRacersRemaining = gTotalRacers - gRacersRetired;
+@@ -5704,7 +5715,7 @@ Gfx* Menus_Draw(Gfx* gfx) {
+                                               (sPlayerLoserFinishTimer[0] >= 300))))) {
+                     if (gNumPlayers == 1
+ #ifdef PORT
+-                        && !gdxHudTopSuppressed
++                        && gdxHudPortraitsOnTop
+ #endif
+                     ) {
+ #ifdef PORT
+@@ -5759,7 +5770,7 @@ Gfx* Menus_Draw(Gfx* gfx) {
+                      * (gdx3ds_bottomhud.c); this just stops the top screen from also
+                      * drawing it when that screen is supposed to be hidden-HUD. */
+ #ifdef PORT
+-                    if (!gdxHudTopSuppressed) {
++                    if (gdxHudRankOnTop) {
+ #endif
+ #ifdef PORT
+                     gdxRaceAnchor = GdxRacePositionAnchor(gNumPlayers, i, gdxWideHud, gdxWideSplitHud);
+@@ -5780,7 +5791,7 @@ Gfx* Menus_Draw(Gfx* gfx) {
+                 if (((gNumPlayers != 1) || (sPlayerGameoverState[i] == PLAYER_GAMEOVER_NONE)) &&
+                     !(gRacers[i].stateFlags & RACER_STATE_FINISHED)
+ #ifdef PORT
+-                    && !gdxHudTopSuppressed /* item 4: kph speedometer moves to the DASH */
++                    && gdxHudSpeedOnTop /* item 4: kph speedometer moves to the DASH */
+ #endif
+                 ) {
+ #ifdef PORT

@@ -8,6 +8,7 @@
 
 #include "gdx3ds_config.h"
 #include "gdx3ds_filelog.h"
+#include "gdx_net_enabled_default.h" /* [net] enabled's default resolution, host-testable */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +26,15 @@
 
 #include <3ds.h>
 
+/* hw bug n60-3d8, item 3: the real branch@hash now comes from this generated, build-time
+ * header (port/3ds/cmake/gdx3ds_gen_build_id.cmake) instead of a configure-time -D; the
+ * __has_include guard + #ifndef below is a safety net for a build that never generated or
+ * wired up the include path for it. */
+#if defined(__has_include)
+#if __has_include("gdx3ds_build_id.h")
+#include "gdx3ds_build_id.h"
+#endif
+#endif
 #ifndef GDX3DS_BUILD_ID
 #define GDX3DS_BUILD_ID "unknown@nohash"
 #endif
@@ -54,7 +64,9 @@ __attribute__((weak)) void gdx_replay_start(const char* sdmcPath);
 #define NET_DEFAULT_SOC_KB 1024
 
 #define NET_RING_CAP 32768u  /* SPSC log ring (static) */
-#define NET_RX_CAP 65536u    /* file-receive staging chunk (static) */
+#define NET_RX_CAP 65536u    /* file-receive staging chunk (static); GET reuses it to send */
+#define NET_GET_CAP NET_RX_CAP /* GET size cap -- sRxBuf is the whole buffer, one shot */
+#define NET_GET_PREFIX "/3ds/gdiffuser/" /* GET is confined under here (see netPathUnderGdiffuser) */
 #define NET_LINE_CAP 512u    /* one control command line */
 #define NET_PATH_CAP 192u
 #define NET_THREAD_STACK (32 * 1024)
@@ -98,9 +110,21 @@ static u32 sRingDrop = 0;
 static u32 sRingDropTotal = 0;
 static volatile int sRingArmed = -1; /* -1 pre-init (buffer boot lines), 0 off, 1 on */
 
+/* sRxBuf is staging for PUT/RELOAD (net thread fills it, net thread writes it to the FS in
+ * NET_RX_CAP-sized chunks) AND the whole-file buffer GET reads into (main thread fills it
+ * from the FS in one shot, net thread sends it). Both uses are safe in the SAME buffer only
+ * because exactly one control command is ever in flight at a time (netReadCtl dispatches one
+ * line, to completion, before reading the next) -- there is never a PUT mid-stream at the
+ * same moment a GET is being served. */
 static char sRxBuf[NET_RX_CAP];
 static char sCtlLine[NET_LINE_CAP];
 static unsigned sCtlLineLen = 0;
+
+/* GET's result, written by the main thread inside REQ_GET, read by the net thread right
+ * after netPostRequest() returns (which happens-after the main thread's write, same fence
+ * the REQ_* protocol already relies on for sReqRc). */
+static u32 sGetLen = 0;
+static u32 sGetCrc = 0;
 
 /* ---- main-thread request queue ---------------------------------------------------- */
 
@@ -112,7 +136,8 @@ enum {
     REQ_REPLAY,
     REQ_INI_SET,
     REQ_INI_DEL,
-    REQ_INI_SAVE
+    REQ_INI_SAVE,
+    REQ_GET
 };
 
 static volatile int sReqKind = REQ_NONE;
@@ -406,6 +431,32 @@ __attribute__((format(printf, 1, 2))) static void netCtlReply(const char* fmt, .
     netCtlSend(msg);
 }
 
+/* Binary-safe counterpart of netCtlSend: an explicit length instead of strlen, for GET's raw
+ * file bytes (which may contain '\0' or anything else). Same bounded-stall contract: a
+ * stalled peer costs at most NET_IO_TIMEOUT_S per send() retry. */
+static void netCtlSendRaw(const char* buf, size_t len) {
+    const int fd = sCtlFd;
+    if (fd < 0) {
+        return;
+    }
+    size_t off = 0;
+    while (off < len) {
+        int n = send(fd, buf + off, len - off, 0);
+        if (n > 0) {
+            off += (size_t)n;
+            continue;
+        }
+        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            netCloseCtl("send failed");
+            return;
+        }
+        if (!netWaitFd(fd, POLLOUT)) {
+            netCloseCtl("send timeout");
+            return;
+        }
+    }
+}
+
 /* ---- main-thread request hand-off --------------------------------------------------- */
 
 static int netPostRequest(int kind, const char* a, const char* b, const char* c) {
@@ -435,6 +486,11 @@ static int netPostRequest(int kind, const char* a, const char* b, const char* c)
     }
     return -3; /* main thread is not draining */
 }
+
+/* Defined below, in "file send (GET)" -- forward-declared here because gdx3ds_net_tick
+ * calls it (main-thread execution per the comment above netGetFileForHost itself) and the
+ * REQ_* dispatch functions are grouped earlier in the file than the file-send section. */
+static int netGetFileForHost(const char* sdmcPath, u32* outLen, u32* outCrc);
 
 void gdx3ds_net_tick(unsigned long frameNum) {
     sFrameNum = frameNum;
@@ -486,6 +542,13 @@ void gdx3ds_net_tick(unsigned long frameNum) {
         case REQ_INI_SAVE:
             rc = gdx3ds_config_save(GDX3DS_CONFIG_DEFAULT_PATH);
             netLog("[net] cmd INI SAVE rc=%d", rc);
+            break;
+        case REQ_GET:
+            /* Flush first: if the target is log.txt, a pending batch in the filelog's own
+             * ring would otherwise make the pulled file look older than the live log. */
+            gdx3ds_filelog_flush();
+            rc = netGetFileForHost(sReqC, &sGetLen, &sGetCrc);
+            netLog("[net] cmd GET path=%s rc=%d len=%lu", sReqC, rc, (unsigned long)sGetLen);
             break;
         default:
             rc = -1;
@@ -601,6 +664,59 @@ static int netRecvFileTo(int fd, const char* sdmcPath, u32 size, u32 wantCrc) {
     return 0;
 }
 
+/* ---- file send (GET) ----------------------------------------------------------------
+ *
+ * MAIN THREAD ONLY, per netPostRequest's REQ_* discipline (this file's header, "LOCK
+ * DISCIPLINE") -- the same reason RELOAD/INI go through the request queue rather than
+ * being handled straight on the net thread. Unlike PUT/RELOAD (which stream straight to
+ * the FS from the net thread because they only ever touch a FRESH .tmp path of their own),
+ * GET's target can be log.txt: a file gdx3ds_filelog_write() may be appending to AT THE
+ * SAME TIME from another thread (main, watchdog, audio) through its own recursive lock.
+ * libctru's sdmc devoptab is not documented safe for two independently-opened FILE* onto
+ * the SAME path from two threads at once, so GET's fopen/fread is routed onto the main
+ * thread -- the thread the filelog sink itself always flushes from for its OWN writes, so
+ * the two paths are at least serialized by the request queue's one-command-at-a-time rule
+ * plus main-thread-only execution, never genuinely concurrent with a cross-thread flush. */
+
+/* Returns 0 (ok, *outLen/*outCrc set), -5 (not found/unreadable) or -4 (over NET_GET_CAP). */
+static int netGetFileForHost(const char* sdmcPath, u32* outLen, u32* outCrc) {
+    long size;
+    size_t got;
+    FILE* f = fopen(sdmcPath, "rb");
+    if (f == NULL) {
+        return -5;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -5;
+    }
+    size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return -5;
+    }
+    if ((u32)size > NET_GET_CAP) {
+        fclose(f);
+        return -4;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -5;
+    }
+    got = (size > 0) ? fread(sRxBuf, 1, (size_t)size, f) : 0;
+    fclose(f);
+    if (got != (size_t)size) {
+        return -5;
+    }
+    netCrcInit();
+    u32 crc = 0xFFFFFFFFu;
+    crc = netCrcUpdate(crc, sRxBuf, got);
+    crc ^= 0xFFFFFFFFu;
+    *outLen = (u32)got;
+    *outCrc = crc;
+    return 0;
+}
+
 /* ---- control command dispatch ------------------------------------------------------- */
 
 /* Splits `line` in place into at most `max` whitespace-separated tokens. */
@@ -641,6 +757,16 @@ static int netPathOk(const char* p) {
         return 0;
     }
     return strlen(p) + 6 < NET_PATH_CAP;
+}
+
+/* GET is read access, not write access, and the control port is LAN-reachable: confine it
+ * to our own sandbox (NET_GET_PREFIX) rather than the whole sdmc: tree PUT/RELOAD can
+ * target. Reuses netPathOk's ".." / length checks first. */
+static int netPathUnderGdiffuser(const char* p) {
+    if (!netPathOk(p)) {
+        return 0;
+    }
+    return strncmp(p, NET_GET_PREFIX, sizeof(NET_GET_PREFIX) - 1) == 0;
 }
 
 static void netHandleCommand(char* line) {
@@ -754,6 +880,30 @@ static void netHandleCommand(char* line) {
         } else {
             netCtlReply("ERR PUT rc=%d", rc);
             netCloseCtl("PUT failed");
+        }
+        return;
+    }
+    if (strcmp(tok[0], "GET") == 0) {
+        /* GET <sdmc-relative-path>, confined under NET_GET_PREFIX and NET_GET_CAP. Reply is
+         * "OK GET <size> <crc32hex>" followed by exactly <size> raw bytes, or "ERR GET ..."
+         * with no bytes at all -- the host tells them apart by the first word, same as
+         * every other reply on this link. */
+        if (n < 2 || !netPathUnderGdiffuser(tok[1])) {
+            netCtlReply("ERR GET needs a path under %s", NET_GET_PREFIX);
+            return;
+        }
+        char sdmc[NET_PATH_CAP];
+        snprintf(sdmc, sizeof(sdmc), "sdmc:%s", tok[1]);
+        int rc = netPostRequest(REQ_GET, NULL, NULL, sdmc);
+        if (rc == 0) {
+            netCtlReply("OK GET %lu %08lX", (unsigned long)sGetLen, (unsigned long)sGetCrc);
+            netCtlSendRaw(sRxBuf, sGetLen);
+        } else if (rc == -4) {
+            netCtlReply("ERR GET too-large cap=%lu", (unsigned long)NET_GET_CAP);
+        } else if (rc == -5) {
+            netCtlReply("ERR GET not-found-or-unreadable %s", sdmc);
+        } else {
+            netCtlReply("ERR GET %s", netReqErr(rc));
         }
         return;
     }
@@ -1036,12 +1186,32 @@ static void netSocAtexit(void) {
 
 void gdx3ds_net_init(int argc, char** argv) {
     sBootTick = svcGetSystemTick();
-    if (!gdx3ds_config_get_bool("net", "enabled", 0)) {
+
+    /* [net] enabled's DEFAULT (not the ini, which always wins when present) depends on how
+     * we were launched. __3dslink_host is nonzero here exactly when hbmenu's netloader
+     * (3dslink) launched us -- it is injected before main() runs (see this file's header,
+     * "Bring-up"), well before this point in a normal boot. The resolution itself (and the
+     * GDX_NET_ENABLED_SENTINEL this relies on) lives in port/gdx_net_enabled_default.c,
+     * split out so it is host-testable -- this TU is 3DS-only. */
+    const int netEnabledExplicit =
+        gdx3ds_config_get_bool("net", "enabled", GDX_NET_ENABLED_SENTINEL);
+    const int launchedViaNetloader = (__3dslink_host.s_addr != 0);
+    const int netEnabledResolved =
+        gdx_net_enabled_resolve(netEnabledExplicit, launchedViaNetloader);
+    if (!netEnabledResolved) {
         sRingArmed = 0; /* stop buffering boot lines nobody will drain */
         return;         /* KILLSWITCH: not one receipt, not one byte allocated */
     }
     sNetEnabled = 1;
     sRingArmed = 1;
+
+    if (gdx_net_enabled_was_defaulted(netEnabledExplicit)) {
+        /* Only reachable when launchedViaNetloader was the deciding vote (the ini had no
+         * key and a plain hbmenu/SD/CIA launch would have stayed off), so the receipt never
+         * needs an if/else -- it is always the netloader reason. */
+        netLog("[net] enabled defaulted ON: launched via 3dslink netloader, no [net] "
+               "enabled key in gdiffuser.ini");
+    }
 
     sCtlPort = gdx3ds_config_get_int("net", "port", NET_DEFAULT_CTL_PORT);
     sLogPort = gdx3ds_config_get_int("net", "log_port", NET_DEFAULT_LOG_PORT);

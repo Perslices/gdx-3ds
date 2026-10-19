@@ -8,10 +8,15 @@
 
 #include "gdx3ds_config.h"
 #include "gdx3ds_filelog.h"
+#include "gdx3ds_perf_preset.h"
 
 extern int gdx_rival_detail_floor(void); /* gdx3ds_menu.c: the user's [perf] rival_detail */
 
-#define GDX_DYNLOD_TIER_MAX 2
+/* The controller's ceiling. 2 (MINIMAL) is the shipped one; [perf] rival_tier_max = 3 lets it
+   reach LOW, the Old 3DS tier (decomp-port-o3ds-scene-lod.patch), which only the o3ds preset
+   turns on by default (gdx3ds_perf_preset.c). */
+#define GDX_DYNLOD_TIER_MAX_DEFAULT 2
+#define GDX_DYNLOD_TIER_CEIL 3
 #define GDX_DYNLOD_RAISE_FRAMES 4
 /* A RAISE needs a MAJORITY of the window over hi, not just a window mean over hi. The mean
    of 4 frames is not outlier-robust: one load beat of +6 ms lifts it by 1.5 ms, and a
@@ -42,6 +47,7 @@ static int sLoX10 = 90;           /* lower when an sLowerFrames block averages b
 static int sLowerFrames = 90;     /* LOWER block length; 1.5 s at 60 fps */
 static int sDwellFrames = GDX_DYNLOD_DWELL_FRAMES;
 static int sLoClamped = 0;        /* 1 when the ini asked for a deadband narrower than the floor */
+static int sTierMax = GDX_DYNLOD_TIER_MAX_DEFAULT; /* [perf] rival_tier_max, 2..3 */
 
 static volatile int sTier = 0;    /* controller tier; effective = max(floor, sTier) */
 static u64 sTaskT0 = 0;
@@ -91,7 +97,9 @@ void gdx3ds_dynlod_init(void) {
     }
     sInited = 1;
     sAuto = gdx3ds_config_get_bool("perf", "rival_detail_auto", 1) ? 1 : 0;
-    sHiX10 = ClampInt(gdx3ds_config_get_int("perf", "rival_auto_hi_x10", 150), 10, 1000);
+    sTierMax = ClampInt(gdx3ds_perf_get_int("rival_tier_max", GDX_DYNLOD_TIER_MAX_DEFAULT),
+                        GDX_DYNLOD_TIER_MAX_DEFAULT, GDX_DYNLOD_TIER_CEIL);
+    sHiX10 = ClampInt(gdx3ds_perf_get_int("rival_auto_hi_x10", 150), 10, 1000);
     /* lo is clamped to hi - GDX_DYNLOD_MIN_DEADBAND_X10, not just defaulted below it: a
        deadband narrower than the controller's own authority is the oscillation, and the
        ini must not be able to ask for it. The old shipped 12.0 is such a value, so an
@@ -100,7 +108,7 @@ void gdx3ds_dynlod_init(void) {
     if (loMax < 5) {
         loMax = 5;
     }
-    const int loWanted = gdx3ds_config_get_int("perf", "rival_auto_lo_x10", 90);
+    const int loWanted = gdx3ds_perf_get_int("rival_auto_lo_x10", 90);
     sLoX10 = ClampInt(loWanted, 5, loMax);
     sLoClamped = (loWanted > loMax) ? 1 : 0;
     sLowerFrames = ClampInt(gdx3ds_config_get_int("perf", "rival_auto_lower_frames", 90), 1, 600);
@@ -120,16 +128,16 @@ void gdx3ds_dynlod_init(void) {
     sLowerMaxOver = ClampInt(gdx3ds_config_get_int("perf", "rival_auto_lower_maxover", -1), -1, 600);
     sDwellFrames = ClampInt(gdx3ds_config_get_int("perf", "rival_auto_dwell", GDX_DYNLOD_DWELL_FRAMES),
                             GDX_DYNLOD_RAISE_FRAMES, 600);
-    sTier = ClampInt(gdx_rival_detail_floor(), 0, GDX_DYNLOD_TIER_MAX);
+    sTier = ClampInt(gdx_rival_detail_floor(), 0, sTierMax);
     sSinceChange = 0xFFFFu;
     char line[192];
     snprintf(line, sizeof(line),
              "[dynlod] init auto=%d floor=%d hi=%d.%d lo=%d.%d%s lowerN=%d lowerBlk=%d lowerMaxOver=%d "
-             "raiseN=%d/%d dwell=%d band=%d.%d",
+             "raiseN=%d/%d dwell=%d band=%d.%d tierMax=%d",
              sAuto, sTier, sHiX10 / 10, sHiX10 % 10, sLoX10 / 10, sLoX10 % 10,
              sLoClamped ? "(clamped)" : "", sLowerFrames, sLowerBlocks, sLowerMaxOver, GDX_DYNLOD_RAISE_OVER_MIN,
              GDX_DYNLOD_RAISE_FRAMES, sDwellFrames,
-             (sHiX10 - sLoX10) / 10, (sHiX10 - sLoX10) % 10);
+             (sHiX10 - sLoX10) / 10, (sHiX10 - sLoX10) % 10, sTierMax);
     DynLodLog(line);
 }
 
@@ -157,6 +165,13 @@ int gdx3ds_dynlod_effective_level(int floorLevel) {
     }
     const int tier = sTier;
     return tier > floorLevel ? tier : floorLevel;
+}
+
+int gdx3ds_dynlod_tier_max(void) {
+    if (!sInited) {
+        gdx3ds_dynlod_init();
+    }
+    return sTierMax;
 }
 
 int gdx3ds_dynlod_tier(void) {
@@ -230,7 +245,7 @@ static void DynLodOnChanged(void) {
 }
 
 static void DynLodStep(unsigned msX10) {
-    const int floorLevel = ClampInt(gdx_rival_detail_floor(), 0, GDX_DYNLOD_TIER_MAX);
+    const int floorLevel = ClampInt(gdx_rival_detail_floor(), 0, sTierMax);
     int tier = sTier;
     if (tier < floorLevel) {
         tier = floorLevel; /* the user raised the floor above us — judge the new tier afresh */
@@ -293,7 +308,7 @@ static void DynLodStep(unsigned msX10) {
        be wrong: a LOWER needs a whole lowerFrames block averaging under lo AND
        dwell + lowerFrames frames since the last change. Undoing a RAISE therefore costs
        1.75 s of sustained evidence, while reacting to a real crowd costs a quarter second. */
-    if (dwellDone && sHistN >= GDX_DYNLOD_RAISE_FRAMES && tier < GDX_DYNLOD_TIER_MAX &&
+    if (dwellDone && sHistN >= GDX_DYNLOD_RAISE_FRAMES && tier < sTierMax &&
         avg4X10 > (unsigned)sHiX10 && overHi >= GDX_DYNLOD_RAISE_OVER_MIN) {
         DynLodLogTransition("raise", tier, tier + 1, avg4X10, overHi, blockAvgX10, blockN, blockOver);
         tier++;
@@ -366,6 +381,7 @@ void gdx3ds_dynlod_test_reset(void) {
     sLowCount = 0;
     sSinceChange = 0xFFFFu;
     sLoClamped = 0;
+    sTierMax = GDX_DYNLOD_TIER_MAX_DEFAULT;
     sWinFrames = 0;
     sWinTicks = 0;
     sWinMaxTicks = 0;

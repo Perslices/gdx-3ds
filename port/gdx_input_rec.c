@@ -331,6 +331,37 @@ static void ReplayApply(unsigned long tick, GdxInputPad* pad) {
     }
 }
 
+/* C5TICK: does the NEXT replay line carry a SHOT? The hollow-tick lever (port/3ds/gdx3ds_c5tick.h)
+ * decides one tick ahead whether the display list being built will be dropped, and a SHOT
+ * forces that next tick to render. Reads ahead one data line and seeks back; replay only. */
+int gdx_input_rec_peek_shot(void) {
+    char line[GDX_REC_LINE_CAP];
+    long pos;
+    int shotNext = 0;
+    if (sRepPending) {
+        return 1; /* not started yet: be conservative */
+    }
+    if (!sRepActive || sRepFile == NULL) {
+        return 0;
+    }
+    pos = ftell(sRepFile);
+    while (fgets(line, (int)sizeof(line), sRepFile) != NULL) {
+        GdxInputPad pad;
+        unsigned long ftick = 0;
+        char shot[32];
+        if (IsBlankOrComment(line)) {
+            continue;
+        }
+        memset(&pad, 0, sizeof(pad));
+        if (ParseDataLine(line, &ftick, &pad, shot, sizeof(shot)) == 0) {
+            shotNext = shot[0] != '\0';
+        }
+        break;
+    }
+    fseek(sRepFile, pos, SEEK_SET);
+    return shotNext;
+}
+
 void gdx_input_rec_poll(unsigned long tick, GdxInputPad* pad, int gameMode) {
     if (sRepPending) {
         sRepPending = 0;

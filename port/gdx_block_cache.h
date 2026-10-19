@@ -35,6 +35,12 @@ extern "C" {
 
 #define GDX_BLOCK_CACHE_WAYS 4
 
+/* READ-AHEAD stream slots. The audio consumer interleaves several sequential walks at once --
+ * one SampleDma per voice per audio frame -- so a single "was the last fill block B-1" test
+ * detects almost nothing. Four slots is enough to carry the concurrent voices the synthesiser
+ * actually keeps walking, and costs four int compares on the MISS path only. */
+#define GDX_BLOCK_CACHE_SEQ_SLOTS 4
+
 typedef struct GdxBlockCacheStats {
     unsigned long long reads;          /* read() calls that were served */
     unsigned long long readBytes;      /* bytes those calls asked for */
@@ -75,6 +81,16 @@ typedef struct GdxBlockCache {
     unsigned char* touched;
     unsigned int touchedBytes;
     unsigned long long uniqueBlocks;
+    /* Every fillSlot(), demand or speculative. Kept OUT of GdxBlockCacheStats on purpose:
+     * gdx_disk_stream.h mirrors that struct and gdx_disk_stream.cpp static_asserts the two
+     * layouts identical, so growing it would ripple into the 64DD wrapper for no reason. */
+    unsigned long long blockFills;
+    unsigned long long prefetchFills;
+    /* READ-AHEAD ([debug] audio_stream_readahead, default 0 = the unchanged path). */
+    unsigned int readAhead;
+    unsigned int seqTail[GDX_BLOCK_CACHE_SEQ_SLOTS];
+    unsigned char seqValid[GDX_BLOCK_CACHE_SEQ_SLOTS];
+    unsigned char seqNext;
     GdxBlockOverlayFn overlay;
     GdxBlockCacheStats stats;
     char path[512];
@@ -105,6 +121,13 @@ void gdx_block_cache_set_overlay(GdxBlockCache* c, GdxBlockOverlayFn fn);
  * Returns 1 on full success, 0 on refusal with `dst` untouched (see the header note). */
 int gdx_block_cache_read(GdxBlockCache* c, unsigned int offset, unsigned int length, void* dst);
 
+/* QUICKFIX: 1 if gdx_block_cache_read(c, offset, length, ..) MAY touch the file -- a block of the
+ * range is not resident, or read-ahead is on and one of the `readAhead` blocks after the range
+ * is not (a superset of what noteSequential would fetch). 0 means the read is served from
+ * memory. A pure lookup: no LRU touch, no statistics. The caller holds whatever lock guards `c`
+ * across this call and the read. */
+int gdx_block_cache_would_fill(const GdxBlockCache* c, unsigned int offset, unsigned int length);
+
 /* Drops any cached blocks covering [offset, offset+length) (absolute file offsets). */
 void gdx_block_cache_invalidate(GdxBlockCache* c, unsigned int offset, unsigned int length);
 
@@ -132,6 +155,30 @@ int gdx_block_cache_read_uncached(GdxBlockCache* c, unsigned int offset, unsigne
  * cheap enough to leave always on, and a lever that can only be read with a special build is
  * a lever nobody reads. */
 unsigned long long gdx_block_cache_unique_blocks(const GdxBlockCache* c);
+
+/* READ-AHEAD. `blocks` = how many blocks past the end of a SEQUENTIAL read to fetch
+ * speculatively; 0 (the default, and what every existing caller gets) is the unchanged path
+ * and not one instruction of this runs.
+ *
+ * WHY IT EXISTS, and why capacity is not the same lever. `diskstream` section 3 named
+ * read-ahead as the right shape for audio and nobody built it: the synthesiser walks a
+ * sample's loop region forward in ~760-byte DMAs, so a 16 KiB block serves ~20 of them and
+ * then the NEXT block is a certain miss. On the emulator a miss is a host-directory read and
+ * costs almost nothing, which is exactly why this was not caught before it shipped; on a real
+ * SD card it is a seek. The quantity this moves is therefore the FILL COUNT (`pf=` and
+ * `hostKB` in the receipt), not a millisecond figure any emulator lane can produce.
+ *
+ * SAFETY. Speculation happens AFTER a read has copied its bytes out, never inside the
+ * prove-then-copy walk, so it can never evict a block the read in flight still needs -- the
+ * "dst untouched on refusal" contract is unaffected. A block already cached is left alone and
+ * does not even take an LRU touch. */
+void gdx_block_cache_set_readahead(GdxBlockCache* c, unsigned int blocks);
+unsigned int gdx_block_cache_readahead(const GdxBlockCache* c);
+
+/* Speculative fills issued since the last stats reset. `blockFills` is every fill, demand or
+ * speculative; with read-ahead off the two are `blockMisses` and 0. */
+unsigned long long gdx_block_cache_prefetch_fills(const GdxBlockCache* c);
+unsigned long long gdx_block_cache_fills(const GdxBlockCache* c);
 
 void gdx_block_cache_note_overlay(GdxBlockCache* c, unsigned int bytes);
 void gdx_block_cache_get_stats(const GdxBlockCache* c, GdxBlockCacheStats* out);

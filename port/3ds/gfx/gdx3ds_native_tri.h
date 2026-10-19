@@ -50,6 +50,19 @@ void Tri(RunCtx& c, uint8_t a, uint8_t b, uint8_t d);
 /* Flush (or, in verify, hash and discard) the open native batch and close it; the next tri
  * goes exact. */
 void FlushNative(RunCtx& c);
+/* [native] track_retained: draw and close the open native batch but KEEP the resolved state
+ * (needExact / prepValid / the snapshot) -- a GPU-transform draw of the same material is about
+ * to follow in painter's order. The next CPU tri reopens a batch through the exact path. */
+void FlushBatchKeepState(RunCtx& c);
+
+/* Combiner-input evaluation, verbatim from GfxSpTri1's gdxInput lambda (k = 0 colour, 1 alpha;
+ * `v` supplies SHADE / SHADE_ALPHA, `v1` the LOD_FRACTION distance). */
+struct InputResult {
+    GdxSeamRgba c;
+    bool isShade;
+};
+InputResult EvalInput(const GdxSeamRegs& R, const uint8_t (*inputMap)[7], int j, int k, const GdxSeamVertex* v,
+                      const GdxSeamVertex* v1);
 
 } // namespace GdxNativeTri
 

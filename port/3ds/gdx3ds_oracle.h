@@ -50,6 +50,19 @@ void gdx3ds_oracle_frame_mark(unsigned long frame, unsigned long tick, int gameM
  * queue, sentinel-polled), hash, receipt, BMP. */
 void gdx3ds_oracle_after_endframe(void);
 
+/* FRAMESKIP (port/3ds/gdx3ds_frameskip.h, main thread, rtMode 0 only): the host iteration
+ * that submits no frame calls this INSTEAD of after_endframe, so sFrame stays equal to the
+ * host frameNum and every later receipt keeps its frame number. Coverage still sees the
+ * frame; nothing is captured (there is nothing new to capture). */
+void gdx3ds_oracle_skip_frame(void);
+
+/* 1 when the NEXT host frame would be captured (a pending SHOT/CAPTURE, or an [debug]
+ * fh_every sample). The frame-skip governor never skips such a frame: a SHOT or a sampled
+ * [fh] of a frame that was not rendered would hash a stale image. */
+int gdx3ds_oracle_wants_next_frame(void);
+/* C5TICK: the same question for the iteration after the next (see gdx3ds_c5tick.h). */
+int gdx3ds_oracle_wants_frame_after_next(void);
+
 /* GDX3DS_BUILD_ID ("<branch>@<sha8>") — the .gdxrec `build` header uses it. */
 const char* gdx3ds_oracle_build_id(void);
 

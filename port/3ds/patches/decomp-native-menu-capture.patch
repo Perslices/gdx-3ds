@@ -1,0 +1,21 @@
+diff --git a/src/game/game.c b/src/game/game.c
+--- a/src/game/game.c
++++ b/src/game/game.c
+@@ -904,7 +904,17 @@
+ 
+     GDX_DLB(OTHER);
+     if ((gGameModeChangeState != GAMEMODE_CHANGE_INIT) && D_i2_80106DA0) {
++#if defined(PORT) && defined(GDX_NATIVE_HUD)
++        /* nimenu [native] ni_menu (port/3ds/gfx/gdx3ds_menu_capture.c): a non-race mode's draw is
++         * compacted like a HUD region (kind MENU); race modes and ni_menu=0 leave the list as written. */
++        extern void* gdxmenu_capture(void* regionStart, void* regionEnd, int mode);
++        const s32 gdxMenuMode = GET_MODE(gGameMode);
++        Gfx* const gdxMenuStart = gfx;
++        gfx = sGamemodeDrawFuncs[gdxMenuMode](gfx);
++        gfx = (Gfx*) gdxmenu_capture((void*) gdxMenuStart, (void*) gfx, (int) gdxMenuMode);
++#else
+         gfx = sGamemodeDrawFuncs[GET_MODE(gGameMode)](gfx);
++#endif
+     }
+ #if defined(PORT) && defined(GDX_PLATFORM_3DS)
+     GDX_DLB(TRANS);

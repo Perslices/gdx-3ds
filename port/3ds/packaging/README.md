@@ -9,6 +9,7 @@ Inputs for the `.3dsx` metadata (always built) and the optional installable `.ci
 |---|---|---|
 | `icon.png` | 48x48 SMDH icon (HBL list + HOME menu) | `assets/branding/gdiffuser-icon.png` downscaled (ImageMagick) |
 | `banner.png` | 256x128 HOME-menu banner image | `assets/branding/gdiffuser-logo-menu.png` centered on `#101018` |
+| `banner-ek.png` | the Expansion Kit title's banner (`-DGDX_3DS_EXPANSION_KIT=ON`): `banner.png` with the logo raised 12 px and "EXPANSION KIT" under it | generated (Pillow, its bundled Aileron font, SIL OFL) |
 | `banner.wav` | banner audio: 0.25 s of silence (deliberately quiet) | generated (Python `wave`, 22050 Hz mono s16) |
 | `gdiffuser.rsf` | makerom spec; see header comment for the choices | Steveice10 buildtools `template.rsf`, inlined |
 

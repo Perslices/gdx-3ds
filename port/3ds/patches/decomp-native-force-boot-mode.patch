@@ -1,0 +1,26 @@
+diff --git a/src/game/game.c b/src/game/game.c
+index 5185abe..c463649 100644
+--- a/src/game/game.c
++++ b/src/game/game.c
+@@ -612,6 +612,21 @@ void func_800690FC(void) {
+                     break;
+ #endif
+             }
++#ifdef PORT
++            /* nimenu [debug] force_mode: this GAMEMODE_CHANGE_INIT case is reached exactly
++             * once per process (only from the `gGameMode == -1` check above), so overriding
++             * the boot target here cannot hijack a later, player-driven mode change. A
++             * measurement-only reach aid for screens with no menu path and no finishable
++             * replay (credits, the GP ending, the EAD demo) -- see
++             * port/3ds/gdx3ds_force_mode.c and nimenu-progress.md. Default -1 = off, the
++             * game boots into gQueuedGameMode exactly as it always did. */
++            { extern int gdx_debug_force_boot_mode(void);
++              int gdxForcedMode = gdx_debug_force_boot_mode();
++              if (gdxForcedMode >= 0) {
++                  gQueuedGameMode = gdxForcedMode;
++              }
++            }
++#endif
+             gGameMode = gQueuedGameMode;
+ #ifdef PORT
+             /* Republish at the flip itself: the port's per-frame tick only sees gGameMode as

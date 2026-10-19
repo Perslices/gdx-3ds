@@ -1,0 +1,136 @@
+# tools/native/nrr_hot.list -- hot functions a category cannot name Nrr<Cat>Hot* (nrr_size.sh).
+# Format: <category> <symbol> (demangled name, its base name, or its last :: component).
+
+# mach (n60mach): the shared helpers its loop calls besides the core's public hot entries.
+mach gdx3ds_mesh_generation
+mach NrrSnapGet
+mach gdxn::Interp::ApplyViewportScissor
+
+# shd / dress (n60fx): the shared sprite engine of gdx_nrr_fx.cpp is named NrrFxHot* (counted under
+# fx); shadows and the gadget pass run the same functions.
+fx gdxn::Interp::NrrFxHotTex
+fx gdxn::Interp::NrrFxHotHead
+fx NrrSnapGet
+shd NrrFxHotXform
+shd NrrFxHotPack
+shd NrrFxHotTri
+shd NrrFxHotUse
+shd NrrFxHotFlush
+shd NrrFxHotReady
+shd NrrFxHotInputs
+shd NrrFxHotVtx
+shd gdxn::Interp::NrrFxHotTex
+shd gdxn::Interp::NrrFxHotHead
+shd NrrSnapGet
+dress NrrFxHotXform
+dress NrrFxHotKeep
+dress NrrFxHotPack
+dress NrrFxHotTri
+dress NrrFxHotTris
+dress NrrFxHotRunColor
+dress NrrFxHotFogByte
+dress NrrFxHotUse
+dress NrrFxHotFlush
+dress NrrFxHotReady
+dress NrrFxHotInputs
+dress gdxn::Interp::NrrFxHotTex
+dress gdxn::Interp::NrrFxHotHead
+dress gdxn::Interp::NrrFxHotFog
+dress NrrSnapGet
+shd NrrFxHotRunColor
+shd NrrFxHotEmit
+dress NrrFxHotEmit
+shd NrrFxHotFogByte
+shd NrrFxHotKeep
+shd NrrFxHotOpen
+dress NrrFxHotOpen
+shd NrrShdHotRemap
+shd NrrShdHotSlot
+
+# deco (n60deco): NrrDecoHot* plus the machine run loop it shares (its bytes are the mach set's too:
+# the union of mach + deco is what the two categories cost together).
+deco NrrMachHotMeshXf
+deco NrrMachHotRun
+deco NrrSnapGet
+deco gdxn::Interp::ApplyViewportScissor
+deco gdxn::Interp::NrrFxHotFog
+
+# race (nirace): the handler bodies the span programs' typed ops call each steady racing frame (SEG, DL,
+# CALL), counted with NrrRaceHot* so the race phase's receipt is what it fetches (DpFillRectangle is not:
+# the frame's z-clear is the full-screen depth clear NrrRaceHotCall answers itself). The marker hooks
+# (gdx3ds_nrr_marker, HudReplayRun, the c5cat / overlap marker) are the categories' own.
+race gdxn::Interp::SpMatrix
+race gdxn::Interp::SpMovemem
+race gdxn::Interp::CalcAndSetViewport
+race gdxn::Interp::AdjustViewportOrScissor
+race gdxn::Interp::SpMoveword
+race gdxn::Interp::DpSetColorImage
+race gdxn::Interp::DpSetZImage
+race gdxn::Interp::DpSetTextureImage
+race gdxn::Interp::DpSetPrimColor
+race gdxn::Interp::DpSetFogColor
+race gdxn::Interp::DpLoadBlock
+race BytesForTexels
+race gdxn::Interp::DirectScopeLoadBlock
+race gdxn::DlSrc::SetSegment
+race gdxn::DlSrc::UcodeVariant
+race gdxn::Interp::ResolveListMemo
+# NrrNoopDispatch (nimenu W4): NrrRaceHotDrive's own marker-dispatch call (the HudHotClose-then-hook
+# pair), shared with Exec's OP_NOOP case to cut the duplicate bytes; doesn't match Nrr*Hot* naming.
+race gdxn::Interp::NrrNoopDispatch
+# SpDmaIo dropped (nimenu W2, review W4 "check whether SpDmaIo is stale"): verified via objdump that
+# its only two callers in the linked binary are both inside Interp::Exec (the general dispatcher),
+# never NrrRaceHotRun/HotCall/HotSpan/HotDrive/GeoOp -- it is not part of race's steady-state native
+# program loop, only reachable (like any other opcode) through the shared Exec() the cold fallback
+# paths (NrrRaceMissRecover/SegFallback/StOther) also call. Listing it here overstated race's hot
+# footprint by its own 180 B.
+
+# menu (nimenu, [native] ni_menu): the non-race screen runner NrrMenuHotRun (gdx_nrr_menu.inc: the program
+# lookup and op dispatch inlined) calls the HUD's out-of-line op bodies; a menu frame runs no race HUD
+# run, so its phase is core + these + citro3d (NrrHudHotRun / RrTry / RectFrom / RrSnap are not reached).
+menu NrrHudHotHash
+menu gdxn::Interp::NrrHudHotRect
+menu gdxn::Interp::NrrHudHotMemoFind
+menu gdxn::Interp::NrrHudHotReserve
+menu gdxn::Interp::NrrHudHotBatch
+menu gdxn::Interp::NrrHudHotLoad
+menu gdxn::Interp::NrrHudHotSlot
+menu gdxn::Interp::NrrHudHotSl
+menu gdxn::Interp::NrrHudHotGroups
+menu NrrHudHotTexCoord
+menu gdxn::Interp::NrrHudHotDraw
+menu gdxn::Interp::NrrHudHotSplits
+menu gdxn::Interp::NrrHudHotClose
+
+# machmenu (nimach, nointerp S5b): the menus' machines -- NrrMachMenuHot* plus the race loop's run /
+# uniform helpers they share, the marker dispatch, and the per-entry viewport through the interpreter
+# and the backend ([vpfix] fold + scissor).
+machmenu NrrMachHotDraw
+machmenu NrrMachHotMeshXf
+machmenu gdx3ds_mesh_generation
+machmenu NrrSnapGet
+machmenu gdxn::Interp::ApplyViewportScissor
+machmenu gdxn::Interp::CalcAndSetViewport
+machmenu gdxn::Interp::AdjustViewportOrScissor
+machmenu gdxn::Interp::Flush
+machmenu Fast::GfxRenderingAPIC3D::SetViewport
+machmenu Fast::GfxRenderingAPIC3D::ApplyScissorRect
+machmenu NrrProjInvalidate
+machmenu NrrCoreDxProjInvalidate
+machmenu gdxn::Interp::NrrFxHotFog
+machmenu gdx3ds_mesh_apply_tail
+
+# course (nicourse, [native] ni_course): NrrCourseHot* plus what a preview frame runs per model -- the
+# walker's marker hook, the mesh module's model lookup + word check, the levers, the walker's viewport
+# apply and the core hand-off entry (round 2: the draw is a memoised NRR state block + NrrDrawXf; the
+# round-1 ResolveDrawState draw is cold, once per material). Not an NRR category: core counted as usual.
+course OwnedNoopHook
+course OwnedNoopHookBody
+course gdx3ds_mesh_course_model
+course gdx3ds_mesh_course_level
+# gdx3ds_mesh_course_clip removed, W6 (Fable review): the ni_course_clip lever it read is gone,
+# the PICA clip on a straddling course-preview model is now unconditional.
+course gdx3ds_mesh_course_maxerr
+course gdx3ds_nrr_open_ext
+course gdx3ds_nrr_close
+course gdxn::Interp::ApplyViewportScissor

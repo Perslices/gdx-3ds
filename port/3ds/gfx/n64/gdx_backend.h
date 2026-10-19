@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gdx3ds_hsx.h"
 #include "gdx3ds_vbopack.h"
 
 namespace gdxn {
@@ -100,6 +101,55 @@ class Backend {
     virtual void AtlasArm(bool on) = 0;
     virtual int TexPage(uint32_t texId) = 0;
     virtual void VboPackRefresh(Gdx3dsVboPackParams* params) = 0;
+
+    /* [native] hud_retain (gdx_hud_retain.cpp): floats still free in the streamed VBO pool (a
+     * retained run replays only when every batch begin it makes would get the whole batch),
+     * and the [trectbatch] atlas placement epoch (moves whenever a placed view can move: a
+     * page eviction or reset). Defaults: unlimited, constant. */
+    virtual size_t VboFreeFloats() {
+        return static_cast<size_t>(-1);
+    }
+    /* N60TEX [debug] tex_keep: backend memory one texture id holds, and the linear heap left.
+     * Defaults: 0 bytes, unlimited. */
+    virtual uint32_t TexBytes(uint32_t texId) {
+        (void)texId;
+        return 0;
+    }
+    virtual size_t LinearFreeBytes() {
+        return static_cast<size_t>(-1);
+    }
+    virtual unsigned long AtlasEpoch() {
+        return 0;
+    }
+    /* The same epoch as a counter the caller may poll directly ([native] nrr_hud reads it once per
+     * HUD run); nullptr = no atlas (the epoch is the constant 0). */
+    virtual const unsigned long* AtlasEpochPtr() {
+        return nullptr;
+    }
+
+    /* [native] hudsky_emit (gdx3ds_hsx.h): run a retained HUD run's whole backend program in one
+     * call, or refuse (false, nothing done) -- the interpreter then issues the ops one virtual
+     * call each. DrawPackedLean: a packed batch through the backend's lean draw tail when it
+     * has one (exactly DrawPackedBatch otherwise). Defaults: refuse / DrawPackedBatch. */
+    virtual bool HsxRun(Gdx3dsHsxProgram* prog) {
+        (void)prog;
+        return false;
+    }
+    virtual void DrawPackedLean(size_t numTris, const Gdx3dsVboPackAux* aux) {
+        DrawPackedBatch(numTris, aux);
+    }
+    /* [native] nrr_hud (n60hud, gdx_nrr_hud.cpp): a packed batch's write cursor and its GEOMLOSS
+     * cap without the parameter derivation (the caller refreshes the texture fields with
+     * VboPackRefresh). Default: VboPackBegin. */
+    virtual float* NrrPackCursor(uint32_t* capTris) {
+        Gdx3dsVboPackParams scratch;
+        return VboPackBegin(&scratch, capTris);
+    }
+    /* [native] nrr_hud: is a scissor rect in force on the GPU right now? (citro3d's SetViewport
+     * disables it, so after a viewport change it is off until the next SetScissor.) Default: yes. */
+    virtual bool NrrScissorLive() {
+        return true;
+    }
 };
 
 } // namespace gdxn

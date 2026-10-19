@@ -1,0 +1,66 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5713,6 +5713,7 @@
+ 
+ #if defined(PORT) && defined(GDX_PLATFORM_3DS)
+ #include "nrr/gdx3ds_nrr_mach.h" /* N60MACH (decomp-3ds-nrr-mach.patch): the machines' NRR snapshot */
++#include "gdx3ds_prewarm.h" /* N60PREWARM (decomp-3ds-prewarm.patch): [native] prewarm in the opaque appear frame */
+ extern int gdx_rival_lod6_skip(void);
+ 
+ /* N60MACH: Racer_Draw's body section ([native] nrr_mach, n60mach-progress.md), as the BODY
+@@ -5938,6 +5939,7 @@
+     s32 fogG;
+     s32 fogB;
+     s32 legacyHl = 0;
++    s32 prewarm;
+     s32 legacyBody = 0;
+     s32 fallback = 0;
+     s32 other = 0;
+@@ -5955,6 +5957,9 @@
+     }
+     f->n = 0;
+     lod6Skip = gdx_rival_lod6_skip();
++    /* N60PREWARM: in the race's opaque appear frame, the stock draws of every (machine, LOD, pass) without a
++     * record follow the marker too (gdx3ds_prewarm.h); 0 outside it. */
++    prewarm = gdx3ds_prewarm_mach_plan(playerIndex, lod6Skip);
+     Racer_NrrMachPoses();
+     Racer_NrrMachLights(playerIndex, camera, &fogR, &fogG, &fogB);
+     Racer_NrrMachFrameLights(f, playerIndex, fogR, fogG, fogB);
+@@ -6006,7 +6011,7 @@
+             }
+         }
+     }
+-    f->rec = (legacyHl != 0) || (legacyBody != 0) || (gGameMode == GAMEMODE_TIME_ATTACK);
++    f->rec = (legacyHl != 0) || (legacyBody != 0) || (gGameMode == GAMEMODE_TIME_ATTACK) || (prewarm != 0);
+     gfx = gdx3ds_nrr_mach_publish(gfx, playerIndex, f, fallback, other);
+     if (f->rec) {
+         gSPDisplayList(gfx++, D_303A7D8); /* stock: the highlight setup precedes the body pass */
+@@ -6026,13 +6031,16 @@
+             }
+         }
+     }
+-    if ((legacyBody != 0) || (other != 0) || (gGameMode == GAMEMODE_TIME_ATTACK)) {
++    if ((legacyBody != 0) || (other != 0) || (gGameMode == GAMEMODE_TIME_ATTACK) || (prewarm & GDX_PREWARM_MACH)) {
+         gSPDisplayList(gfx++, D_303A6A8);
+         gSPLight(gfx++, &D_1000000.unk_21A88[playerIndex].l[0], 1);
+         gSPLight(gfx++, &D_1000000.unk_21A88[playerIndex].a, 2);
+         gSPDmaRead(gfx++, 0x8B0, D_800CE3D0, ARRAY_COUNT(D_800CE3D0));
+         gSPLookAtY(gfx++, &D_1000000.unk_21AE8[playerIndex]);
+         gDPSetFogColor(gfx++, fogR, fogG, fogB, 255);
++        if (prewarm & GDX_PREWARM_MACH) {
++            gfx = gdx3ds_prewarm_mach_bodies(gfx, playerIndex, lod6Skip, legacyHl == 0);
++        }
+         for (racer = sLastRacer; racer >= gRacers; racer--) {
+             if (!(bodyLegacyMask & (1u << (racer - gRacers)))) {
+                 continue;
+@@ -6088,6 +6096,9 @@
+             }
+         }
+     }
++    if (prewarm & GDX_PREWARM_HL) {
++        gfx = gdx3ds_prewarm_mach_hl(gfx, playerIndex, fogR, fogG, fogB);
++    }
+     return gfx;
+ }
+ #endif

@@ -1,0 +1,142 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5596,6 +5596,30 @@
+     } while (0)
+ #else
+ #define GDX_C5CAT(cat)
++#endif
++
++#if defined(PORT) && defined(GDX_NATIVE_HUD)
++/* C5 STAGE 2 [native] hud_batch / shadow_batch / fx_batch (port/3ds/gfx/gdx3ds_hud_capture.c):
++ * after a HUD, shadow or boost-flame section returns, the display list it wrote is compacted in
++ * place -- each run of RDP-state / texture / rectangle / triangle commands moves into a record
++ * behind ONE G_NOOP marker (p=0x5E, shadows 0x5F) that the owned walker replays at that same
++ * position. The draw code and its game logic run unchanged. Off (the default)
++ * gdxhud_armed_kind() is 0 and nothing is touched: the list is byte-identical. */
++extern int gdxhud_armed_kind(int kind);
++extern void* gdxhud_capture_kind(void* regionStart, void* regionEnd, int kind);
++#define GDX_HUD_KIND_HUD 0
++#define GDX_HUD_KIND_SHADOW 1
++#define GDX_HUD_KIND_FX 2
++#define GDX_HUD_REGION_BEGIN(var) Gfx* var = gfx
++#define GDX_HUD_CAPTURE(var, kind)                                                              \
++    do {                                                                                        \
++        if (gdxhud_armed_kind(GDX_HUD_KIND_##kind)) {                                           \
++            gfx = (Gfx*) gdxhud_capture_kind((void*) (var), (void*) gfx, GDX_HUD_KIND_##kind);  \
++        }                                                                                       \
++    } while (0)
++#else
++#define GDX_HUD_REGION_BEGIN(var)
++#define GDX_HUD_CAPTURE(var, kind)
+ #endif
+ 
+ Gfx* Racer_Draw(Gfx* gfx, s32 playerIndex) {
+@@ -6006,6 +6030,7 @@
+         }
+     }
+     GDX_C5CAT(SHD);
++    GDX_HUD_REGION_BEGIN(gdxShadowStart);
+     if (gRaceIntroTimer < 280) {
+         gSPDisplayList(gfx++, D_303A758);
+         if (gGameMode == GAMEMODE_GP_END_CS) {
+@@ -6074,6 +6099,7 @@
+         gRacers[0].speed = gRacers[1].speed = gRacers[2].speed = gRacers[3].speed = 0.0f;
+     }
+ 
++    GDX_HUD_CAPTURE(gdxShadowStart, SHADOW);
+     GDX_C5CAT(MACH);
+     gSPDisplayList(gfx++, D_303A7D8);
+ 
+@@ -6305,6 +6331,7 @@
+     sp564 = camera->basis.y.z;
+ 
+     GDX_C5CAT(FX);
++    GDX_HUD_REGION_BEGIN(gdxFxStart);
+     gSPDisplayList(gfx++, aSetupBoosterDL);
+ 
+     if (!gGamePaused) {
+@@ -6553,6 +6580,7 @@
+             }
+         }
+     }
++    GDX_HUD_CAPTURE(gdxFxStart, FX);
+ #if defined(PORT) && defined(GDX_NATIVE_FX)
+ #include "gdx3ds_fx_shim_begin.h"
+     GDXFX_BEGIN(playerIndex);
+@@ -6938,6 +6966,7 @@
+ #endif
+ 
+     GDX_C5CAT(HUD);
++    GDX_HUD_REGION_BEGIN(gdxHudStart);
+ #ifndef EXPANSION_KIT
+     if (gRaceIntroTimer != 0) {
+ #else
+@@ -7272,6 +7301,7 @@
+         }
+     }
+ 
++    GDX_HUD_CAPTURE(gdxHudStart, HUD);
+     GDX_C5CAT(MISC);
+     return gfx;
+ }
+diff --git a/src/overlays/ovl_i2/race.c b/src/overlays/ovl_i2/race.c
+--- a/src/overlays/ovl_i2/race.c
++++ b/src/overlays/ovl_i2/race.c
+@@ -163,6 +163,30 @@
+     } while (0)
+ #else
+ #define GDX_C5CAT(cat)
++#endif
++
++#if defined(PORT) && defined(GDX_NATIVE_HUD)
++/* C5 STAGE 2 [native] hud_batch / shadow_batch / fx_batch (port/3ds/gfx/gdx3ds_hud_capture.c):
++ * after a HUD, shadow or boost-flame section returns, the display list it wrote is compacted in
++ * place -- each run of RDP-state / texture / rectangle / triangle commands moves into a record
++ * behind ONE G_NOOP marker (p=0x5E, shadows 0x5F) that the owned walker replays at that same
++ * position. The draw code and its game logic run unchanged. Off (the default)
++ * gdxhud_armed_kind() is 0 and nothing is touched: the list is byte-identical. */
++extern int gdxhud_armed_kind(int kind);
++extern void* gdxhud_capture_kind(void* regionStart, void* regionEnd, int kind);
++#define GDX_HUD_KIND_HUD 0
++#define GDX_HUD_KIND_SHADOW 1
++#define GDX_HUD_KIND_FX 2
++#define GDX_HUD_REGION_BEGIN(var) Gfx* var = gfx
++#define GDX_HUD_CAPTURE(var, kind)                                                              \
++    do {                                                                                        \
++        if (gdxhud_armed_kind(GDX_HUD_KIND_##kind)) {                                           \
++            gfx = (Gfx*) gdxhud_capture_kind((void*) (var), (void*) gfx, GDX_HUD_KIND_##kind);  \
++        }                                                                                       \
++    } while (0)
++#else
++#define GDX_HUD_REGION_BEGIN(var)
++#define GDX_HUD_CAPTURE(var, kind)
+ #endif
+ 
+ Gfx* Race_Draw(Gfx* gfx) {
+@@ -280,7 +304,11 @@
+             gfx = Camera_Draw(gfx, SCISSOR_BOX_FULL_SCREEN, 0);
+             gfx = Racer_Draw(gfx, 0);
+             GDX_C5CAT(HUD);
+-            gfx = Menus_Player1SpecialDraw(gfx, 0);
++            {
++                GDX_HUD_REGION_BEGIN(gdxHudStart);
++                gfx = Menus_Player1SpecialDraw(gfx, 0);
++                GDX_HUD_CAPTURE(gdxHudStart, HUD);
++            }
+             GDX_C5CAT(MISC);
+             break;
+         case 2:
+@@ -329,7 +357,11 @@
+ 
+ #ifdef PORT
+     GDX_C5CAT(HUD);
+-    gfx = Menus_Draw(gfx);
++    {
++        GDX_HUD_REGION_BEGIN(gdxHudStart);
++        gfx = Menus_Draw(gfx);
++        GDX_HUD_CAPTURE(gdxHudStart, HUD);
++    }
+     GDX_C5CAT(MISC);
+     return gfx;
+ #else

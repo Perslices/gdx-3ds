@@ -23,6 +23,7 @@ struct MockBatch {
     Gdx3dsVboPackAux aux;
     bool depthTest, depthMask, decal, alpha;
     int vp[4], sc[4];
+    float primDepth, alphaThr; /* the drain's uniforms */
 };
 
 class MockBackend final : public gdxn::Backend {
@@ -174,6 +175,8 @@ class MockBackend final : public gdxn::Backend {
         b.vbo.assign(pool.data() + poolOff, pool.data() + poolOff + numTris * 3 * 12);
         b.aux = *aux;
         b.depthTest = depthTest; b.depthMask = depthMask; b.decal = decal; b.alpha = alpha;
+        b.primDepth = primDepth;
+        b.alphaThr = alphaThr;
         memcpy(b.vp, vp, sizeof(vp));
         memcpy(b.sc, sc, sizeof(sc));
         batches.push_back(b);
@@ -242,6 +245,10 @@ class MockBackend final : public gdxn::Backend {
         return -1;
     }
     void VboPackRefresh(Gdx3dsVboPackParams*) override {
+    }
+    /* [native] hud_retain: the pool headroom a retained run checks before it replays. */
+    size_t VboFreeFloats() override {
+        return pool.size() > poolOff ? pool.size() - poolOff : 0;
     }
 };
 

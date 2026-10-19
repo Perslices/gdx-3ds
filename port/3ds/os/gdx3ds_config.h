@@ -79,6 +79,38 @@ int gdx3ds_config_set_int(const char* section, const char* key, int value);
  * removed, 3 if there was none (both leave the key absent), 1 on bad arguments. */
 int gdx3ds_config_unset(const char* section, const char* key);
 int gdx3ds_config_save(const char* path);
+/* RAM-only override consulted before the INI by every getter; never saved (boot bisect).
+ * Returns 0 on success, 2 when the override table is full. */
+int gdx3ds_config_override(const char* section, const char* key, const char* value);
+/* N60LAUNCH: the index-th INI entry of `section` (case-insensitive, INI table only -- overrides
+ * are not listed), in file order. Returns 1 and sets *key and *value (aliases into the table, valid
+ * until the next load), or 0 when there is no such entry. */
+int gdx3ds_config_section_entry(const char* section, int index, const char** key, const char** value);
+/* N60LAUNCH: entries in the INI table / its fixed capacity (a full table drops keys quietly). */
+int gdx3ds_config_entry_count(void);
+int gdx3ds_config_entry_capacity(void);
+/* n60lead: number of keys the INI/override tables could not hold since the last load (0 = none),
+ * *firstKey = "section.key" of the first one. main logs a loud [config] OVERFLOW line (boot trail +
+ * log) when it is non-zero: a dropped key used to be silent. */
+int gdx3ds_config_overflow(const char** firstKey);
+
+/* n3ds: PRESET DEFAULTS. A preset is a built-in table of default values, selected by the ini's
+ * `[perf] preset = <name>`, that every getter consults AFTER the override and INI tables and
+ * BEFORE the caller's compiled-in fallback: an explicit ini key always wins, a key the ini leaves
+ * out reads the preset's value, a key neither has reads the fallback. The resolver maps the
+ * preset name (NULL when the key is absent) to a table (sections and keys lower-case) or NULL
+ * (no preset: every lookup exactly as without a resolver). Re-resolved after every load / set /
+ * unset / override. Preset values are never written by gdx3ds_config_save and are not listed by
+ * gdx3ds_config_section_entry or counted by gdx3ds_config_entry_count. */
+typedef struct {
+    const char* section;
+    const char* key;
+    const char* value;
+} Gdx3dsCfgPresetEntry;
+typedef const Gdx3dsCfgPresetEntry* (*Gdx3dsCfgPresetResolver)(const char* name, int* count);
+void gdx3ds_config_set_preset_resolver(Gdx3dsCfgPresetResolver resolver);
+/* Entries of the active preset (0 = none). */
+int gdx3ds_config_preset_count(void);
 
 #ifdef __cplusplus
 }

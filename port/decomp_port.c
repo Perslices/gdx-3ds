@@ -1834,3 +1834,347 @@ void gdx_discord_snapshot(GdxDiscordSnapshot* out) {
     out->playerPosition = gRacers[0].position;
     out->playerFinished = (gRacers[0].stateFlags & RACER_STATE_FINISHED) != 0;
 }
+
+/* ---------------------------------------------------------------------------------------- */
+/* BOTTOMHUD — race-map state sample for the 3DS bottom screen (port/gdx_racemap.h).         */
+/*                                                                                          */
+/* Lives here for the same reason gdx_discord_snapshot does: this is the TU compiled with    */
+/* the decomp's headers, so the consumer (port/3ds/gdx3ds_racemap.c) never declares a game   */
+/* symbol or a game type. Both functions below are reached ONLY when                         */
+/* gdiffuser.ini [debug] bottom_map is on and the bottom-screen MAP tab is showing; with the */
+/* lever off nothing here runs at all.                                                       */
+/*                                                                                          */
+/* Every number is lifted from decomp/src/overlays/ovl_i3/minimap.c so that the bottom       */
+/* screen and the top screen cannot drift: the marker arithmetic is                          */
+/* Minimap_DrawCourseMinimap's, the scale rule is Minimap_InitCourseMinimap's, and the       */
+/* marker SET is the same one the top screen would draw (3 co-op players, the GP leader or   */
+/* the time-attack ghost, and the player's own blinking marker).                              */
+
+#include "gdx_racemap.h"
+
+/* minimap.c's own two globals. Declared, not #included: minimap.h drags in gfx.h and the Gfx
+   command macros, and this TU wants only the bytes. The sizes are MINIMAP_MAX_SIZE (0x1000)
+   and 4 TLUT entries; both are asserted against the constants below. */
+#ifndef EXPANSION_KIT
+extern u8 sCourseMinimapTex[0x1000];
+#else
+extern u8* sCourseMinimapTex; /* EK: Arena_Allocate'd per race, NULL in the course editor */
+#endif
+extern u16 sCourseMinimapPalette[];
+
+#define GDX_RACEMAP_DIM 64            /* MINIMAP_MAX_DIMENSION */
+#define GDX_RACEMAP_WORLD 16000.0f    /* MINIMAP_WORLD_DIMENSION */
+
+/* Minimap_DrawCourseMinimap's marker arithmetic, verbatim, minus the `+= left/top` that puts
+   it on the N64 screen. Callers get minimap-source pixels; the 3DS side owns the placement. */
+static void gdx_racemap_marker_cell(const Racer* racer, f32 scale, s32* outCol, s32* outRow) {
+    const Vec3f* p = &racer->segmentPositionInfo.segmentPos;
+    *outCol = Math_Round(((p->x * GDX_RACEMAP_DIM * scale) / GDX_RACEMAP_WORLD) + (GDX_RACEMAP_DIM * scale)) / 2;
+    *outRow = Math_Round(((p->z * GDX_RACEMAP_DIM * scale) / GDX_RACEMAP_WORLD) + (GDX_RACEMAP_DIM * scale)) / 2;
+}
+
+static void gdx_racemap_push(GdxRaceMapSnapshot* out, const Racer* racer, f32 scale, int kind, int blink) {
+    s32 col;
+    s32 row;
+    if (racer == NULL || out->markerCount >= GDX_RACEMAP_MAX_MARKERS) {
+        return;
+    }
+    gdx_racemap_marker_cell(racer, scale, &col, &row);
+    out->markers[out->markerCount].col = (int) col;
+    out->markers[out->markerCount].row = (int) row;
+    out->markers[out->markerCount].kind = kind;
+    out->markers[out->markerCount].blink = blink;
+    out->markerCount++;
+}
+
+/* The modes in which race.c has run Minimap_InitCourseMinimap and the 64x64 buffer therefore
+   describes the course that is on screen. Outside them the buffer still holds the PREVIOUS
+   race's track, which is why `valid` exists and why the drawing side must honour it. */
+static int gdx_racemap_mode_is_race(int mode) {
+    switch (mode) {
+        case GAMEMODE_GP_RACE:
+        case GAMEMODE_PRACTICE:
+        case GAMEMODE_VS_2P:
+        case GAMEMODE_VS_3P:
+        case GAMEMODE_VS_4P:
+        case GAMEMODE_TIME_ATTACK:
+        case GAMEMODE_DEATH_RACE:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+void gdx_racemap_snapshot(GdxRaceMapSnapshot* out) {
+    extern s32 gNumPlayers;
+    extern s32 gTotalRacers;
+    extern s32 gTotalLapCount;
+    extern u32 gGameFrameCount;
+    extern Racer* gRacersByPosition[];
+    extern GhostRacer* gFastestGhostRacer;
+    extern CourseInfo* gCurrentCourseInfo;
+
+    const int mode = GET_MODE(gGameMode);
+    int numPlayersIndex;
+    int otherCount;
+    f32 scale;
+    int i;
+
+    memset(out, 0, sizeof(*out));
+    out->mode = mode;
+    out->numPlayers = gNumPlayers;
+    out->scaleNum = 1;
+    out->scaleDen = 1;
+    if (!gdx_racemap_mode_is_race(mode) || gCurrentCourseInfo == NULL) {
+        return;
+    }
+#ifdef EXPANSION_KIT
+    if (sCourseMinimapTex == NULL) {
+        return;
+    }
+#endif
+
+    /* Minimap_InitCourseMinimap: scale is 1 for a single player and 0.75 otherwise, and it is
+       baked into the RASTERISED TRACK as well as into the marker formula. Reporting it lets the
+       drawing side label the picture; it must not apply a second scale of its own. */
+    if (gNumPlayers == 1) {
+        scale = 1.0f;
+        out->scaleNum = 1;
+        out->scaleDen = 1;
+    } else {
+        scale = 0.75f;
+        out->scaleNum = 3;
+        out->scaleDen = 4;
+    }
+
+    out->valid = 1;
+    out->lap = gRacers[0].lap;
+    out->totalLaps = gTotalLapCount;
+    out->position = gRacers[0].position;
+    out->totalRacers = gTotalRacers;
+    out->blinkOn = ((gGameFrameCount % 16) < 8) ? 1 : 0;
+
+    /* Marker set, in Minimap_DrawCourseMinimap's order. numPlayersIndex/playerIndex are that
+       function's arguments for the player-1 viewport: gNumPlayers-1 and 0. */
+    numPlayersIndex = gNumPlayers - 1;
+    if (numPlayersIndex < 0) {
+        numPlayersIndex = 0;
+    }
+    if ((mode == GAMEMODE_VS_2P) || (mode == GAMEMODE_VS_3P)) {
+        otherCount = gTotalRacers;
+    } else {
+        otherCount = numPlayersIndex + 1;
+    }
+    /* The game's own `switch (i)` only assigns a fill colour for i in 0..3, so racers past the
+       fourth reuse the previous colour. Clamped rather than reproduced: four is the honest
+       number of distinct player markers the minimap has. */
+    if (otherCount > 4) {
+        otherCount = 4;
+    }
+    for (i = 0; i < otherCount; i++) {
+        if (i == 0) {
+            continue; /* playerIndex — drawn last, with the blink */
+        }
+        gdx_racemap_push(out, &gRacers[i], scale, GDX_RACEMAP_MARKER_PLAYER1 + i, 0);
+    }
+    if (numPlayersIndex == 0) {
+        if (mode == GAMEMODE_GP_RACE) {
+            const Racer* leader = (gRacers[0].position == 1) ? gRacersByPosition[1] : gRacersByPosition[0];
+            gdx_racemap_push(out, leader, scale, GDX_RACEMAP_MARKER_LEADER, 0);
+        } else if (gFastestGhostRacer != NULL) {
+            gdx_racemap_push(out, gFastestGhostRacer->racer, scale, GDX_RACEMAP_MARKER_GHOST, 0);
+        }
+    }
+    gdx_racemap_push(out, &gRacers[0], scale, GDX_RACEMAP_MARKER_PLAYER1, 1);
+}
+
+int gdx_racemap_bitmap(const unsigned char** outTex, unsigned short* outPalette4) {
+    int i;
+#ifdef EXPANSION_KIT
+    /* EK only: the buffer is Arena_Allocate'd per race. In the retail build it is a static
+       array, and a NULL test on it is a compile-time constant (and a -Waddress warning). */
+    if (sCourseMinimapTex == NULL) {
+        return 0;
+    }
+#endif
+    if (outTex != NULL) {
+        *outTex = (const unsigned char*) sCourseMinimapTex;
+    }
+    if (outPalette4 != NULL) {
+        for (i = 0; i < 4; i++) {
+            const u16 stored = sCourseMinimapPalette[i];
+#ifdef PORT
+            /* minimap.c's MINIMAP_TLUT_ENTRY stores each entry PRE-SWAPPED under PORT, because
+               the CI decoder reads TLUT bytes big-endian. Undo it so the caller gets real
+               RGBA5551 and never has to know. */
+            outPalette4[i] = (unsigned short) ((u16) ((stored >> 8) | (stored << 8)));
+#else
+            outPalette4[i] = (unsigned short) stored;
+#endif
+        }
+    }
+    return 1;
+}
+
+/* nibottom (Phase 2): DASH dashboard data, beyond the map. See gdx_racemap.h's own comment on
+   GdxRaceHudSnapshot for why this is a sibling of GdxRaceMapSnapshot/gdx_racemap_snapshot above,
+   not a growth of it. `sPlayerLeadInterval` is hud.c's own non-static global (ovl_i3/hud.c:43),
+   declared here rather than #included for the same reason minimap.c's globals are above: this TU
+   wants only the bytes, not hud.c's drawing-side types. */
+int gdx_title_demo_active(void) {
+    extern s8 gTitleDemoState;
+    return gTitleDemoState != TITLE_DEMO_INACTIVE;
+}
+
+void gdx_racehud_snapshot(GdxRaceHudSnapshot* out) {
+    extern s32 gNumPlayers;
+    extern s32 gTotalRacers;
+    extern s32 gTotalLapCount;
+    extern Racer* gRacersByPosition[];
+    extern s32 sPlayerLeadInterval[4];
+    extern s16 gCpuRacersRetired; /* item 4 (hw bug n60-3d7): same field hud.c's own  */
+                                   /* Hud_DrawRacePositionExtras reads for its "/N"    */
+    extern s16 gRacersKOd; /* item 6 (hardware feedback round): same global hud.c's own */
+                            /* Hud_DrawKOStars reads (decomp/src/game/racer.c:84/2280)   */
+    extern char* gCurrentTrackName; /* game/common.c; set by course_select.c/main_menu.c from  */
+                                     /* sTrackNames[gCourseIndex] when the course is picked --  */
+                                     /* COORDINATOR FIX (nibottom Phase 2, 3rd round, item 2):  */
+                                     /* the DASH header used to bake a frozen "MUTE CITY I"     */
+                                     /* string regardless of the actual course; read the real   */
+                                     /* one here instead. */
+
+    const int mode = GET_MODE(gGameMode);
+    const Racer* self = &gRacers[0];
+    s32 bestLapMs;
+    int i;
+    int count;
+
+    memset(out, 0, sizeof(*out));
+    out->numPlayers = gNumPlayers;
+    if (!gdx_racemap_mode_is_race(mode)) {
+        return;
+    }
+
+    out->valid = 1;
+    out->position = self->position;
+    out->totalRacers = gTotalRacers;
+    out->racersRemaining = gTotalRacers - gCpuRacersRetired;
+    out->speedKph = (int) (self->speed * 21.6f + 0.5f); /* hud.c's own Hud_DrawPlayerSpeed formula */
+    out->lap = self->lap;
+    out->totalLaps = gTotalLapCount;
+    out->character = (int) self->character;
+    out->energyMilli = (self->maxEnergy > 0.0f)
+        ? (int) ((1000.0f * self->energy / self->maxEnergy) + 0.5f)
+        : 0;
+    if (out->energyMilli < 0) {
+        out->energyMilli = 0;
+    } else if (out->energyMilli > 1000) {
+        out->energyMilli = 1000;
+    }
+    out->boostReady = (self->stateFlags & RACER_STATE_CAN_BOOST) ? 1 : 0;
+    out->koCount = (int) gRacersKOd;
+    out->lapTimeMs = (int) (self->raceTime - self->completedLapsTime);
+
+    bestLapMs = 0;
+    for (i = 0; i < 3; i++) {
+        if (self->lapTimes[i] > 0 && (bestLapMs == 0 || self->lapTimes[i] < bestLapMs)) {
+            bestLapMs = self->lapTimes[i];
+        }
+    }
+    out->bestTimeMs = (int) bestLapMs;
+
+    out->gapMs = (int) sPlayerLeadInterval[0];
+
+    count = gTotalRacers;
+    if (count < 0) {
+        count = 0;
+    } else if (count > GDX_RACEHUD_TOP5_MAX) {
+        count = GDX_RACEHUD_TOP5_MAX;
+    }
+    out->top5Count = count;
+    for (i = 0; i < count; i++) {
+        out->top5Character[i] = (gRacersByPosition[i] != NULL) ? (int) gRacersByPosition[i]->character : -1;
+    }
+
+    out->trackName[0] = '\0';
+    if (gCurrentTrackName != NULL) {
+        int j = 0;
+        for (; j < (int) sizeof(out->trackName) - 1 && gCurrentTrackName[j] != '\0'; j++) {
+            unsigned char c = (unsigned char) gCurrentTrackName[j];
+            if (c >= 0x80u) {
+                break; /* a FONT_SET_3-only glyph code (e.g. the Greek alpha/beta suffix on the  */
+                       /* two SECTOR courses) -- stop cleanly rather than emit garbage */
+            }
+            if (c >= (unsigned char) 'a' && c <= (unsigned char) 'z') {
+                c = (unsigned char) (c - (unsigned char) 'a' + (unsigned char) 'A');
+            }
+            out->trackName[j] = (char) c;
+        }
+        out->trackName[j] = '\0';
+    }
+}
+
+/* ── GSTATE: a game-state digest for visual-only levers (NEXT.md C4p) ─────────────────────
+ *
+ * The [fh] parity gate hashes PIXELS, so it cannot tell a lever that changes only what is
+ * drawn (a rival's LOD tier, how far the track is drawn) from one that changes the race: both
+ * diverge on every race frame. This digest is the gate for the first kind. It hashes what
+ * the game SIMULATES and nothing it merely draws -- both RNG streams, the logic frame counter,
+ * and per racer its state flags, position, velocity, speed, energy, race distance, lap, rank
+ * and race time -- and deliberately leaves out machineLod / unk_2B2 / unk_2B3, the three
+ * per-racer fields a draw-side LOD lever writes. Two runs of one replay whose digests agree
+ * at every tick simulated the same race, whatever they drew. FNV-1a over the raw bits, so a
+ * float that differs in the last ulp differs here. Main thread, after the game update. */
+static u32 gdx_gstate_mix(u32 h, const void* data, size_t len) {
+    const u8* p = (const u8*) data;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static u32 gdx_gstate_mix_racer(u32 h, const Racer* racer) {
+    h = gdx_gstate_mix(h, &racer->stateFlags, sizeof(racer->stateFlags));
+    h = gdx_gstate_mix(h, &racer->segmentPositionInfo.pos, sizeof(racer->segmentPositionInfo.pos));
+    h = gdx_gstate_mix(h, &racer->velocity, sizeof(racer->velocity));
+    h = gdx_gstate_mix(h, &racer->speed, sizeof(racer->speed));
+    h = gdx_gstate_mix(h, &racer->energy, sizeof(racer->energy));
+    h = gdx_gstate_mix(h, &racer->raceDistance, sizeof(racer->raceDistance));
+    h = gdx_gstate_mix(h, &racer->lap, sizeof(racer->lap));
+    h = gdx_gstate_mix(h, &racer->position, sizeof(racer->position));
+    h = gdx_gstate_mix(h, &racer->raceTime, sizeof(racer->raceTime));
+    return h;
+}
+
+unsigned int gdx_gstate_hash(int* outRacers) {
+    extern s32 gTotalRacers;
+    extern u32 gGameFrameCount;
+    extern s32 gRandSeed1;
+    extern u32 gRandMask1;
+    extern s32 gRandSeed2;
+    extern u32 gRandMask2;
+    u32 h = 2166136261u;
+    s32 count = gTotalRacers;
+    s32 i;
+
+    if (count < 0) {
+        count = 0;
+    } else if (count > TOTAL_RACER_COUNT) {
+        count = TOTAL_RACER_COUNT;
+    }
+    h = gdx_gstate_mix(h, &gRandSeed1, sizeof(gRandSeed1));
+    h = gdx_gstate_mix(h, &gRandMask1, sizeof(gRandMask1));
+    h = gdx_gstate_mix(h, &gRandSeed2, sizeof(gRandSeed2));
+    h = gdx_gstate_mix(h, &gRandMask2, sizeof(gRandMask2));
+    h = gdx_gstate_mix(h, &gGameFrameCount, sizeof(gGameFrameCount));
+    h = gdx_gstate_mix(h, &count, sizeof(count));
+    for (i = 0; i < count; i++) {
+        h = gdx_gstate_mix_racer(h, &gRacers[i]);
+    }
+    if (outRacers != NULL) {
+        *outRacers = (int) count;
+    }
+    return (unsigned int) h;
+}

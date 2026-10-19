@@ -6,6 +6,7 @@
 #include "gdx_interp.h"
 
 #include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
+#include "gdx3ds_hotcold.h" // hotcold: GDX_COLD / GDX_UNLIKELY (per-function attributes only)
 
 #include <string.h>
 
@@ -14,14 +15,22 @@ extern "C" long long gdx_ninterp_now(void);
 
 namespace gdxn {
 
+/* hotcold: the census clock reads and accumulation, out of line and cold. */
+static GDX_COLD uint64_t DspPhNow() {
+    return (uint64_t)gdx_ninterp_now();
+}
+static GDX_COLD void DspPhEnd(Counters& s, int ph, uint64_t t0) {
+    s.phTicks[ph] += (uint64_t)gdx_ninterp_now() - t0;
+    s.phCalls[ph]++;
+}
+
 /* One-line phase timer for the dspcensus>=2 sub-buckets. `on` is mDspCensus >= 2, so the
  * whole thing folds to nothing with the lever off. */
-#define DSP_PH_BEGIN(on) const uint64_t dspT0_ = (on) ? (uint64_t)gdx_ninterp_now() : 0
+#define DSP_PH_BEGIN(on) const uint64_t dspT0_ = GDX_UNLIKELY(on) ? DspPhNow() : 0
 #define DSP_PH_END(on, ph)                                                                                   \
     do {                                                                                                     \
-        if (on) {                                                                                            \
-            mStats.phTicks[ph] += (uint64_t)gdx_ninterp_now() - dspT0_;                                       \
-            mStats.phCalls[ph]++;                                                                             \
+        if (GDX_UNLIKELY(on)) {                                                                              \
+            DspPhEnd(mStats, ph, dspT0_);                                                                     \
         }                                                                                                    \
     } while (0)
 
@@ -35,6 +44,7 @@ void Interp::ArmTexturesChanged() {
 void Interp::DpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_t tmem, uint8_t tile, uint32_t palette,
                        uint32_t cmt, uint32_t maskt, uint32_t shiftt, uint32_t cms, uint32_t masks,
                        uint32_t shifts) {
+    TexSkipNoteWriter(0xF5); /* [native] machines_texskip tripwire */
     if (cms == TX_WRAP && masks == TX_NOMASK) {
         cms = TX_CLAMP;
     }
@@ -64,6 +74,7 @@ void Interp::DpSetTile(uint8_t fmt, uint32_t siz, uint32_t line, uint32_t tmem, 
 }
 
 void Interp::DpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt) {
+    TexSkipNoteWriter(0xF2); /* [native] machines_texskip tripwire */
     Tile& t = mRdp.texture_tile[tile];
     if (t.uls == uls && t.ult == ult && t.lrs == lrs && t.lrt == lrt) {
         return;
@@ -75,9 +86,25 @@ void Interp::DpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lr
     ArmTexturesChanged();
 }
 
+/* [native] hud_batch: inside a replayed HUD run the resolution goes through the run's memo
+ * (gdx_hud_replay.cpp), which falls back to the stock body below. */
+bool Interp::ResolveTextureSource(size_t requiredBytes) {
+    if (GDX_UNLIKELY(mLoadSrcForce != nullptr)) {
+        auto& tl = mRdp.texture_to_load; /* [native] nrr_hud: a virtual load's recorded resolution */
+        tl.addr = mLoadSrcForce;
+        tl.immutable = mLoadSrcFlags & 1u;
+        tl.native_rgba16 = (mLoadSrcFlags >> 1) & 1u;
+        return true;
+    }
+    if (mHud != nullptr) {
+        return HudResolveTextureSource(requiredBytes);
+    }
+    return ResolveTextureSourceStock(requiredBytes);
+}
+
 /* SETTIMG resolution is lazy: the load extent is only known here. Mirrors the bridge's
  * TranslateTexturePointer(estimate) / wide-stub hop, minus the persistent copy. */
-bool Interp::ResolveTextureSource(size_t requiredBytes) {
+bool Interp::ResolveTextureSourceStock(size_t requiredBytes) {
     auto& tl = mRdp.texture_to_load;
     const bool ph = mDspCensus >= 2;
 
@@ -144,6 +171,7 @@ bool Interp::ResolveTextureSource(size_t requiredBytes) {
 }
 
 void Interp::DpLoadTlut(uint8_t tile, uint32_t highIndex) {
+    TexSkipNoteWriter(0xF0); /* [native] machines_texskip tripwire */
     const uint32_t entryCount = highIndex + 1;
     const uint32_t byteCount = entryCount * 2;
     if (!ResolveTextureSource(byteCount)) {
@@ -225,6 +253,42 @@ static bool ListRebuild(Rdp& rdp) {
     return true;
 }
 
+/* [native] o3dsfast: set tmem_span_base[from, to) to `value`, two halfwords per store where the
+ * index is even. Exactly the stores the per-word loop makes. */
+static void FillSpanBase(uint16_t* base, uint32_t from, uint32_t to, uint16_t value) {
+    uint32_t w = from;
+    if (w < to && (w & 1u) != 0) {
+        base[w++] = value;
+    }
+    const uint32_t pair = static_cast<uint32_t>(value) | (static_cast<uint32_t>(value) << 16);
+    for (; w + 2u <= to; w += 2u) {
+        memcpy(&base[w], &pair, sizeof(pair));
+    }
+    if (w < to) {
+        base[w] = value;
+    }
+}
+
+/* Retire a span's words OUTSIDE [start, newEnd): the historic loop tests every word of the old
+ * span; the two ranges it can hit are [base, min(spanEnd, start)) and [max(base, newEnd), spanEnd). */
+static void ZeroSpanOutside(uint16_t* spanBase, uint32_t base, uint32_t spanEnd, uint32_t start, uint32_t newEnd,
+                            bool fast) {
+    if (!fast) {
+        for (uint32_t w = base; w < spanEnd; ++w) {
+            if (w < start || w >= newEnd) spanBase[w] = 0;
+        }
+        return;
+    }
+    const uint32_t loEnd = spanEnd < start ? spanEnd : start;
+    if (base < loEnd) {
+        FillSpanBase(spanBase, base, loEnd, 0);
+    }
+    const uint32_t hiBegin = base > newEnd ? base : newEnd;
+    if (hiBegin < spanEnd) {
+        FillSpanBase(spanBase, hiBegin, spanEnd, 0);
+    }
+}
+
 /* == StoreLoadedTexture end state: every span overlapping [start, end) is removed (its words
  * outside the new range unmapped), then one span is recorded at `start`. */
 void Interp::StoreLoadedTexture(uint16_t start, const LoadedTexture& t) {
@@ -235,6 +299,9 @@ void Interp::StoreLoadedTexture(uint16_t start, const LoadedTexture& t) {
     if (requested < 1) requested = 1;
     const uint32_t wordCount = requested < (512u - start) ? requested : (512u - start);
     const uint32_t newEnd = start + wordCount;
+    const bool fast = mO3dsFast != 0;
+    mSpanEpoch++; /* [native] trimemo: LoadedTexAt reads this store */
+    mStats.spanWords += wordCount;
 
     if (rdp.tmem_span_list_n == kListInvalid) {
         ListRebuild(rdp);
@@ -255,13 +322,12 @@ void Interp::StoreLoadedTexture(uint16_t start, const LoadedTexture& t) {
             memset(&rdp.loaded_texture[base], 0, sizeof(LoadedTexture));
             rdp.tmem_span_words[base] = 0;
             rdp.tmem_span_load_kind[base] = 0;
-            for (uint32_t w = base; w < spanEnd; ++w) {
-                if (w < start || w >= newEnd) rdp.tmem_span_base[w] = 0;
-            }
+            ZeroSpanOutside(rdp.tmem_span_base, base, spanEnd, start, newEnd, fast);
             rdp.tmem_span_list[i] = rdp.tmem_span_list[--rdp.tmem_span_list_n];
         }
     } else {
-        /* Overflowed list: per-word walk (rare). */
+        /* Overflowed list: per-word walk (rare). hotcold: out of line and cold. */
+        [&rdp, start, newEnd]() GDX_COLD {
         for (uint32_t w = start; w < newEnd;) {
             const uint16_t bp1 = rdp.tmem_span_base[w];
             if (bp1 == 0) {
@@ -278,9 +344,14 @@ void Interp::StoreLoadedTexture(uint16_t start, const LoadedTexture& t) {
             }
             w = spanEnd > w ? spanEnd : w + 1;
         }
+        }();
     }
-    for (uint32_t w = start; w < newEnd; ++w) {
-        rdp.tmem_span_base[w] = static_cast<uint16_t>(start + 1u);
+    if (fast) {
+        FillSpanBase(rdp.tmem_span_base, start, newEnd, static_cast<uint16_t>(start + 1u));
+    } else {
+        for (uint32_t w = start; w < newEnd; ++w) {
+            rdp.tmem_span_base[w] = static_cast<uint16_t>(start + 1u);
+        }
     }
     ListInsert(rdp, start);
     rdp.tmem_span_words[start] = static_cast<uint16_t>(wordCount);
@@ -293,6 +364,14 @@ void Interp::StoreLoadedTexture(uint16_t start, const LoadedTexture& t) {
 
 /* == RDP::MaterializeTmemSlot, computed on read. */
 LoadedTexture Interp::LoadedTexAt(uint16_t word) const {
+    if (mTexOv != nullptr) {
+        /* [native] machines_texskip window: the skipped list's view of its own tiles. */
+        for (int t = 0; t < 8; t++) {
+            if (((mTexOvMask >> t) & 1u) != 0 && mTexOv->tile[t].tmem_index == word) {
+                return mTexOv->lt[t];
+            }
+        }
+    }
     LoadedTexture empty;
     memset(&empty, 0, sizeof(empty));
     if (word >= 512) return empty;
@@ -304,9 +383,15 @@ LoadedTexture Interp::LoadedTexAt(uint16_t word) const {
     if (w == 0) return t;
     const uint32_t logicalSize = t.orig_size_bytes != 0 ? t.orig_size_bytes : t.size_bytes;
     const uint32_t logicalByteOffset = w * 8u;
+    /* [native] o3dsfast: when the host and logical sizes agree (every LOADBLOCK / LOADTILE
+       record: size_bytes = orig_size_bytes) the scale is (x * s) / s, which is exactly x in
+       64-bit arithmetic -- and on ARMv6 the division is a libgcc __aeabi_uldivmod call per
+       interior view, i.e. per textured triangle whose tile starts inside a span. */
+    const bool sameScale = mO3dsFast != 0 && t.size_bytes == logicalSize;
     const uint32_t hostByteOffset =
-        logicalSize != 0 ? static_cast<uint32_t>((static_cast<uint64_t>(logicalByteOffset) * t.size_bytes) / logicalSize)
-                         : logicalByteOffset;
+        (logicalSize != 0 && !sameScale)
+            ? static_cast<uint32_t>((static_cast<uint64_t>(logicalByteOffset) * t.size_bytes) / logicalSize)
+            : logicalByteOffset;
     LoadedTexture e = t;
     if (e.addr != nullptr) e.addr += hostByteOffset;
     e.size_bytes = t.size_bytes > hostByteOffset ? t.size_bytes - hostByteOffset : 0;
@@ -374,7 +459,7 @@ void Interp::RecordTmemSrcStamp(uint16_t base, const uint64_t stamp[2], unsigned
 }
 
 /* Census only: which test of SameContentDescriptor failed first. See Counters::tmemMissSpan. */
-void Interp::NoteDescriptorMiss(uint16_t base, uint8_t kind, const LoadedTexture& fresh) {
+GDX_COLD void Interp::NoteDescriptorMiss(uint16_t base, uint8_t kind, const LoadedTexture& fresh) {
     if (base >= 512u) {
         mStats.tmemMissSpan++;
         return;
@@ -417,6 +502,11 @@ void Interp::NoteDescriptorMiss(uint16_t base, uint8_t kind, const LoadedTexture
  * class regardless, so a level change does not need a warm-up frame. */
 bool Interp::TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTexture& fresh, uint32_t readBytes,
                                  uint64_t outStamp[2], unsigned* outCls) {
+    if (GDX_UNLIKELY(mNrrTmemLive)) {
+        /* [native] nrr_hud: every interpreter TMEM load passes here BEFORE its same-content
+         * decision -- the NRR's pending loads over these words are settled or dropped first. */
+        NrrTmemWrite(static_cast<uint32_t>(base) * 8u, readBytes != 0 ? readBytes : 8u);
+    }
     outStamp[0] = 0;
     outStamp[1] = 0;
     *outCls = GDX_TMEMSRC_UNKNOWN;
@@ -425,7 +515,7 @@ bool Interp::TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTextur
        and not one extra comparison. The classification below is a range scan and the descriptor
        test is ten compares that `!fresh.immutable` used to short-circuit; paying either on the
        default path would be a regression dressed up as a diagnostic. */
-    if (mTmemSkip == 0 && mTmemCls == 0) {
+    if (GDX_LIKELY(mTmemSkip == 0 && mTmemCls == 0)) {
         return SameContentLoad(base, kind, fresh);
     }
 
@@ -474,7 +564,7 @@ bool Interp::TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTextur
     /* [memotear] B54: this load is admitted and is about to skip. If fault injection is armed
        it is forced stale HERE -- after admission, before either test -- so the two arms below
        are the code that has to catch it. See TmemInjectStaleness. */
-    const bool injected = (mTmemFault != 0) && TmemInjectStaleness(base, cls, src, readBytes);
+    const bool injected = GDX_UNLIKELY(mTmemFault != 0) && TmemInjectStaleness(base, cls, src, readBytes);
     /* The class the STAMP was taken under has to be the class being tested now; the seam
        re-derives the live class and refuses a mismatch, and this is the stored half of it. */
     if (mRdp.tmem_span_src_cls[base] != static_cast<uint8_t>(cls)) {
@@ -523,7 +613,7 @@ bool Interp::TmemLoadIsRedundant(uint16_t base, uint8_t kind, const LoadedTextur
  * load, so an injected run must draw the same pixels as the tmemskip=0 run. That is the second
  * half of the gate and the reason the injector never touches the SOURCE BYTES: mutating those
  * would change the picture, and then "the frame still draws correctly" could not be asserted. */
-bool Interp::TmemInjectStaleness(uint16_t base, unsigned cls, uintptr_t src, uint32_t readBytes) {
+GDX_COLD bool Interp::TmemInjectStaleness(uint16_t base, unsigned cls, uintptr_t src, uint32_t readBytes) {
     mTmemFaultTick++;
     if (mTmemFault <= 0 || (mTmemFaultTick % static_cast<uint32_t>(mTmemFault)) != 0) {
         return false;
@@ -547,11 +637,30 @@ bool Interp::TmemInjectStaleness(uint16_t base, unsigned cls, uintptr_t src, uin
 /* The TMEM mirror sees what LUS saw: CopyRawTextureBytes byte-swapped host-order RGBA16
  * sources before the interpreter read them. */
 void Interp::MirrorToTmem(uint8_t* dst, const uint8_t* src, uint32_t n, bool nativeRgba16) {
+    /* [native] hud_direct: a direct HUD load leaves its bytes as debt; any other copy
+       supersedes the debt it overwrites (gdx_hud_direct.cpp). */
+    if ((mHudDebtN != 0 || mHudVirtualLoad) && HudDebtMirror(dst, src, n, nativeRgba16)) {
+        return;
+    }
+    mStats.tmemCopyBytes += n;
     if (!nativeRgba16) {
         memcpy(dst, src, n);
         return;
     }
+    mStats.tmemSwapBytes += n;
     uint32_t i = 0;
+    if (mO3dsFast != 0) {
+        /* [native] o3dsfast: swap the two bytes of every halfword a WORD at a time (ARMv6 REV16
+           shape) -- byte i+1 -> i and i -> i+1 for each even i, exactly the loop below, which
+           finishes whatever tail the word loop leaves. `dst` is TMEM (8-aligned base + an 8-byte
+           multiple); `src` may be unaligned, hence memcpy for the loads. */
+        for (; i + 4u <= n; i += 4u) {
+            uint32_t w;
+            memcpy(&w, src + i, sizeof(w));
+            w = ((w & 0xFF00FF00u) >> 8) | ((w & 0x00FF00FFu) << 8);
+            memcpy(dst + i, &w, sizeof(w));
+        }
+    }
     for (; i + 1 < n; i += 2) {
         dst[i] = src[i + 1];
         dst[i + 1] = src[i];
@@ -559,7 +668,12 @@ void Interp::MirrorToTmem(uint8_t* dst, const uint8_t* src, uint32_t n, bool nat
     if (i < n) dst[i] = src[i];
 }
 
-static uint32_t BytesForTexels(uint64_t texels, uint8_t siz) {
+/* nrrdiet: plain `noinline` (NOT GDX_COLD -- this runs on every LOADBLOCK, not rarely), so its
+ * 4-way size switch compiles once instead of being duplicated at each of its 4 call sites (2 in
+ * DpLoadBlock, 2 more inside LoadBlockLineBytes's cross-tile search). Registered `race
+ * BytesForTexels` in nrr_hot.list: it is reached from DpLoadBlock on the steady race path, so
+ * outlining it must not make it invisible to the receipt. */
+static __attribute__((noinline)) uint32_t BytesForTexels(uint64_t texels, uint8_t siz) {
     uint64_t bytes = 0;
     switch (siz) {
         case IM_SIZ_4b: bytes = (texels + 1u) / 2u; break;
@@ -571,17 +685,23 @@ static uint32_t BytesForTexels(uint64_t texels, uint8_t siz) {
     return bytes > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes);
 }
 
-void Interp::DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
-    mStats.tmemLoads++;
-    auto& tl = mRdp.texture_to_load;
-    const uint32_t orig_size_bytes = BytesForTexels(static_cast<uint64_t>(lrs) + 1u, tl.siz);
-    const uint32_t size_bytes = orig_size_bytes;
-    const uint16_t tmemIndex = mRdp.texture_tile[tile].tmem_index;
-    LoadedTexture loaded;
-    memset(&loaded, 0, sizeof(loaded));
-    loaded.orig_size_bytes = orig_size_bytes;
-    loaded.size_bytes = size_bytes;
-
+/* G_LOADBLOCK's source line pitch: a SETTIMG width of 1 (the G_LOADBLOCK form) reads the block
+ * as one line; a wider transfer takes the line of another tile at the same TMEM address whose
+ * pitch fits (its DXT line, or the SETTIMG width in that tile's texel size), else the SETTIMG
+ * width's own line when it divides the block, else the block. [native] nrr_hud keeps such a load
+ * virtual and replays it later under other tiles: it records this decision (NrrLoadRecord) and
+ * hands it back through mLoadLineForce (NrrMaterializeAt). */
+uint32_t Interp::LoadBlockLineBytes(uint8_t tile, uint16_t tmemIndex, uint32_t size_bytes, uint32_t dxt) const {
+    const auto& tl = mRdp.texture_to_load;
+    /* nrrdiet: every iteration below `continue`s on `tl.width <= 1` (the plain G_LOADBLOCK form:
+     * the standard sky/race load), so for that case the loop and the tl.width>1 tail are dead by
+     * construction -- make the fast return explicit instead of walking 8 dead iterations. Proven
+     * from DpLoadBlock's callers below: a cross-tile shared-pitch search is only meaningful when
+     * SETTIMG declared a real multi-texel width (a rare wide transfer), never for a 1-texel-wide
+     * block load. Behaviour-identical: logical_line_bytes would stay 0 and return size_bytes. */
+    if (GDX_LIKELY(tl.width <= 1)) {
+        return size_bytes;
+    }
     uint32_t logical_line_bytes = 0;
     for (uint32_t renderTile = 0; renderTile < 8; ++renderTile) {
         const Tile& ct = mRdp.texture_tile[renderTile];
@@ -589,7 +709,9 @@ void Interp::DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs,
             continue;
         }
         uint32_t candidateTmemLineBytes = ct.line_size_bytes;
-        if (ct.siz == IM_SIZ_32b) candidateTmemLineBytes *= 2u;
+        if (ct.siz == IM_SIZ_32b) {
+            candidateTmemLineBytes *= 2u;
+        }
         if (dxt != 0 && tl.siz != ct.siz) {
             constexpr uint32_t kDxtOne = 1u << 11;
             const uint32_t dxtWordsPerLine = (kDxtOne + dxt - 1u) / dxt;
@@ -615,6 +737,27 @@ void Interp::DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs,
             source_line_bytes = transferLineBytes;
         }
     }
+    return source_line_bytes;
+}
+
+void Interp::DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
+    TexSkipNoteWriter(0xF3); /* [native] machines_texskip tripwire */
+    mStats.tmemLoads++;
+    auto& tl = mRdp.texture_to_load;
+    const uint32_t orig_size_bytes = BytesForTexels(static_cast<uint64_t>(lrs) + 1u, tl.siz);
+    const uint32_t size_bytes = orig_size_bytes;
+    const uint16_t tmemIndex = mRdp.texture_tile[tile].tmem_index;
+    LoadedTexture loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    loaded.orig_size_bytes = orig_size_bytes;
+    loaded.size_bytes = size_bytes;
+
+    /* nrrdiet: LoadBlockLineBytes itself fast-returns size_bytes for the common tl.width <= 1
+     * form (see its own top-of-function comment) -- measured smaller as a real call than
+     * duplicating the width<=1 test here too (the extra inline branch cost more than the call
+     * it would have skipped). */
+    const uint32_t source_line_bytes =
+        GDX_LIKELY(mLoadLineForce == 0) ? LoadBlockLineBytes(tile, tmemIndex, size_bytes, dxt) : mLoadLineForce;
     loaded.line_size_bytes = source_line_bytes;
     loaded.full_image_line_size_bytes = source_line_bytes;
     const size_t rowOffset = static_cast<size_t>(ult) * source_line_bytes;
@@ -681,6 +824,7 @@ void Interp::DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs,
 }
 
 void Interp::DpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
+    TexSkipNoteWriter(0xF4); /* [native] machines_texskip tripwire */
     mStats.tmemLoads++;
     auto& tl = mRdp.texture_to_load;
     uint32_t word_size_shift = 0;

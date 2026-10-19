@@ -27,6 +27,9 @@
 // a changed epoch, forces every pool matrix that tick to snap.
 extern "C" void gdx_interp_mark_cut(void);
 extern "C" void gdx_interp_mark_cut_src(const char* tag);
+// The epoch itself (monotonic). The 3DS pose-replay (C6, port/3ds/gfx/gdx3ds_replay.cpp) never
+// replays across a change of it, so these cut sites must survive M5's interpolation deletion.
+extern "C" std::uint32_t gdx_interp_cut_epoch(void);
 
 namespace gdx_interp {
 

@@ -93,6 +93,22 @@ lands on VS BATTLE and the replay walks a different menu.
 Parity state per replay is in `docs/research/native/replays-progress.md` — two of the four
 currently FAIL the `[native] all=1 interp=1` gate, with the lever bisected.
 
+## time-attack corpus (`n60ships`-track, 2026-10-01, build `native/n60ships`)
+
+| File | Ticks / SHOTs | Reaches | Needs |
+|---|---|---|---|
+| `race-timeattack-mc.gdxrec` | 6000 / **45** | TITLE → SELECT MODE (TIME ATTACK: START, RIGHT, A) → course / machine / settings screens → **GAMEMODE_TIME_ATTACK(14)** on JACK 1 MUTE CITY from tick ~3726: full throttle down the start straight, then coasting with the one machine on track and active to the end (`[ships] act=1.0 vis=1.00`, run `20261001-233741-n60ships-tt1`). Schedule derived from that run's `[debug] cov=1` census (247/247 features) | — |
+| `race-timeattack-mc-finish.gdxrec` | 14200 / **99** | ticks 0-5999 = `race-timeattack-mc`; then, with **`--ini debug.autodrive=1`** (the CPU driver steers player 1, `decomp-3ds-autodrive.patch`), the 3 laps finish (~10400: FINISH, lap times), A@11000 records / name entry, START@11300 + START@11500 (END, saved), records table, A@12200 Retry, the retry's intro / countdown / race with the new ghost. SHOT `e<tick>` every 280 ticks 6100..10300 (the autodriven laps), every 100 ticks 10300..14000 (hand-placed, n60tex) | `--ini debug.autodrive=1` |
+| `race-gp-finish.gdxrec` | 15000 / **106** | n60lap's GP finish scratch, committed by n60finish: explosion-pileup's menu walk and start to tick 3300 (GP, JACK cup, MUTE CITY, 30 machines), then **`--ini debug.autodrive=1`** finishes the 3 laps: the 3D FINISH banner (~9900-10450), the GP lap-times screen, results, standings (A every 400 ticks from 10600). SHOTs: pileup's derived schedule to 3300, then `g<tick>` every 280 ticks to 9800 and every 100 ticks 9800..14900 (hand-placed; not a coverage census) | `--ini debug.autodrive=1` |
+
+What it is for: the one-machine race scene of the time trial (n60ships: the GP-vs-TT receipts, the
+NRR categories' one-machine path). **No ghost**: a ghost needs a FINISHED 3-lap time attack in the
+same session (racer.c: a finished run writes `gGhosts`, the retry's `Race_Init` loads
+`gGhostRacers` from them), and an open-loop script leaves the course within ~15 s (the first cut
+of this replay retired at ~4800). A ghost replay needs closed-loop driving: e.g. a debug lever
+that lets `Cpu_GenerateInputs` drive racer 0 while `[debug] input_record=1` records the pad, then
+a replay of the recorded pad without the lever (n60ships-progress.md, the TT replay section).
+
 ## residuals-track probes
 
 Tick-exact truncations of `race-mutecity-start.gdxrec` (same header, same pins) with their own
@@ -107,3 +123,13 @@ between shots.
 | `probe3.gdxrec` | 1811 | 43 | parity gate — every 100 frames, **every frame 1690..1712**, 1750/1800/1810 |
 | `probeboot.gdxrec` | 420 | 7 | fast boot/title check (~1 min/run) |
 | `probetitle.gdxrec` | 1300 | 9 | 1300 ticks of ZERO input: stays on the title long enough for the audio-driven attract-demo trigger to be reached. Reproduces the boot residual pre-pin. |
+
+## attract demos (`niview`-track, 2026-10-08, build `native/niview`)
+
+| File | Ticks / SHOTs | Reaches | Needs |
+|---|---|---|---|
+| `attract-demos.gdxrec` | 6300 / **33** | zero input on the title; with the tick-driven arm the three attract demos run back to back: GP 1P (Devil's Forest, 30 racers) ticks ~600-2130, VS 2P (Silence) ~2580-4110, VS 4P (Sand Ocean) ~4590-6120, then the title again. SHOTs every 100-300 ticks, hand-placed (title, each demo, the transitions) | **`--ini debug.det_title_demo=400`** (`det=1`: the audio pin otherwise never arms the demo; `decomp-port-title-demo-tick.patch`) |
+
+Under `det=1` the attract demo never fires from the title BGM's synthesis position (the audio pin), so
+no other corpus replay reaches it; `probetitle` stays on the title for 39k+ ticks. The demo course and
+player-count rotation is the game's own (`sTitleDemoGameModes` / `sTitleDemoCourses`, game.c).

@@ -1,0 +1,76 @@
+diff --git a/src/game/game.c b/src/game/game.c
+--- a/src/game/game.c
++++ b/src/game/game.c
+@@ -3,8 +3,62 @@
+ #include "fzx_game.h"
+ #include "fzx_camera.h"
+ #include "fzx_course.h"
++#include "fzx_racer.h"
+ #include "src/overlays/ovl_i3/hud.h"
+ 
++#ifdef PORT
++/* nimach [debug] force_mode / GAMEMODE_GP_END_CS: a cold boot leaves every racer-standings
++ * global at its BSS-zero default, which `Racer_Init`'s GAMEMODE_GP_END_CS branch (racer.c)
++ * does not expect -- it walks `gRacerPositionsById[]` looking for the racers placed 1st/2nd/
++ * 3rd and reads `gRacers[j]` at whatever index it stops on; an all-zero array never matches,
++ * so the loop runs off the end and reads `gRacers[TOTAL_RACER_COUNT]` (one past the valid
++ * 0..29 range). This gives that branch a minimal, safe placement (3 racers, 1st/2nd/3rd) and
++ * picks a mid-field difficulty/cup so the podium and congratulations text paths both run,
++ * rather than leaving the OOB read for `force_mode` to trip over. Called once, only when
++ * `force_mode` is steering the very first mode change straight into the ending -- see
++ * gdx3ds_force_mode.c and the `gdxForcedMode == GAMEMODE_GP_END_CS` call site below. */
++static void gdx_force_mode_setup_gp_end_cs(void) {
++    extern s16 gRacerPositionsById[];
++    extern s16 gPlayer1OverallPosition;
++    extern s8 gUnlockableLevel;
++    extern s16 gForceCredits;
++    extern s32 gCupType;
++    extern s32 gDifficulty;
++    extern void Math_Rand1Init(s32 seed, s32 mask);
++    extern void Math_Rand2Init(s32 seed, s32 mask);
++
++    /* nimach (native-review-2026-10-15.md follow-up): a bare cold boot's frame count before this
++     * hook fires (RetroArch/core init, audio thread start, how many blank ticks precede the
++     * first GAMEMODE_CHANGE_INIT) is host-timing-dependent, not game-deterministic -- confirmed
++     * by two separate process launches with identical ini diverging from the ending's first
++     * frame (tick=419), always in the same few RNG-driven places (ending_effects.c's firework
++     * launches, background.c's star field), never in positions/camera/text. Math_Rand1/2's seed
++     * and mask default to fixed compile-time constants (sys/math.c: 12345/6789, 9876/54321) --
++     * restoring those defaults here, at the one point this whole cold-boot path is reproducible
++     * from (force_mode's single redirect), makes the GP ending's own frames deterministic across
++     * runs again, independent of whatever ran before it. */
++    Math_Rand1Init(12345, 6789);
++    Math_Rand2Init(9876, 54321);
++
++    gRacerPositionsById[0] = 1;
++    gRacerPositionsById[1] = 2;
++    gRacerPositionsById[2] = 3;
++
++    gRacers[0].character = CAPTAIN_FALCON;
++    gRacers[0].machineSkinIndex = 0;
++    gRacers[1].character = DR_STEWART;
++    gRacers[1].machineSkinIndex = 0;
++    gRacers[2].character = PICO;
++    gRacers[2].machineSkinIndex = 0;
++
++    gPlayer1OverallPosition = 1;
++    gDifficulty = STANDARD;
++    gCupType = JACK_CUP;
++    gUnlockableLevel = 0;
++    gForceCredits = 0;
++}
++#endif
++
+ UNUSED s32 D_800DCE40;
+ s32 gGameMode;
+ s32 gQueuedGameMode;
+@@ -624,6 +678,9 @@
+               int gdxForcedMode = gdx_debug_force_boot_mode();
+               if (gdxForcedMode >= 0) {
+                   gQueuedGameMode = gdxForcedMode;
++                  if (gdxForcedMode == GAMEMODE_GP_END_CS) {
++                      gdx_force_mode_setup_gp_end_cs();
++                  }
+               }
+             }
+ #endif

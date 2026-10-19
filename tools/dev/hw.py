@@ -10,12 +10,24 @@ Stdlib only, no third-party imports: this has to run on a bare macOS python3.
     hw.py capture <tag> [--ip ...]
     hw.py replay  <file.gdxrec> [--ip ...] [--dest /3ds/gdiffuser/rec/<name>]
     hw.py ini     <section> <key> <value> [--save] [--ip ...]
+    hw.py put     <local-file> <sdmc-path> [--ip ...]
+    hw.py get     <sdmc-path> [--out LOCAL] [--ip ...]
     hw.py quit    [--ip ...]
     hw.py input   [--demo | --script FILE] [--ip ...]
     hw.py gdb     [--ip ...] [--elf PATH]
 
-The console side is port/3ds/net/gdx3ds_net.c; it must be running with
-`[net] enabled = 1` in sdmc:/3ds/gdiffuser/gdiffuser.ini for anything but `push`.
+The console side is port/3ds/net/gdx3ds_net.c. [net] enabled DEFAULTS ON when 3dslink's
+netloader launched the console (which `push` always goes through) and OFF for a plain
+hbmenu/SD/CIA launch; either way an explicit `[net] enabled` key in gdiffuser.ini always
+wins. So after a `push`, every subcommand below just works with no ini edit; from a
+non-netloader launch (SD/CIA), set `[net] enabled = 1` in sdmc:/3ds/gdiffuser/gdiffuser.ini
+first (or push one with `hw.py put ... /3ds/gdiffuser/gdiffuser.ini`).
+
+Common one-liners:
+    hw.py log --out artifacts/session.log           # stream the live log to a local file
+    hw.py put new.ini /3ds/gdiffuser/gdiffuser.ini   # push a file to an sdmc path
+    hw.py get /3ds/gdiffuser/log.txt --out log.txt   # pull a file back
+    hw.py reload --build                             # relaunch with a fresh build
 
 --ip defaults to `[hw] ip` in tools/dev/hw.ini, which is GITIGNORED — the console's
 address is the user's LAN detail and never lands in a commit.
@@ -178,6 +190,51 @@ class Control(object):
             rate = (size / 1024.0 / dt) if dt > 0 else 0.0
             sys.stdout.write("\r  100.0%%  %d B in %.1fs (%.0f KiB/s)\n" % (size, dt, rate))
         return self.read_line()
+
+    def get_file(self, sdmc_path, out_path, progress=True):
+        """Console-side counterpart of put_file: GET <path> -> 'OK GET <size> <crc32hex>'
+        then exactly <size> raw bytes. GET is confined to sdmc:/3ds/gdiffuser/ on the
+        console (port/3ds/net/gdx3ds_net.c netPathUnderGdiffuser) and capped at NET_GET_CAP
+        (64 KiB) -- it is a dev-loop pull (e.g. log.txt), not a general file browser.
+
+        read_line() may already have pulled part of the raw payload into self.buf while
+        looking for the reply's trailing '\\n' (a single recv() can return both), so that
+        leftover has to seed `data` here rather than being dropped."""
+        reply = self.command("GET %s" % sdmc_path)
+        if not reply.startswith("OK GET"):
+            raise IOError("console refused the pull: %s" % reply)
+        parts = reply.split()
+        if len(parts) < 4:
+            raise IOError("malformed GET reply: %s" % reply)
+        size = int(parts[2])
+        want_crc = int(parts[3], 16)
+        data = self.buf
+        self.buf = b""
+        t0 = time.time()
+        while len(data) < size:
+            chunk = self.sock.recv(min(65536, size - len(data)))
+            if not chunk:
+                raise IOError("console closed mid-GET (%d/%d B)" % (len(data), size))
+            data += chunk
+            if progress:
+                pct = 100.0 * len(data) / size if size else 100.0
+                sys.stdout.write("\r  %6.1f%%  %d/%d B" % (pct, len(data), size))
+                sys.stdout.flush()
+        if len(data) > size:
+            # Nothing else is sent after a GET's payload, but trim defensively rather than
+            # ever hand the caller trailing bytes that belong to a later reply.
+            self.buf = data[size:] + self.buf
+            data = data[:size]
+        if progress:
+            dt = time.time() - t0
+            rate = (size / 1024.0 / dt) if dt > 0 else 0.0
+            sys.stdout.write("\r  100.0%%  %d B in %.1fs (%.0f KiB/s)\n" % (size, dt, rate))
+        got_crc = binascii.crc32(data) & 0xFFFFFFFF
+        if got_crc != want_crc:
+            raise IOError("GET crc mismatch want=%08X got=%08X" % (want_crc, got_crc))
+        with open(out_path, "wb") as f:
+            f.write(data)
+        return size
 
 
 # --------------------------------------------------------------------------------------
@@ -595,6 +652,41 @@ def cmd_ini(args):
     return 0
 
 
+def cmd_put(args):
+    """Push a local file to an arbitrary sdmc-relative path -- the generic console-side
+    PUT, same wire command `hw.py replay` already uses for .gdxrec files. The headline use:
+    replacing sdmc:/3ds/gdiffuser/gdiffuser.ini without a card swap --
+        hw.py put local.ini /3ds/gdiffuser/gdiffuser.ini
+    (PUT takes effect on disk immediately; the running process only re-reads the ini on its
+    own next boot, so follow with `hw.py reload` to pick it up without a power cycle.)"""
+    if not os.path.exists(args.file):
+        die("no such file: %s" % args.file)
+    if not args.dest.startswith("/"):
+        die("dest must be an sdmc-relative absolute path, e.g. /3ds/gdiffuser/gdiffuser.ini")
+    with Control(load_ip(args.ip), timeout=30.0) as c:
+        print("=> %s" % c.put_file("PUT %s" % args.dest, args.file))
+    return 0
+
+
+def cmd_get(args):
+    """Pull a file back from the console -- the counterpart of `put`. Confined to
+    sdmc:/3ds/gdiffuser/ and capped at 64 KiB on the console side (gdx3ds_net.c
+    NET_GET_PREFIX / NET_GET_CAP), so this is a dev-loop pull (log.txt, gdiffuser.ini), not
+    a general file browser. Headline use:
+        hw.py get /3ds/gdiffuser/log.txt --out artifacts/log.txt"""
+    if not args.path.startswith("/3ds/gdiffuser/"):
+        die("GET is confined to /3ds/gdiffuser/ on the console (gdx3ds_net.c "
+            "netPathUnderGdiffuser) -- got %r" % args.path)
+    out = args.out or os.path.join(REPO, "artifacts", os.path.basename(args.path))
+    d = os.path.dirname(out)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with Control(load_ip(args.ip), timeout=30.0) as c:
+        size = c.get_file(args.path, out)
+    print("pulled %s -> %s (%d B)" % (args.path, out, size))
+    return 0
+
+
 def cmd_quit(args):
     with Control(load_ip(args.ip)) as c:
         print(c.command("QUIT"))
@@ -864,6 +956,19 @@ def main(argv):
                         "(setting an empty value does NOT do this)")
     p.add_argument("--save", action="store_true", help="also write gdiffuser.ini back")
     p.set_defaults(fn=cmd_ini)
+
+    p = sub.add_parser("put", help="push a local file to an sdmc-relative path (e.g. a new "
+                                   "gdiffuser.ini)")
+    ip_arg(p)
+    p.add_argument("file", help="local file to push")
+    p.add_argument("dest", help="sdmc-relative destination, e.g. /3ds/gdiffuser/gdiffuser.ini")
+    p.set_defaults(fn=cmd_put)
+
+    p = sub.add_parser("get", help="pull a file back from sdmc:/3ds/gdiffuser/ (e.g. log.txt)")
+    ip_arg(p)
+    p.add_argument("path", help="sdmc-relative source, under /3ds/gdiffuser/")
+    p.add_argument("--out", help="local destination (default artifacts/<basename>)")
+    p.set_defaults(fn=cmd_get)
 
     p = sub.add_parser("quit", help="clean programmatic exit through the [exit] chain")
     ip_arg(p)

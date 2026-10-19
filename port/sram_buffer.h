@@ -24,9 +24,16 @@ void gdx_sram_init(void);
 // logged and ignored (read returns zeros) rather than touching memory outside it.
 void gdx_sram_read(unsigned int offset, void* dst, unsigned int size);
 
-// Write-through: persists the whole image to fzerox.sav immediately, no debounce
-// needed at this size and call frequency.
+// Updates the in-memory image (the game's source of truth) and persists it to fzerox.sav:
+// write-through on the caller by default; with [debug] sram_async=1 (3DS) the SD write is
+// queued to a low-priority writer thread that coalesces a burst into one file write.
 void gdx_sram_write(unsigned int offset, const void* src, unsigned int size);
+
+// [debug] sram_async: synchronously writes anything the writer has not written yet. Waits at
+// most timeoutMs for an in-flight async write first, then gives up (the previous save stays
+// intact on disk). WHY names the caller in the receipt. No-op when the writer is not running.
+// Called from the exit chain and the HOME/sleep suspend hook (port/3ds/main_3ds.cpp).
+void gdx_sram_flush_pending(unsigned int timeoutMs, const char* why);
 
 #ifdef __cplusplus
 }

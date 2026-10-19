@@ -22,6 +22,13 @@
 
 #if defined(GDX_PLATFORM_3DS)
 #include <3ds.h>
+/* QUICKFIX [debug] audio_io_unlock (port/gdx_audio_thread.cpp): a read that may touch the SD
+ * card drops the audio producer's sAudioCtxMutex for its duration, so the game thread's
+ * AudioThread_QueueCmd never waits behind card I/O. Both return 0 / do nothing when the lever
+ * is off or the caller is not a producer tick holding the mutex once. */
+extern "C" int gdx_audio_ctx_io_unlock_enabled(void) __attribute__((weak));
+extern "C" int gdx_audio_ctx_io_release(void) __attribute__((weak));
+extern "C" void gdx_audio_ctx_io_reacquire(void) __attribute__((weak));
 #elif defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -292,6 +299,45 @@ unsigned int gdx_o2r_stream_cache_bytes(void) {
     return gdx_block_cache_bytes(&s_cache);
 }
 
+void gdx_o2r_stream_set_readahead(unsigned int blocks) {
+    lockTake();
+    gdx_block_cache_set_readahead(&s_cache, blocks);
+    lockDrop();
+}
+
+unsigned int gdx_o2r_stream_readahead(void) {
+    lockTake();
+    const unsigned int ra = gdx_block_cache_readahead(&s_cache);
+    lockDrop();
+    return ra;
+}
+
+/* Caller holds s_lock. Returns 1 when sAudioCtxMutex was dropped for this read (the caller then
+ * re-acquires it). The bytes served do not depend on it: the same cache, the same reads in the
+ * same order, on the same thread; only who may take the mutex meanwhile changes. */
+static int releaseAudioCtxForIo(unsigned int absOffset, unsigned int length) {
+#if defined(GDX_PLATFORM_3DS)
+    if (&gdx_audio_ctx_io_unlock_enabled == nullptr || &gdx_audio_ctx_io_release == nullptr ||
+        &gdx_audio_ctx_io_reacquire == nullptr || !gdx_audio_ctx_io_unlock_enabled()) {
+        return 0; /* lever off: not even the lookup */
+    }
+    if (!gdx_block_cache_would_fill(&s_cache, absOffset, length)) {
+        return 0;
+    }
+    return gdx_audio_ctx_io_release();
+#else
+    (void) absOffset;
+    (void) length;
+    return 0;
+#endif
+}
+
+static void reacquireAudioCtx() {
+#if defined(GDX_PLATFORM_3DS)
+    gdx_audio_ctx_io_reacquire();
+#endif
+}
+
 int gdx_o2r_stream_read(unsigned int offset, unsigned int length, void* dst) {
     if (!gdx_block_cache_active(&s_cache)) {
         return 0;
@@ -303,8 +349,12 @@ int gdx_o2r_stream_read(unsigned int offset, unsigned int length, void* dst) {
         return 0;
     }
     lockTake();
+    const int released = releaseAudioCtxForIo(s_dataOffset + offset, length);
     const int ok = gdx_block_cache_read(&s_cache, s_dataOffset + offset, length, dst);
     lockDrop();
+    if (released) {
+        reacquireAudioCtx(); /* after lockDrop: the producer's order is ctx, then s_lock */
+    }
     return ok;
 }
 

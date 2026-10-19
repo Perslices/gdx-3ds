@@ -31,7 +31,8 @@ add_library(gdx3ds_lus_glue OBJECT
     gdx3ds_libultra.cpp
 )
 
-target_include_directories(gdx3ds_lus_glue PRIVATE ../include)
+target_include_directories(gdx3ds_lus_glue PRIVATE ../include
+    ../..)   # port/: gdx_ndsp_hash.h, for the [debug] ndsphash_pin arm in osAiGetLength
 target_link_libraries(gdx3ds_lus_glue PRIVATE gdx3ds_lus_carve gdx3ds_os gdx3ds_audio gdx3ds_gfx)
 
 target_compile_definitions(gdx3ds_lus_glue PRIVATE GDX_PLATFORM_3DS=1 F3DEX_GBI_2=1)

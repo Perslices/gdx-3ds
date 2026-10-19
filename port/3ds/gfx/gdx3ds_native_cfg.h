@@ -14,6 +14,13 @@
  *   ownfold    = 0   ; the SAME prim/env fold inside the OWNED interpreter's own batches
  *                    ; (fx_hud is inert under interp=1). Tier-2: `all` turns it on.
  *   ncensus    = 0   ; [ncensus] batch-split attribution on the owned path (raw, not Tier-2)
+ *   machines_retained      = 0 ; C5 Stage 1: gpuxf meshes drawn from GPU-resident per-(slot,LOD)
+ *                                ; buffers, FLX alpha in the shader (needs gpuxf=1; [rr] receipt)
+ *   machines_retained_clip = 0 ; 1 = performance mode: the PICA clips edge-straddling meshes and
+ *                                ; runs bind without the survivor screen (tolerance-gated)
+ *   machines_texskip       = 0 ; 1 = skip covered machine texture-set lists (interp=1; exact),
+ *                                ; 2 = verify (never skips) -- [texskip] receipt
+ *   (none of the three is Tier-2: `all` never turns them on)
  *
  * Levers are read at first use, after the ini is loaded; every consumer latches its own copy
  * (a boot-time decision, like trectbatch/renderthread). Everything external is weak so this

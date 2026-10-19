@@ -10,6 +10,28 @@
 
 #include "gdx_log.h"
 #include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
+#include "gdx3ds_hitch.h" // HITCH: per-frame event counters
+#include "gdx3ds_hwprof.h" // hwprof [hwsite]: GDX3DS_HWS_* site ids
+#include "gdx3ds_hotcold.h" // hotcold: GDX_COLD / GDX_UNLIKELY (per-function attributes only)
+
+/* hwprof [hwsite] (port/3ds/include/gdx3ds_hwprof.h): per-call timers behind [debug] hwsite. The
+ * seam returns 0 when the lever is off (one call per site); the host test stubs it. */
+extern "C" long long gdx_ninterp_hws_begin(void);
+extern "C" void gdx_ninterp_hws_end(int site, long long t0);
+namespace {
+struct InterpHwsScope {
+    int site;
+    long long t0;
+    explicit InterpHwsScope(int s) : site(s), t0(gdx_ninterp_hws_begin()) {}
+    ~InterpHwsScope() {
+        if (t0 != 0) {
+            gdx_ninterp_hws_end(site, t0);
+        }
+    }
+    InterpHwsScope(const InterpHwsScope&) = delete;
+    InterpHwsScope& operator=(const InterpHwsScope&) = delete;
+};
+} // namespace
 
 extern "C" int gdx_ninterp_palhash(void);
 
@@ -75,11 +97,22 @@ static void LruPushBack(TexEntry* tex, int16_t& head, int16_t& tail, int16_t i) 
     tail = i;
 }
 
+/* [native] hud_retain: a retained HUD run's cache hit, replayed -- the LRU refresh
+ * TexCacheLookup's hit makes (the binding and the mRs slot ride the recorded run). */
+void Interp::TexCacheTouch(int16_t slot) {
+    LruUnlink(mTex, mTexLruHead, mTexLruTail, slot);
+    LruPushBack(mTex, mTexLruHead, mTexLruTail, slot);
+}
+
 /* == TextureCacheLookup: true = hit (bound, LRU refreshed); false = decode into the bound id. */
 bool Interp::TexCacheLookup(int unit, const TexKey& key) {
     const uint32_t h = KeyHash(key);
     for (int16_t i = mTexHash[h]; i >= 0; i = mTex[i].hashNext) {
         if (KeyEq(mTex[i].key, key)) {
+            if (mTex[i].gen != mTexGen) {
+                mTex[i].gen = mTexGen; /* N60TEX tex_keep: a kept entry served this generation */
+                mTexKeep.keptHits++;
+            }
             mBackend->SelectTexture(unit, mTex[i].texture_id);
             mRs.textures[unit] = i;
             LruUnlink(mTex, mTexLruHead, mTexLruTail, i);
@@ -107,6 +140,7 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
         slot = mTexLruHead;
         TexCacheRetireSlot(slot);
         mStats.texEvicts++;
+        gdx3ds_hitch_add(GDX_HITCH_EV_TEX_EVICT, 1u); /* HITCH */
         gdx3ds_cov_mark(GDX3DS_COV_KEY(GDX3DS_COV_FAM_TC, GDX3DS_COV_TC_EVICT));
     } else {
         for (unsigned i = 0; i < kTexCacheSize; i++) {
@@ -117,6 +151,9 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
         }
     }
     uint32_t texture_id;
+    if (!mTexKeptNone && mTexFreeIdCount == 0 && mBackend->LinearFreeBytes() < mTexKeepFloorBytes) {
+        TexKeepRelieve(); /* N60TEX tex_keep: recycle a kept id before growing the backend */
+    }
     if (mTexFreeIdCount > 0) {
         texture_id = mTexFreeIds[--mTexFreeIdCount];
     } else {
@@ -124,6 +161,7 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
     }
     TexEntry& e = mTex[slot];
     e.key = key;
+    e.gen = mTexGen;
     e.texture_id = texture_id;
     e.uploaded = false;
     e.used = true;
@@ -145,6 +183,41 @@ bool Interp::TexCacheLookup(int unit, const TexKey& key) {
     return false;
 }
 
+/* ---- [native] machines_texskip taps (the rest lives in gdx_texskip.cpp) ------------------ */
+
+/* Inside a skip window: a tile the skipped list set must be an immutable (source-keyed,
+ * source-decoded) texture, or its import would read TMEM the list never wrote. */
+void Interp::TexSkipCheckImport(int tile) {
+    const int t = tile & 7;
+    if (((mTexOvMask >> t) & 1u) == 0) {
+        return; /* a tile the list never sets (the race setup's tile 0): live, stock state */
+    }
+    mTexSkipStats.ovImports++;
+    if (!mTexOv->lt[t].immutable || mTexOv->lt[t].addr == nullptr) {
+        TexSkipTrip(2, static_cast<uint32_t>(t));
+    }
+}
+
+/* The tripwire: something the skip's scan said could not happen inside a window did. kind 1 =
+ * a texture-state writer (detail = opcode), 2 = an import of a set tile whose source is not
+ * immutable (detail = tile), 3 = an unexpected G_DL, 4 = the task ended with the window open. The window closes on
+ * 3/4; the frame may differ from the stock stream from here on, which is what a nonzero trips=
+ * on the [texskip] receipt means. */
+GDX_COLD void Interp::TexSkipTrip(int kind, uint32_t detail) { /* hotcold: a tripwire, cold */
+    mTexSkipStats.trips++;
+    switch (kind) {
+        case 1: mTexSkipStats.tripWriter++; break;
+        case 2: mTexSkipStats.tripImport++; break;
+        case 3: mTexSkipStats.tripDl++; break;
+        default: mTexSkipStats.tripTaskEnd++; break;
+    }
+    if (mTexSkipTripLogs < 16) {
+        mTexSkipTripLogs++;
+        GDXN_LOG("[texskip] TRIP kind=%d detail=%08lx body=%p (1 writer, 2 non-immutable import, 3 dl, 4 task end)",
+                 kind, static_cast<unsigned long>(detail), mTexOvBody);
+    }
+}
+
 /* == TexCacheRetireSlot: unbind, unhash, unlink, hand the backend texture id back to the
  * free list. The one place an entry leaves the cache (LRU eviction, clear, address delete),
  * so every exit re-arms the import pipeline the same way. */
@@ -152,14 +225,9 @@ void Interp::TexCacheRetireSlot(int16_t slot) {
     if (slot < 0) return;
     TexEntry& v = mTex[slot];
     if (!v.used) return;
+    TexCacheSignalRetire(slot);
     if (mTexFreeIdCount < kTexCacheSize) {
         mTexFreeIds[mTexFreeIdCount++] = v.texture_id;
-    }
-    for (int j = 0; j < 2; j++) {
-        if (mRs.textures[j] == slot) {
-            mRs.textures[j] = -1;
-            ArmTexturesChanged();
-        }
     }
     const uint32_t vh = KeyHash(v.key);
     int16_t* pp = &mTexHash[vh];
@@ -176,10 +244,90 @@ void Interp::TexCacheRetireSlot(int16_t slot) {
  * gdx_rdram_mode_reset (decomp_port.c) at every mode transition, because the bump arena
  * rewinds and re-hands the same host addresses to the next mode's content. */
 void Interp::TexCacheClear() {
+    if (mTexKeepBytes != 0) {
+        TexCacheClearKeeping();
+        return;
+    }
     mStats.texClears++;
     for (unsigned i = 0; i < kTexCacheSize; i++) {
         TexCacheRetireSlot(static_cast<int16_t>(i));
     }
+}
+
+/* What a retire tells the rest of the interpreter: the nrr state blocks naming the slot are
+ * stale, and a live binding of it is dropped (re-arming the import pipeline). */
+void Interp::TexCacheSignalRetire(int16_t slot) {
+    mNrrTexEpoch++; /* [native] nrr_hud: a state block naming this slot is stale */
+    mNrrSlotGen[slot]++;
+    for (int j = 0; j < 2; j++) {
+        if (mRs.textures[j] == slot) {
+            mRs.textures[j] = -1;
+            ArmTexturesChanged();
+        }
+    }
+}
+
+/* ---- N60TEX [debug] tex_keep ------------------------------------------------------------------ */
+
+/* An entry whose key names its content: a hit on it after the clear is the decode the clear
+ * would have redone (the same bytes under the same tile/format/palette key). */
+bool Interp::TexKeepEligible(const TexEntry& e) const {
+    return e.used && e.uploaded && e.key.content_hash != 0;
+}
+
+/* The clear, keeping the most recently used content-keyed entries within the byte budget. Each
+ * kept slot still signals a retire (dependents re-resolve exactly as after a stock clear); it
+ * keeps its key, hash chain, LRU place and backend id. */
+GDX_COLD void Interp::TexCacheClearKeeping() {
+    mStats.texClears++;
+    mTexGen++;
+    const size_t linFree = mBackend->LinearFreeBytes();
+    const uint32_t budget = linFree < mTexKeepFloorBytes ? 0u : mTexKeepBytes;
+    uint32_t keptBytes = 0;
+    uint32_t kept = 0;
+    uint32_t retired = 0;
+    for (int16_t i = mTexLruTail; i >= 0;) {
+        const int16_t older = mTex[i].lruPrev;
+        const uint32_t bytes = TexKeepEligible(mTex[i]) ? mBackend->TexBytes(mTex[i].texture_id) : 0u;
+        if (bytes != 0 && keptBytes + bytes <= budget) {
+            TexCacheSignalRetire(i);
+            keptBytes += bytes;
+            kept++;
+        } else {
+            TexCacheRetireSlot(i);
+            retired++;
+        }
+        i = older;
+    }
+    mTexKeptNone = kept == 0;
+    mTexKeep.clears++;
+    mTexKeep.kept = kept;
+    mTexKeep.keptKiB = keptBytes / 1024u;
+    mTexKeep.retired = retired;
+    mTexKeep.linFreeKiB = linFree > 0xFFFFFFFFu ? 0xFFFFFFFFu / 1024u : static_cast<uint32_t>(linFree / 1024u);
+    TexKeepLog();
+}
+
+GDX_COLD void Interp::TexKeepLog() const {
+    GDXN_LOG("[tex-keep] clear#%u kept=%u (%u KiB, budget %u KiB) retired=%u linfree=%u KiB | since last: "
+             "kept hits=%u pressure retires=%u",
+             static_cast<unsigned>(mTexKeep.clears), static_cast<unsigned>(mTexKeep.kept),
+             static_cast<unsigned>(mTexKeep.keptKiB), static_cast<unsigned>(mTexKeepBytes / 1024u),
+             static_cast<unsigned>(mTexKeep.retired), static_cast<unsigned>(mTexKeep.linFreeKiB),
+             static_cast<unsigned>(mTexKeep.keptHits), static_cast<unsigned>(mTexKeep.pressureRetires));
+}
+
+/* A miss with no free id while the linear heap is under the floor: hand back the oldest entry a
+ * previous generation left, so this upload recycles its id the way it would after a stock clear. */
+GDX_COLD void Interp::TexKeepRelieve() {
+    for (int16_t i = mTexLruHead; i >= 0; i = mTex[i].lruNext) {
+        if (mTex[i].gen != mTexGen) {
+            TexCacheRetireSlot(i);
+            mTexKeep.pressureRetires++;
+            return;
+        }
+    }
+    mTexKeptNone = true;
 }
 
 /* == TexCacheDeleteAddress: LUS Interpreter::TextureCacheDelete's counterpart. Exact-address
@@ -301,6 +449,172 @@ static inline uint16_t Texel16(const uint8_t* p, bool native) {
     return native ? static_cast<uint16_t>((p[1] << 8) | p[0]) : static_cast<uint16_t>((p[0] << 8) | p[1]);
 }
 
+
+
+/* ---- N60TEX [debug] tex_fast: the decoders' table forms ----------------------------------------
+ * Each writes, for every texel, the SAME four bytes (R, G, B, A in memory order) the reference
+ * loop below it stores one at a time -- as one little-endian word, from a table instead of a
+ * multiply/divide per channel. Byte-for-byte identical output; port/tests/gdx_interp_host_tests
+ * and the parity gates compare. */
+extern "C" int gdx3ds_tex_fast_enabled(void);
+
+static const uint8_t kScale5To8[32] = { 0,   8,   16,  24,  32,  41,  49,  57,  65,  74,  82,
+                                        90,  98,  106, 115, 123, 131, 139, 148, 156, 164, 172,
+                                        180, 189, 197, 205, 213, 222, 230, 238, 246, 255 };
+
+static inline uint32_t PackRgbaWord(uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+    return r | (g << 8) | (b << 16) | (a << 24);
+}
+
+static inline void PutTexelWord(uint8_t* dst, uint32_t i, uint32_t word) {
+    memcpy(dst + 4u * i, &word, 4);
+}
+
+/* == the reference's SCALE_5_8 channels and `a ? 255 : 0` of one RGBA5551 texel */
+static inline uint32_t Rgba5551Word(uint32_t col16) {
+    return PackRgbaWord(kScale5To8[col16 >> 11], kScale5To8[(col16 >> 6) & 0x1f], kScale5To8[(col16 >> 1) & 0x1f],
+                        (col16 & 1u) ? 255u : 0u);
+}
+
+/* == SCALE_4_8 intensity in R, G, B and SCALE_4_8 alpha (IA8: high nibble I, low nibble A) */
+static inline uint32_t Ia8Word(uint32_t byte) {
+    const uint32_t i = SCALE_4_8(byte >> 4);
+    return PackRgbaWord(i, i, i, SCALE_4_8(byte & 0xfu));
+}
+
+static void FastRgba16Tmem(uint8_t* dst, const uint8_t* tmemSrc, uint32_t lineBytes, uint32_t width,
+                           uint32_t height) {
+    uint32_t px = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = tmemSrc + static_cast<size_t>(y) * lineBytes;
+        for (uint32_t x = 0; x < width; x++) {
+            PutTexelWord(dst, px++, Rgba5551Word((static_cast<uint32_t>(row[2 * x]) << 8) | row[2 * x + 1]));
+        }
+    }
+}
+
+static void FastRgba32(uint8_t* dst, const uint8_t* addr, uint32_t stridePx, uint32_t width, uint32_t height) {
+    for (uint32_t y = 0; y < height; y++) {
+        memcpy(dst + static_cast<size_t>(y) * width * 4u, addr + static_cast<size_t>(y) * stridePx * 4u,
+               static_cast<size_t>(width) * 4u);
+    }
+}
+
+static void FastIA8(uint8_t* dst, const uint8_t* addr, uint32_t full, uint32_t width, uint32_t height) {
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = addr + static_cast<size_t>(y) * full;
+        for (uint32_t x = 0; x < width; x++) {
+            PutTexelWord(dst, i++, Ia8Word(row[x]));
+        }
+    }
+}
+
+static void FastIA16(uint8_t* dst, const uint8_t* addr, uint32_t full, uint32_t width, uint32_t height) {
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = addr + static_cast<size_t>(y) * (full / 2) * 2;
+        for (uint32_t x = 0; x < width; x++) {
+            const uint32_t intensity = row[2 * x];
+            PutTexelWord(dst, i++, PackRgbaWord(intensity, intensity, intensity, row[2 * x + 1]));
+        }
+    }
+}
+
+static void FastI8(uint8_t* dst, const uint8_t* addr, uint32_t full, uint32_t width, uint32_t height) {
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = addr + static_cast<size_t>(y) * full;
+        for (uint32_t x = 0; x < width; x++) {
+            PutTexelWord(dst, i++, static_cast<uint32_t>(row[x]) * 0x01010101u);
+        }
+    }
+}
+
+/* The 4-bit formats: texel `idx` of the row-major nibble stream, high nibble first. */
+static inline uint32_t NibbleAt(const uint8_t* addr, uint32_t idx) {
+    return (addr[idx / 2] >> (4 - (idx % 2) * 4)) & 0xfu;
+}
+
+static void FastI4(uint8_t* dst, const uint8_t* addr, uint32_t full, uint32_t width, uint32_t height) {
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint32_t rowIdx = y * (full * 2);
+        for (uint32_t x = 0; x < width; x++) {
+            PutTexelWord(dst, i++, SCALE_4_8(NibbleAt(addr, rowIdx + x)) * 0x01010101u);
+        }
+    }
+}
+
+static void FastIA4(uint8_t* dst, const uint8_t* addr, uint32_t full, uint32_t width, uint32_t height) {
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint32_t rowIdx = y * (full * 2);
+        for (uint32_t x = 0; x < width; x++) {
+            const uint32_t part = NibbleAt(addr, rowIdx + x);
+            const uint32_t intensity = SCALE_3_8(part >> 1);
+            PutTexelWord(dst, i++, PackRgbaWord(intensity, intensity, intensity, (part & 1u) ? 255u : 0u));
+        }
+    }
+}
+
+/* A palette's decoded words, filled on first use of each index (the reference reads only the
+ * entries the texels use; so does this). */
+struct PaletteWords {
+    uint32_t word[256];
+    uint32_t valid[8];
+};
+
+static inline uint32_t PaletteWordAt(PaletteWords& pw, uint32_t idx, const uint8_t* entry) {
+    const uint32_t bit = 1u << (idx & 31u);
+    if ((pw.valid[idx >> 5] & bit) == 0) {
+        pw.word[idx] = Rgba5551Word((static_cast<uint32_t>(entry[0]) << 8) | entry[1]);
+        pw.valid[idx >> 5] |= bit;
+    }
+    return pw.word[idx];
+}
+
+static void FastCi4(uint8_t* dst, const uint8_t* addr, const uint8_t* palette, uint32_t full, uint32_t width,
+                    uint32_t height) {
+    PaletteWords pw;
+    memset(pw.valid, 0, sizeof(pw.valid));
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint32_t rowIdx = y * (full * 2);
+        for (uint32_t x = 0; x < width; x++) {
+            const uint32_t idx = NibbleAt(addr, rowIdx + x);
+            PutTexelWord(dst, i++, PaletteWordAt(pw, idx, palette + idx * 2));
+        }
+    }
+}
+
+static void FastCi8(uint8_t* dst, const uint8_t* addr, const uint8_t* const palettes[2], uint32_t full,
+                    uint32_t width, uint32_t height) {
+    PaletteWords pw;
+    memset(pw.valid, 0, sizeof(pw.valid));
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const uint8_t* row = addr + static_cast<size_t>(y) * full;
+        for (uint32_t x = 0; x < width; x++) {
+            const uint32_t idx = row[x];
+            PutTexelWord(dst, i++, PaletteWordAt(pw, idx, palettes[idx / 128] + (idx % 128) * 2));
+        }
+    }
+}
+
+/* N60TEX tex_fast: the legacy (source-bytes) RGBA16 loop, a texel past `maxTexel` reading 0. */
+static void FastRgba16Source(uint8_t* dst, const uint8_t* addr, uint32_t strideTexels, uint32_t maxTexel, bool native,
+                             uint32_t width, uint32_t height) {
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+            const uint32_t clrIdx = (y * strideTexels) + x;
+            const uint32_t col16 = (clrIdx < maxTexel) ? Texel16(addr + 2 * clrIdx, native) : 0u;
+            PutTexelWord(dst, i++, Rgba5551Word(col16));
+        }
+    }
+}
+
 /* == ImportTextureRgba16 (both the TMEM path and the legacy path). */
 void Interp::DecodeRgba16(int unit, int tile, const LoadedTexture& lt) {
     (void)unit;
@@ -328,6 +642,11 @@ void Interp::DecodeRgba16(int unit, int tile, const LoadedTexture& lt) {
             if (width > 0 && height > 0) {
                 if (!UploadPrepare(width, height)) return;
                 const uint8_t* tmemSrc = mRdp.tmem + tmemByteOffset;
+                if (gdx3ds_tex_fast_enabled()) {
+                    FastRgba16Tmem(mTexUpload, tmemSrc, lineBytes, width, height);
+                    Upload(width, height);
+                    return;
+                }
                 uint32_t px = 0;
                 for (uint32_t y = 0; y < height; y++) {
                     const uint8_t* row = tmemSrc + static_cast<size_t>(y) * lineBytes;
@@ -369,6 +688,11 @@ void Interp::DecodeRgba16(int unit, int tile, const LoadedTexture& lt) {
     const uint32_t maxTexel = readableBytes / 2;
     if (!UploadPrepare(width, height)) return;
     const bool native = lt.native_rgba16 != 0;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastRgba16Source(mTexUpload, addr, fullImageLineSizeBytes / 2, maxTexel, native, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -404,6 +728,11 @@ void Interp::DecodeRgba32(int tile, const LoadedTexture& lt) {
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
     const uint32_t stridePx = full / 4;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastRgba32(mTexUpload, addr, stridePx, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -430,6 +759,11 @@ void Interp::DecodeIA4(int tile, const LoadedTexture& lt) {
     if (full == 0 || full == sizeBytes) full = widthBytes;
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastIA4(mTexUpload, addr, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -459,6 +793,11 @@ void Interp::DecodeIA8(int tile, const LoadedTexture& lt) {
     if (full == 0 || full == sizeBytes) full = width;
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastIA8(mTexUpload, addr, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -487,6 +826,11 @@ void Interp::DecodeIA16(int tile, const LoadedTexture& lt) {
     if (full == 0 || full == size_bytes) full = width * 2;
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastIA16(mTexUpload, addr, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -529,6 +873,11 @@ void Interp::DecodeI4(int tile, const LoadedTexture& lt) {
         }
     }
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastI4(mTexUpload, addr, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -556,6 +905,11 @@ void Interp::DecodeI8(int tile, const LoadedTexture& lt) {
     if (full == 0 || full == sizeBytes) full = width;
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastI8(mTexUpload, addr, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -592,6 +946,11 @@ void Interp::DecodeCi4(int tile, const LoadedTexture& lt) {
     if ((pyramidLike || (tt.cmt & TX_CLAMP)) && tile_h > 0 && tile_h < height) height = tile_h;
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastCi4(mTexUpload, addr, palette, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
@@ -632,6 +991,11 @@ void Interp::DecodeCi8(int tile, const LoadedTexture& lt) {
     if ((pyramidLike || (tt.cmt & TX_CLAMP)) && tile_h > 0 && tile_h < height) height = tile_h;
     ApplyTileMaskExtent(mRdp, tile, width, height, false);
     if (!UploadPrepare(width, height)) return;
+    if (gdx3ds_tex_fast_enabled()) {
+        FastCi8(mTexUpload, addr, mRdp.palettes, full, width, height);
+        Upload(width, height);
+        return;
+    }
     uint32_t out = 0;
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
@@ -692,9 +1056,19 @@ static uint32_t PaletteReadable(const Rdp& rdp, const uint8_t* p, uint32_t want)
  * hashed formats; source-byte hash for the immutable class where LUS keyed on the resource
  * identity), lookup, dispatch. */
 void Interp::ImportTexture(int unit, int tile) {
+    InterpHwsScope hws(GDX3DS_HWS_IMPORT);
     ProfScope prof(mBackend, 4);
     mStats.texImports++;
     mBackend->TexCacheNoteImport();
+    /* [native] machines_texskip: inside a skip window the skipped list's TMEM was never
+     * written; its tiles' sources are immutable (checked at the skip), whose key and decode
+     * below read the source bytes only. The check is the tripwire for that promise. */
+    if (mTexOv != nullptr) {
+        TexSkipCheckImport(tile);
+    }
+    if (GDX_UNLIKELY(mNrrTmemLive)) {
+        NrrTmemRead(tile); /* [native] nrr_hud: this tile's TMEM may still be a pending NRR load */
+    }
     const Tile& tt = mRdp.texture_tile[tile];
     const uint8_t fmt = tt.fmt;
     const uint8_t siz = tt.siz;
@@ -760,11 +1134,23 @@ void Interp::ImportTexture(int unit, int tile) {
                 palHash = (palHash ^ pal[b]) * 16777619u;
             }
         };
-        if (siz == IM_SIZ_4b) {
-            foldPalette(mRdp.palette_staging[(tt.palette / 8) & 1], 256u);
+        /* [native] sky_retain: inside a sky run the fold of these exact staged bytes is memoised
+         * (gdx_sky_retain.cpp); the two halves are contiguous, so CI8's fold is one 512-byte span. */
+        const uint8_t* const palBytes =
+            siz == IM_SIZ_4b ? mRdp.palette_staging[(tt.palette / 8) & 1] : mRdp.palette_staging[0];
+        const uint32_t palBytesN = siz == IM_SIZ_4b ? 256u : 512u;
+        if (mSkyActive && SkyPalHashLookup(palBytes, palBytesN, &palHash)) {
+            /* the key's palette fold, as the loop below would have computed it */
         } else {
-            foldPalette(mRdp.palette_staging[0], 256u);
-            foldPalette(mRdp.palette_staging[1], 256u);
+            if (siz == IM_SIZ_4b) {
+                foldPalette(mRdp.palette_staging[(tt.palette / 8) & 1], 256u);
+            } else {
+                foldPalette(mRdp.palette_staging[0], 256u);
+                foldPalette(mRdp.palette_staging[1], 256u);
+            }
+            if (mSkyActive) {
+                SkyPalHashStore(palBytes, palBytesN, palHash);
+            }
         }
         key.palette_content_hash = palHash;
     }
@@ -782,6 +1168,8 @@ void Interp::ImportTexture(int unit, int tile) {
      * (n64_gfx_bridge.cpp:2884-2925), which the owned walk never runs. Plan 06 §3.7 asked for
      * this key ("plus the palette bytes for CI") and invariant (11); it was not carried. */
     const bool hashSource = lt.immutable || (mHashCiRgba32 && (isCi || isRgba32));
+    bool hudHashCovered = false; /* [native] hud_retain: the key's hash is a function of one load's source */
+    uint32_t hudHashOff = 0, hudHashSpan = 0;
     if (!lt.immutable && (isRgba16 || isFontFmt)) {
         const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIdx) * 8u;
         const uint32_t lineBytes = tt.line_size_bytes;
@@ -806,15 +1194,34 @@ void Interp::ImportTexture(int unit, int tile) {
                 }
             }
             uint32_t contentHash = 2166136261u;
-            const uint8_t* tmemBytes = mRdp.tmem + tmemByteOffset;
-            uint32_t b = 0;
-            for (; b + 4 <= span; b += 4) {
-                uint32_t word;
-                memcpy(&word, tmemBytes + b, 4);
-                contentHash = (contentHash ^ word) * 16777619u;
-            }
-            for (; b < span; b++) {
-                contentHash = (contentHash ^ tmemBytes[b]) * 16777619u;
+            /* [native] hud_batch: TMEM mirrored from a STABLE source by the live load at this
+             * base hashes the same every time (gdx_hud_replay.cpp HudTmemHashLookup).
+             * [native] hud_direct: TMEM still owed by a direct HUD load is hashed from the
+             * per-source memo or settled first (gdx_hud_direct.cpp HudDebtHash). */
+            if (mHudDebtN != 0 && HudDebtHash(tmemByteOffset, span, &contentHash)) {
+                /* the key's hash, as the loop below would have computed it */
+                hudHashCovered = HudDirectLastHashCovered(); /* [native] hud_retain */
+                hudHashOff = tmemByteOffset;
+                hudHashSpan = span;
+            } else if (mSkyActive && SkyTmemHashLookup(tmemIdx, span, &contentHash)) {
+                /* [native] sky_retain: the span's source is unchanged since it was hashed */
+            } else if (mHud == nullptr || !HudTmemHashLookup(tmemIdx, span, &contentHash)) {
+                const uint8_t* tmemBytes = mRdp.tmem + tmemByteOffset;
+                uint32_t b = 0;
+                for (; b + 4 <= span; b += 4) {
+                    uint32_t word;
+                    memcpy(&word, tmemBytes + b, 4);
+                    contentHash = (contentHash ^ word) * 16777619u;
+                }
+                for (; b < span; b++) {
+                    contentHash = (contentHash ^ tmemBytes[b]) * 16777619u;
+                }
+                if (mHud != nullptr) {
+                    HudTmemHashStore(tmemIdx, span, contentHash);
+                }
+                if (mSkyActive) {
+                    SkyTmemHashStore(tmemIdx, span, contentHash);
+                }
             }
             key.content_hash = contentHash;
         }
@@ -825,7 +1232,23 @@ void Interp::ImportTexture(int unit, int tile) {
         uint32_t n = lt.size_bytes;
         const size_t readable = DlSrc::ReadableBytes(reinterpret_cast<uintptr_t>(origAddr));
         if (n > readable) n = static_cast<uint32_t>(readable);
-        uint32_t h = FoldBytes(2166136261u, origAddr, n);
+        /* [native] hud_batch: an immutable (o2r asset) source's bytes never change, so inside a
+         * replayed HUD run its hash is memoised (gdx_hud_replay.cpp). CI folds a live palette
+         * after this and is never memoised. */
+        const bool hudHash = mHud != nullptr && lt.immutable && !isCi;
+        uint32_t h = 0;
+        if (!hudHash || !HudHashLookup(origAddr, n, &h)) {
+            /* [native] sky_retain: a sky run's source hash is memoised per source (gdx_sky_retain.cpp) */
+            if (!(mSkyActive && SkySrcHashLookup(origAddr, n, lt.immutable != 0, &h))) {
+                h = FoldBytes(2166136261u, origAddr, n);
+                if (mSkyActive) {
+                    SkySrcHashStore(origAddr, n, lt.immutable != 0, h);
+                }
+            }
+            if (hudHash) {
+                HudHashStore(origAddr, n, h);
+            }
+        }
         if (isCi && mHashCiRgba32) {
             /* The palette is half the decoded pixel: the same index bytes under a different TLUT
              * are a different texture. Night-course CI4 TLUTs are staged into the GfxPool and
@@ -863,9 +1286,26 @@ void Interp::ImportTexture(int unit, int tile) {
 
     if (tt.line_size_bytes == 0 || lt.size_bytes == 0) return;
 
+    if (mHudRec) {
+        /* [native] hud_retain: the retained run may replay this import only when its key is a
+         * function of the run's own loads (gdx_hud_retain.cpp). */
+        HudRecNoteImportBegin(tmemIdx, hudHashOff, hudHashSpan, !lt.immutable && (isRgba16 || isFontFmt),
+                              hudHashCovered, !isCi && (!isRgba32 || lt.immutable));
+    }
     if (TexCacheLookup(unit, key)) {
+        if (mHudRec) {
+            HudRecNoteImportHit(unit, mRs.textures[unit], true);
+        }
         return;
     }
+    /* hotcold: the cache-miss path (decode + upload), out of line and cold: a steady race imports
+     * by cache hit; misses cluster at scene loads, where the decoders (separate -O2 functions)
+     * carry the work, not this dispatch. */
+    [this, unit, tile, &lt, origAddr, fmt, siz, tmemIdx, &key]() GDX_COLD {
+    if (mHudDebtN != 0) {
+        HudDebtPayAll(); /* [native] hud_direct: DecodeRgba16 reads TMEM */
+    }
+    const uint64_t hitchT0 = gdx3ds_hitch_now(); /* HITCH: decode + upload time of a miss */
     mUploadDone = false; /* DROPSITE 1: did any decoder below actually reach Upload()? */
     mBackend->TexCacheNoteMiss(origAddr, fmt, siz, tmemIdx, key.line_size_bytes, lt.size_bytes, key.tile_width,
                                key.tile_height, key.content_hash);
@@ -892,6 +1332,7 @@ void Interp::ImportTexture(int unit, int tile) {
         default:
             break;
     }
+    gdx3ds_hitch_add(GDX_HITCH_EV_TEX_DECODE_TICKS, (uint32_t)(gdx3ds_hitch_now() - hitchT0));
     /* DROPSITE 1. Pre-fix this marked the entry uploaded unconditionally. Every decoder above
      * has early-outs -- a null source, a zero extent, a decode above the scratch ceiling, and
      * an fmt/siz pair with no case in the switch at all (G_IM_FMT_RGBA at 4b/8b falls straight
@@ -917,6 +1358,7 @@ void Interp::ImportTexture(int unit, int tile) {
             UploadNeutralFallback(unit);
         }
     }
+    }();
 }
 
 } // namespace gdxn

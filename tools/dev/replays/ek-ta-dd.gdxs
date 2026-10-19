@@ -1,0 +1,70 @@
+# ek-ta-dd (o3dsek probe): TIME ATTACK on the first course of the 64DD DD-1 cup (bottom-left cup).
+# Measured walk (o3dsek ddC3 [gstate] modes): A@1000 opens the TIME ATTACK/RECORDS submenu (mode 7),
+# A@1750 is ignored there, A@2300 enters SELECT COURSE cups (mode 10 by tick 2400). DOWN on the cup
+# screen -> DD-1, then A every 300 ticks through cup, course, ghost, machine (mode 8) and settings
+# (mode 9). [debug] autodrive=1 drives the race; A presses during the race are ignored by it.
+build native/o3dsek
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 stereo=0
+at 400
+press START 15 0
+at 700
+press RIGHT 12 0
+at 1000
+press A 15 0
+at 1750
+press A 15 0
+at 2300
+press A 15 0
+at 2550
+shot s_cups
+at 2600
+press DOWN 12 0
+at 2750
+shot s_cup_dd1
+at 2900
+press A 15 0
+at 3150
+shot s_a0
+at 3200
+press A 15 0
+at 3450
+shot s_a1
+at 3500
+press A 15 0
+at 3750
+shot s_a2
+at 3800
+press A 15 0
+at 4050
+shot s_a3
+at 4100
+press A 15 0
+at 4350
+shot s_a4
+at 4400
+press A 15 0
+at 4650
+shot s_a5
+at 4700
+press A 15 0
+at 4950
+shot s_a6
+at 5000
+press A 15 0
+at 5250
+shot s_a7
+at 5400
+shot r_5400
+at 6000
+shot r_6000
+at 6600
+shot r_6600
+at 7200
+shot r_7200
+at 7800
+shot r_7800
+at 8400
+shot r_8400
+len 8600

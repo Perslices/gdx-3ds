@@ -14,7 +14,11 @@ screenshot and independent game state. Working configuration, all four measured 
     19,160,008 bytes, Mach-O arm64 — NOT the nightly, which is only the fallback;
   - citra_graphics_api = "Vulkan" with RetroArch video_driver = "vulkan" (MoltenVK).
     First try; OpenGL and Software were never needed;
-  - citra_is_new_3ds = "enabled" (mandatory: the render thread is New3DS-only);
+  - citra_is_new_3ds = "enabled" (mandatory: the render thread is New3DS-only) -- this
+    spelling turned out NOT to be a legal option value and was silently falling back to
+    the option default the whole time; see CORE_OPTIONS_TEMPLATE / the README's
+    core_options warning for the actual legal value ("New 3DS") and the emufix fix
+    (2026-10-16) that made this file start being read at all;
   - the private SD is <savefile_directory>/Azahar/Azahar/sdmc — the "Azahar" segment
     appears TWICE (see Instance.sdmc()).
 Azahar Qt remains the DEFAULT lane; `--lane retro` is opt-in. Details and the two
@@ -494,9 +498,18 @@ video_driver = "%(video_driver)s"
 # because the same shared .opt is what every concurrent agent reads, redirecting it is also
 # what keeps a --3d run from turning on 3D underneath somebody else's mono parity run.
 #
-# This redirection is applied ONLY under --3d. Honouring core options for the first time is
-# a real behaviour change for the lane (it is what finally makes `--gfx` reach the core),
-# and that deserves its own re-baseline rather than riding in on a stereo branch.
+# This redirection used to be applied ONLY under --3d/--model, which left every mono run
+# reading AND (RetroArch rewrites the file on exit) WRITING that one shared file. With up to
+# MAX_CONCURRENT instances doing that at once, a mono boot COULD be handed a torn or
+# half-written Azahar.opt by a sibling instance exiting mid-boot. This was investigated
+# (emufix, 2026-10-16) as the cause of the mono lane's intermittent host
+# EXC_BAD_ACCESS/SIGBUS boot crash ("last guest frame ~38") -- it is NOT the (sole) cause:
+# the crash reproduces under the fixed tooling too, with zero concurrent instances, matching
+# docs/research/native/nimenu-progress.md §9.7's independent finding that it is a host-
+# process RetroArch/MoltenVK boot race unrelated to guest code or config. This fix is worth
+# having regardless: it is now applied on EVERY run, so mono gets the same private,
+# per-instance options file --3d always had, and no lane ever touches the user's shared
+# Azahar.opt again -- it just should not be expected to change the crash rate.
 CFG_COREOPT_REDIRECT = 'rgui_config_directory = "%s"\n'
 # Kept under its old name for any caller that still spells it that way.
 CFG_3D_EXTRA = CFG_COREOPT_REDIRECT
@@ -521,37 +534,33 @@ def model_or_die(name):
                        % (name, ", ".join(sorted(MODELS))), util.EXIT_USAGE)
     return key
 
-# Values written under --3d. Spelled so every one of them is LEGAL for the core, because
-# under --3d the file is finally read: `citra_is_new_3ds = "enabled"` (the mono template's
-# spelling) is not a legal value — the legal pair is "New 3DS"/"Old 3DS" — and an illegal
-# value falls back to the option default. New 3DS, 1x and the default layout happen to BE
-# the defaults, so a --3d run differs from a mono run in render_3d/factor_3d and nothing
-# else; only citra_graphics_api actually starts being honoured, and it is asked for the
-# value it was defaulting to anyway.
-CORE_OPTIONS_3D_TEMPLATE = """\
-# Written by `gdx-dev retro run --3d` / `--model`. Unlike retroarch-core-options.cfg this
-# path IS read (see CFG_COREOPT_REDIRECT), so every value here has to be one the core
-# declares. `citra_is_new_3ds` is SUBSTITUTED rather than appended to, because RetroArch's
-# config parser returns the FIRST entry for a duplicated key -- appending a second
-# assignment wrote a file that said "Old 3DS" and booted a New 3DS, which the guest's
-# [mem-budget] receipt caught and nothing else would have.
+# The ONE set of core-option values this lane writes, for every run. Spelled so every one
+# of them is LEGAL for the core (verified against the pinned core's own option strings --
+# see the README's core_options warning): `citra_is_new_3ds = "enabled"`,
+# `citra_resolution_factor = "1x (Native)"` and `citra_layout_option = "Default Top-Bottom
+# Screen"` were all illegal display-label guesses, not the core's actual value strings
+# ("New 3DS"/"Old 3DS", "1", "default"), and an illegal value silently falls back to the
+# option default instead of erroring -- which is the only reason nothing visibly broke
+# before this file was ever actually read. New 3DS, 1x and the default layout happen to BE
+# the defaults, so honouring this file changes only citra_graphics_api (which was always
+# asked for the value it was already defaulting to) and, under --3d, the stereo keys below.
+# This used to be two near-identical templates (one for mono, with the illegal values
+# above; one for --3d/--model, with the legal ones) written to two different files --
+# now there is one template and one piece of text written to both.
+CORE_OPTIONS_TEMPLATE = """\
+# Written by `gdx-dev retro run`. core_options_path is inert for this RetroArch (see the
+# README's core_options warning); the file actually read is the one at the
+# rgui_config_directory redirect (see CFG_COREOPT_REDIRECT), and every value here has to be
+# one the core DECLARES or it silently falls back to the option default.
+# citra_is_new_3ds is MANDATORY: the render thread is New3DS-only (port/3ds/gdx3ds_renderthread.cpp).
+# It is SUBSTITUTED rather than appended to, because RetroArch's config parser returns the
+# FIRST entry for a duplicated key -- appending a second assignment wrote a file that said
+# "Old 3DS" and booted a New 3DS, which only the guest's own [mem-budget] receipt caught.
 citra_is_new_3ds = "%(model)s"
 citra_graphics_api = "%(gfx)s"
 citra_use_hw_shader = "enabled"
 citra_resolution_factor = "1"
 citra_layout_option = "default"
-citra_use_virtual_sd = "enabled"
-citra_use_libretro_save_path = "LibRetro Default"
-citra_region_value = "Auto"
-"""
-
-CORE_OPTIONS_TEMPLATE = """\
-# citra_is_new_3ds is MANDATORY: the render thread is New3DS-only (port/3ds/gdx3ds_renderthread.cpp).
-citra_is_new_3ds = "enabled"
-citra_graphics_api = "%(gfx)s"
-citra_use_hw_shader = "enabled"
-citra_resolution_factor = "1x (Native)"
-citra_layout_option = "Default Top-Bottom Screen"
 citra_use_virtual_sd = "enabled"
 citra_use_libretro_save_path = "LibRetro Default"
 citra_region_value = "Auto"
@@ -563,9 +572,23 @@ def write_config(inst, gfx="Vulkan", audio="false", video_driver="vulkan",
     """Write this instance's retroarch.cfg + core-options file.
 
     `three_d` is (mode, depth) from `--3d`, or None. `model` is "new"/"old" from
-    `--model`, or None. When BOTH are None not one byte of the core-options file changes
-    and no redirect is written, so a plain run is exactly the run it was before either
-    flag existed -- which is what keeps every baseline taken on this lane valid.
+    `--model`, or None (-> the core's own default, New 3DS).
+
+    The per-instance `rgui_config_directory` redirect and options file are written on
+    EVERY run now, mono included -- `core_options_path` does not work (README), so without
+    it every instance falls through to the SHARED
+    ~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt, which up to
+    MAX_CONCURRENT instances read and (RetroArch rewrites it on exit) WRITE at once. This
+    was investigated (emufix, 2026-10-16) as the cause of the mono lane's intermittent host
+    EXC_BAD_ACCESS/SIGBUS boot crash -- it reproduces under the fixed tooling too (and with
+    zero concurrent instances, per nimenu-progress.md §9.7), so it is NOT the crash's
+    (sole) cause; see the README's core_options warning. The values chosen (model defaults
+    to New 3DS, gfx to whatever --gfx asked for) are the same ones the core was already
+    defaulting to, so this changes what the lane RUNS ON (a private file instead of a
+    contended shared one) without changing what it asks for -- except that --gfx, and
+    --model, now actually reach the core, which they never did before. Confirmed
+    behaviour-preserving by an exact `[fh]`/`[gstate]` comparison, old tooling vs this one,
+    same binary, same deterministic seed (README).
     """
     for d in (inst.dir, inst.system, inst.saves, inst.screenshots):
         os.makedirs(d, exist_ok=True)
@@ -576,33 +599,26 @@ def write_config(inst, gfx="Vulkan", audio="false", video_driver="vulkan",
             "shots": inst.screenshots, "coreopts": inst.core_options,
             "cores": os.path.dirname(core or core_path() or ""), "dir": inst.dir,
             "port": inst.port, "audio": audio, "video_driver": video_driver,
-            "extra": (CFG_COREOPT_REDIRECT % cfg_dir) if (three_d or model) else "",
+            "extra": CFG_COREOPT_REDIRECT % cfg_dir,
         })
-    with open(inst.core_options, "w") as f:
-        f.write(CORE_OPTIONS_TEMPLATE % {"gfx": gfx})
-    if three_d or model:
+    opt_text = CORE_OPTIONS_TEMPLATE % {"gfx": gfx, "model": MODELS[model or "new"]}
+    if three_d:
         from . import stereo3d
-        # The path RetroArch actually reads. "Azahar" is the core's `corename`, which is
-        # both the directory and the file stem of a per-core options file. Every value
-        # written here has to be one the core DECLARES, or it silently falls back to the
-        # option default -- the trap CORE_OPTIONS_3D_TEMPLATE's comment records.
-        opt = os.path.join(cfg_dir, "Azahar", "Azahar.opt")
-        os.makedirs(os.path.dirname(opt), exist_ok=True)
-        with open(opt, "w") as f:
-            if model:
-                # --model: the emulated SYSTEM MODEL. "Old 3DS" halves the FCRAM the guest
-                # is granted and removes core 2, so the port's render thread self-disables
-                # (APT_CheckNew3DS). Restart required, which a fresh instance per run
-                # already satisfies. Verify it landed with the guest's own [mem-budget]
-                # receipt (model=/memtype=), never with this file.
-                f.write(CORE_OPTIONS_3D_TEMPLATE % {"gfx": gfx, "model": MODELS[model]})
-            else:
-                f.write(CORE_OPTIONS_3D_TEMPLATE % {"gfx": gfx, "model": MODELS["new"]})
-            if three_d:
-                f.write("# --3d: the HOST knob. Without it the emulated 3D slider reads 0 and\n"
-                        "# the guest skips its right-eye pass whatever [stereo] enabled says.\n")
-                for key, value in stereo3d.core_options(*three_d):
-                    f.write('%s = "%s"\n' % (key, value))
+        opt_text += ("# --3d: the HOST knob. Without it the emulated 3D slider reads 0 and\n"
+                     "# the guest skips its right-eye pass whatever [stereo] enabled says.\n")
+        opt_text += "".join('%s = "%s"\n' % kv for kv in stereo3d.core_options(*three_d))
+    # core_options_path is inert (see CFG_COREOPT_REDIRECT), so this file is never read by
+    # the core itself -- kept only so `retro setup` and _last_used() have something to show
+    # / stat. The file RetroArch actually reads is the redirected Azahar.opt below, and it
+    # gets the exact same text: one template, one value set, written to both places.
+    with open(inst.core_options, "w") as f:
+        f.write(opt_text)
+    # The path RetroArch actually reads. "Azahar" is the core's `corename`, which is both
+    # the directory and the file stem of a per-core options file (see CFG_COREOPT_REDIRECT).
+    opt = os.path.join(cfg_dir, "Azahar", "Azahar.opt")
+    os.makedirs(os.path.dirname(opt), exist_ok=True)
+    with open(opt, "w") as f:
+        f.write(opt_text)
     return inst.cfg
 
 
@@ -894,6 +910,7 @@ def _attempt(inst, gfx, core, threedsx, extra, seconds, settings, rd, ctx, out, 
     guest_log = os.path.join(inst.gdx_dir(), "log.txt")
     if os.path.exists(guest_log):
         os.unlink(guest_log)
+    _BOOT_STARTED["t"] = time.time()
 
     cmd = [RETRO_BIN, "-c", inst.cfg, "-L", core, threedsx, "-v", "--log-file", inst.log]
     cmd += list(extra)
@@ -1028,9 +1045,10 @@ def do_run(args, out, ctx):
     # citra_render_3d / citra_factor_3d core options. Without the flag nothing below
     # changes and the pinned release core is used exactly as before.
     three_d = _three_d_or_none(args)
-    # --model: the emulated system model (NEXT.md C4). None keeps the lane byte-identical
-    # to what it was: no core-options redirect, so the core's own default (New 3DS) still
-    # decides, exactly as every existing baseline on this lane was taken.
+    # --model: the emulated system model (NEXT.md C4). None keeps the EFFECTIVE model what
+    # it always was -- New 3DS, the core's own compiled default -- by writing that value
+    # explicitly rather than leaving it unset (emufix, 2026-10-16: the redirect itself is
+    # now written on every run, see write_config).
     model = model_or_die(getattr(args, "model", None))
     if dry:
         # ensure_core() DOWNLOADS and unzips. "Change nothing" means nothing.
@@ -1237,8 +1255,8 @@ def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three
          % (MAX_CONCURRENT, MAX_LOADAVG, host_load())],
         ["tree", buildmod.tree_receipt(tree)],
         ["system model", "%s%s" % (MODELS.get(model, "New 3DS"),
-                                   "" if model else "  (core default; no core-options "
-                                                    "redirect written)")],
+                                   "" if model else "  (core default, written explicitly "
+                                                    "via the per-instance redirect)")],
     ])
     out.say("")
     out.say("would seed this guest ini (every [debug]/[native] key stripped first):")
@@ -1437,8 +1455,36 @@ def do_status(args, out, ctx):
     return util.EXIT_OK
 
 
+# n60launch: when the current boot started (set by _attempt), so a launch-variant log-<X>.txt
+# left by an earlier boot on a reused instance is never taken for this boot's log.
+_BOOT_STARTED = {"t": 0.0}
+
+
+def _guest_log_path(inst):
+    """The guest's live filelog: log.txt, or -- n60launch, `[debug] launch_variants` -- the
+    variant's own log-<X>.txt written since this boot started (never a -prev file)."""
+    default = os.path.join(inst.gdx_dir(), "log.txt")
+    if os.path.exists(default):
+        return default
+    gdx = inst.gdx_dir()
+    try:
+        names = os.listdir(gdx)
+    except OSError:
+        return default
+    live = []
+    for n in names:
+        if not (n.startswith("log-") and n.endswith(".txt")) or "-prev" in n:
+            continue
+        path = os.path.join(gdx, n)
+        if os.path.getmtime(path) >= _BOOT_STARTED["t"] - 2:
+            live.append(path)
+    if not live:
+        return default
+    return max(live, key=os.path.getmtime)
+
+
 def _retro_snapshot(rd, inst):
-    rd.snapshot(os.path.join(inst.gdx_dir(), "log.txt"), "log-%s.txt" % inst.name)
+    rd.snapshot(_guest_log_path(inst), "log-%s.txt" % inst.name)
     rd.snapshot(inst.log, "retroarch-%s.log" % inst.name)
     # Two screenshot sources, and a --replay run needs BOTH: RetroArch's own dir (the
     # UDP SCREENSHOT and --max-frames-ss output) and the guest's autotest/ on the private

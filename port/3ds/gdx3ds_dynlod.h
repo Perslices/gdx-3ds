@@ -64,7 +64,9 @@ void gdx3ds_dynlod_set_auto(int on);
 /* The effective rival-detail level for the decomp hook: max(floor, auto tier) with the
  * controller on, exactly `floor` with it off. */
 int gdx3ds_dynlod_effective_level(int floorLevel);
-/* The controller's current tier (0..2) for the menu's live row. */
+/* The controller's ceiling: 2 (MINIMAL) by default, 3 (LOW) with [perf] rival_tier_max = 3. */
+int gdx3ds_dynlod_tier_max(void);
+/* The controller's current tier (0..tier_max) for the menu's live row. */
 int gdx3ds_dynlod_tier(void);
 
 /* One pair per gfx task around gdx_gfx_run. Both are no-ops with the killswitch off. */

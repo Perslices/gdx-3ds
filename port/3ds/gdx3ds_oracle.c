@@ -12,7 +12,17 @@
 #include "gdx3ds_config.h"
 #include "gdx3ds_cov.h"
 #include "gdx3ds_filelog.h"
+#include "gdx_input_rec.h" /* C5TICK: gdx_input_rec_peek_shot */
 
+/* hw bug n60-3d8, item 3: the real branch@hash now comes from this generated, build-time
+ * header (port/3ds/cmake/gdx3ds_gen_build_id.cmake) instead of a configure-time -D; the
+ * __has_include guard + #ifndef below is a safety net for a build that never generated or
+ * wired up the include path for it. */
+#if defined(__has_include)
+#if __has_include("gdx3ds_build_id.h")
+#include "gdx3ds_build_id.h"
+#endif
+#endif
 #ifndef GDX3DS_BUILD_ID
 #define GDX3DS_BUILD_ID "unknown-build"
 #endif
@@ -199,11 +209,77 @@ static void CaptureEye(int eye, const char* tag, int writeBmp, unsigned long fra
     }
 }
 
+/* The (tick, mode) main published for `frame`; 1 when the ring still holds it. */
+static int OracleLookupMark(unsigned long frame, unsigned long* tick, int* mode) {
+    const unsigned slot = (unsigned)(frame % ORACLE_MARK_RING);
+    /* acquire: pairs with the release store of .frame in gdx3ds_oracle_frame_mark */
+    if (__atomic_load_n(&sMarks[slot].frame, __ATOMIC_ACQUIRE) != frame) {
+        return 0;
+    }
+    *tick = sMarks[slot].tick;
+    *mode = sMarks[slot].mode;
+    return 1;
+}
+
+/* COVERAGE: the frame boundary, taken from the SAME (frame, tick, mode) tuple a [fh]
+ * receipt is stamped with -- which is the whole point, since a [cov] frame number has to
+ * be usable to place a SHOT that fhdiff will then match by frame. Runs every frame,
+ * rendered or skipped; capture only on the sampled ones. */
+static void OracleCoverFrame(unsigned long frame) {
+    unsigned long tick = 0;
+    int mode = -1;
+    (void)OracleLookupMark(frame, &tick, &mode);
+    gdx3ds_cov_frame(frame, tick, mode);
+}
+
+void gdx3ds_oracle_skip_frame(void) {
+    sFrame++; /* keeps sFrame == host frameNum across a skipped (never presented) iteration */
+    if (gdx3ds_cov_on) {
+        OracleCoverFrame(sFrame);
+    }
+}
+
+/* N60PREWARM ([native] prewarm bit 4, gdx3ds_prewarm.h): the race's opaque appear frame wants to be
+ * drawn (its list holds the race's first-use work, under a black fade). Game side, weak: absent in
+ * builds without the game library's prewarm unit. */
+int gdx3ds_prewarm_wants_render(void) __attribute__((weak));
+static int PrewarmWants(void) {
+    return &gdx3ds_prewarm_wants_render != NULL && gdx3ds_prewarm_wants_render() != 0;
+}
+
+int gdx3ds_oracle_wants_next_frame(void) {
+    const unsigned long next = sFrame + 1;
+    if (__atomic_load_n(&sPendingArmed, __ATOMIC_ACQUIRE) != 0) {
+        return 1;
+    }
+    if (PrewarmWants()) {
+        return 1; /* the iteration about to begin walks the opaque frame's list */
+    }
+    return sEvery > 0 && next >= (unsigned long)sStart && (next % (unsigned long)sEvery) == 0;
+}
+
+/* C5TICK: the veto one iteration further ahead -- will the iteration AFTER the next one want a
+ * capture? (The display list built in iteration N is walked in N+1; the hollow-tick lever
+ * decides at N's build whether N+1 may skip.) A pending request is answered conservatively. */
+int gdx3ds_oracle_wants_frame_after_next(void) {
+    const unsigned long afterNext = sFrame + 2;
+    if (__atomic_load_n(&sPendingArmed, __ATOMIC_ACQUIRE) != 0) {
+        return 1;
+    }
+    if (gdx_input_rec_peek_shot()) {
+        return 1;
+    }
+    if (PrewarmWants()) {
+        return 1; /* the list being built is the opaque frame's: keep it whole (no hollow build) */
+    }
+    return sEvery > 0 && afterNext >= (unsigned long)sStart && (afterNext % (unsigned long)sEvery) == 0;
+}
+
 void gdx3ds_oracle_after_endframe(void) {
     unsigned long frame;
     unsigned long tick = 0;
     int mode = -1;
-    int markOk = 0;
+    int markOk;
     int shot;
     char tag[ORACLE_TAG_CAP];
     sFrame++; /* one increment per host frame: the ring lookup below needs it in every mode */
@@ -212,19 +288,7 @@ void gdx3ds_oracle_after_endframe(void) {
     }
     shot = __atomic_exchange_n(&sPendingArmed, 0, __ATOMIC_ACQ_REL);
     frame = sFrame;
-    {
-        const unsigned slot = (unsigned)(frame % ORACLE_MARK_RING);
-        /* acquire: pairs with the release store of .frame in gdx3ds_oracle_frame_mark */
-        if (__atomic_load_n(&sMarks[slot].frame, __ATOMIC_ACQUIRE) == frame) {
-            tick = sMarks[slot].tick;
-            mode = sMarks[slot].mode;
-            markOk = 1;
-        }
-    }
-    /* COVERAGE: the frame boundary, taken from the SAME (frame, tick, mode) tuple a [fh]
-     * receipt is stamped with -- which is the whole point, since a [cov] frame number has to
-     * be usable to place a SHOT that fhdiff will then match by frame. Before the capture
-     * early-out: coverage runs every frame, capture only on the sampled ones. */
+    markOk = OracleLookupMark(frame, &tick, &mode);
     gdx3ds_cov_frame(frame, tick, mode);
     if (!shot && (sEvery == 0 || sFrame < (unsigned long)sStart || (sFrame % (unsigned long)sEvery) != 0)) {
         return;

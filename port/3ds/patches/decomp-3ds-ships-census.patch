@@ -1,0 +1,175 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -21,6 +21,24 @@
+    marker. Runtime-gated on [native] fx_sink; inactive, every redefined macro emits the original
+    GBI via helpers compiled with this same gbi.h. The C bodies are unchanged. */
+ #include "gdx3ds_fx_shim.h"
++#endif
++
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++/* N60SHIPS (port/3ds/gdx3ds_ships.h, decomp-3ds-ships-census.patch): [debug] ships_census counts the
++   visibility pass after it ran; [debug] logic_split marks the racer update's phases. Both read-only
++   (counters / timer reads); off, one int test each. */
++#include "gdx3ds_ships.h"
++#define GDX_LSPLIT(b) GDX3DS_LSPLIT_MARK(GDX3DS_LSPLIT_##b)
++static void Racer_GdxShipsCensus(void);
++#define GDX_SHIPS_CENSUS()            \
++    do {                              \
++        if (gdx3ds_ships_census_on) { \
++            Racer_GdxShipsCensus();   \
++        }                             \
++    } while (0)
++#else
++#define GDX_LSPLIT(b)
++#define GDX_SHIPS_CENSUS()
+ #endif
+ 
+ s32 gTotalRacers;
+@@ -4975,6 +4993,7 @@
+ 
+     if (racer->stateFlags & RACER_STATE_CPU_CONTROLLED) {
+         preInputEnergy = racer->energy;
++        GDX_LSPLIT(AI);
+         Cpu_GenerateInputs(racer, &dummyController);
+         if (preInputEnergy < racer->energy) {
+             racer->energy = preInputEnergy;
+@@ -4985,8 +5004,10 @@
+                 racer->unk_2A4--;
+             }
+         }
++        GDX_LSPLIT(PHYS);
+         Racer_UpdateFromControls(racer, &dummyController);
+     } else {
++        GDX_LSPLIT(PHYS);
+         Racer_UpdateFromControls(racer, &gControllers[gPlayerControlPorts[racer->id]]);
+         racer->unk_33C = -racer->segmentPositionInfo.segmentDisplacement.x * racer->segmentBasis.z.x -
+                          racer->segmentPositionInfo.segmentDisplacement.y * racer->segmentBasis.z.y -
+@@ -5151,6 +5172,7 @@
+             racer->machineLod = racer->unk_2B2 = racer->unk_2B3 = 1;
+         }
+     }
++    GDX_LSPLIT(COLL);
+     if (gTotalRacers >= 2) {
+         racer = sLastRacer;
+         do {
+@@ -5315,6 +5337,7 @@
+             Racer_UpdateMovement(racer);
+         }
+     }
++    GDX_LSPLIT(RPOST);
+ 
+     for (i = 0; i < gNumPlayers; i++) {
+         racer2 = &gRacers[i];
+@@ -6046,7 +6069,52 @@
+     return gfx;
+ }
+ #endif
++
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++/* N60SHIPS [ships]: what the visibility pass just decided, counted per call (read-only). The
++   shadow / flame / highlight tests are the draw loops' own conditions below. */
++static void Racer_GdxShipsCensus(void) {
++    u8 c[GDX3DS_SHIPS_COUNT] = { 0 };
++    Racer* racer;
++    s32 i;
+ 
++    for (racer = sLastRacer; racer >= gRacers; racer--) {
++        if (racer->stateFlags & RACER_STATE_ACTIVE) {
++            c[GDX3DS_SHIPS_ACT]++;
++        }
++        if (racer->machineLod != 0) {
++            c[GDX3DS_SHIPS_VIS]++;
++            if ((racer->machineLod >= 1) && (racer->machineLod <= 6)) {
++                c[GDX3DS_SHIPS_L1 + racer->machineLod - 1]++;
++            }
++            if (racer->stateFlags & RACER_STATE_CRASHED) {
++                c[GDX3DS_SHIPS_CRASH]++;
++            }
++            if ((racer->attackHighlightScale != 0) && (racer->machineLod < 6)) {
++                c[GDX3DS_SHIPS_HL]++;
++            }
++        }
++        if ((gRaceIntroTimer < 280) && (racer->unk_2B2 != 0) && (racer->shadowPos.y != -54321.0f)) {
++            c[GDX3DS_SHIPS_SHD]++;
++        }
++        if ((racer->unk_2B3 != 0) && !(racer->stateFlags & (RACER_STATE_CRASHED | RACER_STATE_SPINNING_OUT))) {
++            c[GDX3DS_SHIPS_BOOST]++;
++            if (racer->unk_2B3 == 2) {
++                c[GDX3DS_SHIPS_NEAR]++;
++            }
++        }
++    }
++    if (gGameMode == GAMEMODE_TIME_ATTACK) {
++        for (i = 0; i < 3; i++) {
++            if (gGhostRacers[i].exists && (gGhostRacers[i].racer->machineLod != 0)) {
++                c[GDX3DS_SHIPS_GHOST]++;
++            }
++        }
++    }
++    gdx3ds_ships_census_add(c, gGameMode, gNumPlayers, gTotalRacers);
++}
++#endif
++
+ Gfx* Racer_Draw(Gfx* gfx, s32 playerIndex) {
+     s32 var_s3; // sp5CC
+     s32 var_s4; // sp5C8
+@@ -6455,6 +6523,7 @@
+             }
+         }
+     }
++    GDX_SHIPS_CENSUS();
+     GDX_C5CAT(SHD);
+     GDX_DLB(SHD);
+     /* C5TICK: GDX_DL_SKIP(sec) is 1 when this section's display list will never be walked (a
+diff --git a/src/overlays/ovl_i2/race.c b/src/overlays/ovl_i2/race.c
+--- a/src/overlays/ovl_i2/race.c
++++ b/src/overlays/ovl_i2/race.c
+@@ -112,15 +112,47 @@
+     RI_CK(P_done)
+ #undef RI_CK
+ }
++
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++/* N60SHIPS ([debug] logic_split, default 0; port/3ds/gdx3ds_ships.h): a flat timeline of the race
++   update for the [lsplit] receipt. Timer reads only: no game state is touched. Off, each mark is one
++   int test. */
++#include "gdx3ds_ships.h"
++#define GDX_LSPLIT_BEGIN()        \
++    do {                          \
++        if (gdx3ds_lsplit_on) {   \
++            gdx3ds_lsplit_begin(); \
++        }                         \
++    } while (0)
++#define GDX_LSPLIT_END()        \
++    do {                        \
++        if (gdx3ds_lsplit_on) { \
++            gdx3ds_lsplit_end(); \
++        }                       \
++    } while (0)
++#define GDX_LSPLIT(b) GDX3DS_LSPLIT_MARK(GDX3DS_LSPLIT_##b)
++#else
++#define GDX_LSPLIT_BEGIN()
++#define GDX_LSPLIT_END()
++#define GDX_LSPLIT(b)
++#endif
+ 
+ s32 Race_Update(void) {
++    GDX_LSPLIT_BEGIN();
+     Menus_Update();
++    GDX_LSPLIT(EFX);
+     Effects_Update();
++    GDX_LSPLIT(RPRE);
+     Racer_Update();
++    GDX_LSPLIT(CAM);
+     Camera_Update();
++    GDX_LSPLIT(BG);
+     Background_Update();
++    GDX_LSPLIT(CRS);
+     Course_Update();
++    GDX_LSPLIT(OTH);
+     func_80074844();
++    GDX_LSPLIT_END();
+ 
+     return gGameMode;
+ }

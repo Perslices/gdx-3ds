@@ -5,7 +5,8 @@ an overwrite silently disarms another agent's lever mid-run and its A/B becomes 
 This module only ever rewrites the keys it was asked to set, preserving every other key,
 section, order, and (unlike the in-game menu writer) comments.
 
-Key syntax on the CLI: `--ini k=v` sets `[debug] k`; `--ini section.k=v` targets a section.
+Key syntax on the CLI: `--ini k=v` sets `[debug] k`; `--ini section.k=v` targets a section;
+`--ini variant.N.k=v` targets the launch variant section `[variant.N]` (n60launch).
 """
 
 import os
@@ -15,9 +16,10 @@ from . import util
 from .util import GdxError
 
 DEFAULT_SECTION = "debug"
+VARIANT_PREFIX = "variant."
 
 _SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
-_KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*?)(\s*)$")
+_KEY_RE = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_.]*)(\s*=\s*)(.*?)(\s*)$")
 
 
 def parse_spec(spec):
@@ -27,7 +29,12 @@ def parse_spec(spec):
     lhs, value = spec.split("=", 1)
     lhs = lhs.strip()
     value = value.strip()
-    if "." in lhs:
+    if lhs.startswith(VARIANT_PREFIX) and lhs.count(".") >= 2:
+        # N60LAUNCH: `variant.N.ndsp_core1=1` -> [variant.N] ndsp_core1 (the section has a dot);
+        # `variant.P.native.all=0` -> [variant.P] native.all (a variant key may name a section).
+        name, key = lhs[len(VARIANT_PREFIX):].split(".", 1)
+        section = VARIANT_PREFIX + name
+    elif "." in lhs:
         section, key = lhs.split(".", 1)
     else:
         section, key = DEFAULT_SECTION, lhs

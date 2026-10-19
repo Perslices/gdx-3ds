@@ -1,0 +1,392 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5665,7 +5665,388 @@
+ #define GDX_DL_SKIP(sec, view) 0
+ #define GDX_DL_SKIP_LABEL(label) label:;
+ #endif
++
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++#include "nrr/gdx3ds_nrr_mach.h" /* N60MACH (decomp-3ds-nrr-mach.patch): the machines' NRR snapshot */
++extern int gdx_rival_lod6_skip(void);
++
++/* N60MACH: Racer_Draw's body section ([native] nrr_mach, n60mach-progress.md), as the BODY
++ * consumer's stub (gdx3ds_c5tick_consume): it makes every game-state write the section makes --
++ * each visible machine's model matrix and highlight matrix (modelMatrix + *MatrixInit, which the
++ * booster section reads), the view's lights in the GfxPool -- then snapshots what a native draw
++ * needs and writes ONE marker for the recorded racers. Everything the snapshot does not model
++ * (a racer whose (slot, LOD, pass) has no complete record yet, crashed machines, the LOD-6 speck,
++ * time-attack ghosts) is written as the stock commands, in stock order, after the marker; the
++ * marker arms the port's recorder for them, which is how a record is made.
++ * Returns NULL (the section builds the stock way) in the GP ending cutscene / course editor. */
++static void Racer_NrrMachPoses(void) {
++    Racer* racer;
++
++    for (racer = sLastRacer; racer >= gRacers; racer--) {
++        if (racer->machineLod == 0) {
++            continue;
++        }
++        if (!racer->modelMatrixInit) {
++            Matrix_ScaleFrom3DMatrix(&gGfxPool->unk_20308[racer->id], &racer->modelMatrix, D_800CE748, D_800CE74C,
++                                     D_800CE750, &racer->modelBasis, &racer->modelPos);
++            racer->modelMatrixInit = true;
++        }
++        if ((racer->attackHighlightScale != 0) && (racer->machineLod < 6) && !racer->attackHighlightMatrixInit) {
++            Matrix_ScaleFrom3DMatrix(&gGfxPool->unk_21208[racer->id], NULL,
++                                     racer->attackHighlightScale * D_800CE748,
++                                     racer->attackHighlightScale * D_800CE74C,
++                                     racer->attackHighlightScale * D_800CE750, &racer->modelBasis, &racer->modelPos);
++            racer->attackHighlightMatrixInit = true;
++        }
++    }
++}
++
++/* The stock lights block (ambient by tunnel depth, light direction, fog colour, the FLX alpha
++ * light), written into the GfxPool exactly as the section writes it; the fog colour comes back. */
++static void Racer_NrrMachLights(s32 playerIndex, Camera* camera, s32* fogR, s32* fogG, s32* fogB) {
++    Racer* playerRacer = &gRacers[playerIndex];
++    Lights1* lights = &gGfxPool->unk_21A88[playerIndex];
++    Vec3s* var_v0;
++    f32 temp_fs0;
++    f32 sp560;
++    f32 sp55C;
++    f32 sp558;
++    s32 var_s3;
++    s32 var_s4;
++    s32 sp5C4;
++
++    var_s3 = 100;
++    var_s4 = 100;
++    sp5C4 = 100;
++    if (playerRacer->segmentPositionInfo.courseSegment->trackSegmentInfo & TRACK_FLAG_INSIDE) {
++        s32 inJoin = true;
++
++        temp_fs0 = 0.0f;
++        if (playerRacer->segmentPositionInfo.courseSegment->nextJoinStartTValue <
++            playerRacer->segmentPositionInfo.segmentTValue) {
++            temp_fs0 = (1.0f - playerRacer->segmentPositionInfo.segmentLengthProportion) /
++                       playerRacer->segmentPositionInfo.courseSegment->joinScale;
++        } else if (playerRacer->segmentPositionInfo.segmentTValue <
++                   playerRacer->segmentPositionInfo.courseSegment->previousJoinEndTValue) {
++            temp_fs0 = playerRacer->segmentPositionInfo.segmentLengthProportion /
++                       playerRacer->segmentPositionInfo.courseSegment->joinScale;
++        } else {
++            inJoin = false;
++        }
++        if (inJoin) {
++            var_s3 = Math_Round(temp_fs0 * -50.0f) + 100;
++            var_s4 = Math_Round(temp_fs0 * -50.0f) + 100;
++            sp5C4 = Math_Round(temp_fs0 * -50.0f) + 100;
++        } else {
++            var_s3 = 50;
++            var_s4 = 50;
++            sp5C4 = 50;
++        }
++    }
++    lights->a.l.colc[0] = var_s3;
++    lights->a.l.col[0] = var_s3;
++    lights->a.l.colc[1] = var_s4;
++    lights->a.l.col[1] = var_s4;
++    lights->a.l.colc[2] = sp5C4;
++    lights->a.l.col[2] = sp5C4;
++
++    if ((playerRacer->segmentPositionInfo.courseSegment->trackSegmentInfo & TRACK_FLAG_INSIDE) &&
++        !(playerRacer->stateFlags & RACER_STATE_FLAGS_80000000)) {
++        sp560 = playerRacer->segmentBasis.y.x;
++        lights->l[0].l.dir[0] = Math_Round(sp560 * 120.0f);
++        sp55C = playerRacer->segmentBasis.y.y;
++        lights->l[0].l.dir[1] = Math_Round(sp55C * 120.0f);
++        sp558 = playerRacer->segmentBasis.y.z;
++        lights->l[0].l.dir[2] = Math_Round(sp558 * 120.0f);
++        if ((playerRacer->segmentPositionInfo.courseSegment->trackSegmentInfo & TRACK_SHAPE_MASK) == TRACK_SHAPE_PIPE) {
++            var_v0 =
++                &sPipeFogColors[playerRacer->segmentPositionInfo.courseSegment->trackSegmentInfo & TRACK_TYPE_MASK];
++        } else {
++            var_v0 =
++                &sTunnelFogColors[playerRacer->segmentPositionInfo.courseSegment->trackSegmentInfo & TRACK_TYPE_MASK];
++        }
++        var_s3 = var_v0->x;
++        sp5C4 = var_v0->y;
++        var_s4 = var_v0->z;
++    } else {
++        lights->l[0].l.dir[0] = lights->l[0].l.dir[1] = lights->l[0].l.dir[2] = 0x45;
++        sp560 = 0.57735f;
++        sp55C = 0.57735f;
++        sp558 = 0.57735f;
++        var_s3 = gCurrentCourseInfo->racerFogColors[0];
++        sp5C4 = gCurrentCourseInfo->racerFogColors[1];
++        var_s4 = gCurrentCourseInfo->racerFogColors[2];
++    }
++    gGfxPool->unk_21AE8[playerIndex].l.unk_08[0] = Math_Round((sp560 - camera->basis.x.x) * 16383.0f);
++    gGfxPool->unk_21AE8[playerIndex].l.unk_08[1] = Math_Round((sp55C - camera->basis.x.y) * 16383.0f);
++    gGfxPool->unk_21AE8[playerIndex].l.unk_08[2] = Math_Round((sp558 - camera->basis.x.z) * 16383.0f);
++    *fogR = var_s3;
++    *fogG = sp5C4;
++    *fogB = var_s4;
++}
+ 
++static void Racer_NrrMachFrameLights(GdxNrrMachSnap* f, s32 playerIndex, s32 fogR, s32 fogG, s32 fogB) {
++    Lights1* lights = &gGfxPool->unk_21A88[playerIndex];
++    s32 k;
++
++    for (k = 0; k < 3; k++) {
++        f->ldir[k] = lights->l[0].l.dir[k];
++        f->lcol[k] = lights->l[0].l.col[k];
++        f->amb[k] = lights->a.l.col[k];
++        f->alpha[k] = gGfxPool->unk_21AE8[playerIndex].l.unk_08[k];
++    }
++    f->fog[0] = fogR;
++    f->fog[1] = fogG;
++    f->fog[2] = fogB;
++}
++
++static void Racer_NrrMachAdd(GdxNrrMachSnap* f, Mtx* mtx, Racer* racer, s32 kind) {
++    GdxNrrMachEnt* e = &f->e[f->n++];
++    const s32* words = (const s32*) mtx;
++    s32 k;
++
++    for (k = 0; k < 16; k++) {
++        e->mtx[k] = words[k];
++    }
++    e->idx = racer->machineIndex * 6 + racer->machineLod - 1;
++    e->kind = kind;
++    if (kind == GDX_NRR_MACH_HL) {
++        e->rgb[0] = racer->attackHighlightR;
++        e->rgb[1] = racer->attackHighlightG;
++        e->rgb[2] = racer->attackHighlightB;
++    } else {
++        e->rgb[0] = racer->bodyR;
++        e->rgb[1] = racer->bodyG;
++        e->rgb[2] = racer->bodyB;
++    }
++}
++
++static s32 Racer_NrrMachIsBody(Racer* racer) {
++    return (racer->machineLod != 0) && (racer->machineLod < 6) && !(racer->stateFlags & RACER_STATE_CRASHED);
++}
++
++static s32 Racer_NrrMachIsHighlight(Racer* racer) {
++    return (racer->attackHighlightScale != 0) && (racer->machineLod != 0) && (racer->machineLod < 6);
++}
++
++/* The list index of the body a far speck inherits its state from in stock order: the previous
++ * LOD 1-5, not-crashed racer of the body loop (sLastRacer down to gRacers), else none. */
++static s32 Racer_NrrMachSpeckPred(Racer* speck) {
++    Racer* racer;
++
++    for (racer = speck + 1; racer <= sLastRacer; racer++) {
++        if (Racer_NrrMachIsBody(racer)) {
++            return racer->machineIndex * 6 + racer->machineLod - 1;
++        }
++    }
++    return GDX_NRR_MACH_NOPRED;
++}
++
++/* Which racers' body-pass draws stay the stock commands this frame (bit = racer index): a body
++ * with no complete record, and a speck whose material is not recorded yet -- together with its
++ * predecessor body, so the legacy stream gives it the stock predecessor to record against. */
++static u32 Racer_NrrMachBodyLegacy(s32 lod6Skip) {
++    Racer* racer;
++    Racer* predRacer;
++    u32 mask = 0;
++
++    for (racer = sLastRacer; racer >= gRacers; racer--) {
++        s32 pred;
++
++        if ((racer->machineLod == 0) || (racer->stateFlags & RACER_STATE_CRASHED)) {
++            continue;
++        }
++        if (racer->machineLod < 6) {
++            if (!gdx3ds_nrr_mach_ready(racer->machineIndex * 6 + racer->machineLod - 1, GDX_NRR_MACH_BODY)) {
++                mask |= 1u << (racer - gRacers);
++            }
++            continue;
++        }
++        if (lod6Skip >= 2) {
++            continue;
++        }
++        pred = Racer_NrrMachSpeckPred(racer);
++        if (gdx3ds_nrr_mach_ready((pred != GDX_NRR_MACH_NOPRED) ? pred : GDX_NRR_MACH_SPECK_IDX,
++                                  GDX_NRR_MACH_SPECK)) {
++            continue;
++        }
++        mask |= 1u << (racer - gRacers);
++        for (predRacer = racer + 1; predRacer <= sLastRacer; predRacer++) {
++            if (Racer_NrrMachIsBody(predRacer)) {
++                mask |= 1u << (predRacer - gRacers);
++                break;
++            }
++        }
++    }
++    return mask;
++}
++
++void* Racer_NrrMachStub(void* gfxv, int sec, int playerIndex) {
++    Gfx* gfx = gfxv;
++    static GdxNrrMachSnap sSnap;
++    Camera* camera = &gCameras[playerIndex];
++    GdxNrrMachSnap* f = &sSnap;
++    Racer* racer;
++    GhostRacer* sp4F8;
++    s32 lod6Skip;
++    s32 fogR;
++    s32 fogG;
++    s32 fogB;
++    s32 legacyHl = 0;
++    s32 legacyBody = 0;
++    s32 fallback = 0;
++    s32 other = 0;
++    s32 var_s7;
++    u32 hlLegacyMask = 0;
++    u32 bodyLegacyMask = 0;
++
++    (void) sec;
++#ifndef EXPANSION_KIT
++    if (gGameMode == GAMEMODE_GP_END_CS) {
++#else
++    if (gGameMode == GAMEMODE_GP_END_CS || gGameMode == GAMEMODE_COURSE_EDIT) {
++#endif
++        return NULL;
++    }
++    f->n = 0;
++    lod6Skip = gdx_rival_lod6_skip();
++    Racer_NrrMachPoses();
++    Racer_NrrMachLights(playerIndex, camera, &fogR, &fogG, &fogB);
++    Racer_NrrMachFrameLights(f, playerIndex, fogR, fogG, fogB);
++
++    /* Highlight pass, stock order: recorded racers into the snapshot, the rest stay stock. */
++    for (racer = sLastRacer; racer >= gRacers; racer--) {
++        if (!Racer_NrrMachIsHighlight(racer)) {
++            continue;
++        }
++        if (racer->stateFlags & RACER_STATE_CRASHED) {
++            hlLegacyMask |= 1u << (racer - gRacers);
++            legacyHl++;
++            other++;
++        } else if (gdx3ds_nrr_mach_ready(racer->machineIndex * 6 + racer->machineLod - 1, GDX_NRR_MACH_HL)) {
++            Racer_NrrMachAdd(f, &gGfxPool->unk_21208[racer->id], racer, GDX_NRR_MACH_HL);
++        } else {
++            hlLegacyMask |= 1u << (racer - gRacers);
++            legacyHl++;
++            fallback++;
++        }
++    }
++    /* Body pass. */
++    bodyLegacyMask = Racer_NrrMachBodyLegacy(lod6Skip);
++    for (racer = sLastRacer; racer >= gRacers; racer--) {
++        if ((racer->machineLod == 0) || ((racer->machineLod == 6) && (lod6Skip >= 2))) {
++            continue;
++        }
++        if (racer->stateFlags & RACER_STATE_CRASHED) {
++            other++;
++        } else if (bodyLegacyMask & (1u << (racer - gRacers))) {
++            legacyBody++;
++            if (racer->machineLod == 6) {
++                other++;
++            } else {
++                fallback++;
++            }
++        } else if (racer->machineLod == 6) {
++            Racer_NrrMachAdd(f, &gGfxPool->unk_20308[racer->id], racer, GDX_NRR_MACH_SPECK);
++            f->e[f->n - 1].idx = Racer_NrrMachSpeckPred(racer);
++        } else {
++            Racer_NrrMachAdd(f, &gGfxPool->unk_20308[racer->id], racer, GDX_NRR_MACH_BODY);
++        }
++    }
++
++    if (gGameMode == GAMEMODE_TIME_ATTACK) {
++        for (sp4F8 = &gGhostRacers[2]; sp4F8 >= gGhostRacers; sp4F8--) {
++            if (sp4F8->exists && (sp4F8->racer->machineLod != 0)) {
++                other++;
++            }
++        }
++    }
++    f->rec = (legacyHl != 0) || (legacyBody != 0) || (gGameMode == GAMEMODE_TIME_ATTACK);
++    gfx = gdx3ds_nrr_mach_publish(gfx, playerIndex, f, fallback, other);
++    if (f->rec) {
++        gSPDisplayList(gfx++, D_303A7D8); /* stock: the highlight setup precedes the body pass */
++    }
++    if (legacyHl != 0) {
++        for (racer = sLastRacer; racer >= gRacers; racer--) {
++            if (!(hlLegacyMask & (1u << (racer - gRacers)))) {
++                continue;
++            }
++            gSPMatrix(gfx++, &D_1000000.unk_21208[racer->id], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++            gDPPipeSync(gfx++);
++            gDPSetBlendColor(gfx++, racer->attackHighlightR, racer->attackHighlightG, racer->attackHighlightB, 255);
++            if (!(racer->stateFlags & RACER_STATE_CRASHED)) {
++                gSPDisplayList(gfx++, D_800CDDB0[racer->machineIndex * 6 + racer->machineLod - 1]);
++            } else {
++                gSPDisplayList(gfx++, D_800CE080[racer->machineLod - 1]);
++            }
++        }
++    }
++    if ((legacyBody != 0) || (other != 0) || (gGameMode == GAMEMODE_TIME_ATTACK)) {
++        gSPDisplayList(gfx++, D_303A6A8);
++        gSPLight(gfx++, &D_1000000.unk_21A88[playerIndex].l[0], 1);
++        gSPLight(gfx++, &D_1000000.unk_21A88[playerIndex].a, 2);
++        gSPDmaRead(gfx++, 0x8B0, D_800CE3D0, ARRAY_COUNT(D_800CE3D0));
++        gSPLookAtY(gfx++, &D_1000000.unk_21AE8[playerIndex]);
++        gDPSetFogColor(gfx++, fogR, fogG, fogB, 255);
++        for (racer = sLastRacer; racer >= gRacers; racer--) {
++            if (!(bodyLegacyMask & (1u << (racer - gRacers)))) {
++                continue;
++            }
++            gSPMatrix(gfx++, &D_1000000.unk_20308[racer->id], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++            if (!((racer->machineLod == 6) && (lod6Skip >= 1))) {
++                gSPDisplayList(gfx++, D_800CDD38[racer->machineIndex]);
++            }
++            gDPSetEnvColor(gfx++, racer->bodyR, racer->bodyG, racer->bodyB, 255);
++            gSPDisplayList(gfx++, D_800CDDB0[racer->machineIndex * 6 + racer->machineLod - 1]);
++        }
++
++        /* Crashed machines and time-attack ghosts: the stock tail of the section, verbatim. */
++        var_s7 = 0;
++        for (racer = sLastRacer; racer >= gRacers; racer--) {
++            if (racer->machineLod == 0) {
++                continue;
++            }
++            if (racer->stateFlags & RACER_STATE_CRASHED) {
++                if (var_s7 == 0) {
++                    gSPDisplayList(gfx++, D_7045150);
++                    var_s7 = 1;
++                }
++                gSPMatrix(gfx++, &D_1000000.unk_20308[racer->id], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++                gDPPipeSync(gfx++);
++                gDPSetEnvColor(gfx++, racer->bodyR, racer->bodyG, racer->bodyB, 255);
++                gSPDisplayList(gfx++, D_800CE080[racer->machineLod - 1]);
++            }
++        }
++        if (gGameMode == GAMEMODE_TIME_ATTACK) {
++            gDPPipeSync(gfx++);
++            gDPSetRenderMode(gfx++,
++                             Z_CMP | Z_UPD | IM_RD | CVG_DST_FULL | ZMODE_XLU | FORCE_BL |
++                                 GBL_c1(G_BL_CLR_IN, G_BL_A_IN, G_BL_CLR_MEM, G_BL_1MA),
++                             Z_CMP | Z_UPD | IM_RD | CVG_DST_FULL | ZMODE_XLU | FORCE_BL |
++                                 GBL_c2(G_BL_CLR_IN, G_BL_A_IN, G_BL_CLR_MEM, G_BL_1MA));
++
++            for (sp4F8 = &gGhostRacers[2]; sp4F8 >= gGhostRacers; sp4F8--) {
++                if (!sp4F8->exists) {
++                    continue;
++                }
++                racer = sp4F8->racer;
++                if (racer->machineLod == 0) {
++                    continue;
++                }
++                Matrix_ScaleFrom3DMatrix(&gGfxPool->unk_20308[racer->id], &racer->modelMatrix,
++                                         sp4F8->scale * D_800CE748, sp4F8->scale * D_800CE74C,
++                                         sp4F8->scale * D_800CE750, &racer->modelBasis, &racer->modelPos);
++                gSPMatrix(gfx++, &D_1000000.unk_20308[racer->id], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
++                gSPDisplayList(gfx++, D_800CDD38[racer->machineIndex]);
++                gDPSetEnvColor(gfx++, racer->bodyR, racer->bodyG, racer->bodyB, 160);
++                gSPDisplayList(gfx++, D_800CDDB0[racer->machineIndex * 6 + racer->machineLod - 1]);
++            }
++        }
++    }
++    return gfx;
++}
++#endif
++
+ Gfx* Racer_Draw(Gfx* gfx, s32 playerIndex) {
+     s32 var_s3; // sp5CC
+     s32 var_s4; // sp5C8

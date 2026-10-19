@@ -64,6 +64,7 @@
 #include <string.h>
 
 #include "rsp/cxd4/gdx_rsp_driver.h"
+#include "gdx_ndsp_hash.h"
 #include "n64_rdram.h"
 
 extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
@@ -1096,6 +1097,18 @@ void gdx_audio_lle_run(const void* dataPtr, unsigned int dataSizeBytes) {
         }
 #endif
         return;
+    }
+    /* [ndsphash] the render digest's VALUE side is folded inside the HLE interpreter's
+       A_SAVEBUFF handler (port/n64_audio_hle.c).  The LLE bridge writes its output through
+       the RSP core instead, so an LLE session would produce keys with no values -- pairs that
+       LOOK comparable and are not.  Say so once, loudly, and record nothing. */
+    if (gdx_ndsphash_enabled()) {
+        static int sNdspHashLleWarned = 0;
+        if (!sNdspHashLleWarned) {
+            sNdspHashLleWarned = 1;
+            gdx_lle_logf("[ndsphash] executor=LLE unsupported -- no pairs recorded "
+                          "([audio] lle=0 is the 3DS default and the one this gate covers)\n");
+        }
     }
     gdx_audio_lle_bridge_run(dataPtr, dataSizeBytes);
 }

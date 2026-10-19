@@ -38,6 +38,30 @@ git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-residency-seam.patch
 git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-async-guards.patch
 git -C decomp apply ../port/3ds/patches/decomp-3ds-ek-diskcourse-decline.patch
 git -C decomp apply ../port/3ds/patches/decomp-3ds-disk-audio-load-census.patch
+git -C decomp apply ../port/3ds/patches/decomp-port-o3ds-scene-lod.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-c5cat-markers.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-hud-capture.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-track-resident-bake.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-sky-capture.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-c5tick-dlb.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-c5sub-markers.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-dress-shim.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-nrr-mach.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-nrr-trk.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-ships-census.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-autodrive.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-prewarm.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-finish-direct.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-finish-mesh.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-hud-placement.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-menu-capture.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-menu-trans-capture.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-force-boot-mode.patch
+git -C decomp apply ../port/3ds/patches/decomp-3ds-nimach.patch
+git -C decomp apply ../port/3ds/patches/decomp-port-title-demo-tick.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-records-scene.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-course-preview.patch
+git -C decomp apply ../port/3ds/patches/decomp-native-hud-elem-gate.patch
 ```
 
 (The six entries above `decomp-3ds-ek-diskcourse-decline.patch` were missing from this list
@@ -409,8 +433,9 @@ function with no port-side boundary between them. There is nowhere else to stand
 
 **Cost and blast radius.** `GDX_MP(n)` is one call to `gdx_mprof_ck` (`port/n64_sched.c`,
 defined for every platform; a no-op off 3DS), whose first statement tests the single int
-`gdx3ds_mprof_active`. That int is 0 unless `gdiffuser.ini [debug] mainprof = 1`, which
-defaults to 0. Nine calls per game frame, in family with the `gdx_diag_verbose()` call the
+`gdx3ds_mprof_active`. That int is 0 unless `gdiffuser.ini [debug] mainprof = 1` or
+`[debug] gputrace = 1` (C4i: the `[oth]` split reads this clock; gputrace runs it without
+the `[mprof]` receipt), both of which default to 0. Nine calls per game frame, in family with the `gdx_diag_verbose()` call the
 adjacent `GDX_CK` lines already make. No game state is read or written: the profiler only
 reads `svcGetSystemTick`. Armed, the receipt is emitted from the HOST loop at a window
 boundary, never from inside a game fiber, so the replay's tick order is untouched —
@@ -694,3 +719,555 @@ threshold). With it off each scope costs one `int` compare and reads no clock. R
 than an `#include` because `port/3ds/game/CMakeLists.txt` deliberately keeps `port/` off the
 decomp target's include path; the site ids are duplicated in each TU and the canonical list with
 its rationale is `port/gdx_audio_load_census.h`.
+
+## decomp-port-o3ds-scene-lod.patch (O3DS-SCENE-LOD, NEXT.md C4p, agent `o3dslod`)
+
+Two visual-only levers for the Old 3DS preset (`port/3ds/gdx3ds_perf_preset.c`,
+`[perf] preset = auto|off|o3ds`; `auto` = o3ds on an Old 3DS only). Applies on top of
+`decomp-port-rival-detail.patch` (racer.c) and the course.c stack; listed last.
+
+- **racer.c, rival tier 3 (LOW).** `gdx_rival_detail_level()` may now return 3 when the port
+  opens it (`[perf] rival_tier_max = 3`; the dynlod controller's ceiling stays 2 otherwise).
+  LOW biases an unprotected rival's view depth `80 + (d - 80) * 10`; the nearest
+  `GDX_RIVAL_PROTECT_COUNT_LOW` (3) rivals are not exempt as under MINIMAL (5) but get REDUCED's
+  curve (`250 + (d - 250) * 2.5`, `GDX_RIVAL_BIAS_MILD`), so their shadow and effects thin out
+  too while their mesh stays near-native. Effective for an unprotected rival: LOD 5 past ~119,
+  LOD 6 (the far speck) past ~222, shadow past ~152, effects tiers at ~112/~162. Tiers 0-2 are
+  byte-for-byte the rival-detail patch's.
+- **racer.c, LOD-6 emission (`gdx_rival_lod6_skip()`, 3DS `[perf] lod6_skip`, default 0).**
+  LOD 6 is NOT an empty list (07-machines-plan.md called it one): `D_7045098` is a 5-command,
+  12-vertex far speck, a few pixels on screen. But Racer_Draw emits the machine's whole
+  texture-load list `D_800CDD38[i]` (every LOADBLOCK of that machine's textures) in front of it,
+  once per LOD-6 machine per frame. Mode 1 drops only that texture-load list and keeps the
+  speck: **pixel-identical** on the canonical replay (fhdiff 49/49, race frames included), and
+  -5.5% of the Old 3DS emulator race frame at NATIVE, much more at MINIMAL/LOW where most of
+  the field is LOD 6. Mode 2 drops the speck too (machines past LOD 6 vanish; measured, not
+  shipped). The model matrix is still initialised in both modes.
+- **course.c, far cull below stock.** Course_Draw's `gdxFarRenderDistanceScale` (the desktop
+  `DrawDistance` CVar, clamped 100..200) is additionally multiplied by the port hook
+  `gdx_track_draw_distance_pct()` when it returns 1..99 (3DS: `[perf] draw_distance`, clamped
+  40..100). At 100 the multiply is skipped entirely, so stock output is bit-identical.
+
+**Visual only, and why that holds.** Every lever here only changes which display-list
+commands are emitted. Game logic reads `racer->machineLod` only as `!= 0`
+(visible at all; cpu.c:1082/1172, racer.c:4696/4830/5223), and the bias is applied after the
+frustum/2500 tests that decide 0 vs non-zero, so no racer's visibility bit changes;
+`unk_2B2`/`unk_2B3` are read only by the shadow/effect draw code. `chunk->drawState` (the far
+cull's output) is read only by Course_Draw and Course_GadgetsDraw; neither function nor
+Racer_Draw calls the RNG. Measured: the `[debug] gstate_every` digest (RNG streams, frame
+counter, every racer's physics and race progress) is identical at all 6002 ticks between the
+levers off and on (o3dslod-progress.md §4). The desktop build links both hooks from
+`port/gdx_linkstubs_desktop.c` (100 and 0: stock).
+
+## decomp-3ds-c5cat-markers.patch (C5 STAGE 0 `[c5cat]`, NEXT.md C5, agent `c5s0`)
+
+`GDX_C5CAT(cat)` scene-category markers in `src/overlays/ovl_i2/race.c` (`Race_Draw`: sky /
+track / dressing around the 1P `Background_Draw`, `Course_Draw`, `Course_GadgetsDraw`; HUD
+around `Menus_Player1SpecialDraw` and `Menus_Draw`) and `src/game/racer.c` (`Racer_Draw`:
+machines at entry and before the highlight/body pass, shadows before `D_303A758`, fx before
+`aSetupBoosterDL` (boost flames + the effects bracket), HUD before the race-intro/marker
+block, misc at the return), plus the macro block that defines them (`#ifdef PORT` only; off
+PORT the macro is empty).
+
+**Why the decomp.** The Old 3DS per-category CPU timers (`port/3ds/gdx3ds_mainprof.h`, the
+`[c5cat]` receipt) need to know which part of the scene the owned walker is drawing. The
+walker only sees commands; the scene structure exists only in the order `Race_Draw` and
+`Racer_Draw` emit them. A marker at each boundary hands that structure to the walker at the
+exact stream position, the same mechanism as the track (0x5A/0x5B) and fx (0x5C/0x5D)
+markers. p=0x61 is used because the retained-renderer design reserves 0x5E/0x5F/0x60.
+
+**Cost and blast radius.** Each marker is one call to `gdx_c5cat_armed` (`port/n64_sched.c`,
+every platform; 0 off 3DS), which returns the 3DS clock's armed int. That is 0 unless
+`[debug] gputrace = 1` or `[debug] mainprof = 1`, both default 0; then NOTHING is written and
+the display list is byte-identical to the unpatched game. Armed, each marker writes one
+`G_NOOP` (w0 = `G_NOOP<<24 | 0x61<<16 | cat`, w1 = 0), about 12 per 1P race frame. A G_NOOP
+draws nothing on either interpreter: the owned walker hands it to `OwnedNoopHook`, and the
+LUS noop handler ignores an unknown p. No game state is read or written.
+
+## decomp-native-hud-capture.patch (C5 STAGE 2 `[native] hud_batch`, NEXT.md C5-S2, agent `c5s2`)
+
+Three HUD regions are bracketed: `Racer_Draw`'s marker/countdown tail (`src/game/racer.c`,
+from the `GDX_C5CAT(HUD)` marker to the return), and `Menus_Player1SpecialDraw` and
+`Menus_Draw` in `Race_Draw` (`src/overlays/ovl_i2/race.c`). `GDX_HUD_REGION_BEGIN()` remembers
+where the region starts; `GDX_HUD_CAPTURE()` calls `gdxhud_capture(start, gfx)`
+(`port/3ds/gfx/gdx3ds_hud_capture.c`) after the section has written its display list. Both
+macros exist only under `#if defined(PORT) && defined(GDX_NATIVE_HUD)` (the 3DS game library
+defines `GDX_NATIVE_HUD`, like `GDX_NATIVE_FX`); elsewhere they are empty.
+
+**Why the decomp.** The HUD's CPU cost on the owned walker is per command (C5 Stage 0:
+25-31% of the race's render work, ~520 walked commands and ~28 texture loads a frame). The
+capture moves each run of RDP-state / texture-load / rectangle commands out of the list into a
+record and leaves one `G_NOOP` p=0x5E marker in its place; the owned interpreter replays the
+run at the marker through its own handlers (`port/3ds/gfx/n64/gdx_hud_replay.cpp`). Only the
+place where a HUD region ends is known to the game, so the call sites have to be here.
+
+**What it does not change.** No draw function is skipped, shortened or reordered: the HUD code
+(its minimap toggle, sounds, finish timers) runs in full and writes its commands exactly as
+before; the compaction happens afterwards and keeps every command that is not in the
+recordable set in place. Unarmed (`[native] hud_batch = 0`, the default, or `interp = 0`, or
+the `interp_verify` oracle on) `gdxhud_armed()` returns 0 and nothing is touched: the display
+list is byte-identical to the unpatched game.
+
+## decomp-native-track-resident-bake.patch (C5 STAGE 3c `[native] track_resident`, NEXT.md C5, agent `c5s3c`)
+
+Two calls in `src/game/course.c`, both under `#if defined(PORT) && defined(GDX_NATIVE_TRACK)`
+(the shim header `gdx3ds_track_shim.h` declares them):
+
+- **`gdxtrk_course_loaded()` at the end of `Course_Init`**, once `func_800A1954` has chunked the
+  spline and the render distances are set. With `[native] track_resident=1` it bakes every
+  course ring the per-frame walk can emit (`port/3ds/gfx/gdx3ds_track_resident.cpp`, using the
+  decomp's own `Course_SetupChunk*Vtx` through `port/3ds/game/gdx3ds_track_bake_game.c`) into a
+  GPU-resident buffer. It runs at every `Course_Init` (race, records, ending), so X Cup's
+  generated courses and edited courses are baked at their own load. Lever off: an int test.
+- **`gdxtrk_draw_enter()` at the top of `Course_Draw`**: the `[trkcat]` clock's start of the
+  cull + grouping (armed only with `[debug] gputrace=1` or `mainprof=1` and `[debug] trkcat=1`).
+
+**Why the decomp.** The bake needs the moment the chunks are complete, which only
+`Course_Init` knows. Nothing in the game changes: neither call writes game state (the bake
+saves and restores the two globals the setup functions write, `gCourseVtxPtr` and
+`D_800F8930`, around each call, and runs before the first `Course_Draw`).
+
+## decomp-native-sky-capture.patch (`[native] sky_retain` / `skyclock`, NEXT.md C5, agent `c5sky`)
+
+`Background_Draw` (`src/overlays/ovl_i3/background.c`) is bracketed: `GDX_SKY_REGION_BEGIN()`
+remembers where it starts, `GDX_SKYSEC(HEAD|GRAD|STARS|SPRITES|FLOOR|FIREWORKS|CLOUDS|END)`
+writes one `G_NOOP` p=0x65 section marker at each of its sections, and `GDX_SKY_CAPTURE()` calls
+`gdxsky_capture(start, gfx, cameraIndex, &identity)` (`port/3ds/gfx/gdx3ds_sky_capture.c`)
+before it returns. The bracket is inside `Background_Draw`, so every caller is covered by one
+patch site: the race's 1P/2P/3P/4P cameras (`race.c`), `records.c`, the ending and the course
+editor. The macros exist only under `#if defined(PORT) && defined(GDX_NATIVE_SKY)` (the 3DS
+game library defines it); elsewhere they are empty.
+
+**Why the decomp.** Only the game knows where the sky's sections begin and end, and which
+textures the sky draws with this frame (`gdxSkyIdentityFill`: the skybox/floor/cloud/star
+textures, each sprite's texture and palette, the palette-replacement count, the course, the game
+mode, the skybox flags). The markers let the owned walker time each section (`[skycnt]`); the
+capture moves each run of recordable commands (RDP/RSP state, texture loads, rectangles,
+triangles, and the segmented `G_MTX`/`G_VTX`) into a record behind one p=0x65 run marker that
+the owned interpreter replays at the same position (`port/3ds/gfx/n64/gdx_sky_retain.cpp`); the
+identity's generation keys every retained answer.
+
+**What it does not change.** No draw function is skipped, shortened or reordered:
+`Background_Draw` and its helpers (the sprite matrices, the night palette flash, the star
+projection) run in full and write their commands exactly as before. Unarmed (`[native]
+sky_retain = 0` and `skyclock = 0`, the defaults, or `interp = 0`, or the `interp_verify` oracle
+on) `gdxsky_armed()` returns 0 and nothing is written: the display list is byte-identical.
+
+## decomp-3ds-c5tick-dlb.patch (C5TICK: the per-tick DL build, agent `c5tick`)
+
+Listed last. Touches `src/game/game.c` (`func_80069698`), `src/overlays/ovl_i2/race.c`
+(`Race_Draw`) and `src/game/racer.c` (`Racer_Draw`); includes
+`port/3ds/gfx/gdx3ds_dlb_shim.h` only under `#if defined(PORT) && defined(GDX_PLATFORM_3DS)`,
+elsewhere the macros are empty (`GDX_DL_SKIP` is 0) and the game is stock. Port side:
+`port/3ds/gdx3ds_c5tick.{h,c}`; progress and numbers: `docs/research/native/c5tick-progress.md`.
+
+**Two things.**
+- `GDX_DLB(sec)` section markers: the `[c5dlb]` per-section build time (`[debug] dlbprof`) and
+  the write-set check (`[debug] dlwrite`). One call + one int test per marker when both are off.
+- `GDX_DL_SKIP(sec, view)` around the side-effect-free sections: in `Race_Draw` the
+  `Background_Draw` / `Course_Draw` / `Course_GadgetsDraw` / `Camera_Draw` calls (every player
+  count), in `Racer_Draw` the shadow, body (highlight + lights + machines + ghosts), booster
+  and effects sections (skipped by `goto` to a label at the section's end, so the patch leaves
+  the function body in place). The port answers 1 on a HOLLOW tick (frameskip drops this
+  tick's task and `[debug] dl_hollow = 1`) or when a native path has consumed the section on
+  rendered ticks (`gdx3ds_c5tick_consume`); 0 otherwise, so with both levers off the display
+  list is byte-identical.
+
+**What always runs (it changes game state), and why the rest may skip.** Static audit of every
+callee plus the write-set check on the corpus (progress doc §2):
+- `Race_Draw` head: `D_i2_80106F10--` (the clear countdown) -- always runs.
+- `Racer_Draw` visibility pass: writes `machineLod` / `unk_2B2` / `unk_2B3`; the AI reads
+  `machineLod != 0` (cpu.c:1082/1172, racer.c:2303/2352/2404/4701/4739) -- always runs.
+- `Racer_Draw` shadow section's `else`: `gRacers[0..3].speed = 0` while `gRaceIntroTimer >= 280`
+  -- kept in the skip branch.
+- `Racer_Draw` HUD tail: countdown SEs 3/2/1/GO, the BGM start at `gRaceIntroTimer == 1`, the
+  approach-warning SE and `soundEffectFlags` -- always runs.
+- `Menus_Player1SpecialDraw`, `Menus_Draw`: AI inputs (`func_i3_801175A4`), race finalisation
+  (`func_8008AA8C`), timers compared for equality, input edges, RNG, SRAM saves -- always run.
+- `Transition_Draw`: outside `Race_Draw` (its FINISHED teardown is game state) -- always runs.
+- Skippable: `Background_Draw` (reads only; its RNG fireworks are ending-cutscene only, and hollow
+  is scoped to `Race_Draw`), `Course_Draw` + `Course_GadgetsDraw` (per-call cull recomputed for
+  every chunk before it is read; the gadget pass reads the track's cull, so a consumer must take
+  both), `Camera_Draw` (writes nothing), and Racer_Draw's shadow / body / booster / effects
+  sections, which write the GfxPool, the effects vertex cursor (reset by `Race_Draw` every
+  tick) and the `*MatrixInit` flags + `modelMatrix` (reset by the racer update every tick, read
+  only by `Racer_Draw` after it recomputes them).
+- A HOLLOW tick skips only sky / track / dressing / camera / shadows / bodies
+  (`kHollowSkippable`): the booster and effects sections keep running because the debris and
+  spark triangles read vertex fields no build writes (the previous build's bytes in that GfxPool
+  half), so skipping them would change the next frame drawn from that half. With the body section
+  skipped, every visible machine's model matrix is still built (`[debug] dl_hollow_poses`,
+  default 1) for a pose-replay stage.
+- Dynamic check (`[debug] dlwrite`, 32-byte blocks, lever off, canonical / 4p-vs /
+  explosion-pileup / gp2-sector): sky and camera change no decomp byte; track/dressing only the
+  course.c / course_gadgets.c per-call statics above; shadows/bodies only the gRacers draw scratch
+  (and the intro speed clamp, which the skip branch keeps) and `math.c`'s `sDefaultMtxF` output
+  sink; the HUD tail (always run) is where the audio command queue is written.
+
+## decomp-3ds-c5sub-markers.patch (C5 STAGE 3b `[c5sub]`, NEXT.md C5, agent `c5dress`)
+
+Diagnostic only. `GDX_C5SUB(piece)` writes ONE `G_NOOP` with p=0x62 and a sub-id at each piece
+boundary of `Course_GadgetsDraw` (`src/game/course_gadgets.c`: landmines, jumps, the course
+effects setup and each course effect by type, the gate/sign pass, the building pass) and of
+`Racer_Draw`'s effects section (`src/game/racer.c`: boost flames and the seven effect classes).
+The owned walker's noop hook (`port/3ds/gfx/n64/gdx_rt_glue.cpp`) times and counts each piece
+(`[c5sub]` line on the `[c5cat]` cadence). Ids match `GDX3DS_C5SUB_*` in
+`port/3ds/gdx3ds_mainprof.h`. Inside the `[native] fx` shim bracket a pending native fx run is
+closed with its marker first (what the next class's setup list does anyway), so the run's replay
+is charged to its own class.
+
+**Why the decomp.** Only the game knows where one piece of dressing ends and the next begins.
+
+**What it does not change.** Written only while `gdx_c5sub_armed()` (`[debug] c5sub=1` on top of
+an armed `[c5cat]` clock: `gputrace=1` or `mainprof=1`); unarmed the display list is
+byte-identical. The markers draw nothing on either interpreter.
+
+## decomp-native-dress-shim.patch (C5 STAGE 3b `[native] gadget_batch` / `dress_retained` / `fxshd_direct`, agent `c5dress`)
+
+`src/game/course_gadgets.c`: the gadget pass of `Course_GadgetsDraw` (landmines, jumps, the
+course effects) is bracketed by `gdx3ds_gad_shim_begin.h` / `_end.h` (push/pop_macro, like the
+fx shim) with `GDXGAD_BEGIN(!IN_COURSE_EDITOR)` / `GDXGAD_END()`; direct-load scope markers
+(`GDXDRESS_SCOPE`, G_NOOP p=0x6C) open and close around the gadget pass and the two decoration
+passes. `src/game/racer.c`: the same scope marker around the effects section (after
+`GDX_C5CAT(FX)`, before `GDX_C5CAT(HUD)`). All of it is under `#if defined(PORT) &&
+defined(GDX_NATIVE_DRESS)` (the 3DS game library defines it).
+
+**Why the decomp.** The gadget pass emits its vertices and triangles one small piece at a time
+(`gSPVertex` + `gSP2Triangles` per mine / jump / dash plate / strip group); the recorder needs
+those call sites, exactly as the fx shim does for Racer_Draw's effect classes. The scopes mark
+where the dressing and effect passes begin and end, which only the game knows.
+
+**What it does not change.** No draw function is skipped or reordered; the game logic in the
+gadget pass (the per-chunk `drawState` culling, the ST wrap patches) runs as before. With every
+lever at 0 (the default), `gdxgad_active` is 0, every shim macro emits the original GBI through
+`port/3ds/game/gdx3ds_gad_gbi.c` (compiled with the same gbi.h), and no marker is written: the
+display list is byte-identical. The course editor branch (EXPANSION_KIT) always runs stock.
+
+## decomp-3ds-nrr-mach.patch (n60 NRR milestone 2 `[native] nrr_mach`, NEXT.md C7, agent `n60mach`)
+
+`src/game/racer.c`: adds `Racer_NrrMachStub(gfx, sec, view)` in front of `Racer_Draw` (nothing in
+`Racer_Draw` changes). The port registers it as the BODY section's consumer
+(`gdx3ds_c5tick_consume`, `port/3ds/gfx/nrr/gdx3ds_nrr_mach.cpp`) when `[native] nrr_mach = 1`; it
+then runs in place of the body section on rendered ticks (`GDX_DL_SKIP(BODY)`, the
+decomp-3ds-c5tick-dlb.patch seam). It makes every game-state write the section makes -- each
+visible machine's `modelMatrix` / `modelMatrixInit` (read by the booster section) and highlight
+`attackHighlightMatrixInit`, the GfxPool matrices and the view's lights -- then copies what a
+native draw needs into the port's per-(GfxPool, view) `GdxNrrMachFrame` and writes one
+`G_NOOP p=0x63` marker. Racers the snapshot does not model (no complete record yet, crashed, the
+LOD-6 speck, time-attack ghosts) are written as the section's stock commands, in stock order,
+after the marker; the not-yet-recorded racers' commands are bracketed by `p=0x63` record markers.
+Returns NULL (the section builds the stock way) in the GP ending cutscene and the course editor.
+
+**Why the decomp.** The stub needs the section's statics (`sLastRacer`, the pipe/tunnel fog
+tables) and must reproduce its writes exactly; it is the section's own code, regrouped.
+
+**What it does not change.** Nothing runs unless the lever registered the consumer (default 0):
+the function is never called and the display list is byte-identical.
+
+## decomp-native-nrr-trk.patch (n60 NRR track, `[native] nrr_trk`, agent `n60trk`)
+
+`src/game/course.c` `Course_Draw`: one call before the far-to-near group walk (the `while (true)`
+loop over `sSegmentChunkGroups`) and one label after it, both under `#if defined(PORT) &&
+defined(GDX_NATIVE_TRACK)` (the shim header `gdx3ds_track_shim.h` declares the call). When
+`gdxtrk_nrr_walk()` returns 1 the stock loop is skipped; the stock tail (the final `gSPTexture`
+off, `GDXTRK_END`) runs either way. It returns 0 (stock loop, byte-identical list) unless
+`[native] nrr_trk=1`, the pass is camera 0 of a 1P game inside `Race_Draw` (the c5tick section
+markers), and the course has an NRR index (`[native] track_resident=1` bake).
+
+**What replaces the loop.** `port/3ds/game/gdx3ds_nrr_trk_game.c`, compiled with the game's
+headers, runs the same selection loop, the same two group walks (merge LOD included, same f32
+expressions) and the ten shape emitters' decisions, and WRITES EVERY GLOBAL THE STOCK WALK
+WRITES with the stock value: `D_800F89D4`, `D_800F892C`, `sLastTrackShapeType`, `D_800F8930`,
+`D_800F8958[].chunk`, `D_800F89B8/BC/C0/C8`, `sWorkingSegmentChunk`, `sWorkingNextSegmentChunk`,
+`sWorkingChunkJoinInfo`, `gCourseVtxPtr` (advanced by the same counts) and every group's
+`averageDepth`. It emits the walk's texture-state GBI (`gSPTexture` pairs, `LoadSync`,
+`SetTextureImage`, `LoadBlock`) verbatim through the shim's emitters, so the RDP state the gadget
+pass inherits is the stock one, and the stock final `gSPTexture` follows. What it does not do:
+write the rings into `courseVtxBuffer` (GfxPool scratch: only this list's own `gSPVertex` read
+it) and emit `gSPVertex` / template `gSPDisplayList` / `gSPModifyVertex`; per material run it
+writes one G_NOOP p=0x63 marker instead (the render side draws the run's resident rings).
+
+**Side-effect proof.** (1) Static: nothing outside `course.c`'s walk reads `courseVtxBuffer`,
+`gCourseVtxPtr` is reset by every caller before `Course_Draw` (race.c, records.c, ending.c, the
+course editor) and read only by the walk; the walk globals are written with the stock values
+(above); `Course_GadgetsDraw` reads `chunk->drawState`, which the cull writes before this call.
+(2) Dynamic: `[native] nrr_trk=2` runs the lean walk dry, puts every global back, lets the stock
+walk run recorded, and compares the stock walk's end-of-pass globals and every template op's two
+rings (positions and final U/V, vertex for vertex) with the lean walk's (`[nrrtrk] verify ...
+bad=0 globals_bad=0`). (3) `[gstate]` (+ `gstate_ext`) identical at every tick, `nrr_trk=0` vs
+`1`, over the corpus (n60trk-progress.md).
+
+**Fallback.** A group the bake cannot serve (a tunnel-mouth join, whose five join vertices
+carry stale U/V; a ring variant outside the bake window) is rewound and walked by the stock
+`Course_Draw{Forward,Backward}ChunkGroup` with the legacy recorder armed (the c5s3 retained
+path draws it). Both slot chunks are forced to NULL around such a group (a fresh ring pair):
+visual only, the walk globals are read by nothing but the walk.
+
+## decomp-3ds-ships-census.patch (n60ships `[debug] ships_census` / `logic_split`, agent `n60ships`)
+
+`src/game/racer.c`: `Racer_GdxShipsCensus()` (in front of `Racer_Draw`) counts what the visibility
+pass just decided -- active racers, visible ones by `machineLod` 1..6, shadows / flames / flame
+trails / highlight passes by the draw loops' own conditions, crashed, time-attack ghosts -- and hands
+the counts to `gdx3ds_ships_census_add` (`port/3ds/gdx3ds_ships.c`); one call before the shadow
+section, under `[debug] ships_census`. `Racer_UpdateMovement` / `Racer_Update` get `GDX_LSPLIT`
+marks (AI = `Cpu_GenerateInputs`, PHYS = `Racer_UpdateFromControls`, COLL = the pair-collision
+loop, RPOST = the rest after the movement loop). `src/overlays/ovl_i2/race.c` `Race_Update`: begin /
+end of the `[lsplit]` timeline and a mark before each phase (menus, effects, racers, camera,
+background, course, func_80074844).
+
+**Why the decomp.** The census reads `Racer` fields right after the pass that writes them; the
+split's phases are call sites inside the race update.
+
+**What it does not change.** Read-only: counters and `svcGetSystemTick` reads, receipts emitted by
+the host loop. Off (the default) each site is one int test; nothing else runs, and game state, the
+display list and `[gstate]` are identical either way.
+
+## decomp-3ds-autodrive.patch (n60tex `[debug] autodrive`, agent `n60tex`)
+
+`Racer_UpdateMovement` (racer.c): with `[debug] autodrive = 1` player 1 takes
+`Cpu_GenerateInputs` (the game's own post-finish autopilot branch) instead of the pad, so a
+replay that only drives the menus finishes a race on the emulator lane (TT FINISH text,
+post-finish HUD, results). Measurement lever, default 0; `#if defined(PORT) && defined(__3DS__)`.
+Hook: `port/3ds/gdx3ds_autodrive.c`. `docs/research/native/n60tex-progress.md`.
+
+## decomp-3ds-prewarm.patch (n60prewarm `[native] prewarm`, agent `n60prewarm`)
+
+`src/game/racer.c` `Racer_NrrMachStub` (decomp-3ds-nrr-mach.patch): three hooks into
+`port/3ds/game/gdx3ds_prewarm_game.c`. `gdx3ds_prewarm_mach_plan()` answers non-zero only in a
+race's opaque appear frame (the load tick's list, drawn under `TRANSITION_TYPE_FADE` at alpha 255)
+with the lever on; then the stub arms the recorder (`f->rec`), always writes the body prologue,
+and after it `gdx3ds_prewarm_mach_bodies()` writes the stock body draw of every (machine in the
+race, LOD 1-5) without a complete record, each followed by a far-speck draw, under one pose in
+front of the camera; at the section's end `gdx3ds_prewarm_mach_hl()` writes the highlight pass of
+the same set (`D_303A7D8`, blend colour, body list) and the body prologue again. The recorder,
+the mesh bakes and the material tables see them as first sights. `docs/research/native/
+n60prewarm-progress.md`.
+
+**Why the decomp.** The draws are the stub's own stock commands; they belong in its stream, after
+its prologue and before its legacy bodies (the speck-material rule reads the stock order).
+
+**What it does not change.** With `[native] prewarm = 0` (the default), or in any frame but the
+opaque one, `plan` returns 0 and the stub's output is byte-identical. No game state is written in
+either case (the pose is a file-static `Mtx` in the port's game unit).
+
+## decomp-native-finish-direct.patch (n60lap `[native] finish_direct`, agent `n60lap`)
+
+`src/overlays/ovl_i3/menus.c` `Menus_DrawFinish`: the `gSPDisplayList(aFinishDL)` of the 3D FINISH
+banner (drawn after the finish line in GP and Time Attack, ~380 frames per race) is bracketed by
+two `gdx_finish_scope_marker` calls (port/3ds/gfx/gdx3ds_dress_sink.c). With `[native]
+finish_direct=1` and `fxshd_direct` armed they write the effects section's direct-load scope
+markers (G_NOOP p=0x6C, `GDXDRESS_SCOPE_FX` / 0), so the banner's twelve LOADBLOCKs per frame take
+that scope's exact path (resolved once, TMEM as debt, the import hash memoised per source).
+Otherwise they write nothing and the list is unchanged. Under `GDX_NATIVE_DRESS` only (the 3DS
+game target); other builds compile the stock call. Pure delta; applies last.
+
+
+## decomp-native-finish-mesh.patch (n60finish `[native] finish_mesh`, agent `n60finish`)
+
+`src/overlays/ovl_i3/menus.c` `Menus_DrawFinish`, inside finish-direct's `GDX_NATIVE_DRESS` block:
+right before `gSPDisplayList(gfx++, aFinishDL)` a `gdx_finish_mesh_marker` call
+(port/3ds/gfx/gdx3ds_dress_sink.c) writes a G_NOOP p=0x6A when `[native] finish_mesh=1` and the
+owned walker draws (not under interp_verify). The walker hands the next G_DL to the mesh registry,
+which draws the banner as a retained GPU-transform mesh (gdx3ds_mesh.cpp, "finish_mesh"). Off, the
+list is unchanged. Pure delta on top of decomp-native-finish-direct.patch; applies last.
+
+## decomp-3ds-hud-placement.patch (nibottom Phase 2 `[hud] placement`, agent `nibottom`)
+
+`src/overlays/ovl_i3/menus.c` `Menus_Draw`: reads `gdx_hud_top_suppressed(gNumPlayers)` and
+`gdx_hud_minimap_suppressed(gNumPlayers)` (port/input_bridge.c, cached into
+`gdxHudTopSuppressed`/`gdxHudMapSuppressed` once per frame, same idiom as the existing
+`gdxPhotoActive`/`gdxWideHud` locals) and ANDs them into the three call sites that draw the
+top-screen race HUD: `Hud_DrawHud` + `Hud_DrawRacePortraits` (gated on `gdxHudTopSuppressed`) and
+both `Minimap_DrawCourseMinimap` calls (gated on `gdxHudMapSuppressed`). The predicates fold in the
+numPlayers>1 force-ALL_TOP rule themselves (port/gdx_hud_placement.h), so 2-4P is always
+unaffected regardless of the lever. `[hud] placement = ALL_TOP` (default): both predicates always
+answer 0 and the list is byte-identical to stock -- this is Gate 1 (bottom_race on/off, mode
+ALL_TOP, fh+gstate byte-identical). `SPLIT`/`ALL_BOTTOM`: the suppressed elements leave the exact
+pixel boxes they used to draw blank; nothing else on the top screen changes (Gate 2). No overlap
+with `decomp-native-finish-direct.patch`/`decomp-native-finish-mesh.patch` (same file, lines
+~1733-1758, this patch's lines are ~5546-5718) or with `decomp-native-menu-capture.patch`/
+`decomp-native-menu-trans-capture.patch` (`src/game/game.c`, a different file -- the `nimenu`-owned
+"menu-capture" patches this one must not touch). Pure delta; order-independent among those four.
+docs/research/native/nibottom-progress.md.
+
+## decomp-native-menu-capture.patch (nointerp S2 `[native] ni_menu`, agent `nimenu`)
+
+`src/game/game.c` `func_80069698`: the draw-table call `sGamemodeDrawFuncs[GET_MODE(gGameMode)](gfx)`
+is bracketed (under `PORT && GDX_NATIVE_HUD`): the list start is kept and, after the draw function
+returns, `gdxmenu_capture(start, gfx, mode)` (port/3ds/gfx/gdx3ds_menu_capture.c) compacts the region
+like a HUD region (kind MENU, 0x5E markers) for every mode whose draw function is not `Race_Draw`, when
+`[native] ni_menu != 0`. The draw functions run unchanged; off, the list is byte-identical. Pure delta.
+`decomp-native-menu-trans-capture.patch` widens this same bracket; applies right after it.
+docs/research/native/nimenu-progress.md.
+
+## decomp-native-menu-trans-capture.patch (nointerp residue round, agent `nimenu`)
+
+`src/game/game.c` `func_80069698`: widens `decomp-native-menu-capture.patch`'s bracket to close after
+`Transition_Draw(gfx)` instead of right after the mode's draw function, so both land in the same MENU
+capture region. `gdxMenuStart`/`gdxMenuMode` are now taken unconditionally at function entry (same
+pointer value either way, since `gfx` is not touched before the gate), but `gdxmenu_capture` only runs
+when `gdxMenuArmed` -- set exactly where the original code's `if` gated the whole native-HUD branch --
+is 1, so the capture fires under precisely the same condition as before. Before this patch,
+`Transition_Draw`'s own words (the wipe/wide-stretch scissor and, on screens with a perpetual idle
+background wipe, its per-frame fill/texrect chain) landed after the capture call and stayed on the
+stock walker every frame (nimenu-progress.md Sec.1.1's "wipe background ~8/f" residue, present on every
+`ni_menu` screen regardless of lever state because it was never inside the bracket to begin with). Race
+modes are unaffected: `gdxMenuArmed` is still only set when the native-HUD branch's `if` ran, and
+`gdxmenu_capture` itself still refuses race modes (`MenuIsRaceDraw`). `[native] ni_menu = 0`: the list
+is byte-identical (capture is skipped either way, same as before). Pure delta; applies right after
+`decomp-native-menu-capture.patch`. docs/research/native/nimenu-progress.md.
+
+## decomp-native-force-boot-mode.patch (`[debug] force_mode`, agent `nimenu`)
+
+`src/game/game.c` `func_800690FC`'s `GAMEMODE_CHANGE_INIT` case -- reached exactly once per process,
+only from the `gGameMode == -1` check a few lines above -- gets one hook (under `PORT`) right before
+`gGameMode = gQueuedGameMode;`: if `gdx_debug_force_boot_mode()` (port/3ds/gdx3ds_force_mode.c,
+`[debug] force_mode`) returns `>= 0`, `gQueuedGameMode` is overridden to that `GameMode` (fzx_game.h)
+before the assignment, so the game boots straight into it instead of `GAMEMODE_TITLE`. Reach aid for
+screens with no menu path and no finishable replay (credits, the GP ending, the EAD demo); default
+-1 = off, the list is byte-identical. MEASUREMENT ONLY -- a forced boot mode runs with no antecedent
+race/cup state, so its content is real code on its real path but not a result a player could produce.
+Pure delta; applies last. docs/research/native/nimenu-progress.md.
+
+## decomp-native-gp-end-setup.patch (`[debug] force_mode` GP-ending racer setup, agent `nimach`)
+
+`src/game/game.c`: a cold `force_mode` boot into `GAMEMODE_GP_END_CS` leaves every racer-standings
+global (`gRacerPositionsById[]`, `gRacers[]`, `gPlayer1OverallPosition`, ...) at its BSS-zero default.
+`Racer_Init`'s `GAMEMODE_GP_END_CS` branch (racer.c) does not expect that: it searches
+`gRacerPositionsById[]` for the racers placed 1st/2nd/3rd and indexes `gRacers[]` at wherever the
+search stops; an all-zero array never matches, so the search runs off the end and reads
+`gRacers[TOTAL_RACER_COUNT]` -- one past the valid 0..29 range. This adds `gdx_force_mode_setup_gp_end_cs`
+(called from the same one-shot `force_mode` hook `decomp-native-force-boot-mode.patch` adds, only when
+`gdxForcedMode == GAMEMODE_GP_END_CS`): a minimal, safe 3-racer 1st/2nd/3rd placement
+(Captain Falcon/Dr. Stewart/Pico, all stock machine skins) at `STANDARD` difficulty / `JACK_CUP`, which
+avoids the OOB read and exercises both the podium and the congratulations-text draw paths. Off
+(`force_mode` unset, or set to any other mode), nothing changes. Applies right after
+decomp-native-force-boot-mode.patch, before decomp-native-gp-end-mach.patch. docs/research/native/nimach-progress.md.
+
+## decomp-native-gp-end-mach.patch (GP ending native machine-body coverage, agent `nimach`)
+
+`src/game/racer.c`: `Racer_NrrMachStub` (the N60MACH machine-body native-coverage stub,
+`[native] nrr_mach`) declined with an early `return NULL` whenever `gGameMode ==
+GAMEMODE_GP_END_CS`, forcing the GP ending cutscene's machine-body geometry back onto the full
+stock/interpreted draw. That exclusion was never load-bearing: `EndingCutscene_Init` places its
+racers through the same `Racer_Init`/`Course_Init` path a real race uses, so the section's
+snapshot (model/highlight matrices, GfxPool lights, the native-draw marker) is exactly as valid
+during the ending as it is mid-race. Removes the `GAMEMODE_GP_END_CS` check, keeping only the
+course editor's `GAMEMODE_COURSE_EDIT` exclusion (now `#ifdef EXPANSION_KIT`-only, since that mode
+does not exist outside the Expansion Kit build). nicensus measured ~1240 cmds/f of stock-walked
+machine-body geometry in the "gp_end_cs/steady" bucket before this fix; see
+docs/research/native/nimach-progress.md for the after numbers. Applies right after
+decomp-native-gp-end-setup.patch, before decomp-3ds-nimach.patch (same stub, same file).
+
+`src/overlays/ending/ending.c`: that stub alone was not reachable here -- `EndingCutscene_Draw`
+calls `Racer_Draw` directly, outside `Race_Draw`'s own `RHEAD..TRANS` bracket, so
+`gdx3ds_c5tick.c`'s `sRaceScope` stays false for the whole mode and `gdx_dl_skip` never calls any
+registered consumer stub at all (`stub=0 markers=0` for a full run, confirmed by instrumentation).
+Wraps the `Racer_Draw(gfx, 0)` call in `gdx_dl_scene_mach(1)`/`(0)` (new, `gdx3ds_c5tick.c`/`.h`),
+a scene scope armed by `gdx3ds_nrr_mach_armed()` (new one-line accessor, `gdx3ds_nrr_mach.cpp`) --
+the mach category's own settled `[native] ni_mach` state. Deliberately a separate entry point from
+`gdx_dl_scene` (the records flyby's own scope, `decomp-native-records-scene.patch`, armed by
+niview's `gdx3ds_nrr_scene_ok()`): an earlier draft OR'd `gdx3ds_nrr_mach_armed()` into
+`gdx_dl_scene` itself, which would have also opened the flyby's scope whenever `[native] ni_mach`
+is armed regardless of niview's own records bit, letting the mach BODY stub claim sections of a
+scene it has no business touching. Two named functions make that cross-talk structurally
+impossible instead of relying on a convention. `[nrr] mach` went from `stub=0` to `stub=64` per
+64-frame window (every frame, all 3 podium racers) once this landed; nicensus residue dropped
+~15-18% (`walkW` 1044.1 -> `walkB` ~859-861 at frames=17,999). Gated on-vs-off (49/49 SHOT
+checkpoints, byte-identical every frame) and the records flyby on-vs-off with `[native] ni_mach`
+armed vs not (unaffected, by construction). See docs/research/native/nimach-progress.md §7.6-7.7.
+
+## decomp-3ds-nimach.patch (nointerp S5b `[native] ni_mach`, agent `nimach`)
+
+`src/overlays/ovl_i4/machine.c`, 3DS port builds only (not the Expansion Kit): with `[native]
+ni_mach` bit 1 (`gdx3ds_nimach_level()`, latched by the NRR mach category: needs `nrr=1 nrr_mach=1`),
+`MachineSelect_MachineDraw` keeps its stock prologue (projection, `D_303A5F8`, the lights and
+`Lights_SetSource`) and then, instead of the 30-slot loop, `MachineSelect_NimachMachines` snapshots
+every slot whose (body list, menu pass) has a complete NRR record -- its GfxPool matrix, its `Vp`,
+its light set and `func_8009CCBC`'s env colour -- into one `GdxNrrMachMenuSnap` and writes ONE
+`G_NOOP p=0x63` marker (`port/3ds/gfx/nrr/gdx3ds_nrr_mach.cpp`, menu kinds). Slots without a record
+follow the marker as the loop's stock commands (the marker arms the recorder for them: their legacy
+draw is the record pass); the RSP state the stock loop leaves (slot 29's lights, viewport, matrix,
+env colour) is written last. No game state is written (the stock loop writes none). Lever 0 (the
+default), or the snapshot not taken: the stock loop, byte-identical. Pure delta; applies last.
+`docs/research/native/nimach-progress.md`.
+
+## decomp-port-title-demo-tick.patch (niview — attract demos under det=1)
+
+Pure delta on top of `decomp-port-title-demo-audio-pin.patch` (same two functions,
+`src/audio/rom/external.c:func_800B84B8` and `src/audio/disk/external.c:func_807442E4`). Under the
+audio pin (det=1) the attract demo never fires; this adds one PORT call at the top of each function:
+`gTitleDemoState = gdx_det_title_demo_step(gGameMode == GAMEMODE_FLX_TITLE, gTitleDemoState)`
+(`port/gdx_determinism.c`). With `[debug] det_title_demo = N` (> 0) the demo is armed after N
+consecutive updates on the title with the demo inactive, and ended (START_EXIT, the audio window's
+own write) after `det_title_demo_len` (default 1500) updates of an active demo outside the title.
+Default 0: the step returns the state unchanged, so every existing replay is untouched; unpinned
+(real play) the call is not made. Used by `replays/attract-demos.gdxrec` (docs/research/native/
+niview-progress.md).
+
+## decomp-native-records-scene.patch (niview — the records flyby on the NRR)
+
+Pure delta on top of the stack (only `src/overlays/records/records.c`, which no other patch edits).
+`Records_Draw` draws the flyby's sky, course and dressing outside Race_Draw, so the c5tick consume
+stubs and the track's race-scope check never saw it. Under `PORT && GDX_PLATFORM_3DS`: the shim header,
+`gdx_dl_scene(1)` before `Background_Draw` and `gdx_dl_scene(0)` after `Course_GadgetsDraw`, and the sky
+and dressing calls behind `GDX_DL_SKIP(SKY, 0)` / `GDX_DL_SKIP(DRESS, 0)`. The scene scope
+(`port/3ds/gdx3ds_c5tick.c`) opens only when `[native] ni_view` has the records bit (0x400) and the NRR
+master is on (`gdx3ds_nrr_scene_ok`); closed, `gdx_dl_skip` returns 0 for every section and the
+function builds exactly the stock commands. Open, only a section with a consume STUB can skip, the stub may
+decline (NULL: stock), the hollow-tick path never applies (hollow stays Race_Draw's), and the course
+itself is never skipped (the gadget pass reads its cull; the NRR track runs inside Course_Draw).
+Gameplay: the three sections are pure (c5tick §3.1); Records_Draw's state writes (none in these calls
+beyond the GfxPool and the c5tick-proven scratch) are unchanged.
+
+## decomp-native-course-preview.patch (nicourse `[native] ni_course`, agent `nicourse`)
+
+`src/overlays/course_select/course_model.c` `func_i5_80115E64` (the course select / GP next-course
+card / records course select 3D course preview): each `Course_DrawModel` call is bracketed by
+`gdx_course_model_mark_begin` / `gdx_course_model_mark_end` (port/3ds/game/gdx3ds_course_game.c).
+With `[native] ni_course != 0` (owned walker, not under interp_verify) begin reserves two Gfx before
+the model's G_VTX / G_TRI2 run and end fills them with a G_NOOP p=0x6B pair (vertex buffer, command
+count, vertex count, content generation); off, both return / write nothing and the list is the stock
+list. `src/game/course.c` `func_800A2D2C` (writes a model's vertex buffer) bumps that generation on
+entry. The owned walker draws the run from a GPU-resident mesh (port/3ds/gfx/n64/gdx_nicourse.cpp,
+gdx3ds_course_mesh.inc) or walks it. Pure delta; applies last.
+
+## decomp-native-hud-elem-gate.patch (nihudtop Phase 3 per-element top-screen gate, agent `nihudtop`)
+
+Builds on `decomp-3ds-hud-placement.patch`: turns the top-screen HUD's all-or-nothing suppression
+into a per-GDX_HUD_ELEM_* gate (port/gdx_hud_placement.h/.c), so a future CUSTOM mode can show some
+elements on top and hide others, instead of the whole bundle moving together. Two files:
+
+- `src/overlays/ovl_i3/hud.c` `Hud_DrawHud`: computes `gdxTopMask1P = gdx_hud_top_element_mask(1)`
+  once (same idiom as the existing `gdxWideHud`/`gdxWideSplitHud` locals), then wraps each
+  `case 1:` (1P) piece in its own `if (gdxTopMask1P & kGdxHudBit*)` -- TIME (`Hud_DrawTimeRectangle`
+  + `Hud_DrawDeathRaceBest`/`Timer`/`BestTime`), the `Hud_UpdatePlayerHudInfo` vs.
+  `Hud_AdvanceLapAnnouncementsOnly` side-effect-preserving swap (also TIME, same pattern the
+  menus.c-level swap already uses when the whole function is suppressed), INTERVAL
+  (`Hud_UpdateRaceIntervalInfo` + `Hud_DrawPracticeBestLap`/`LapDelta`), ENERGY
+  (`Hud_DrawEnergyOutlineRectangle` + `Bar`), LAP (`Hud_DrawLapRectangle` + `Counter`), REVERSE,
+  LIVES, KO_STARS. `case 2:`/`3:`/`4:` (2-4P) are UNTOUCHED: FORCED ALL_TOP IN 2-4P
+  (`gdx_hud_placement.h`) means every bit they'd ever test is already set, so there is nothing to
+  gate there and zero bytes to add. The `kGdxHudBit*` values and the `gdx_hud_element_on_top`
+  element numbers used in menus.c below are a LOCAL mirror of `GDX_HUD_ELEM_*`, not an #include
+  (decomp/src has no port/ include path); `port/tests/gdx_hud_placement_host_tests.c` pins the
+  real enum's numeric values so a future reorder there fails the host test instead of silently
+  mis-gating a piece here.
+- `src/overlays/ovl_i3/menus.c` `Menus_Draw`: RANK/SPEED/PORTRAITS already had their own
+  individual `if` at their own call site (never routed through `Hud_DrawHud`), so each one's
+  `!gdxHudTopSuppressed` condition becomes its own cached `gdxHudRankOnTop`/`SpeedOnTop`/
+  `PortraitsOnTop` (`gdx_hud_element_on_top`, one call each per frame, read in the per-racer loop
+  exactly like the pre-existing `gdxHudTopSuppressed`/`gdxHudMapSuppressed` locals). MINIMAP is
+  unchanged (`gdx_hud_minimap_suppressed` already independent pre-Phase-3; now just reads
+  `GDX_HUD_ELEM_MINIMAP`'s bit under the hood, see port/gdx_hud_placement.c).
+
+Modes 0-2 (ALL_TOP/SPLIT/ALL_BOTTOM) must answer EXACTLY as `decomp-3ds-hud-placement.patch` did
+before this patch existed -- the host test's `test_modes_0_to_2_match_legacy` checks every
+(mode, element, numPlayers) combination those modes can reach against the pre-Phase-3 rule
+independently re-derived, not against the new code's own mask. CUSTOM (mask-driven, not reachable
+through the MODE chip yet -- `gdx_hud_set_custom_top_mask`, dev ini lever only) is the new
+behaviour this patch exists to unlock; FORCED ALL_TOP IN 2-4P holds for it too (`numPlayers<=1`
+gate inside `gdx_hud_top_element_mask`). Applies after `decomp-3ds-hud-placement.patch` (same
+functions, later context) and after `decomp-native-hud-lap-announce.patch` (needs
+`Hud_AdvanceLapAnnouncementsOnly` to already exist in `hud.c`); applies last in the stack.
+docs/research/native/nihudtop-progress.md.

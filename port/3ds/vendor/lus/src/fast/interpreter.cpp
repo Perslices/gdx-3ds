@@ -8018,9 +8018,9 @@ bool gfx_noop_handler_f3dex2(F3DGfx** cmd0) {
             g_exec_stack.closeDisp();
         }
 #ifdef __3DS__
-    } else if (p == 0x5A || p == 0x5B) {
+    } else if (p == 0x5A || p == 0x5B || p == 0x60) {
         // [native] track: the course tessellator's material-run marker (p=0x5A end, 0x5B
-        // verify start). The port replays the recorded VTX/MODIFYVTX/template ops here, at
+        // verify start, 0x60 [native] track_retained end -- C5 Stage 3). The port replays the recorded VTX/MODIFYVTX/template ops here, at
         // the exact display-list position the stock commands occupied.
         if (&gdx3ds_track_marker != nullptr) {
             gdx3ds_track_marker(sGfxInstanceRaw, (uint32_t)cmd->words.w0, (uintptr_t)cmd->words.w1);

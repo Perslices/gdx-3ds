@@ -48,12 +48,23 @@ void gdx3ds_menu_set_fps_line(const char* line);
 int gdx3ds_dbg_verbose_active(void);
 
 /* APT lifecycle (main_3ds.cpp aptLifecycleHook): 1 while [OFF] holds the bottom backlight
- * down through the gsp::Lcd session; force_backlight re-applies a GSPLCD power state on
- * that session WITHOUT touching the menu's own screen-off state or logging (safe from the
- * hook: no console). ONSUSPEND powers the panel on for the HOME menu, ONRESTORE/ONWAKEUP
- * re-apply the saved state. */
+ * down; force_backlight re-applies a GSPLCD power state through a SHORT-LIVED gsp::Lcd
+ * session (open, one call, close -- C4j: a session held across the HOME jump froze the
+ * Old 3DS HOME menu) WITHOUT touching the menu's own screen-off state or logging (safe from
+ * the hook: no console). Returns the GSPLCD result, 0 when nothing was needed. ONSUSPEND
+ * powers the panel on for the HOME menu, ONRESTORE/ONWAKEUP re-apply the saved state.
+ * lcd_session_open: 1 only while one of those calls is in flight (receipt; must read 0). */
 int gdx3ds_menu_backlight_off(void);
-void gdx3ds_menu_force_backlight(int on);
+int gdx3ds_menu_force_backlight(int on);
+int gdx3ds_menu_lcd_session_open(void);
+
+/* Arms a one-shot BMP dump of the bottom screen on the next tick this file's own plain
+ * console UI is the one painting it (not the race DASH or idle-view takeover, which arm
+ * gdx3ds_bottomhud_note_shot instead), written to autotest/<label>_R.bmp -- same mechanism
+ * and naming convention as gdx3ds_bottomhud_note_shot/gdx3ds_racemap_note_shot. Weak-linked
+ * from port/n64_gfx_bridge.cpp's gdx_request_frame_dump, same call site that arms the other
+ * two; a no-op unless [menu] enabled is on. */
+void gdx3ds_menu_note_shot(const char* label);
 
 #ifdef __cplusplus
 }

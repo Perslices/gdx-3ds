@@ -2,7 +2,9 @@
 
 One page. Do steps 1-6 once per power-on; after that the Mac drives the console on its own.
 
-Console side: `port/3ds/net/gdx3ds_net.c` (killswitch `[net] enabled`, **default off**).
+Console side: `port/3ds/net/gdx3ds_net.c` (killswitch `[net] enabled`, **default CONDITIONAL**:
+ON when hbmenu's netloader (3dslink) launched the console, OFF for a plain hbmenu/SD/CIA
+launch; an explicit `enabled = 0`/`= 1` in the ini always wins over either default).
 Mac side: `tools/dev/hw.py` (stdlib only). Design + rationale: see `docs/research/native/README.md`.
 
 ## 1. Console setup (once per power-on)
@@ -19,12 +21,20 @@ Mac side: `tools/dev/hw.py` (stdlib only). Design + rationale: see `docs/researc
    - *Miscellaneous options* → **Enable input redirection** — needed for `hw.py input`.
    - *Debugger options* → **Enable debugger** — needed for `hw.py gdb`. Leave it off if you
      are not debugging, and turn it off before powering down.
-6. On the SD card, `sdmc:/3ds/gdiffuser/gdiffuser.ini` needs:
+6. `[net] enabled` now DEFAULTS ON for exactly this launch path (`hw.py push` always goes
+   through 3dslink's netloader, which the console detects via `__3dslink_host`) — so a card
+   whose `gdiffuser.ini` says nothing about `[net]` at all needs NO edit. This also covers a
+   frozen/unwritable SD card: if the ini cannot be touched, push through hbmenu's netloader
+   and the link comes up anyway. Only if the card's ini has an EXPLICIT
 
    ```ini
    [net]
-   enabled = 1
+   enabled = 0
    ```
+
+   do you need to change or remove that line (`hw.py put` a replacement ini, or edit the
+   card directly) — an explicit key always overrides the launch-method default. Launching
+   from the SD/CIA menu with no netloader involved still defaults OFF, same as before.
 
    Everything else has a working default (see the header of `port/3ds/net/gdx3ds_net.h`).
    `[debug] filelog = 1` is also worth having: it keeps a copy of everything on the card,
@@ -65,6 +75,8 @@ Everything else:
 | `hw.py ini <section> <key> <value> [--save]` | Change a config key at runtime; `--save` writes `gdiffuser.ini` back. |
 | `hw.py capture <tag>` | Arm the oracle track's frame capture for the next frame. |
 | `hw.py replay <file.gdxrec>` | Push a `.gdxrec` to the card and start the in-app tick-exact replay. |
+| `hw.py put <file> <sdmc-path>` | Push any local file to an sdmc-relative path — e.g. a replacement `gdiffuser.ini`: `hw.py put new.ini /3ds/gdiffuser/gdiffuser.ini`. |
+| `hw.py get <sdmc-path> [--out F]` | Pull a file back (confined to `/3ds/gdiffuser/`, capped at 64 KiB) — e.g. `hw.py get /3ds/gdiffuser/log.txt`. |
 | `hw.py input --demo` / `--script F` | Drive Rosalina InputRedirection over UDP 4950. |
 | `hw.py quit` | Clean programmatic exit through the whole `[exit]` chain. |
 | `hw.py gdb` | Batch backtrace against the Rosalina GDB stub on port 4000. |

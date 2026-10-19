@@ -1,0 +1,196 @@
+diff --git a/src/game/course_gadgets.c b/src/game/course_gadgets.c
+--- a/src/game/course_gadgets.c
++++ b/src/game/course_gadgets.c
+@@ -249,6 +249,34 @@
+ extern s32 D_800DCCFC;
+ #define VERTEX_MODIFIED_ST(s, t) ((((s) << 15) & 0xFFFF0000) | ((t) &0xFFFF))
+ #define VERTEX_MODIFIED_ST2(s, t) ((((s) << 16) & 0xFFFF0000) | ((t) &0xFFFF))
++
++#ifdef PORT
++/* C5 STAGE 3b "[c5sub]" sub-category markers (diagnostic, [debug] c5sub=1 on top of the [c5cat]
++ * clock): ONE G_NOOP with p=0x62 and a sub-id at each piece boundary of the course dressing, so
++ * the walker can split [c5cat] dress= into mines / jumps / course effects by type / decorations.
++ * Unarmed nothing is written and the display list is byte-identical. Ids must match
++ * GDX3DS_C5SUB_* in port/3ds/gdx3ds_mainprof.h. */
++extern int gdx_c5sub_armed(void);
++#define GDX_C5SUB_MINE 1
++#define GDX_C5SUB_JUMP 2
++#define GDX_C5SUB_CEFF 3
++#define GDX_C5SUB_DSIGN 8
++#define GDX_C5SUB_DBLDG 9
++#define GDX_C5SUB_ID(id)                                                     \
++    do {                                                                     \
++        if (gdx_c5sub_armed()) {                                             \
++            gfx->words.w0 = ((u32) G_NOOP << 24) | (0x62u << 16) | (u32)(id); \
++            gfx->words.w1 = 0;                                               \
++            gfx++;                                                           \
++        }                                                                    \
++    } while (0)
++#define GDX_C5SUB(sub) GDX_C5SUB_ID(GDX_C5SUB_##sub)
++/* course effect of type t (COURSE_EFFECT_PIT..ICE = 1..4) -> sub-id 3 + t */
++#define GDX_C5SUB_EFFECT(t) GDX_C5SUB_ID(GDX_C5SUB_CEFF + ((t) & 0xF))
++#else
++#define GDX_C5SUB(sub)
++#define GDX_C5SUB_EFFECT(t)
++#endif
+ 
+ #if !defined(EXPANSION_KIT) || defined(NON_MATCHING)
+ // Draw Course Effects and Features
+@@ -277,6 +305,7 @@
+     EffectDrawData* effectDrawDataEnd; // sp1A0
+     s32 temp_t0;
+ 
++    GDX_C5SUB(MINE);
+     gSPDisplayList(gfx++, aSetupLandmineTextureDL);
+ 
+ #ifdef EXPANSION_KIT
+@@ -325,6 +354,7 @@
+             } while (vtx >= D_80225800.landmineVtx);
+         }
+     }
++    GDX_C5SUB(JUMP);
+     if (featuresInfo->jumpCount != 0) {
+         gDPLoadTextureBlock(gfx++, aJumpFeatureTex, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 0, G_TX_NOMIRROR | G_TX_WRAP,
+                             G_TX_NOMIRROR | G_TX_WRAP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+@@ -372,6 +402,7 @@
+ 
+     effectsInfo = &gCourseEffectsInfo;
+ 
++    GDX_C5SUB(CEFF);
+     if (effectsInfo->count != 0) {
+ 
+         gSPDisplayList(gfx++, aSetupCourseEffectTextureDL);
+@@ -468,6 +499,7 @@
+ #ifndef EXPANSION_KIT
+             effectDrawDataEnd = gEffectsDrawData + effectsInfo->count;
+             for (effectDrawData = gEffectsDrawData; effectDrawData < effectDrawDataEnd; effectDrawData++) {
++                GDX_C5SUB_EFFECT(effectDrawData->effectType);
+                 gSPTexture(gfx++, 0x8000, 0x8000, 0, effectDrawData->effectType, G_ON);
+ #else
+             effectDrawDataEnd = gEffectsDrawData[0] + effectsInfo->count;
+@@ -538,6 +570,7 @@
+             }
+         }
+     }
++    GDX_C5SUB(DSIGN);
+     gSPSetGeometryMode(gfx++, G_CULL_BACK);
+     gSPTexture(gfx++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_ON);
+     gSPFogPosition(gfx++, 980, 1000);
+@@ -710,6 +743,7 @@
+                                  GBL_c2(G_BL_CLR_FOG, G_BL_A_SHADE, G_BL_CLR_IN, G_BL_1MA));
+         }
+ 
++        GDX_C5SUB(DBLDG);
+         decoration = gCourseDecorations;
+         decorationMtx = D_80225800.decorationMtx;
+         for (feature = featuresInfo->features; feature < featuresEnd; feature++) {
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5593,9 +5593,42 @@
+             gfx->words.w1 = 0;                                                      \
+             gfx++;                                                                  \
+         }                                                                           \
++    } while (0)
++/* C5 STAGE 3b "[c5sub]" sub-category markers (diagnostic, [debug] c5sub=1): p=0x62 + a sub-id at
++ * each effect class boundary, so [c5cat] fx= splits by class. Inside the fx shim bracket a
++ * pending native fx run is closed first (exactly what the next class's setup list would do), so
++ * the run's replay marker lands in the class it belongs to. Ids match GDX3DS_C5SUB_*. */
++extern int gdx_c5sub_armed(void);
++#define GDX_C5SUB_BOOST 10
++#define GDX_C5SUB_EXPL 11
++#define GDX_C5SUB_DEBRIS 12
++#define GDX_C5SUB_FSPARK 13
++#define GDX_C5SUB_CSPARK 14
++#define GDX_C5SUB_SMOKE 15
++#define GDX_C5SUB_PITFF 16
++#define GDX_C5SUB_FALLX 17
++#if defined(GDX_NATIVE_FX)
++#define GDX_C5SUB_FXFLUSH()                    \
++    do {                                       \
++        if (gdxfx_active && gdxfx_pending()) { \
++            gdxfx_marker(gfx++);               \
++        }                                      \
+     } while (0)
+ #else
++#define GDX_C5SUB_FXFLUSH()
++#endif
++#define GDX_C5SUB(sub)                                                                \
++    do {                                                                              \
++        if (gdx_c5sub_armed()) {                                                      \
++            GDX_C5SUB_FXFLUSH();                                                      \
++            gfx->words.w0 = ((u32) G_NOOP << 24) | (0x62u << 16) | GDX_C5SUB_##sub; \
++            gfx->words.w1 = 0;                                                        \
++            gfx++;                                                                    \
++        }                                                                             \
++    } while (0)
++#else
+ #define GDX_C5CAT(cat)
++#define GDX_C5SUB(sub)
+ #endif
+ 
+ #if defined(PORT) && defined(GDX_NATIVE_HUD)
+@@ -6376,6 +6409,7 @@
+     sp564 = camera->basis.y.z;
+ 
+     GDX_C5CAT(FX);
++    GDX_C5SUB(BOOST);
+     GDX_DLB(BOOST);
+     if (GDX_DL_SKIP(BOOST, playerIndex)) {
+         goto gdx_after_boost;
+@@ -6639,6 +6673,7 @@
+ #include "gdx3ds_fx_shim_begin.h"
+     GDXFX_BEGIN(playerIndex);
+ #endif
++    GDX_C5SUB(EXPL);
+     gSPDisplayList(gfx++, D_4007FB8);
+ 
+     for (var_s3 = gExplosions1Count, var_s7 = (gExplosions1Index - 1) & 0x1F;
+@@ -6736,6 +6771,7 @@
+         gEffectsVtxPtr += 4;
+     }
+ 
++    GDX_C5SUB(DEBRIS);
+     gSPDisplayList(gfx++, D_4007FD8);
+ 
+     for (var_s3 = gMachineDebrisCount, var_s7 = (gMachineDebrisIndex - 1) & 0x7F;
+@@ -6759,6 +6795,7 @@
+         gEffectsVtxPtr += 3;
+     }
+ 
++    GDX_C5SUB(FSPARK);
+     gSPDisplayList(gfx++, D_4008000);
+ 
+     for (var_s3 = gFlyingSparksCount, var_s7 = (gFlyingSparksIndex - 1) & 0x1F;
+@@ -6786,6 +6823,7 @@
+         gEffectsVtxPtr += 3;
+     }
+ 
++    GDX_C5SUB(CSPARK);
+     gSPDisplayList(gfx++, D_4008028);
+ 
+     for (var_s3 = gCollisionSparkCount, var_s7 = (gCollisionSparkIndex - 1) & 0x1F;
+@@ -6834,6 +6872,7 @@
+         gEffectsVtxPtr += 4;
+     }
+ 
++    GDX_C5SUB(SMOKE);
+     gSPDisplayList(gfx++, D_4008130);
+ 
+     for (var_s3 = gSmokesCount, var_s7 = (gSmokesIndex - 1) & 0x1F;
+@@ -6873,6 +6912,7 @@
+         gEffectsVtxPtr += 4;
+     }
+ 
++    GDX_C5SUB(PITFF);
+     gSPDisplayList(gfx++, aSetupPitForceFieldDL);
+ 
+     if (!gGamePaused) {
+@@ -6919,6 +6959,7 @@
+         gEffectsVtxPtr += 4;
+     }
+ 
++    GDX_C5SUB(FALLX);
+     gSPDisplayList(gfx++, aSetupFallExplosionDL);
+ 
+     for (var_s3 = gFallExplosionsCount, var_s7 = (gFallExplosionsIndex - 1) & 0x1F;

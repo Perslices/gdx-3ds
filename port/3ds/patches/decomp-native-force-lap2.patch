@@ -1,0 +1,43 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+index 0000000..0000000 100644
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -4307,6 +4307,38 @@
+                           racer->segmentPositionInfo.pos.z + racer->velocity.z, i, var_fa1) == 0) {
+             sp128 = racer->lapDistance;
+             racer->lapDistance = func_8009DFA0(&racer->segmentPositionInfo);
++#ifdef PORT
++            /* DEBUG LEVER (coordinator hw bug n60-3d7, item 2): [debug] force_lap2=1 drives
++             * racer 0's lapDistance bookkeeping with a fixed per-tick ramp, completely
++             * independent of its real physical position, so the REAL (unmodified) finish-line
++             * wrap check just below fires naturally and repeatedly -- once to leave the grid
++             * (lap 0->1, a no-op) and a second time to complete lap 1 (lap 1->2, the CAN_BOOST
++             * set-site this item exists to let a GP race reach quickly) -- in well under a
++             * second instead of requiring two full organic laps. Never does the racer move or
++             * teleport: only the lapDistance SCALAR is overridden (every tick, after the real
++             * segmentPositionInfo-based recompute just above), so physics/position/collision
++             * are untouched. The ramp step (60.0f) is deliberately tiny next to any real
++             * course's half-length, so every ordinary tick's delta stays inside the no-wrap
++             * zone and only the deliberate wrap instant (when the accumulator rolls past
++             * gCurrentCourseInfo->length) produces the large delta the check is looking for --
++             * the same shape an organic crossing has. Stops once lap reaches 2 (the gate
++             * below), handing lapDistance back to the real per-frame recompute for the rest of
++             * the race. Default off (see gdx_debug_force_lap2_enabled in
++             * gdx3ds_bottomhud.c); kept as a permanent lever, not reverted, so a lap-2+
++             * boost-ready state can be reached on real hardware in seconds for re-verifying
++             * this item without having to drive a full GP lap by hand. */
++            if (racer->id == 0 && racer->lap < 2) {
++                extern int gdx_debug_force_lap2_enabled(void);
++                static float sForceLap2Fake = 0.0f;
++                if (gdx_debug_force_lap2_enabled()) {
++                    sForceLap2Fake += 60.0f;
++                    if (sForceLap2Fake >= gCurrentCourseInfo->length) {
++                        sForceLap2Fake -= gCurrentCourseInfo->length;
++                    }
++                    racer->lapDistance = sForceLap2Fake;
++                }
++            }
++#endif
+ 
+             racer->currentRadiusLeft = (racer->segmentPositionInfo.segmentLengthProportion *
+                                         (racer->segmentPositionInfo.courseSegment->next->radiusLeft -

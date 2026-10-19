@@ -69,8 +69,76 @@ void Interp::DpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lr
     mRdp.scissor.width = static_cast<uint32_t>(width);
     mRdp.scissor.height = static_cast<uint32_t>(height);
     AdjustViewportOrScissor(&mRdp.scissor);
+#ifdef EXPANSION_KIT
+    ScissorPillarSafeX(x, width);
+#endif
     mRdp.viewport_or_scissor_changed = true;
 }
+
+#ifdef EXPANSION_KIT
+/* B11o -- the scissor and a 2D rectangle do NOT use the same x mapping on a 400x240 panel,
+ * and a 48-pixel-wide drop-down is small enough for the disagreement to eat its text.
+ *
+ * AdjustViewportOrScissor scales x LINEARLY FROM ZERO by curW/nativeW = 400/320 = 1.25.
+ * DrawRectangle instead takes x to NDC and runs it through AdjXForAspectRatio, a 0.8x
+ * compression ABOUT SCREEN CENTRE, so a 2D rectangle lands at screen x = n64x + 40 -- the
+ * hor+ pillarbox ekdraw-progress.md §2 derives (320 content columns, 40-px pillars, 1:1).
+ * The two agree only at n64x = 160; the error is 0.25*x - 40 and grows outward.
+ *
+ * Full-screen scissors survive it (12..308 -> 15..385 still covers the whole 40..360 band),
+ * which is why nothing noticed until an Expansion Kit build could open a drop-down.
+ * expansion_kit/A3AE0.c:1033 scissors a drop-down to exactly its own 48-px item column,
+ *     gDPSetScissor(..., widget->left, widget->top, widget->left + 48, ...)
+ * On N64 those bounds are identically the drawn extent, so they clip NOTHING. On 3DS
+ * gCreateWidget (left = 24) gets scissor 30..90 against content at 64..112 and loses the
+ * right 22 columns of 48; gCourseEditEntryWidget (left = 216) loses its left 14.
+ *
+ * The fix is the UNION of the two mappings, because a scissor on this platform cannot know
+ * whether what follows is 2D or 3D: keep the linear box (3D geometry and the viewport are
+ * mapped that way and must stay clipped that way) and extend it to also cover where a 2D
+ * rectangle with the same N64 bounds actually lands. It is strictly widening, so it can only
+ * ever fail to clip; it never clips something the N64 kept.
+ *
+ * It is a NO-OP for every scissor whose edges sit at 0, 160 or 320, and for the 12/308 full
+ * screen (15/385 by either mapping). It is scoped to EXPANSION_KIT anyway so that the
+ * shipped .3dsx stays byte-identical; see docs/research/native/ekwidget-progress.md.
+ *
+ * [debug] ek_widget_scissor = 0 restores the linear-only box (i.e. restores the bug), which
+ * is what makes the A/B a one-lever pair out of one binary. */
+extern "C" int gdx_ninterp_ekwidgetscissor(void);
+
+void Interp::ScissorPillarSafeX(float n64X, float n64W) {
+    if (!gdx_ninterp_ekwidgetscissor()) {
+        return;
+    }
+    const float halfW = static_cast<float>(mCfg.nativeW / 2);
+    const float curW = static_cast<float>(mCfg.curW);
+    const float curH = static_cast<float>(mCfg.curH);
+    if (halfW <= 0.0f || curW <= 0.0f || curH <= 0.0f) {
+        return;
+    }
+    /* Where DrawRectangle puts these same two N64 columns: NDC, AdjXForAspectRatio, viewport. */
+    const float k = (4.0f / 3.0f) / (curW / curH);
+    const float lo2d = (((n64X / halfW) - 1.0f) * k + 1.0f) * 0.5f * curW;
+    const float hi2d = ((((n64X + n64W) / halfW) - 1.0f) * k + 1.0f) * 0.5f * curW;
+    int32_t lo = mRdp.scissor.x;
+    int32_t hi = lo + static_cast<int32_t>(mRdp.scissor.width);
+    if (static_cast<int32_t>(lo2d) < lo) {
+        lo = static_cast<int32_t>(lo2d);
+    }
+    if (static_cast<int32_t>(hi2d) > hi) {
+        hi = static_cast<int32_t>(hi2d);
+    }
+    if (lo < 0) {
+        lo = 0;
+    }
+    if (hi < lo) {
+        hi = lo;
+    }
+    mRdp.scissor.x = static_cast<int16_t>(lo);
+    mRdp.scissor.width = static_cast<uint32_t>(hi - lo);
+}
+#endif /* EXPANSION_KIT */
 
 void Interp::DrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
     const uint32_t saved_other_mode_h = mRdp.other_mode_h;

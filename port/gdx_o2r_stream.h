@@ -67,6 +67,12 @@ unsigned int gdx_o2r_stream_data_offset(void); /* absolute file offset of the PA
 unsigned int gdx_o2r_stream_payload_bytes(void);
 unsigned int gdx_o2r_stream_cache_bytes(void);
 
+/* Arms read-ahead on the audio cache (gdx_block_cache_set_readahead; 0 = off, the default and
+ * the unchanged path). Takes the same lock the reads take, so it is safe after the producer
+ * thread is running -- though the only caller arms it at init. */
+void gdx_o2r_stream_set_readahead(unsigned int blocks);
+unsigned int gdx_o2r_stream_readahead(void);
+
 /* Reads [offset, offset+length) of the entry PAYLOAD into `dst`. Returns 1 on full success;
  * 0 on refusal, with `dst` untouched (gdx_block_cache.h's contract, inherited).
  *

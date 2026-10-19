@@ -37,6 +37,7 @@
 #include "gdx3ds_config.h"
 #include "gdx3ds_dynlod.h"
 #include "gdx3ds_filelog.h"
+#include "gdx3ds_tickahead.h" /* N60TICK4: Old 3DS render thread on core 0 */
 #include "gfx/gdx3ds_gpu_prof.h"
 #include "n64_gfx_bridge.h" /* gdx_gfx_run + GdxTaskUcode + segment view API */
 
@@ -378,37 +379,49 @@ extern "C" int gdx3ds_rt_init(const GdxRtCallbacks* cb) {
     }
     sInited = 1;
     sMode = kOff;
-    const int key = gdx3ds_config_get_int("debug", "renderthread", 1);
+    /* N60TICK4 ([debug] tick_ahead, gdx3ds_tickahead.h): on the Old 3DS the render thread is
+     * created on CORE 0 and the host runs on core 1. It overrides `renderthread` (the O3DS card
+     * ini pins renderthread=0) and is pipe only: ahead (2) moves the pool-half protection to the
+     * next submit and has never been gated with the NRR snapshots. */
+    const int tickAheadCore = gdx3ds_tickahead_render_core();
+    const int key = tickAheadCore >= 0 ? 1 : gdx3ds_config_get_int("debug", "renderthread", 1);
     if (cb == nullptr || key <= 0) {
         RtLog("[rt] off (debug.renderthread=0): sequential path");
         return sMode;
     }
     bool isNew3ds = false;
     APT_CheckNew3DS(&isNew3ds);
-    if (!isNew3ds) {
+    if (!isNew3ds && tickAheadCore < 0) {
         RtLog("[rt] unavailable: not a New 3DS (core 2 is New3DS-only); sequential path");
         return sMode;
     }
+    const int core = tickAheadCore >= 0 ? tickAheadCore : kRtCore;
     sCb = *cb;
     LightSemaphore_Init(&sCmdSem, 0, 0x7FFF);
     LightEvent_Init(&sDoneEvent, RESET_STICKY);
     sVblankPeriodTicks = (uint64_t)(CPU_TICKS_PER_MSEC * (1000.0 / 59.8337));
-    sThread = threadCreate(RenderThreadMain, nullptr, kRtStack, kRtPrio, kRtCore, false);
+    sThread = threadCreate(RenderThreadMain, nullptr, kRtStack, kRtPrio, core, false);
     if (sThread == nullptr) {
-        RtLog("[rt] unavailable: threadCreate(core 2) failed; sequential path");
+        RtLogf("[rt] unavailable: threadCreate(core %d) failed; sequential path", core);
         return sMode;
     }
     const int forceSync = gdx3ds_config_get_bool("debug", "renderthread_sync", 0);
-    sMode = forceSync ? kSync : (key >= 2 ? kAhead : kPipe);
+    sMode = forceSync ? kSync : ((key >= 2 && tickAheadCore < 0) ? kAhead : kPipe);
     sBridgeMain = gdx3ds_config_get_bool("debug", "bridgemain", 1) ? 1 : 0;
     gdx3ds_gpuprof_set_external_pacing(1); /* render-thread FrameBegin never vblank-syncs */
-    RtLogf("[rt] mode=%s core=%d prio=0x%02X stack=%uK bridgemain=%d", ModeName(sMode), kRtCore,
-           kRtPrio, (unsigned)(kRtStack / 1024u), sBridgeMain);
+    RtLogf("[rt] mode=%s core=%d prio=0x%02X stack=%uK bridgemain=%d%s", ModeName(sMode), core,
+           kRtPrio, (unsigned)(kRtStack / 1024u), sBridgeMain, tickAheadCore >= 0 ? " tick_ahead=1" : "");
     return sMode;
 }
 
 extern "C" int gdx3ds_rt_mode(void) {
     return sMode;
+}
+
+/* 1 once gdx3ds_rt_init has decided the mode (off included): until then gdx3ds_rt_mode() reads 0
+ * whatever the ini says, so one-shot latches that refuse the render thread defer on this. */
+extern "C" int gdx3ds_rt_inited(void) {
+    return sInited;
 }
 
 extern "C" int gdx3ds_rt_on_render_thread(void) {

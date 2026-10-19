@@ -172,6 +172,22 @@ roundtrip_ok() { # sub snapfile fwd...
     return 1
 }
 
+# Advisor fix (native-review-2026-10-15.md follow-up): a rapid reset -> manual-apply ->
+# reset -> rebuild cycle (regenerating a patch's CONTENT under the same filename, then
+# letting ci-3ds.sh reapply it) can land a patched file with the SAME mtime, to the
+# second, as the stale .o ninja/ccache already built from its earlier content -- ninja's
+# dependency check is mtime-based and sees "not newer", so it serves the stale object
+# despite `git apply` having written the new text. Bumping every patched file's mtime to
+# "now" right after confirming the stack is applied costs nothing on the normal path (the
+# mtimes are about to be current anyway) and removes the one-second race on the rapid
+# edit/rebuild path every agent on this stack was hitting by hand. The sentinel is the
+# submodule's own git state: whatever differs from HEAD was put there by the patch stack
+# (or is a submodule-local edit the gate has already decided is fine to touch).
+touch_patched_files() { # sub
+    local sub="$1"
+    git -C "${ROOT}/${sub}" diff --name-only HEAD 2>/dev/null | xargs -r -I{} touch -- "${ROOT}/${sub}/{}"
+}
+
 report_drift() { # sub  fwd...
     local sub="$1"; shift
     local -a fwd=("$@")
@@ -229,6 +245,7 @@ for sub in "${SUBMODULES[@]}"; do
     if apply_atomic "$sub" "$SNAP" "${fwd[@]}"; then
         echo "applied:         ${sub} (${n} patches, clean tree)"
         APPLIED_NOW=$((APPLIED_NOW + n))
+        touch_patched_files "$sub"
         rm -f "$SNAP"; continue
     fi
 
@@ -257,6 +274,7 @@ for sub in "${SUBMODULES[@]}"; do
                 echo "applied (missing tail): ${sub} (${k} applied now, all ${n} verified by roundtrip)"
                 APPLIED_NOW=$((APPLIED_NOW + k))
                 ALREADY=$((ALREADY + n - k))
+                touch_patched_files "$sub"
                 repaired=1
                 break
             fi
@@ -277,6 +295,7 @@ for sub in "${SUBMODULES[@]}"; do
                 git -C "${ROOT}/${sub}" apply "$p"
                 echo "applied (forced): ${sub} <- $(basename "$p")"
                 APPLIED_NOW=$((APPLIED_NOW + 1))
+                touch_patched_files "$sub"
             else
                 echo "skipped (already/blocked): ${sub} <- $(basename "$p")" >&2
             fi

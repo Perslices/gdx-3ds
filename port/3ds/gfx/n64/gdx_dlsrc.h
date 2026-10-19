@@ -17,6 +17,7 @@
 #include "gdx_gbi.h"
 
 typedef struct GdxGfxJob GdxGfxJob;
+typedef struct GdxDlMemoKey GdxDlMemoKey;
 
 namespace gdxn {
 
@@ -73,6 +74,10 @@ class DlSrc {
 
     bool Root(ListRef& out) const;
     bool ResolveList(const Cmd& c, ListRef& out) const;
+    /* [native] dlmemo: ResolveList, plus *memoOk (0 no, 1 yes, 2 yes with the raw class's
+     * 64-command w0 read set) -- gdx_gfx_job_resolve_list_memo; c5dlmemo-progress.md §1. */
+    bool ResolveListMemoOk(const Cmd& c, ListRef& out, int* memoOk, uint32_t* sniffCmds) const;
+    void MemoKey(GdxDlMemoKey* out) const;
     /* Data operand; 0 = unresolved (caller applies its fallback). */
     uintptr_t ResolveData(const Cmd& c, size_t requiredBytes, bool preferPhysical = false,
                           uintptr_t sourceHint = 0) const;

@@ -1,0 +1,44 @@
+--- a/src/audio/disk/external.c
++++ b/src/audio/disk/external.c
+@@ -2187,6 +2187,7 @@
+ extern s8 gTitleDemoState;
+ #ifdef PORT
+ extern int gdx_det_audio_pin(void);
++extern int gdx_det_title_demo_step(int gameModeIsTitle, int state);
+ #endif
+ extern s32 gGameMode;
+ 
+@@ -2207,6 +2208,11 @@
+        demo is never armed from audio state, so the title screen advances on tick count
+        alone. Unpinned (all real play) the expression is byte for byte the original. */
+     const int gdxDetTitleDemoPin = gdx_det_audio_pin();
++    if (gdxDetTitleDemoPin) {
++        /* niview: [debug] det_title_demo arms (and ends) the attract demo by tick count instead;
++           0 (the default) leaves the state untouched -- the pin's demo-never-fires behaviour. */
++        gTitleDemoState = (s8) gdx_det_title_demo_step(gGameMode == GAMEMODE_FLX_TITLE, gTitleDemoState);
++    }
+ #endif
+ 
+     if ((sActiveBgm == BGM_TITLE) && (gAudioCtx.seqPlayers[1].channels[0] != NULL) && (IS_SEQUENCE_CHANNEL_VALID(gAudioCtx.seqPlayers[1].channels[0]))) {
+--- a/src/audio/rom/external.c
++++ b/src/audio/rom/external.c
+@@ -528,6 +528,7 @@
+ extern s8 gTitleDemoState;
+ #ifdef PORT
+ extern int gdx_det_audio_pin(void);
++extern int gdx_det_title_demo_step(int gameModeIsTitle, int state);
+ #endif
+ extern s32 gGameMode;
+ 
+@@ -548,6 +549,11 @@
+        demo is never armed from audio state, so the title screen advances on tick count
+        alone. Unpinned (all real play) the expression is byte for byte the original. */
+     const int gdxDetTitleDemoPin = gdx_det_audio_pin();
++    if (gdxDetTitleDemoPin) {
++        /* niview: [debug] det_title_demo arms (and ends) the attract demo by tick count instead;
++           0 (the default) leaves the state untouched -- the pin's demo-never-fires behaviour. */
++        gTitleDemoState = (s8) gdx_det_title_demo_step(gGameMode == GAMEMODE_FLX_TITLE, gTitleDemoState);
++    }
+ #endif
+ 
+     if ((sActiveBgm == BGM_TITLE) && (gSeqPlayers[0].channels[0] != NULL) && (IS_SEQUENCE_CHANNEL_VALID(gSeqPlayers[0].channels[0]))) {

@@ -513,9 +513,18 @@ extern "C" unsigned int gdx_disk_image_size(void) {
  * allocation the mode exists to avoid. Returns the REQUESTED mode, not the served one. */
 static int s_diskStreamRequested = -1;
 
+/* The 3DS cannot hold a 61.9 MB resident image on either model, so streaming (mode 2) is its
+ * default; without it the resident malloc below fails and no disk ever mounts. Desktop keeps
+ * the resident image. An explicit [debug] disk_stream key still wins on both. */
+#if defined(GDX_PLATFORM_3DS)
+#define GDX_DISK_STREAM_DEFAULT 2
+#else
+#define GDX_DISK_STREAM_DEFAULT 0
+#endif
+
 static int gdx_disk_stream_requested(void) {
     if (s_diskStreamRequested < 0) {
-        s_diskStreamRequested = gdx_disk_lever("disk_stream", 0);
+        s_diskStreamRequested = gdx_disk_lever("disk_stream", GDX_DISK_STREAM_DEFAULT);
     }
     return s_diskStreamRequested;
 }
@@ -1045,6 +1054,9 @@ int gdx_disk_load(void) {
 
             unsigned char* buf = static_cast<unsigned char*>(malloc(static_cast<size_t>(sz)));
             if (buf == nullptr) {
+                gdx_port_logf("[leo] FAILED to load %s: no memory for the %ld-byte resident image "
+                              "(set [debug] disk_stream = 2 to stream it instead); Expansion Kit "
+                              "modes stay disabled\n", path, sz);
                 fclose(f);
                 if (streamed) {
                     gdx_disk_stream_close();

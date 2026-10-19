@@ -11,9 +11,29 @@
 #   3. builds the host-side unit tests that run on this machine and runs them
 #      (gdx_gfx_pack_tests, gdx_gfx_convert_tests, gdx_track_template_tests,
 #       gdx3ds_config_host_tests, gdx3ds_native_cfg_host_tests, gdx3ds_dynlod_host_tests,
-#       gdx3ds_heapcfg_host_tests,
+#       gdx3ds_frameskip_host_tests, gdx3ds_trkrr_math_host_tests, gdx3ds_replay_math_host_tests,
+#       gdx3ds_perf_preset_host_tests,
+#       gdx3ds_heapcfg_host_tests, gdx3ds_menu_tabbar_host_tests (hw bug n60-3d8 #1: the tab
+#         bar's column math, every MAP/RACE combination, no overlap with OFF),
+#       gdx_hud_placement_host_tests (nihudtop Phase 3: the per-element top-screen gate, modes
+#         0-2 x every element x numPlayers 1-2 against the pre-Phase-3 all-or-nothing rule,
+#         plus the CUSTOM mask override and its numPlayers>1 force-off),
+#       gdx_net_enabled_default_host_tests (n60lead hwlink: [net] enabled's launch-method
+#         default -- an explicit ini key always wins, the 3dslink-netloader-vs-not vote only
+#         applies when it's absent; the emulator lanes cannot simulate a netloader launch),
+#       gdx3ds_launch_host_tests, gdx3ds_audiocrk_host_tests,
+#       gdx_save_replace_tests (n60save: crash-safe save replace on a no-overwrite-rename FS),
+#       gdx_save_ek_layout_tests (ekship: the EK title's own save and its proven-EK one-time seed),
+#       gdx3ds_c3d_scan_host_tests (c5submit: the vendored citro3d diet's dirty scan == stock's),
 #       gdx_disk_stream_host_tests (against a synthetic 64DD image -- no dump required),
 #       gdx_o2r_stream_host_tests (C4d: the audio_table byte source, against a synthetic zip),
+#       gdx3ds_ndsphash_host_tests ([debug] ndsphash: the content-addressed render digest --
+#         a whole-session audio gate; a frame hash cannot see a dropped sample),
+#       gdx_dsp_host_tests (A17: the DSP KERNELS -- VADPCM decode, resampler, FIR, envmixer,
+#         reverb -- driven through gdx_audio_hle_run. ndsphash proves the kernels are
+#         CONSISTENT run to run; this is the only thing that says they are CORRECT; run twice,
+#         the second time on the C4k [debug] audio_simd fast kernels),
+#       gdx_hle_fast_parity_tests (C4k: audio_simd fast kernels == reference, byte for byte),
 #       gdx3ds_fs_host_smoke,
 #      gdx_machines_harness —
 #      compiled directly with the host compiler; no desktop configure needed);
@@ -214,6 +234,34 @@ PATCH_LIST=(
     "decomp:decomp-3ds-disk-audio-async-guards.patch"
     "decomp:decomp-3ds-ek-diskcourse-decline.patch"
     "decomp:decomp-3ds-disk-audio-load-census.patch"
+    "decomp:decomp-port-o3ds-scene-lod.patch"
+    "decomp:decomp-3ds-c5cat-markers.patch"
+    "decomp:decomp-native-hud-capture.patch"
+    "decomp:decomp-native-track-resident-bake.patch"
+    "decomp:decomp-native-sky-capture.patch"
+    "decomp:decomp-3ds-c5tick-dlb.patch"
+    "decomp:decomp-3ds-c5sub-markers.patch"
+    "decomp:decomp-native-dress-shim.patch"
+    "decomp:decomp-3ds-nrr-mach.patch"
+    "decomp:decomp-native-nrr-trk.patch"
+    "decomp:decomp-3ds-ships-census.patch"
+    "decomp:decomp-3ds-autodrive.patch"
+    "decomp:decomp-3ds-prewarm.patch"
+    "decomp:decomp-native-finish-direct.patch"
+    "decomp:decomp-native-finish-mesh.patch"
+    "decomp:decomp-3ds-hud-placement.patch"
+    "decomp:decomp-native-hud-lap-announce.patch"
+    "decomp:decomp-native-force-lap2.patch"
+    "decomp:decomp-native-menu-capture.patch"
+    "decomp:decomp-native-force-boot-mode.patch"
+    "decomp:decomp-native-menu-trans-capture.patch"
+    "decomp:decomp-native-gp-end-setup.patch"
+    "decomp:decomp-native-gp-end-mach.patch"
+    "decomp:decomp-3ds-nimach.patch"
+    "decomp:decomp-port-title-demo-tick.patch"
+    "decomp:decomp-native-records-scene.patch"
+    "decomp:decomp-native-course-preview.patch"
+    "decomp:decomp-native-hud-elem-gate.patch"
 )
 
 banner "submodule patches (decomp)"
@@ -496,8 +544,11 @@ fi
 # the include path: port/gdx_interp.h is a different header.
 if c++ -std=c++20 -O1 \
       "${ROOT}/port/tests/gdx_interp_host_tests.cpp" \
-      "${ROOT}"/port/3ds/gfx/n64/gdx_{dlsrc,dl,interp,cc,tmem,texcache,rsp,tri,rect}.cpp \
+      "${ROOT}"/port/3ds/gfx/n64/gdx_{dlsrc,dl,interp,cc,tmem,texcache,texskip,machsplit,nicensus,nirace,setload,rsp,tri,rect,hud_replay,hud_direct,hud_retain,nrr_hud,sky_retain,dlmemo}.cpp \
       "${ROOT}/port/3ds/gfx/gdx3ds_cov.c" \
+      "${ROOT}/port/3ds/gfx/gdx3ds_hitch_ev.c" \
+      "${ROOT}/port/3ds/gfx/gdx3ds_xf_census.c" \
+      "${ROOT}/port/3ds/gfx/gdx3ds_replay_tags.c" \
       -I"${ROOT}/port/3ds/gfx/n64" -I"${ROOT}/port/3ds/gfx" -I"${ROOT}/port/3ds/include" \
       -I"${ROOT}/port" -I"${ROOT}/port/tests" \
       -o "${HOST_TEST_DIR}/gdx_interp_host_tests"; then
@@ -519,6 +570,115 @@ else
     record "test: gdx_gfx_atlas_uv_tests" FAIL "compile failed"
 fi
 
+# gdx3ds_texswz_host_tests — N60TEX [debug] tex_fast: the upload's word/unrolled texel writer
+# (port/3ds/gfx/gdx3ds_texswz.h) leaves the PICA tiled buffer byte-identical to the stock
+# per-texel loop, over every extent 1..64 x 1..64 and large ones, padding sentinel-checked.
+if cc -O1 -Wall -Wextra -std=c99 \
+      "${ROOT}/port/tests/texswz_tests.c" \
+      -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/texswz_tests"; then
+    run_host_test "gdx3ds_texswz_host_tests" "${HOST_TEST_DIR}/texswz_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_texswz_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_audiocrk_host_tests — [debug] audiocrk (port/3ds/audio/gdx3ds_audio_crk.c), the
+# o3dscrackle census that splits "it crackles" into ring underrun / DSP-queue underrun / ndsp
+# frame drops / clipping / boundary splice. Checks the classification a hardware card is read
+# by: padding is never a boundary, a splice lands in cstep not step, rails and drops count.
+if cc -O1 -Wall -Wextra -std=c99 \
+      "${ROOT}/port/tests/audiocrk_tests.c" \
+      "${ROOT}/port/3ds/audio/gdx3ds_audio_crk.c" \
+      -I"${ROOT}/port/3ds/audio" \
+      -o "${HOST_TEST_DIR}/audiocrk_tests"; then
+    run_host_test "gdx3ds_audiocrk_host_tests" "${HOST_TEST_DIR}/audiocrk_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_audiocrk_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_ndsphash_host_tests — [debug] ndsphash, the content-addressed render digest
+# (port/gdx_ndsp_hash.c). The audio analogue of a frame hash, and the only audio gate this
+# port has: `fhdiff` cannot see a dropped sample, a swapped instrument or a pitch error, and
+# `audioring`'s level census cannot either (audioasync §5). Compiles the module UNMODIFIED and
+# drives it through its public API -- no emulator, no DSP, no ROM.
+# Case 3 is the one that earns its place in CI: it moves every RDRAM address by 1 MB, which is
+# what taking a 10.25 MB blob off the heap does (audiodiet), and asserts the digest does NOT
+# move. Without that masking the cross-run comparison shares no keys and reports a green line
+# over nothing -- the vacuous gate covfinish refused an audio census family over.
+if cc -O1 -Wall -Wextra -std=c99 \
+      "${ROOT}/port/tests/ndsphash_tests.c" \
+      "${ROOT}/port/gdx_ndsp_hash.c" \
+      -I"${ROOT}/port" \
+      -o "${HOST_TEST_DIR}/ndsphash_tests"; then
+    run_host_test "gdx3ds_ndsphash_host_tests" "${HOST_TEST_DIR}/ndsphash_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_ndsphash_host_tests" FAIL "compile failed"
+fi
+
+# gdx_dsp_host_tests — the DSP KERNELS themselves (port/n64_audio_hle.c), driven through its real
+# public entry point gdx_audio_hle_run() with synthetic Acmd command lists. No emulator, no ROM, no
+# DSP firmware. Mirrors port/CMakeLists.txt's gdx_dsp_tests target.
+#
+# Why this is a separate gate from gdx3ds_ndsphash_host_tests, which also says "audio": ndsphash
+# hashes the same render request against the bytes it produced, so it proves the kernels are
+# CONSISTENT — across runs, across [debug] audio_stream, across the sample cache. It cannot prove
+# they are CORRECT: a wrong VADPCM decode is wrong identically every run and every ndsphash fold
+# stays green (ndsphash-progress.md §6). This suite is the only correctness claim the port has about
+# the decoder, and it holds the audible-artefact cases — loop-wrap continuity (a click), deferred
+# clamping across a loud transient (a crushed attack), the last-frame preamble contract (a waveform
+# cliff at every tick boundary), reverb decay-not-growth.
+#
+# It was OUT of CI until A17/dspclick because it had never linked outside CMake; ndsphash supplied
+# the two missing stubs and dspclick found that its two standing failures were malformed TEST
+# CODEBOOKS, not a decoder bug (dspclick-progress.md). It is GREEN and must stay green.
+#
+# audiomix added TESTs 21-23: the MIX -- the stage dspclick §6.2 named as the suite's blind spot.
+# They also gate port/gdx_audio_mix_census.c, the [debug] audiomix headroom census, which is armed
+# BY these tests (gdx_audiomix_configure) and is inert in the shipped build.
+#
+# C4k: the suite runs TWICE, the second time on the [debug] audio_simd fast kernels
+# (GDX_TEST_HLE_FAST=1): every correctness claim it makes must hold on the path the Old 3DS
+# ships, not only on the reference.
+if cc -O1 -Wall -Wextra -Wno-unused-parameter -std=c99 \
+      "${ROOT}/port/tests/dsp_tests.c" \
+      "${ROOT}/port/n64_audio_hle.c" \
+      "${ROOT}/port/n64_audio_hle_fast.c" \
+      "${ROOT}/port/gdx_audio_hle_cost.c" \
+      "${ROOT}/port/gdx_ndsp_hash.c" \
+      "${ROOT}/port/gdx_audio_mix_census.c" \
+      "${ROOT}/port/gdx_dev_gates.c" \
+      -I"${ROOT}/port" -lm \
+      -o "${HOST_TEST_DIR}/dsp_tests"; then
+    run_host_test "gdx_dsp_host_tests" "${HOST_TEST_DIR}/dsp_tests" "${HOST_TEST_DIR}"
+    GDX_TEST_HLE_FAST=1 run_host_test "gdx_dsp_host_tests_simd" "${HOST_TEST_DIR}/dsp_tests" \
+        "${HOST_TEST_DIR}"
+else
+    record "test: gdx_dsp_host_tests" FAIL "compile failed"
+fi
+
+# gdx_hle_fast_parity_tests — C4k's bit-exactness gate for [debug] audio_simd
+# (port/n64_audio_hle_fast.c). The REAL interpreter runs every command list twice, reference
+# and fast, from the same state; all of DMEM, every state buffer, every saved byte and the
+# [spike] last-writer map must be equal. 15,000 lists from three generators (synthesis.c-shaped
+# voices, anything-goes fields, deliberate aliasing), a one-bit negative control, the resample
+# table's int32 bound, and a floor on every packed path and every in-kernel fallback so a green
+# run cannot mean "the proof always refused". Built at -O2 with -fwrapv like the 3DS build; off
+# ARM the packed paths run on exact C emulations of SMLAD/SMUAD/QADD16/SMLAWx.
+if cc -O2 -Wall -Wextra -Wno-unused-parameter -std=c99 -fwrapv -fno-strict-aliasing \
+      "${ROOT}/port/tests/hle_fast_tests.c" \
+      "${ROOT}/port/n64_audio_hle.c" \
+      "${ROOT}/port/n64_audio_hle_fast.c" \
+      "${ROOT}/port/gdx_audio_hle_cost.c" \
+      "${ROOT}/port/gdx_ndsp_hash.c" \
+      "${ROOT}/port/gdx_audio_mix_census.c" \
+      "${ROOT}/port/gdx_dev_gates.c" \
+      -I"${ROOT}/port" -lm \
+      -o "${HOST_TEST_DIR}/hle_fast_tests"; then
+    run_host_test "gdx_hle_fast_parity_tests" "${HOST_TEST_DIR}/hle_fast_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_hle_fast_parity_tests" FAIL "compile failed"
+fi
+
 # gdx3ds_config_host_tests — the ini table (set / unset / save). gdx3ds_config.c is
 # plain C over stdio, so the guest-side behaviour of the net `INI` / `INI DEL` commands
 # can be verified on the build machine instead of only on hardware. Needs a scratch CWD:
@@ -526,13 +686,30 @@ fi
 if cc -O1 -Wall \
       "${ROOT}/port/3ds/os/test/gdx3ds_config_host_tests.c" \
       "${ROOT}/port/3ds/os/gdx3ds_config.c" \
-      -I"${ROOT}/port/3ds/os" \
+      "${ROOT}/port/3ds/gdx3ds_preset_n60.c" \
+      -I"${ROOT}/port/3ds/os" -I"${ROOT}/port/3ds" \
       -o "${HOST_TEST_DIR}/config_host_tests"; then
     rm -rf "${HOST_TEST_DIR}/config-cwd"
     mkdir -p "${HOST_TEST_DIR}/config-cwd"
     run_host_test "gdx3ds_config_host_tests" "${HOST_TEST_DIR}/config_host_tests" "${HOST_TEST_DIR}/config-cwd"
 else
     record "test: gdx3ds_config_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_launch_host_tests — N60LAUNCH launch variants: [launch] hold bindings, the boot-cycle
+# pick, [variant.X] -> RAM-only overrides (section.key form, override-table-full reported), log
+# tags; over the real ini loader. Scratch CWD: the test writes its fixture ini.
+if cc -O1 -Wall -Wextra -Wno-unused-parameter \
+      "${ROOT}/port/3ds/test/gdx3ds_launch_host_tests.c" \
+      "${ROOT}/port/3ds/gdx3ds_launch_core.c" \
+      "${ROOT}/port/3ds/os/gdx3ds_config.c" \
+      -I"${ROOT}/port/3ds" -I"${ROOT}/port/3ds/os" \
+      -o "${HOST_TEST_DIR}/launch_host_tests"; then
+    rm -rf "${HOST_TEST_DIR}/launch-cwd"
+    mkdir -p "${HOST_TEST_DIR}/launch-cwd"
+    run_host_test "gdx3ds_launch_host_tests" "${HOST_TEST_DIR}/launch_host_tests" "${HOST_TEST_DIR}/launch-cwd"
+else
+    record "test: gdx3ds_launch_host_tests" FAIL "compile failed"
 fi
 
 # gdx3ds_native_cfg_host_tests — the [native] lever resolver (port/3ds/gfx/gdx3ds_native_cfg.c).
@@ -568,6 +745,101 @@ else
     record "test: gdx3ds_dynlod_host_tests" FAIL "compile failed"
 fi
 
+# gdx_hud_placement_host_tests — the per-element top-screen HUD gate (port/gdx_hud_placement.c,
+# nihudtop Phase 3): modes 0-2 x every GDX_HUD_ELEM_* x numPlayers 1-2 must match the pre-Phase-3
+# all-or-nothing answer exactly, plus the CUSTOM mask override and its numPlayers>1 force-off.
+# -DGDX_HUD_PLACEMENT_HOST_TEST compiles in a mode-override seam the real build never defines
+# (see that file's own comment) since there is no gdx3ds_bottomhud.c/ini here to drive it.
+if cc -O1 -Wall -Wextra -Wno-unused-parameter -DGDX_HUD_PLACEMENT_HOST_TEST \
+      "${ROOT}/port/tests/gdx_hud_placement_host_tests.c" \
+      "${ROOT}/port/gdx_hud_placement.c" \
+      -I"${ROOT}/port" \
+      -o "${HOST_TEST_DIR}/hud_placement_host_tests"; then
+    run_host_test "gdx_hud_placement_host_tests" "${HOST_TEST_DIR}/hud_placement_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_hud_placement_host_tests" FAIL "compile failed"
+fi
+
+# gdx_net_enabled_default_host_tests — n60lead hwlink round: [net] enabled's DEFAULT
+# resolution (port/gdx_net_enabled_default.c). An explicit ini key always wins; only when
+# the ini has no usable key does the launch method (3dslink netloader vs. hbmenu/SD/CIA)
+# get a vote. Split out of port/3ds/net/gdx3ds_net.c, which pulls in <3ds.h> and cannot
+# compile for the host, so this is the real function gdx3ds_net_init calls, not a
+# reimplementation of its logic. The emulator lanes cannot simulate a netloader launch
+# (no __3dslink_host to set), so this table is this round's stand-in for that A/B.
+if cc -O1 -Wall -Wextra -Wno-unused-parameter \
+      "${ROOT}/port/tests/gdx_net_enabled_default_host_tests.c" \
+      "${ROOT}/port/gdx_net_enabled_default.c" \
+      -I"${ROOT}/port" \
+      -o "${HOST_TEST_DIR}/net_enabled_default_host_tests"; then
+    run_host_test "gdx_net_enabled_default_host_tests" "${HOST_TEST_DIR}/net_enabled_default_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_net_enabled_default_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_frameskip_host_tests — the FRAMESKIP governor (port/3ds/gdx3ds_frameskip_gov.c, NEXT.md
+# C4l) against a simulated console: logic ticks/s must reach ~59.94 on the Old 3DS race and
+# time-trial frame costs and never exceed it in a fast scene, the skip cap must bind, FIXED must
+# render exactly its phase, and an oracle veto must always force a render.
+# See docs/research/native/o3dsskip-progress.md.
+if cc -O1 -Wall -Wextra -Wno-unused-parameter \
+      "${ROOT}/port/3ds/test/gdx3ds_frameskip_host_tests.c" \
+      "${ROOT}/port/3ds/gdx3ds_frameskip_gov.c" \
+      "${ROOT}/port/3ds/gdx3ds_frameskip_steady.c" \
+      "${ROOT}/port/3ds/gdx3ds_frameskip_race0.c" \
+      -I"${ROOT}/port/3ds" \
+      -o "${HOST_TEST_DIR}/frameskip_host_tests"; then
+    run_host_test "gdx3ds_frameskip_host_tests" "${HOST_TEST_DIR}/frameskip_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_frameskip_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_trkrr_math_host_tests — [native] track_retained's geometry (NEXT.md C5 Stage 3,
+# port/3ds/gfx/gdx3ds_track_retained_math.h): the pass origin and near-plane w recovered from the
+# composed matrix, near-plane clip points that are bit-identical for both triangles sharing an
+# edge (watertight), and the visible-region float24 bound checked for rigour against 600k
+# sampled visible points; plus [native] track_resident's per-ring check (C5 Stage 3c) checked
+# conservative against 80k points of accepted rings; plus [native] track_nearclip's lean clipper
+# (C5 Stage 3d) checked bit-identical to ClipPoly on 33k strip triangles with its edge cache hit.
+# See docs/research/native/c5s3-progress.md, c5s3c-progress.md and c5s3d-progress.md.
+if c++ -O1 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+      "${ROOT}/port/3ds/test/gdx3ds_trkrr_math_host_tests.cpp" \
+      -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/trkrr_math_host_tests"; then
+    run_host_test "gdx3ds_trkrr_math_host_tests" "${HOST_TEST_DIR}/trkrr_math_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_trkrr_math_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_replay_math_host_tests — C6 pose-replay (port/3ds/gfx/gdx3ds_replay_math.h): the
+# uniform patches (legacy projection, gpuxf xmvp, the resident re-base, the light rotation)
+# reproduce the vertex B's own frame would produce, and the PICA command-list scan finds every
+# f32 uniform word GPUCMD_Add writes. See docs/research/native/c6replay-progress.md.
+if c++ -O1 -std=c++17 -Wall -Wextra -Wno-unused-parameter \
+      "${ROOT}/port/3ds/test/gdx3ds_replay_math_host_tests.cpp" \
+      -I"${ROOT}/port/3ds/gfx" \
+      -o "${HOST_TEST_DIR}/replay_math_host_tests"; then
+    run_host_test "gdx3ds_replay_math_host_tests" "${HOST_TEST_DIR}/replay_math_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_replay_math_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_perf_preset_host_tests — [perf] preset (port/3ds/gdx3ds_perf_preset.c, NEXT.md C4p):
+# `auto` must leave every [perf] default at its shipped value on a New 3DS, select the o3ds
+# values on an Old 3DS, and lose to any explicit ini key in both directions. The console
+# model comes from a stub APT_CheckNew3DS the test owns (port/3ds/test/host/3ds.h).
+if cc -O1 -Wall -Wextra -Wno-unused-parameter -DGDX3DS_PERF_PRESET_HOST_TEST \
+      "${ROOT}/port/3ds/test/gdx3ds_perf_preset_host_tests.c" \
+      "${ROOT}/port/3ds/gdx3ds_perf_preset.c" \
+      "${ROOT}/port/3ds/gdx3ds_preset_n60.c" \
+      -I"${ROOT}/port/3ds/test/host" -I"${ROOT}/port/3ds" -I"${ROOT}/port/3ds/os" \
+      -I"${ROOT}/port/3ds/include" \
+      -o "${HOST_TEST_DIR}/perf_preset_host_tests"; then
+    run_host_test "gdx3ds_perf_preset_host_tests" "${HOST_TEST_DIR}/perf_preset_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_perf_preset_host_tests" FAIL "compile failed"
+fi
+
 # gdx3ds_heapcfg_host_tests — libctru's heap-split formula (port/3ds/include/gdx3ds_heapcfg.h),
 # checked against the three [mem-budget] grants the guest actually printed. The formula was
 # transcribed by hand from a disassembly of the libctru archive this port links, and the whole
@@ -580,6 +852,72 @@ if cc -O1 -Wall -Wextra \
     run_host_test "gdx3ds_heapcfg_host_tests" "${HOST_TEST_DIR}/heapcfg_host_tests" "${HOST_TEST_DIR}"
 else
     record "test: gdx3ds_heapcfg_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_menu_tabbar_host_tests — hw bug n60-3d8, item 1: the MENU tab bar's column layout
+# (port/3ds/gdx3ds_menu_tabbar_layout.h), the SAME header gdx3ds_menu.c's MenuLayoutTabs()
+# calls, over every MAP/RACE shown-or-hidden combination -- asserting no two visible tabs
+# overlap, OFF never overlaps a visible tab (the actual hardware report: "OFF was cover[ing]"
+# RACE), and every column stays within 320px / 40 columns. Header-only: no TU to compile in.
+if cc -O1 -Wall -Wextra \
+      "${ROOT}/port/3ds/test/gdx3ds_menu_tabbar_host_tests.c" \
+      -I"${ROOT}/port/3ds" \
+      -o "${HOST_TEST_DIR}/menu_tabbar_host_tests"; then
+    run_host_test "gdx3ds_menu_tabbar_host_tests" "${HOST_TEST_DIR}/menu_tabbar_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_menu_tabbar_host_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_hudcustom_layout_host_tests — nibottom Phase 2, CUSTOM HUD mode: the pure clamp/snap/
+# hit-test/ini-line logic (port/3ds/gdx3ds_hudcustom_layout.h/.c) that gdx3ds_bottomhud.c's
+# CUSTOM-mode touch handler and hud.ini [custom] section reader/writer both call into. No
+# <3ds.h>/decomp deps, so it compiles and links on the host exactly like the real 3DS TU.
+if cc -O1 -Wall -Wextra -std=c11 \
+      "${ROOT}/port/3ds/test/gdx3ds_hudcustom_layout_host_tests.c" \
+      "${ROOT}/port/3ds/gdx3ds_hudcustom_layout.c" \
+      -I"${ROOT}/port/3ds" \
+      -o "${HOST_TEST_DIR}/hudcustom_layout_host_tests"; then
+    run_host_test "gdx3ds_hudcustom_layout_host_tests" "${HOST_TEST_DIR}/hudcustom_layout_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_hudcustom_layout_host_tests" FAIL "compile failed"
+fi
+
+# gdx_save_replace_tests — n60save: the crash-safe fzerox.sav / .gdd / ghost replace against a
+# FAT-like stub that refuses rename onto an existing file (the 3DS SD archive does), with a power
+# cut after every filesystem operation of the flush and of the boot's recovery.
+if cc -O1 -Wall -Wextra -std=c11 \
+      "${ROOT}/port/tests/gdx_save_replace_tests.c" \
+      "${ROOT}/port/gdx_save_replace.c" \
+      -I"${ROOT}/port" \
+      -o "${HOST_TEST_DIR}/save_replace_tests"; then
+    run_host_test "gdx_save_replace_tests" "${HOST_TEST_DIR}/save_replace_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_save_replace_tests" FAIL "compile failed"
+fi
+
+# gdx_save_ek_layout_tests — ekship (o3dsek-plan S1): the EK title's own save may be seeded ONCE from
+# the shared fzerox.sav, only when that file is PROVEN EK-layout (the shipped writer's zero bytes 2..9
+# of the edit-cup/DD-cup union), and the seed reads the shared save strictly read-only.
+if cc -O1 -Wall -Wextra -std=c11 \
+      "${ROOT}/port/tests/gdx_save_ek_layout_tests.c" \
+      "${ROOT}/port/gdx_save_ek_layout.c" \
+      -I"${ROOT}/port" \
+      -o "${HOST_TEST_DIR}/save_ek_layout_tests"; then
+    run_host_test "gdx_save_ek_layout_tests" "${HOST_TEST_DIR}/save_ek_layout_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx_save_ek_layout_tests" FAIL "compile failed"
+fi
+
+# gdx3ds_c3d_scan_host_tests — c5submit (r60 P3a): the vendored citro3d's word-at-a-time dirty
+# scan (port/3ds/vendor/citro3d/gdx/c3d_gdx_scan.h) must find exactly the uniform runs stock
+# citro3d 1.7.1's byte loop finds, or [native] c3d_diet is not byte-identical. Header-only.
+if cc -O2 -Wall -Wextra -std=c11 \
+      "${ROOT}/port/3ds/test/gdx3ds_c3d_scan_host_tests.c" \
+      -I"${ROOT}/port/3ds/vendor/citro3d/gdx" \
+      -o "${HOST_TEST_DIR}/c3d_scan_host_tests"; then
+    run_host_test "gdx3ds_c3d_scan_host_tests" "${HOST_TEST_DIR}/c3d_scan_host_tests" "${HOST_TEST_DIR}"
+else
+    record "test: gdx3ds_c3d_scan_host_tests" FAIL "compile failed"
 fi
 
 # gdx3ds_fs_host_smoke — stream D's SD/O2R/zipshim smoke test; needs a scratch
@@ -781,6 +1119,18 @@ else
     record "test: gdxdev_harness_tests" FAIL "see ${GDXDEV_LOG#${ROOT}/}"
 fi
 
+# nrr_tol_tests — the NRR visual tolerance tool (tools/native/nrr_tol.py, n60 design 7.3) on
+# synthetic BMPs: the 2d / 3d / split classes, blobs, the screen-edge exemption, missing frames.
+NRRTOL_LOG="${HOST_TEST_DIR}/nrr_tol_tests.log"
+if python3 "${ROOT}/tools/native/test_nrr_tol.py" > "${NRRTOL_LOG}" 2>&1; then
+    echo "PASS: nrr_tol_tests  ($(tail -1 "${NRRTOL_LOG}"))"
+    record "test: nrr_tol_tests" PASS "$(tail -1 "${NRRTOL_LOG}")"
+else
+    echo "FAIL: nrr_tol_tests — last lines:" >&2
+    tail -20 "${NRRTOL_LOG}" >&2
+    record "test: nrr_tol_tests" FAIL "see ${NRRTOL_LOG#${ROOT}/}"
+fi
+
 # ---------------------------------------------------------------- 3DS build --
 banner "3DS build (game + harness)"
 BUILD_OK=1
@@ -854,6 +1204,16 @@ if ! cmake -S "${ROOT}" -B "${BUILD_3DS}" \
 else
     T_CONFIGURE="$(fmt_ms "$T0")"
     record "3ds configure" PASS "${GEN_NAME}, launcher=${CCACHE_NAME}, ${T_CONFIGURE}"
+
+    # Advisor fix (native-review-2026-10-15.md follow-up): patch-gate.sh above already touches
+    # every patched decomp file right after it applies the stack, but that happens minutes
+    # before this point -- the whole host-test suite runs in between. A second, cheap touch
+    # here, right where the build actually reads these files, removes any chance of ninja
+    # basing its up-to-date check on a mtime this script set long before the build step runs --
+    # belt and suspenders alongside patch-gate.sh's own touch_patched_files.
+    git -C "${ROOT}/decomp" diff --name-only HEAD 2>/dev/null \
+        | xargs -r -I{} touch -- "${ROOT}/decomp/{}"
+
     T0="$(now_ms)"
     if cmake --build "${BUILD_3DS}" -j"${JOBS}" > "${BUILD_3DS}/ci-build.log" 2>&1; then
         T_FULL="$(fmt_ms "$T0")"

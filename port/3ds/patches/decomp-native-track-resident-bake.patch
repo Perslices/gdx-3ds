@@ -1,0 +1,25 @@
+diff --git a/src/game/course.c b/src/game/course.c
+--- a/src/game/course.c
++++ b/src/game/course.c
+@@ -3428,6 +3428,11 @@
+     sCourseFarRenderDistance = sCourseRenderOriginDistance + 4500.0f;
+     D_800F894C += sCourseRenderOriginDistance - 1000.0f;
+     D_800F8950 += sCourseRenderOriginDistance - 1000.0f;
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++    /* [native] track_resident (C5 Stage 3c): bake every chunk ring variant once, now that the
++       chunks exist (a no-op unless the lever is on). */
++    gdxtrk_course_loaded();
++#endif
+ }
+ 
+ void Course_Update(void) {
+@@ -4623,6 +4628,9 @@
+     f32 gdxCullX;
+ #endif
+ 
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++    gdxtrk_draw_enter(); /* [trkcat] (C5 Stage 3c): the cull + grouping start here */
++#endif
+     camera = &gCameras[cameraIndex];
+     racer = &gRacers[camera->id];
+ #ifdef PORT

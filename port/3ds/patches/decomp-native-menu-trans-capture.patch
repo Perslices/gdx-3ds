@@ -1,0 +1,52 @@
+diff --git a/src/game/game.c b/src/game/game.c
+index c463649..db91fcb 100644
+--- a/src/game/game.c
++++ b/src/game/game.c
+@@ -918,15 +918,25 @@ extern s16 D_i2_80106DA0;
+ Gfx* func_80069698(Gfx* gfx) {
+ 
+     GDX_DLB(OTHER);
++#if defined(PORT) && defined(GDX_NATIVE_HUD)
++    /* nimenu [native] ni_menu (port/3ds/gfx/gdx3ds_menu_capture.c): a non-race mode's draw AND the
++     * Transition_Draw call right after it are compacted together, as one MENU region (race modes and
++     * ni_menu=0 leave the list as written). Transition_Draw's own wipe/fill words used to land after
++     * the capture call and stay on the stock walker every frame a transition or idle background wipe
++     * was active (nimenu-progress.md Sec.1.1's "wipe background" residue); widening the bracket to
++     * close after Transition_Draw instead of after the mode's draw function brings those words under
++     * the same compiler as the rest of the screen. `gdxMenuArmed` mirrors the original gate exactly
++     * (computed only when the mode's draw function actually ran this frame). */
++    extern void* gdxmenu_capture(void* regionStart, void* regionEnd, int mode);
++    Gfx* const gdxMenuStart = gfx;
++    s32 gdxMenuMode = 0;
++    s32 gdxMenuArmed = 0;
++#endif
+     if ((gGameModeChangeState != GAMEMODE_CHANGE_INIT) && D_i2_80106DA0) {
+ #if defined(PORT) && defined(GDX_NATIVE_HUD)
+-        /* nimenu [native] ni_menu (port/3ds/gfx/gdx3ds_menu_capture.c): a non-race mode's draw is
+-         * compacted like a HUD region (kind MENU); race modes and ni_menu=0 leave the list as written. */
+-        extern void* gdxmenu_capture(void* regionStart, void* regionEnd, int mode);
+-        const s32 gdxMenuMode = GET_MODE(gGameMode);
+-        Gfx* const gdxMenuStart = gfx;
++        gdxMenuMode = GET_MODE(gGameMode);
++        gdxMenuArmed = 1;
+         gfx = sGamemodeDrawFuncs[gdxMenuMode](gfx);
+-        gfx = (Gfx*) gdxmenu_capture((void*) gdxMenuStart, (void*) gfx, (int) gdxMenuMode);
+ #else
+         gfx = sGamemodeDrawFuncs[GET_MODE(gGameMode)](gfx);
+ #endif
+@@ -935,8 +945,13 @@ Gfx* func_80069698(Gfx* gfx) {
+     GDX_DLB(TRANS);
+     gfx = Transition_Draw(gfx);
+     GDX_DLB(END);
+-    return gfx;
+ #else
+-    return Transition_Draw(gfx);
++    gfx = Transition_Draw(gfx);
+ #endif
++#if defined(PORT) && defined(GDX_NATIVE_HUD)
++    if (gdxMenuArmed) {
++        gfx = (Gfx*) gdxmenu_capture((void*) gdxMenuStart, (void*) gfx, (int) gdxMenuMode);
++    }
++#endif
++    return gfx;
+ }

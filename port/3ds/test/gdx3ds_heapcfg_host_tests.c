@@ -128,6 +128,25 @@ int main(void) {
                   (9UL * 1024UL * 1024UL) > 7702784UL ? 1UL : 0UL, 1UL);
     }
 
+    /* --- 7. OBSERVED ON THE REAL OLD 3DS, 2026-09-29 (C4a). The CIA printed
+     *   [mem-budget] model=old3ds memtype=0 ... heapGrant=25165824 linGrant=30494720
+     *   [mem-budget] heapCfg=auto ... availBoot=55660544
+     * The heap matches case 3's projection to the byte (it is the 24 MiB cap); `avail` does
+     * NOT: a CIA's budget is 290,816 B smaller than case 3's .3dsx figure (67,108,864 -
+     * 55,660,544 - image 3,236,480 - bss 7,948,408 = 263,432 B of CIA-side overhead against
+     * the .3dsx's 20,456), and that difference lands entirely in the linear grant. Under a
+     * linear pin it lands in the HEAP, so a simulation of the CIA must use this avail
+     * (GDX_3DS_SIM_AVAIL_KIB=54356), not GDX_3DS_SIM_O3DS's 54640. */
+    {
+        const unsigned long avail = 25165824UL + 30494720UL; /* = 55,660,544 */
+        expect_eq("o3ds CIA memtype0 (hardware): avail", avail, 54356UL * 1024UL);
+        expect_eq("o3ds CIA memtype0 (hardware): heapGrant", GDX3DS_HEAPCFG_AUTO_HEAP(avail),
+                  25165824UL);
+        expect_eq("o3ds CIA memtype0 (hardware): linGrant", GDX3DS_HEAPCFG_AUTO_LINEAR(avail),
+                  30494720UL);
+        expect_exact_split("o3ds CIA memtype0", avail);
+    }
+
     printf(failures == 0 ? "=== ALL PASS (0 failures) ===\n" : "=== %d FAILURES ===\n", failures);
     return failures == 0 ? 0 : 1;
 }

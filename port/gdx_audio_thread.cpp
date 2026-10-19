@@ -54,6 +54,8 @@
 // R1 (port/3ds/audio/STATUS.md): the carved 3DS build has no LUS AudioPlayer/audiobridge;
 // the ndsp backend's buffered() query stands in for AudioPlayerBuffered below.
 #include "gdx3ds_audio.h"
+// [debug] ndsphash_lockstep: the audio-determinism pin, see port/gdx_ndsp_hash.h.
+#include "gdx_ndsp_hash.h"
 // S4: the HLE audio PRODUCER runs on a spare ARM11 core, not core 0. std::thread on libctru's
 // pthread shim would place it on the application core (core 0) in contention with the game; these
 // hooks (port/3ds/audio/gdx3ds_audio_ndsp.c) host AudioThreadMain on a libctru thread walking the
@@ -94,12 +96,235 @@ extern "C" int gGdxRaceActive; // set by the first course load (port/decomp_port
 // Defined in port/n64_sched.c, which already includes the decomp audio headers this needs. This
 // TU deliberately stays decomp-header-free, like port/n64_audio_hle.c.
 extern "C" int gdx_audio_produce_one_tick(void);
+// C4I: the same tick in its two phases (port/n64_sched.c) -- SETUP needs sAudioCtxMutex, SYNTH
+// (the HLE run over the list SETUP built) does not touch anything the mutex guards.
+extern "C" void* gdx_audio_produce_tick_setup(void);
+extern "C" void gdx_audio_produce_tick_synth(void* task);
+#ifdef GDX_PLATFORM_3DS
+extern "C" long long gdx3ds_prof_now(void); // port/3ds/gfx/gdx3ds_gpu_prof.c (svcGetSystemTick)
+extern "C" int gdx3ds_config_get_int(const char* section, const char* key, int fallback);
+// C4K [debug] audio_simd: the bit-exact fast HLE kernels (port/n64_audio_hle_fast.h).
+extern "C" void gdx_audio_hle_set_fast(int on);
+extern "C" void gdx_audio_hle_set_verify(int everyN);
+extern "C" void gdx_audio_hle_set_rs_align(int on);
+extern "C" void gdx_audio_hle_set_acmd_dump(int ticks); // AUDIOFIX round 3 Task 2: ground-truth capture
+extern "C" void gdx_audio_hle_set_envmix_xbits(int on); // AUDIOFIX round 4: A_ENVMIXER x0-x3 xor fix
+extern "C" void gdx_audio_hle_set_adpcm_scale_clamp(int on); // AUDIOFIX round 4: A_ADPCM scale>12 clamp
+// O3DSHOMEFIX: model-gated defaults (1 on Old 3DS, 0 on New 3DS; port/3ds/audio).
+extern "C" int gdx3ds_is_old3ds(void);
+#endif
 
 namespace {
 
 // Guards decomp's gAudioCtx thread-cmd queue handoff; see the MUTEX BOUNDARY comment above.
 // Recursive because a command handler inside the mutexed drain may re-queue a command.
 std::recursive_mutex sAudioCtxMutex;
+
+#ifdef GDX_PLATFORM_3DS
+// C4I [othx] actx ledger (port/3ds/gfx/gdx3ds_gpu_prof.c): what the game fiber pays to take
+// sAudioCtxMutex in AudioThread_QueueCmd while the producer holds it across a whole tick, and
+// how long those producer ticks hold it. On the Old 3DS the producer runs on the syscore
+// (core 1), so a tick there is slow and the game thread -- the frame -- waits it out. Armed by
+// the gputrace latch; unarmed, each path pays one int test. Static counters only.
+volatile int sCtxLedgerArmed = 0;
+uint64_t sCtxWaitTicks = 0;      // QueueCmd side: blocked in lock() (contended locks only)
+unsigned long sCtxLocks = 0;     // QueueCmd side: every lock
+unsigned long sCtxContended = 0; // QueueCmd side: locks that found it held
+uint64_t sCtxHoldTicks = 0;      // producer side: ticks sAudioCtxMutex was held per tick
+unsigned long sCtxHolds = 0;
+uint64_t sCtxSynthTicks = 0;     // producer side: the SYNTH phase (inside or outside the hold)
+// `[debug] audio_ctx_narrow` (default 0), resolved once when the producer starts: 1 releases
+// sAudioCtxMutex between SETUP and SYNTH, so the game fiber's QueueCmd waits out only the
+// command drain + loads, never the HLE synthesis. 0 = the pre-C4I lock span, byte for byte.
+int sCtxNarrow = 0;
+
+// QUICKFIX `[debug] audio_io_unlock` (hwprof-progress.md §10.3): a sample read that may touch the
+// SD card (an audio-stream block-cache miss or read-ahead, port/gdx_o2r_stream.cpp) drops
+// sAudioCtxMutex for the card I/O and re-takes it after. On hardware the miss read queued behind
+// the async log writer's SD write for 76-351 ms while the producer held the mutex, and the game
+// thread's Audio_Update -> AudioThread_QueueCmd waited it out (the `au` hitches).
+//
+// WHY THIS IS SAFE. The mutex guards one thing: the threadCmdBuf ring write in QueueCmd (game
+// thread, and the producer's own re-queue from a drain handler). A sample read is never inside
+// that write, so while it runs unlocked the producer touches no ring state; a game QueueCmd in
+// the window writes at threadCmdWritePos, beyond every token already published, exactly as it
+// does between two ticks. If the game also pushes a token, a drain still in progress may apply
+// it this tick -- the interleaving the game gets by queueing just before the tick started.
+// The bytes read are the same: the same cache, the same reads in the same order, same thread.
+// Only the OWNING producer tick, holding the mutex exactly once (tTickHold set, no nested
+// QueueCmd lock), ever releases; any other caller gets 0.
+int sIoUnlock = 0;
+__thread int tTickHold = 0;   // this thread holds sAudioCtxMutex for a producer tick, once
+__thread int tTickNested = 0; // recursive gdx_audio_ctx_lock depth on top of the tick's hold
+unsigned long sIoReleases = 0;
+uint64_t sIoUnlockedTicks = 0;
+uint64_t sIoUnlockedMax = 0;
+long long sIoReleaseT0 = 0;
+unsigned long sIoNextReceipt = 1;
+
+// The tick's hold, as a scope inside the lock_guard (constructed after it, destroyed before).
+struct TickHoldScope {
+    TickHoldScope() {
+        tTickHold = 1;
+        tTickNested = 0;
+    }
+    ~TickHoldScope() { tTickHold = 0; }
+};
+
+void AudioCtxLockCounted() {
+    sCtxLocks++;
+    if (sAudioCtxMutex.try_lock()) {
+        return;
+    }
+    const long long t0 = gdx3ds_prof_now();
+    sAudioCtxMutex.lock();
+    sCtxWaitTicks += (uint64_t)(gdx3ds_prof_now() - t0);
+    sCtxContended++;
+}
+
+void AudioCtxLockPlain() {
+    if (sCtxLedgerArmed) {
+        AudioCtxLockCounted();
+    } else {
+        sAudioCtxMutex.lock();
+    }
+}
+
+// Latched with audio_ctx_narrow, on the producer thread before its first tick (or, under the
+// ndsphash lockstep pin, on the game thread's first inline tick).
+// QUICKFIX: default 0 until the hardware card confirms it; the emulator corpus is bit-exact.
+void ResolveIoUnlock() {
+    static std::atomic<int> sResolved{ 0 };
+    if (sResolved.exchange(1) != 0) {
+        return;
+    }
+    sIoUnlock = gdx3ds_config_get_int("debug", "audio_io_unlock", 0) != 0 ? 1 : 0;
+    gdx_port_logf("[actx] audio_io_unlock=%d: audio-stream SD reads %s\n", sIoUnlock,
+                  sIoUnlock ? "drop sAudioCtxMutex (the game thread never waits on card I/O)"
+                            : "run under sAudioCtxMutex (pre-quickfix)");
+}
+
+// C4K `[debug] audio_simd` (default 0): route the HLE ops through the fast kernels where each
+// proves it computes the reference's bytes (n64_audio_hle_fast.h). Resolved on the host thread
+// BEFORE the producer starts, so the first tick -- on either thread, lockstep included -- already
+// runs the chosen path. One receipt either way.
+// `[debug] audio_simd_verify=N` (default 0): with audio_simd=1, render one tick in N twice --
+// reference on saved inputs, then fast -- and count byte mismatches on the real silicon
+// (n64_audio_hle.c). A verification run, not a performance one: that tick's synth costs double.
+// Default ON for the Old 3DS only (hardware 2026-09-29: `[audio-simd] verify=391/0/0`, 0
+// mismatches, 15.9% of the synth); the New 3DS default stays 0. The ini key wins either way.
+void ResolveHleFast() {
+    const int modelDefault = gdx3ds_is_old3ds();
+    const int on = gdx3ds_config_get_int("debug", "audio_simd", modelDefault) != 0 ? 1 : 0;
+    const int verify = gdx3ds_config_get_int("debug", "audio_simd_verify", 0);
+    gdx_audio_hle_set_fast(on);
+    gdx_audio_hle_set_verify(verify);
+    gdx_port_logf("[audio-simd] audio_simd=%d verify=%d (model default %d): HLE kernels = %s\n", on, verify,
+                  modelDefault, on ? "fast (bit-exact per-op proof, reference fallback)" : "reference");
+    // o3dscrackle `[debug] audio_rs_align`: the A_RESAMPLE tap window, see n64_audio_hle.c's
+    // sHleRsAlign. DEFAULT 1 since n3ds (a bug fix: the old window read past the input at every
+    // update seam, ~180 clicks/s, on every model); 0 = the old taps. Receipt only when on.
+    const int rsAlign = gdx3ds_config_get_int("debug", "audio_rs_align", 1) != 0 ? 1 : 0;
+    gdx_audio_hle_set_rs_align(rsAlign);
+    if (rsAlign) {
+        gdx_port_logf("[audiocrk] audio_rs_align=1: A_RESAMPLE taps x[c-4..c-1] (the RSP's window, "
+                      "no lookahead past the consumed input)\n");
+    }
+    // AUDIOFIX round 3 Task 2: [debug] acmd_dump_n, default 0 (inert) -- capture the first N
+    // post-race Acmd lists plus every resolved external address they touch, for a future
+    // independent-ucode (mupen64plus-rsp-hle alist_process_nead_fz) ground-truth diff. An
+    // investigation tool, not a shipped lever: never recommended in a card ini.
+    const int acmdDumpN = gdx3ds_config_get_int("debug", "acmd_dump_n", 0);
+    gdx_audio_hle_set_acmd_dump(acmdDumpN);
+    if (acmdDumpN > 0) {
+        gdx_port_logf("[acmd-dump] armed: %d post-race ticks -> sdmc:/3ds/gdiffuser/acmd-*.bin\n",
+                      acmdDumpN);
+    }
+    // AUDIOFIX round 4: [debug] envmix_xbits, default 0 (old behaviour) -- aEnvMixer's x0-x3 bits
+    // (n64_audio_hle.c's GDX_A_ENVMIXER case), xor-mixed per mupen64plus-rsp-hle's
+    // alist_process_nead_fz. Round 3's acmd_dump_n capture never saw real F-Zero X content set
+    // these bits, so this ships inert until a hardware A/B says the xor path matters.
+    const int envmixXbits = gdx3ds_config_get_int("debug", "envmix_xbits", 0) != 0 ? 1 : 0;
+    gdx_audio_hle_set_envmix_xbits(envmixXbits);
+    if (envmixXbits) {
+        gdx_port_logf("[audiocrk] envmix_xbits=1: A_ENVMIXER applies the mupen64plus-rsp-hle x0-x3 "
+                      "xor masks (reference path only; the fast kernel always declines)\n");
+    }
+    // AUDIOFIX round 4: [debug] adpcm_scale_clamp -- caps A_ADPCM's header-scale-derived
+    // residual shift at 12 (n64_audio_hle.c's RunAdpcm), matching mupen64plus-rsp-hle's
+    // `rshift = (scale < 12) ? 12 - scale : 0` clamp. Found against this ROM's own
+    // race-mutecity-start capture (a scale-13 frame, tick 2): unclamped, this file's
+    // `nibble << shift` overshoots by 1-3 bits past mupen's reference, exactly 2x on the
+    // reported sample. n60-3d12: default ON on Old 3DS (card n60-3d11 "ALL",
+    // hardware-confirmed), off on New 3DS, unchanged; `adpcm_scale_clamp = 0` in the ini still
+    // forces the old unclamped shift on either model.
+    const int adpcmScaleClampDefault = gdx3ds_is_old3ds();
+    const int adpcmScaleClamp =
+        gdx3ds_config_get_int("debug", "adpcm_scale_clamp", adpcmScaleClampDefault) != 0 ? 1 : 0;
+    gdx_audio_hle_set_adpcm_scale_clamp(adpcmScaleClamp);
+    if (adpcmScaleClamp) {
+        gdx_port_logf("[audiocrk] adpcm_scale_clamp=1: A_ADPCM residual shift capped at 12 for "
+                      "any header scale >= 12 (mupen64plus-rsp-hle's rshift clamp)\n");
+    }
+}
+
+// Latched once, on the producer thread, before its first tick: the lock span never changes
+// mid-run. One receipt either way, so a hardware log says which span it measured.
+// Default ON for the Old 3DS only (hardware 2026-09-29: race wall -20 ms/frame); the New 3DS
+// default stays 0. The ini key wins either way.
+void ResolveCtxNarrow() {
+    const int modelDefault = gdx3ds_is_old3ds();
+    sCtxNarrow = gdx3ds_config_get_int("debug", "audio_ctx_narrow", modelDefault) != 0 ? 1 : 0;
+    gdx_port_logf("[actx] audio_ctx_narrow=%d (model default %d): sAudioCtxMutex held across %s\n", sCtxNarrow,
+                  modelDefault, sCtxNarrow ? "SETUP only (HLE synth runs unlocked)" : "the whole tick");
+    ResolveIoUnlock();
+}
+
+void ProduceTickSynthTimed(void* task, bool armed) {
+    const long long t0 = armed ? gdx3ds_prof_now() : 0;
+    gdx_audio_produce_tick_synth(task);
+    if (armed) {
+        sCtxSynthTicks += (uint64_t)(gdx3ds_prof_now() - t0);
+    }
+}
+
+void NoteCtxHold(long long t0, bool armed) {
+    if (armed) {
+        sCtxHoldTicks += (uint64_t)(gdx3ds_prof_now() - t0);
+        sCtxHolds++;
+    }
+}
+
+// One producer tick. Default: SETUP and SYNTH both under sAudioCtxMutex (the historical span).
+// audio_ctx_narrow=1: SYNTH runs after the unlock.
+void ProduceOneTickLocked() {
+    const bool armed = sCtxLedgerArmed != 0;
+    void* task = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> ctxLock(sAudioCtxMutex);
+        TickHoldScope hold;
+        const long long t0 = armed ? gdx3ds_prof_now() : 0;
+        task = gdx_audio_produce_tick_setup();
+        if (task != nullptr && !sCtxNarrow) {
+            ProduceTickSynthTimed(task, armed);
+            task = nullptr;
+        }
+        NoteCtxHold(t0, armed);
+    }
+    if (task != nullptr) {
+        ProduceTickSynthTimed(task, armed);
+    }
+}
+#else
+void AudioCtxLockPlain() {
+    sAudioCtxMutex.lock();
+}
+
+void ProduceOneTickLocked() {
+    std::lock_guard<std::recursive_mutex> ctxLock(sAudioCtxMutex);
+    gdx_audio_produce_one_tick();
+}
+#endif
 
 std::mutex sWakeMutex;
 std::condition_variable sWakeCv;
@@ -256,6 +481,7 @@ void AudioThreadMain() {
 #ifdef GDX_PLATFORM_3DS
     gdx_port_logf("[audio-thread] dedicated audio thread started (DesiredBuffered=%d)\n",
                   (int)kGdx3dsDesiredBufferedFrames);
+    ResolveCtxNarrow();
 #else
     gdx_port_logf("[audio-thread] dedicated audio thread started (DesiredBuffered=%d)\n",
                   AudioPlayerGetDesiredBuffered());
@@ -283,12 +509,20 @@ void AudioThreadMain() {
             break;
         }
         const int32_t desired = gdx3ds_audio_producer_target_frames(gGdxRaceActive); // R2 + audioprime2
+        // Read the pin ONCE per wake, not once per catch-up iteration: this loop runs up to
+        // kMaxTicksPerWake times and the shipped path must not pay a call per iteration for a
+        // lever that is off. It cannot change mid-wake -- it is resolved at boot.
+        const bool ndspHashLockstep = gdx_ndsphash_lockstep() != 0;
         int iterations = 0;
         // Deliberately does NOT pass gdx3ds_audio_buffered(): that takes the ring lock, and the
         // shipped path must not acquire it one extra time per 5 ms wake for a diagnostic. The
         // hook reads the two counters unlocked itself, and only when the census is armed.
         gdx3ds_audio_producer_wake(desired, kMaxTicksPerWake);
-        while ((int32_t)gdx3ds_audio_buffered() < desired && iterations < kMaxTicksPerWake) { // R3
+        // [debug] ndsphash_lockstep: this thread stands down entirely and production moves
+        // to gdx_audio_thread_notify_frame(), inline on the game thread, one tick per frame.
+        // Two producers would reintroduce exactly the interleaving the pin exists to remove.
+        while (!ndspHashLockstep &&
+               (int32_t)gdx3ds_audio_buffered() < desired && iterations < kMaxTicksPerWake) { // R3
             gdx3ds_audio_producer_tick_begin();
 #else
         const int32_t desired = AudioPlayerGetDesiredBuffered();
@@ -296,10 +530,7 @@ void AudioThreadMain() {
         while (AudioPlayerBuffered() < desired && iterations < kMaxTicksPerWake) {
 #endif
             const auto tickStart = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::recursive_mutex> ctxLock(sAudioCtxMutex);
-                gdx_audio_produce_one_tick();
-            }
+            ProduceOneTickLocked();
 #ifdef GDX_PLATFORM_3DS
             gdx3ds_audio_producer_tick_end();
 #endif
@@ -338,6 +569,7 @@ extern "C" void gdx_audio_thread_start(int argc, char** argv) {
 
     sStopRequested.store(false, std::memory_order_relaxed);
 #ifdef GDX_PLATFORM_3DS
+    ResolveHleFast();
     // S4: place the HLE producer on a spare ARM11 core (core 2 on New3DS) instead of core 0.
     // The core-0 rung always succeeds, so a nonzero return means only that thread creation itself
     // failed -- fall back to running production inline is not possible here, so log and continue
@@ -385,6 +617,30 @@ extern "C" void gdx_audio_thread_notify_frame(void) {
     if (!sThreadActive.load(std::memory_order_relaxed)) {
         return;
     }
+#ifdef GDX_PLATFORM_3DS
+    // [debug] ndsphash_lockstep (default 0, one int compare when off): produce the tick HERE,
+    // on the game thread, once per frame, instead of signalling the free-running producer.
+    // Audio tick N then belongs to game frame N by construction, and the game's frames are
+    // already deterministic under [debug] det=1. Without this the producer paces itself
+    // against the ring's occupancy, so the number of audio ticks between two game events
+    // varies run to run, every note-on lands at a different sample position, and two identical
+    // runs share only about a quarter of their audio command lists.
+    //
+    // Running it on THIS thread is also the safer of the two: gdx_audio_produce_one_tick can
+    // reach a blocking osRecvMesg, and port/n64_sched.c's __osEnqueueAndYield spin-yields
+    // rather than touching the fiber scheduler when the caller is not the host thread. Here it
+    // IS the host thread, so the fiber path is the normal one.
+    //
+    // PARITY MODE, not a shipping option: production no longer tracks playback, so the ring
+    // over- or under-runs and no timing, sil_ppk or level from such a run means anything.
+    if (gdx_ndsphash_lockstep()) {
+        ResolveIoUnlock();
+        std::lock_guard<std::recursive_mutex> ctxLock(sAudioCtxMutex);
+        TickHoldScope hold;
+        gdx_audio_produce_one_tick();
+        return;
+    }
+#endif
     // No predicate flag: a notify lost to a race only means the next production waits for the 5ms
     // self-pump instead of happening immediately.
     sWakeCv.notify_one();
@@ -405,23 +661,93 @@ extern volatile uint32_t gdx_watch_ctx_waiters;
 uint32_t gdx_probe_actor(void);
 }
 
+#ifdef GDX_PLATFORM_3DS
+extern "C" void gdx_audio_ctx_ledger_arm(int on) {
+    sCtxLedgerArmed = on ? 1 : 0;
+}
+
+extern "C" void gdx_audio_ctx_ledger_totals(uint64_t* waitTicks, unsigned long* locks,
+                                            unsigned long* contended, uint64_t* holdTicks,
+                                            unsigned long* holds, uint64_t* synthTicks) {
+    *waitTicks = sCtxWaitTicks;
+    *locks = sCtxLocks;
+    *contended = sCtxContended;
+    *holdTicks = sCtxHoldTicks;
+    *holds = sCtxHolds;
+    *synthTicks = sCtxSynthTicks;
+}
+#endif
+
 extern "C" void gdx_audio_ctx_lock(void) {
 #ifdef EXPANSION_KIT
     gdx_watch_ctx_waiters++;
-    sAudioCtxMutex.lock();
+    AudioCtxLockPlain();
     gdx_watch_ctx_waiters--;
     gdx_watch_ctx_owner = gdx_probe_actor();
 #else
-    sAudioCtxMutex.lock();
+    AudioCtxLockPlain();
+#endif
+#ifdef GDX_PLATFORM_3DS
+    if (tTickHold) {
+        tTickNested++;
+    }
 #endif
 }
 
 extern "C" void gdx_audio_ctx_unlock(void) {
+#ifdef GDX_PLATFORM_3DS
+    if (tTickHold && tTickNested > 0) {
+        tTickNested--;
+    }
+#endif
 #ifdef EXPANSION_KIT
     gdx_watch_ctx_owner = 0u;
 #endif
     sAudioCtxMutex.unlock();
 }
+
+#ifdef GDX_PLATFORM_3DS
+extern "C" int gdx_audio_ctx_io_unlock_enabled(void) {
+    return sIoUnlock;
+}
+
+// QUICKFIX [debug] audio_io_unlock: see sIoUnlock. Returns 1 when the mutex was dropped; the
+// caller then MUST call gdx_audio_ctx_io_reacquire() on the same thread.
+extern "C" int gdx_audio_ctx_io_release(void) {
+    if (!sIoUnlock || !tTickHold || tTickNested != 0) {
+        return 0;
+    }
+    tTickHold = 0;
+    sIoReleaseT0 = gdx3ds_prof_now();
+    sAudioCtxMutex.unlock();
+    return 1;
+}
+
+// Receipt at 1, 2, 4, 8, ... releases: bounded log volume, emitted while still unlocked so its
+// log write never runs under the mutex either.
+static void IoUnlockReceipt() {
+    if (sIoReleases < sIoNextReceipt) {
+        return;
+    }
+    sIoNextReceipt *= 2u;
+    const double perMs = 268111.856; // svcGetSystemTick ticks per ms (SYSCLOCK_ARM11 / 1000)
+    gdx_port_logf("[actx] io_unlock releases=%lu unlocked=%.1f ms max=%.1f ms\n", sIoReleases,
+                  (double)sIoUnlockedTicks / perMs, (double)sIoUnlockedMax / perMs);
+}
+
+extern "C" void gdx_audio_ctx_io_reacquire(void) {
+    const uint64_t dt = (uint64_t)(gdx3ds_prof_now() - sIoReleaseT0);
+    sIoReleases++;
+    sIoUnlockedTicks += dt;
+    if (dt > sIoUnlockedMax) {
+        sIoUnlockedMax = dt;
+    }
+    IoUnlockReceipt();
+    AudioCtxLockPlain();
+    tTickHold = 1;
+    tTickNested = 0;
+}
+#endif
 
 // Ring bridge for decomp/src/audio/disk/lib/thread.c: push replaces ScheduleProcessCmds'
 // osSendMesg, pop replaces CreateTaskImpl's drain-loop osRecvMesg. Both keep the OS_MESG_NOBLOCK

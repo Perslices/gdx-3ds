@@ -38,6 +38,21 @@
 
 #include "port_log.h"
 #include "gdx_dev_gates.h"
+/* [ndsphash] the content-addressed render digest: a map from "what this tick asked the DSP to
+   do, with what bytes" to "what it rendered".  Every tap below early-returns on one int
+   compare unless [debug] ndsphash is armed.  See port/gdx_ndsp_hash.h for why that map is the
+   stable thing here and a hash of the PCM stream is not. */
+#include "gdx_ndsp_hash.h"
+/* [audiomix] headroom census.  [ndsphash] above says whether the render is CONSISTENT and
+   port/tests/dsp_tests.c says whether each KERNEL is correct; neither looks at what happens
+   when several loud voices sum into one saturating 16-bit bus.  Every tap below is
+   `if (gdx_audiomix_armed)` on one int that is zero unless [debug] audiomix is armed. */
+#include "gdx_audio_mix_census.h"
+/* [synx] C4k: per-op CPU-vs-wall ledger. One int test per op unless the gputrace latch arms it. */
+#include "gdx_audio_hle_cost.h"
+/* [debug] audio_simd C4k: bit-exact fast kernels, taken per op only where they prove they
+   compute what the reference below computes (n64_audio_hle_fast.h). */
+#include "n64_audio_hle_fast.h"
 
 // Defined in port/n64_gfx_bridge.cpp. Deliberately `unsigned int`, not uintptr_t: the decomp's
 // own stdint shim typedefs uintptr_t as a 32-bit type inside gdiffuser_game TUs, so only
@@ -82,6 +97,93 @@ static void* GdxAudioResolveAddr(uint32_t raw, const char* what) {
     return NULL;
 }
 
+/* AUDIOFIX round 3 Task 2 -- ground-truth capture, kept as an investigation tool (not a shipped
+ * lever; [debug] acmd_dump_n defaults to 0/inert and is never recommended in a card ini).
+ * Dumps the exact Acmd stream gdx_audio_hle_run() receives, plus a first-seen snapshot of every
+ * resolved external address (ADPCM/RESAMPLE persistent state, LOADADPCM codebooks, LOADBUFF/
+ * SAVEBUFF sample/reverb-delay content), so an INDEPENDENT ucode implementation
+ * (mupen64plus-rsp-hle's alist_process_nead_fz, which this project does not otherwise touch) can
+ * be driven on byte-identical input and diffed against this interpreter's PCM output. Armed only
+ * by gdx_audio_hle_set_acmd_dump(); the default (never called) is the one int compare below. */
+static int sAcmdDumpTicksLeft = 0;
+static FILE* sAcmdDumpCmdFile = NULL;
+static FILE* sAcmdDumpMemFile = NULL;
+/* AUDIOFIX round 4: bumped from 1024 -- a multi-second capture's rotating sample-cache ring
+ * (every A_LOADBUFF source address differs tick to tick, a genuinely fresh "first-seen" each
+ * time, not a persistent address reused across ticks) blew through 1024 well before 129 ticks
+ * in the round 3 capture, leaving later ticks' LOADBUFF/LOADADPCM/etc snapshots un-captured --
+ * found while building round 4's byte-exact mupen64plus-rsp-hle diff harness (docs/research/
+ * native/audiofix-progress.md SS16), which needs every address a tick touches. 16384 entries is
+ * 64 KiB of .bss, reserved unconditionally like the 4 KiB before it (this is an investigation
+ * tool, never armed in a shipped card ini either way). */
+#define GDX_ACMD_DUMP_MAX_ADDRS 16384
+static uint32_t sAcmdDumpSeenAddrs[GDX_ACMD_DUMP_MAX_ADDRS];
+static int sAcmdDumpSeenCount = 0;
+
+void gdx_audio_hle_set_acmd_dump(int ticks) {
+    sAcmdDumpTicksLeft = (ticks > 0) ? ticks : 0;
+}
+
+static void AcmdDumpSnapshotAddr(uint32_t raw, const void* resolved, uint32_t len) {
+    int i;
+    if (sAcmdDumpTicksLeft <= 0 || resolved == NULL || len == 0u || raw == 0u) {
+        return;
+    }
+    for (i = 0; i < sAcmdDumpSeenCount; i++) {
+        if (sAcmdDumpSeenAddrs[i] == raw) {
+            return; /* first-seen only: that is the replay's correct starting value */
+        }
+    }
+    if (sAcmdDumpSeenCount >= GDX_ACMD_DUMP_MAX_ADDRS) {
+        return;
+    }
+    if (sAcmdDumpMemFile == NULL) {
+        sAcmdDumpMemFile = fopen("sdmc:/3ds/gdiffuser/acmd-mem.bin", "wb");
+        if (sAcmdDumpMemFile == NULL) {
+            return;
+        }
+    }
+    sAcmdDumpSeenAddrs[sAcmdDumpSeenCount++] = raw;
+    {
+        uint32_t hdr[2];
+        hdr[0] = raw;
+        hdr[1] = len;
+        fwrite(hdr, sizeof(hdr), 1, sAcmdDumpMemFile);
+        fwrite(resolved, 1, len, sAcmdDumpMemFile);
+        fflush(sAcmdDumpMemFile);
+    }
+}
+
+static void AcmdDumpTick(const void* dataPtr, uint32_t dataSizeBytes) {
+    extern int gGdxRaceActive;
+    if (sAcmdDumpTicksLeft <= 0 || !gGdxRaceActive) {
+        return;
+    }
+    if (sAcmdDumpCmdFile == NULL) {
+        sAcmdDumpCmdFile = fopen("sdmc:/3ds/gdiffuser/acmd-cmds.bin", "wb");
+        if (sAcmdDumpCmdFile == NULL) {
+            sAcmdDumpTicksLeft = 0;
+            return;
+        }
+    }
+    {
+        uint32_t lenRecord = dataSizeBytes;
+        fwrite(&lenRecord, sizeof(lenRecord), 1, sAcmdDumpCmdFile);
+        fwrite(dataPtr, 1, dataSizeBytes, sAcmdDumpCmdFile);
+        fflush(sAcmdDumpCmdFile);
+    }
+    sAcmdDumpTicksLeft--;
+    if (sAcmdDumpTicksLeft == 0) {
+        fclose(sAcmdDumpCmdFile);
+        sAcmdDumpCmdFile = NULL;
+        if (sAcmdDumpMemFile != NULL) {
+            fclose(sAcmdDumpMemFile);
+            sAcmdDumpMemFile = NULL;
+        }
+        gdx_port_logf("[acmd-dump] capture complete: %d addrs snapshotted\n", sAcmdDumpSeenCount);
+    }
+}
+
 // Mirrors decomp/include/PR/abi.h. This build is EXPANSION_KIT=1, which is why A_HILOGAIN is 14
 // here and not 24 (see abi.h's #ifdef EXPANSION_KIT).
 enum {
@@ -115,7 +217,12 @@ enum {
 // size. Every offset is masked before use so a malformed command can never write outside sDmem.
 #define GDX_DMEM_SIZE 0x1000u
 #define GDX_DMEM_MASK (GDX_DMEM_SIZE - 1u)
-static uint8_t sDmem[GDX_DMEM_SIZE];
+/* Word-aligned so n64_audio_hle_fast.c can read DMEM as s16/u32 lanes. */
+static union {
+    uint8_t bytes[GDX_DMEM_SIZE];
+    uint32_t align;
+} sDmemStore;
+#define sDmem (sDmemStore.bytes)
 /* [spike] diagnostic: per 16-byte block, the opcode that last wrote it. 0xFF = never written. */
 static uint8_t sDmemLastOp[GDX_DMEM_SIZE >> 4];
 static uint8_t sDmemCurOp = 0xFF;
@@ -152,6 +259,140 @@ static int GdxAudioDbg(void) {
 #define GDX_ADPCM_BOOK_MAX_BYTES 4096u
 static uint8_t sAdpcmBook[GDX_ADPCM_BOOK_MAX_BYTES];
 static uint32_t sAdpcmBookLen = 0;
+/* BookCoef() as a table for the fast ADPCM kernel, rebuilt at every A_LOADADPCM whatever the
+   lever says, so flipping it mid-run never reads a stale book. */
+static GdxHleFastBook sAdpcmBookFast;
+
+/* [debug] audio_simd (default 0): see n64_audio_hle_fast.h. Set once by the platform before the
+   first audio task (gdx_audio_thread.cpp on 3DS); the host parity test flips it directly. */
+static int sHleFastLever = 0;
+static uint32_t sHleFastOps = 0;       /* ops the fast kernels handled */
+static uint32_t sHleFastFallbacks = 0; /* ops that failed a fast kernel's proof -> reference */
+
+void gdx_audio_hle_set_fast(int on) {
+    sHleFastLever = on ? 1 : 0;
+}
+
+/* [debug] audio_rs_align (default 0, o3dscrackle). The A_RESAMPLE tap window.
+ *   0 = this file's historical window {x[c-1], x[c], x[c+1], x[c+2]} around the cursor c: two
+ *       samples of LOOKAHEAD past the cursor.
+ *   1 = the reference window {x[c-4], x[c-3], x[c-2], x[c-1]}: mupen64plus-rsp-hle's
+ *       alist_resample (`ipos -= 4`, taps ipos..ipos+3, state saved from ipos) and
+ *       Project64/AziAudio's RESAMPLE (`srcPtr -= 4`), i.e. what the RSP computes.
+ * The ROM sizes every resample input to EXACTLY the samples the RSP consumes
+ * (AudioSynth_ProcessNote's nSamplesToLoad from pitch * count + samplePosFrac), because the
+ * RSP never reads past its cursor. Mode 0 reads up to two samples past the consumed range on
+ * the last outputs of every update, i.e. whatever DMEM holds after the note's decoded data,
+ * and the NEXT update re-reads those positions from the freshly loaded buffer. Measured with
+ * [audiocrk] (o3dscrackle-progress.md): the last 1-2 frames of a tick leave the waveform's
+ * trajectory and the next tick resumes on it, a step at the tick boundary that does not
+ * exist inside a tick. Mode 1 is a constant 3-sample (94 us) delay of every voice plus the
+ * removal of those boundary samples. The persisted state (4 samples ending at the cursor)
+ * and the accumulator are identical in both modes. The fast kernel takes the same window
+ * (gdx_hlefast_resample's tapBack), proven bit-exact by port/tests/hle_fast_tests.c. */
+static int sHleRsAlign = 0;
+
+void gdx_audio_hle_set_rs_align(int on) {
+    sHleRsAlign = on ? 1 : 0;
+}
+
+int gdx_audio_hle_rs_align(void) {
+    return sHleRsAlign;
+}
+
+/* [debug] envmix_xbits (default 0 = old behaviour, matching every build before this one):
+ * abi.h's aEnvMixer(pkt, dmemi, count, swapLR, x0, x1, x2, x3, m) macro packs four more bits
+ * into w0 (bits 3/2/1/0) that this interpreter never read. mupen64plus-rsp-hle's
+ * alist_process_nead_fz -- the ground-truthed F-Zero X ucode, docs/research/native/
+ * audiofix-progress.md SS13 -- XORs them into the wet/dry channel sums in its ENVMIXER(). Off
+ * by default: round 3's own real-content capture (1,122 ENVMIXER calls) never set any of
+ * these bits, so this is a confirmed-reachable-in-principle correctness fix, not a confirmed
+ * contributor to the reported crackle -- it ships behind a lever until a hardware A/B says
+ * otherwise. */
+static int sHleEnvmixXbits = 0;
+
+void gdx_audio_hle_set_envmix_xbits(int on) {
+    sHleEnvmixXbits = on ? 1 : 0;
+}
+
+int gdx_audio_hle_envmix_xbits(void) {
+    return sHleEnvmixXbits;
+}
+
+/* [debug] adpcm_scale_clamp (default 0 = old behaviour, matching every build before this one):
+ * A_ADPCM's frame header packs SCALE into the high nibble (RunAdpcm's `shift`, 0..15 -- it is a
+ * raw 4-bit field, not range-checked by the ucode). This file's residual math has always used
+ * `nibble << shift` unconditionally. mupen64plus-rsp-hle's reference (src/audio.h
+ * adpcm_predict_sample: `sample = (byte & mask) << lshift; sample >>= rshift;` with `rshift =
+ * (scale < 12) ? 12 - scale : 0`, src/alist.c adpcm_predict_frame_4bits/_2bits) nets out to
+ * `nibble << scale` ONLY for scale < 12 -- for scale == 12..15 the `rshift` clamp to 0 caps the
+ * EFFECTIVE shift at exactly 12, regardless of how far past 12 the header nibble goes. Found via
+ * docs/research/native/audiofix-progress.md's round-4 fresh-capture diff (SS17): tick 2 of
+ * race-mutecity-start's first full post-16384-cap capture diverges at an A_ADPCM call whose
+ * header scale is 13, this file's unclamped shift producing exactly 2x mupen's clamped-at-12
+ * sample (-16384 vs -8192 -- the exact ratio an extra left-shift bit predicts). Off by default:
+ * a real, confirmed-reachable correctness fix (this ROM's own audio data DOES emit scale > 12
+ * in at least one frame), but not yet confirmed against hardware as the crackle's cause -- see
+ * audio_rs_align/envmix_xbits above for why this project ships every such fix behind a lever
+ * until an A/B says otherwise. */
+static int sHleAdpcmScaleClamp = 0;
+
+void gdx_audio_hle_set_adpcm_scale_clamp(int on) {
+    sHleAdpcmScaleClamp = on ? 1 : 0;
+}
+
+int gdx_audio_hle_adpcm_scale_clamp(void) {
+    return sHleAdpcmScaleClamp;
+}
+
+int gdx_audio_hle_fast_enabled(void) {
+    return sHleFastLever;
+}
+
+void gdx_audio_hle_fast_counts(uint32_t* fastOps, uint32_t* fallbacks) {
+    *fastOps = sHleFastOps;
+    *fallbacks = sHleFastFallbacks;
+}
+
+/* The [spike] last-writer map, for port/tests/hle_fast_tests.c's parity check (the fast kernels
+   must mark exactly the blocks the reference marks). */
+void gdx_audio_hle_debug_lastop(uint8_t out[GDX_DMEM_SIZE >> 4]) {
+    memcpy(out, sDmemLastOp, sizeof(sDmemLastOp));
+}
+
+/* Forward: the ROM resample table below, for the parity test's overflow-bound assertion. */
+const int16_t* gdx_audio_hle_debug_resample_table(void);
+
+static uint32_t sHleVerifyChecked;    /* [debug] audio_simd_verify, defined with the verifier */
+static uint32_t sHleVerifySkipped;
+static uint32_t sHleVerifyMismatches;
+
+/* [audio-simd] which inner path the fast kernels took (cumulative), next to [audio-hle]'s
+   periodic receipt: packed/fallback per kernel, so a hardware log shows the packed paths are the
+   ones the game's lists actually reach. */
+static void HleFastLogPaths(void) {
+    uint32_t p[GDX_HLEFAST_PATH_COUNT];
+    gdx_hlefast_path_counts(p);
+    gdx_port_logf("[audio-simd] paths adpcm=%u/%u resample=%u/%u envmix=%u/%u mixer=%u/%u "
+                  "(packed/fallback) ops fast=%u reference=%u verify=%u/%u/%u (checked/skipped/MISMATCH)\n",
+                  (unsigned)p[GDX_HLEFAST_PATH_ADPCM_PACKED], (unsigned)p[GDX_HLEFAST_PATH_ADPCM_WIDE],
+                  (unsigned)p[GDX_HLEFAST_PATH_RESAMPLE_PACKED],
+                  (unsigned)p[GDX_HLEFAST_PATH_RESAMPLE_SCALAR],
+                  (unsigned)p[GDX_HLEFAST_PATH_ENVMIX_PACKED], (unsigned)p[GDX_HLEFAST_PATH_ENVMIX_SCALAR],
+                  (unsigned)p[GDX_HLEFAST_PATH_MIXER_PACKED], (unsigned)p[GDX_HLEFAST_PATH_MIXER_SCALAR],
+                  (unsigned)sHleFastOps, (unsigned)sHleFastFallbacks, (unsigned)sHleVerifyChecked,
+                  (unsigned)sHleVerifySkipped, (unsigned)sHleVerifyMismatches);
+}
+
+/* Counts the verdict of one fast-kernel attempt and passes it through. */
+static int HleFastTook(int handled) {
+    if (handled) {
+        sHleFastOps++;
+    } else {
+        sHleFastFallbacks++;
+    }
+    return handled;
+}
 
 typedef struct {
     uint32_t w0;
@@ -173,6 +414,26 @@ static int16_t DmemGetS16(uint32_t byteOffset) {
 static void DmemSetS16(uint32_t byteOffset, int16_t v) {
     memcpy(&sDmem[byteOffset & GDX_DMEM_MASK & ~1u], &v, sizeof(v));
     sDmemLastOp[(byteOffset & GDX_DMEM_MASK) >> 4] = sDmemCurOp;
+}
+
+/* THE MIX BUS FUNNEL.  Every accumulate of a voice into a mix bus goes through here:
+   A_ENVMIXER's four dry/wet destinations, A_MIXER's gain mix and A_ADDMIXER's unity add.
+   Two reasons it is one function rather than six open-coded clamps:
+
+   1) The clamp is the hardware's, not this port's.  The RSP's mix ops write SATURATED s16
+      into DMEM (mupen64plus-rsp-hle's alist_mix / alist_add / envmix_* all end in
+      `clamp_s16(*dst + ...)`), so `out = clamp(out + in)` per voice IS the reference
+      semantics -- a wrap here would be a defect, and a single funnel is one place to read
+      rather than six.
+   2) `preClamp` is the only moment the overshoot is observable.  After the clamp a sample
+      that wanted +40000 and one that wanted +32768 are the same byte pair, which is exactly
+      why [audioring]'s `level peak=` -- measured on the delivered stream -- can never see a
+      clip. [audiomix] taps the value on its way in. */
+static void MixBusWrite(uint32_t byteOffset, int32_t preClamp) {
+    if (gdx_audiomix_armed) {
+        gdx_audiomix_note_bus_add(preClamp);
+    }
+    DmemSetS16(byteOffset, ClampS16(preClamp));
 }
 
 static uint8_t DmemGetU8(uint32_t byteOffset) {
@@ -945,6 +1206,13 @@ static void RunAdpcm(const GdxBufDesc* buf, uint32_t flags, int16_t* state, cons
            scale=3/pred=0, and that decode matches the SDK reference. */
         uint32_t shift = (header >> 4) & 0xF;
         uint32_t predIdx = header & 0xF;
+        /* [debug] adpcm_scale_clamp -- see the lever's own comment above
+           gdx_audio_hle_set_adpcm_scale_clamp(). mupen's reference effectively caps the residual
+           shift at 12 for any header scale >= 12 (its rshift clamps to 0 there); unclamped, a
+           scale of 13-15 left-shifts the residual 1-3 bits too far. */
+        if (gdx_audio_hle_adpcm_scale_clamp() && shift > 12u) {
+            shift = 12u;
+        }
         uint32_t dataBytes = smallAdpcm ? 4u : 8u;
         uint32_t frameBytes = 1u + dataBytes;
         uint32_t nibblesPerByte = smallAdpcm ? 4u : 2u; /* 2-bit vs 4-bit nibbles */
@@ -1225,6 +1493,10 @@ static const int16_t sResampleTable[GDX_RESAMPLE_PHASES][4] = {
     { GDX_S16(0xffdf), GDX_S16(0x0d46), GDX_S16(0x66ad), GDX_S16(0x0c39) },
 };
 
+const int16_t* gdx_audio_hle_debug_resample_table(void) {
+    return &sResampleTable[0][0];
+}
+
 // A_RESAMPLE: 4-tap polyphase FIR resampler (table above). pitch is Q15, UNITY_PITCH=0x8000 ==
 // 1.0x per PR/abi.h.
 //
@@ -1281,10 +1553,12 @@ static void RunResample(const GdxBufDesc* buf, uint32_t flags, int16_t* state) {
     }
 
     for (n = 0; n < numOutSamples; n++) {
-        int16_t xm1 = GdxResampleSampleAt(buf, hist, virtIdx - 1u);
-        int16_t x0 = GdxResampleSampleAt(buf, hist, virtIdx);
-        int16_t x1 = GdxResampleSampleAt(buf, hist, virtIdx + 1u);
-        int16_t x2 = GdxResampleSampleAt(buf, hist, virtIdx + 2u);
+        /* tap 0's virtual index: c-1 (mode 0) or c-4 (mode 1, the reference); see sHleRsAlign */
+        const uint32_t tap0 = sHleRsAlign ? virtIdx - 4u : virtIdx - 1u;
+        int16_t xm1 = GdxResampleSampleAt(buf, hist, tap0);
+        int16_t x0 = GdxResampleSampleAt(buf, hist, tap0 + 1u);
+        int16_t x1 = GdxResampleSampleAt(buf, hist, tap0 + 2u);
+        int16_t x2 = GdxResampleSampleAt(buf, hist, tap0 + 3u);
         uint32_t phase = (fracQ16 >> (16u - GDX_RESAMPLE_PHASE_BITS)) & (GDX_RESAMPLE_PHASES - 1u);
         const int16_t* c = sResampleTable[phase];
         int32_t out = ((int32_t)xm1 * c[0] + (int32_t)x0 * c[1] +
@@ -1408,6 +1682,70 @@ static void RunFilter(uint32_t dmemBuf, uint32_t sizeBytes, uint32_t flags, int1
    from another OS thread; volatile progress counters, staleness is harmless). If the audio
    thread wedges INSIDE one command, op/idx stop advancing while runs stays flat — naming the
    exact ABI op. Two volatile stores per command; negligible against the DMEM work. */
+/* [synx] the op class and work size ("units") of one ABI command, for the C4k cost ledger:
+   output samples for the DSP kernels, bytes for the DMA/copy ops, 1 for register ops. Read
+   after the op ran; no op below modifies the pending descriptors it reads. */
+static uint32_t HleCostUnits(uint32_t op, uint32_t w0, uint32_t w1, const GdxBufDesc* buf,
+                             uint32_t filterBytes, int* cls) {
+    switch (op) {
+        case GDX_A_ADPCM:
+            *cls = GDX_HLECOST_ADPCM;
+            return buf->count / 2u;
+        case GDX_A_RESAMPLE:
+            *cls = GDX_HLECOST_RESAMPLE;
+            return ((buf->count + 0xFu) & ~0xFu) / 2u;
+        case GDX_A_ENVMIXER:
+            *cls = GDX_HLECOST_ENVMIX;
+            return (w0 >> 8) & 0xFFu;
+        case GDX_A_MIXER:
+            *cls = GDX_HLECOST_MIXER;
+            return ((w0 >> 16) & 0xFFu) * 8u;
+        case GDX_A_ADDMIXER:
+            *cls = GDX_HLECOST_ADDMIX;
+            return ((w0 >> 16) & 0xFFu) * 8u;
+        case GDX_A_INTERLEAVE:
+            *cls = GDX_HLECOST_INTERLEAVE;
+            return (((w0 >> 16) & 0xFFu) << 4) / 2u;
+        case GDX_A_FILTER:
+            if (((w0 >> 16) & 0xFFu) == 2u) {
+                break;
+            }
+            *cls = GDX_HLECOST_FILTER;
+            return filterBytes / 2u;
+        case GDX_A_HILOGAIN:
+            *cls = GDX_HLECOST_HILOGAIN;
+            return (w0 & 0xFFFFu) / 2u;
+        case GDX_A_LOADBUFF:
+            *cls = GDX_HLECOST_LOADBUFF;
+            return ((w0 >> 16) & 0xFFu) << 4;
+        case GDX_A_SAVEBUFF:
+            *cls = GDX_HLECOST_SAVEBUFF;
+            return ((w0 >> 16) & 0xFFu) << 4;
+        case GDX_A_CLEARBUFF:
+            *cls = GDX_HLECOST_CLEARBUFF;
+            return (w1 > GDX_DMEM_SIZE) ? GDX_DMEM_SIZE : w1;
+        case GDX_A_DMEMMOVE:
+            *cls = GDX_HLECOST_DMEMMOVE;
+            return w1 & 0xFFFFu;
+        default:
+            break;
+    }
+    *cls = GDX_HLECOST_OTHER;
+    return 1u;
+}
+
+static void HleCostChargeOp(uint32_t op, uint32_t w0, uint32_t w1, const GdxBufDesc* buf,
+                            uint32_t filterBytes) {
+    int cls = GDX_HLECOST_OTHER;
+    const uint32_t units = HleCostUnits(op, w0, w1, buf, filterBytes, &cls);
+    if (op == GDX_A_INTERLEAVE) {
+        gdx_hle_cost_note_output(units);
+    } else if (op == GDX_A_ADPCM || op == GDX_A_S8DEC) {
+        gdx_hle_cost_note_voice();
+    }
+    gdx_hle_cost_op_end(cls, units);
+}
+
 volatile uint32_t gdx_watch_hle_runs = 0;
 volatile uint32_t gdx_watch_hle_op = 0xFF;
 volatile uint32_t gdx_watch_hle_idx = 0;
@@ -1421,7 +1759,7 @@ static uint32_t sGdxHleEnvmixOps;
 static uint32_t sGdxHleNzSaves;       /* SAVEBUFFs that wrote at least one nonzero byte */
 static int sGdxHleFirstNzLogged;
 
-void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
+static void HleRunList(const void* dataPtr, unsigned int dataSizeBytes, int fastLever, int costAllowed) {
     const GdxAcmd* cmds = (const GdxAcmd*)dataPtr;
     uint32_t count = dataSizeBytes / (uint32_t)sizeof(GdxAcmd);
     uint32_t i;
@@ -1441,6 +1779,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
     int32_t envCurVolLeft = 0, envCurVolRight = 0, envReverbVol2 = 0;
 
     static int sUnhandledLogs = 0;
+    const int costArmed = costAllowed && gdx_hle_cost_armed; /* [synx] latched per run */
+    /* [debug] audio_simd, latched per run. The two census families that tap the kernels'
+       inner loops (per-sample captures) keep the whole run on the reference. */
+    const int fast = fastLever && !gdx_audiomix_armed && !sGdxUnlockStage.active;
+    int reverbOffThisRun = -1; /* fast path: the reverb kill switch, read at the first MIXER */
+    GdxHleFastCtx fctx;
 
     if (cmds == NULL || count == 0) {
         return;
@@ -1458,12 +1802,26 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
     }
 
     gdx_watch_hle_runs++;
+    if (costArmed) {
+        gdx_hle_cost_run_begin(); /* [synx] stamp the per-op timing chain */
+    }
+
+    /* [ndsphash] seal the KEY from this tick's command list before a single command runs.
+       The address-bearing opcodes contribute only their w0 here; their CONTENT joins the key
+       from inside the handlers below, as each address is resolved. */
+    gdx_ndsphash_task_begin(dataPtr, dataSizeBytes);
+    if (gdx_audiomix_armed) {
+        gdx_audiomix_task_begin(); /* [audiomix] per-tick voice/clip accumulators */
+    }
 
     for (i = 0; i < count; i++) {
         uint32_t w0 = cmds[i].w0;
         uint32_t w1 = cmds[i].w1;
         uint32_t op = (w0 >> 24) & 0xFFu;
         sDmemCurOp = (uint8_t)op; /* [spike] last-writer attribution */
+        fctx.dmem = sDmem;
+        fctx.lastOp = sDmemLastOp;
+        fctx.op = (uint8_t)op;
         gdx_watch_hle_op = op;    /* watchdog: last op entered */
         gdx_watch_hle_idx = i;
 
@@ -1487,8 +1845,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     (dmem == 0x940u) && (size >= 0x340u)) {
                     GdxUnlockStageChunkReset();
                 }
-                for (k = 0; k < size; k++) {
-                    DmemSetU8(dmem + k, 0);
+                if (!(fast && HleFastTook(gdx_hlefast_clear(&fctx, dmem, size)))) {
+                    for (k = 0; k < size; k++) {
+                        DmemSetU8(dmem + k, 0);
+                    }
                 }
                 break;
             }
@@ -1512,6 +1872,9 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t k;
                 /* Byte-by-byte to safely handle overlap in either direction without relying on
                    memmove's overlap semantics against a masked/wrapping index space. */
+                if (fast && HleFastTook(gdx_hlefast_move(&fctx, dmemIn, dmemOut, cnt))) {
+                    break;
+                }
                 if (dmemOut <= dmemIn) {
                     for (k = 0; k < cnt; k++) DmemSetU8(dmemOut + k, DmemGetU8(dmemIn + k));
                 } else {
@@ -1524,10 +1887,28 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t size = ((w0 >> 16) & 0xFFu) << 4;
                 uint32_t dmemDest = w0 & 0xFFFFu;
                 void* src = GdxAudioResolveAddr(w1, "LOADBUFF");
+                AcmdDumpSnapshotAddr(w1, src, size); /* AUDIOFIX round 3 Task 2 */
                 if (src != NULL) {
                     uint32_t k;
-                    const uint8_t* s = (const uint8_t*)src;
-                    for (k = 0; k < size; k++) DmemSetU8(dmemDest + k, s[k]);
+                    const uint8_t* s;
+                    /* [ndsphash] SOURCE fault injection, the negative control for the
+                       "wrong bytes reached the DSP" class: flip one bit of one delivered
+                       sample byte, once, in the sample-cache slot itself -- the shape a
+                       streaming regression would have.  It runs BEFORE the key fold, so the
+                       key legitimately changes: this class lands in only_in_a/only_in_b and
+                       collapses `compared`, NOT in `divergent`.  The two classes are
+                       different fields and ndspdiff.py gates on both. */
+                    if (gdx_ndsphash_fault_source() && size > 0u) {
+                        ((uint8_t*)src)[0] ^= 0x01u;
+                    }
+                    /* [ndsphash] the CONTENT of what this load delivers joins the key.  The
+                       ADDRESS never does: it is a sample-cache slot, and audiodiet's diet
+                       moves every allocation after the 10.25 MB table. */
+                    gdx_ndsphash_fold_load(src, size);
+                    s = (const uint8_t*)src;
+                    if (!(fast && HleFastTook(gdx_hlefast_load(&fctx, dmemDest, s, size)))) {
+                        for (k = 0; k < size; k++) DmemSetU8(dmemDest + k, s[k]);
+                    }
                     /* [pcm-cap] plumbing: remember the last compressed-sample
                        source so the ADPCM capture below can name its input. */
                     sPcmCapLastSrc = (uintptr_t)src;
@@ -1556,14 +1937,32 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t size = ((w0 >> 16) & 0xFFu) << 4;
                 uint32_t dmemSrc = w0 & 0xFFFFu;
                 void* dst = GdxAudioResolveAddr(w1, "SAVEBUFF");
+                AcmdDumpSnapshotAddr(w1, dst, size); /* AUDIOFIX round 3 Task 2: pre-write snapshot */
                 if (dst != NULL) {
                     uint32_t k;
                     uint8_t* d = (uint8_t*)dst;
                     uint8_t nzAcc = 0;
-                    for (k = 0; k < size; k++) {
-                        d[k] = DmemGetU8(dmemSrc + k);
-                        nzAcc |= d[k];
+                    int nzFast = 0;
+                    if (fast && HleFastTook(gdx_hlefast_save(&fctx, dmemSrc, d, size, &nzFast))) {
+                        nzAcc = (uint8_t)nzFast;
+                    } else {
+                        for (k = 0; k < size; k++) {
+                            d[k] = DmemGetU8(dmemSrc + k);
+                            nzAcc |= d[k];
+                        }
                     }
+                    /* [ndsphash] RENDER fault injection, the negative control for the gate
+                       proper: flip ONE BIT of ONE rendered sample, once, AFTER the key is
+                       sealed.  Same command list, different bytes out -- which is exactly
+                       what `divergent` means.  One bit in one 16 ms chunk out of ~10,000 is
+                       the smallest real change there is; a gate that misses it is not a
+                       gate. */
+                    if (gdx_ndsphash_fault_render() && size > 0u) {
+                        d[0] ^= 0x01u;
+                    }
+                    /* [ndsphash] the rendered bytes are the VALUE.  Reverb ring saves are
+                       folded too, deliberately: a reverb regression is an audio regression. */
+                    gdx_ndsphash_fold_save(dst, size);
                     /* [audio-hle] receipt: first nonzero PCM leaving the DSP stage. */
                     if (nzAcc != 0) {
                         sGdxHleNzSaves++;
@@ -1585,15 +1984,22 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 if (byteCount > GDX_ADPCM_BOOK_MAX_BYTES) {
                     byteCount = GDX_ADPCM_BOOK_MAX_BYTES;
                 }
+                AcmdDumpSnapshotAddr(w1, src, byteCount); /* AUDIOFIX round 3 Task 2 */
                 if (src != NULL) {
+                    gdx_ndsphash_fold_load(src, byteCount); /* [ndsphash] the codebook IS content */
                     memcpy(sAdpcmBook, src, byteCount);
                     sAdpcmBookLen = byteCount;
+                    gdx_hlefast_build_book(&sAdpcmBookFast, sAdpcmBook, sAdpcmBookLen);
                 }
                 break;
             }
 
             case GDX_A_SETLOOP: {
                 sPendingLoopState = (const int16_t*)GdxAudioResolveAddr(w1, "SETLOOP");
+                AcmdDumpSnapshotAddr(w1, sPendingLoopState, 32u); /* AUDIOFIX round 3 Task 2 */
+                /* [ndsphash] the loop predictor state is a render input; 32 B is exactly what
+                   RunAdpcm reads back out of it (loopState[0..15]). */
+                gdx_ndsphash_fold_load(sPendingLoopState, 32u);
                 sRsCapSetloopSince = 1; /* [rs-cap] loop-wrap marker for the next resample */
                 break;
             }
@@ -1601,7 +2007,19 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             case GDX_A_ADPCM: {
                 uint32_t flags = (w0 >> 16) & 0xFFu;
                 int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "ADPCM-state");
+                AcmdDumpSnapshotAddr(w1, state, 32u); /* AUDIOFIX round 3 Task 2 */
+                /* [ndsphash] carry-in decoder history: an INPUT, folded before RunAdpcm
+                   overwrites it.  It also disambiguates two notes whose command words match
+                   but whose state addresses differ -- the addresses are kept out of the key,
+                   so without this fold they would collide. */
+                gdx_ndsphash_fold_load(state, 32u);
                 sGdxHleAdpcmOps++; /* [audio-hle] per-voice decode work */
+                if (gdx_audiomix_armed) {
+                    /* [audiomix] which codec the voices actually use. flags|4 is small ADPCM,
+                       which the shipped audio/rom synthesis never emits -- the census is what
+                       turns that reading of the decomp into a measurement. */
+                    gdx_audiomix_note_decode((flags & 4u) != 0u, 0);
+                }
                 int stageTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
                 /* [pcm-cap] carry-in snapshot, taken before the decode overwrites it. Under the
                    last-frame state layout the newest two samples are at [15] and [14]. */
@@ -1613,7 +2031,13 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 sRsCapAdpcmIn = pendingBuf.dmemIn;
                 sRsCapAdpcmOut = pendingBuf.dmemOut;
                 sRsCapAdpcmCnt = pendingBuf.count;
-                RunAdpcm(&pendingBuf, flags, state, sPendingLoopState);
+                if (!(fast && !gdx_dev_gate(GDX_GATE_SEQ_ADPCM) &&
+                      HleFastTook(gdx_hlefast_adpcm(&fctx, pendingBuf.dmemIn, pendingBuf.dmemOut,
+                                                    pendingBuf.count, flags, state,
+                                                    sPendingLoopState, &sAdpcmBookFast,
+                                                    gdx_audio_hle_adpcm_scale_clamp())))) {
+                    RunAdpcm(&pendingBuf, flags, state, sPendingLoopState);
+                }
                 GdxUnlockStageCaptureDecode(stageTarget, &pendingBuf, flags);
                 /* [pcm-cap] decode ground truth, one block per UNIQUE sample source: input
                    identity, book, first compressed bytes, first 8 decoded samples. An offline
@@ -1687,6 +2111,10 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
             case GDX_A_S8DEC: {
                 uint32_t flags = (w0 >> 16) & 0xFFu;
                 int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "S8DEC-state");
+                gdx_ndsphash_fold_load(state, 32u); /* [ndsphash] carry-in history */
+                if (gdx_audiomix_armed) {
+                    gdx_audiomix_note_decode(0, 1); /* [audiomix] codec census */
+                }
                 RunS8Dec(&pendingBuf, flags, state);
                 break;
             }
@@ -1695,6 +2123,8 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t flags = (w0 >> 16) & 0xFFu;
                 uint32_t pitch = w0 & 0xFFFFu;
                 int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "RESAMPLE-state");
+                AcmdDumpSnapshotAddr(w1, state, 32u); /* AUDIOFIX round 3 Task 2 */
+                gdx_ndsphash_fold_load(state, 32u); /* [ndsphash] carry-in resampler history */
                 int stageTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
                 sGdxUnlockStage.currentTarget = stageTarget;
                 if (state != NULL) {
@@ -1770,7 +2200,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     /* Stash pitch in the otherwise-unused last slot of the state buffer for
                        RunResample. Decomp C never reads that slot, only this interpreter. */
                     state[15] = (int16_t)(uint16_t)pitch;
-                    RunResample(&pendingBuf, flags, state);
+                    if (!(fast && HleFastTook(gdx_hlefast_resample(&fctx, pendingBuf.dmemIn,
+                                                                   pendingBuf.dmemOut, pendingBuf.count,
+                                                                   flags, state, sResampleTable,
+                                                                   sHleRsAlign ? 4u : 1u)))) {
+                        RunResample(&pendingBuf, flags, state);
+                    }
                     GdxUnlockStageCaptureResample(stageTarget, &pendingBuf, pitch, numOut);
 
                     if (diag) {
@@ -1821,17 +2256,30 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                    engine the reverb is the ucode's own and this path is never taken. */
                 {
                     int reverbOff;
-                    reverbOff = gdx_dev_gate(GDX_GATE_NO_REVERB) ||
-                                !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
+                    /* [debug] audio_simd: the CVar is read once per RUN instead of once per
+                       MIXER op -- on 3DS a lookup is a shared_ptr copy, a std::string and a map
+                       probe, several times the cost of the mix it gates. A toggle still lands
+                       at the next tick (~16 ms), which is all the live read promises. */
+                    if (fast) {
+                        if (reverbOffThisRun < 0) {
+                            reverbOffThisRun = gdx_dev_gate(GDX_GATE_NO_REVERB) ||
+                                               !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
+                        }
+                        reverbOff = reverbOffThisRun;
+                    } else {
+                        reverbOff = gdx_dev_gate(GDX_GATE_NO_REVERB) ||
+                                    !CVarGetInteger("gEnhancements.Audio.Reverb", 1);
+                    }
                     if ((reverbOff || (GdxAudioDbg() & 4)) && dmemOut == 0x940u) {
                         break;
                     }
                 }
-                for (k = 0; k < numSamples; k++) {
-                    int32_t in = DmemGetS16(dmemIn + k * 2u);
-                    int32_t out = DmemGetS16(dmemOut + k * 2u);
-                    out = out + ((in * gain) >> 15);
-                    DmemSetS16(dmemOut + k * 2u, ClampS16(out));
+                if (!(fast && HleFastTook(gdx_hlefast_mixer(&fctx, dmemIn, dmemOut, numSamples, gain)))) {
+                    for (k = 0; k < numSamples; k++) {
+                        int32_t in = DmemGetS16(dmemIn + k * 2u);
+                        int32_t out = DmemGetS16(dmemOut + k * 2u);
+                        MixBusWrite(dmemOut + k * 2u, out + ((in * gain) >> 15));
+                    }
                 }
                 /* [spike] scan the dry bus right after the reverb wet->dry return (the only
                    A_MIXER that writes a dry bus). A spike here means reverb transported a
@@ -1866,10 +2314,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t dmemOut = w1 & 0xFFFFu;
                 uint32_t numSamples = count8 * 8u;
                 uint32_t k;
-                for (k = 0; k < numSamples; k++) {
-                    int32_t in = DmemGetS16(dmemIn + k * 2u);
-                    int32_t out = DmemGetS16(dmemOut + k * 2u);
-                    DmemSetS16(dmemOut + k * 2u, ClampS16(out + in));
+                if (!(fast && HleFastTook(gdx_hlefast_addmix(&fctx, dmemIn, dmemOut, numSamples)))) {
+                    for (k = 0; k < numSamples; k++) {
+                        int32_t in = DmemGetS16(dmemIn + k * 2u);
+                        int32_t out = DmemGetS16(dmemOut + k * 2u);
+                        MixBusWrite(dmemOut + k * 2u, out + in);
+                    }
                 }
                 break;
             }
@@ -1898,9 +2348,21 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     }
                 }
                 uint32_t k;
-                for (k = 0; k < numSamples; k++) {
-                    DmemSetS16(dmemOut + k * 4u + 0u, DmemGetS16(dmemL + k * 2u));
-                    DmemSetS16(dmemOut + k * 4u + 2u, DmemGetS16(dmemR + k * 2u));
+                /* [audiomix] the OUTPUT half of the census: dmemL/dmemR here are the fully
+                   mixed dry buses, so a railed sample at this point is one that actually
+                   leaves the DSP -- unlike a railed intermediate a later negative voice can
+                   still pull back down. One compare per interleave op when disarmed. */
+                if (gdx_audiomix_armed) {
+                    for (k = 0; k < numSamples; k++) {
+                        gdx_audiomix_note_out(DmemGetS16(dmemL + k * 2u));
+                        gdx_audiomix_note_out(DmemGetS16(dmemR + k * 2u));
+                    }
+                }
+                if (!(fast && HleFastTook(gdx_hlefast_interleave(&fctx, dmemOut, dmemL, dmemR, numSamples)))) {
+                    for (k = 0; k < numSamples; k++) {
+                        DmemSetS16(dmemOut + k * 4u + 0u, DmemGetS16(dmemL + k * 2u));
+                        DmemSetS16(dmemOut + k * 4u + 2u, DmemGetS16(dmemR + k * 2u));
+                    }
                 }
                 break;
             }
@@ -1952,6 +2414,9 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
 
             case GDX_A_ENVMIXER: {
                 sGdxHleEnvmixOps++; /* [audio-hle] per-voice envelope-mix work */
+                if (gdx_audiomix_armed) {
+                    gdx_audiomix_note_voice(); /* [audiomix] voices summing into this tick's bus */
+                }
                 /* EK macro: w0 = bits(opcode) | (dmemi>>4)<<16(8) | count<<8(8) | swapLR<<4(1) |
                    x0<<3 | x1<<2 | x2<<1 | x3<<0. `count` is the RAW sample count for this call
                    (e.g. aiBufLen for the chunk -- NOT pre-shifted), unlike dmemi which IS
@@ -1967,10 +2432,28 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t wetRightDmem = (dmemDests & 0xFFu) << 4;
                 /* Ramps advance once per block of 8 samples (see AudioSynth_ProcessEnvelope's
                    `aiBufLen >> 3` ramp-step math -- `sampleCount` here is always a multiple of 8). */
-                uint32_t numBlocks = sampleCount >> 3;
+                uint32_t numBlocks = sampleCount >> 3; /* zeroed when the fast kernel ran */
                 int32_t curVolL = envCurVolLeft, curVolR = envCurVolRight, curReverb = envReverbVol2;
                 uint32_t sIdx = 0;
                 uint32_t blk;
+                /* [debug] envmix_xbits -- see the lever's own comment above gdx_audio_hle_set_
+                   envmix_xbits(). envmixXbitsRaw is w0's x0..x3 nibble verbatim; the four xor
+                   values are LITERAL ports of mupen64plus-rsp-hle's alist_nead.c ENVMIXER() --
+                   `xors[k] = 0 - ((w1 & mask) >> shift)`, NOT a clean sign negate (their own
+                   magnitudes differ: 4/2/1/1 when set), faithfully reproduced rather than
+                   "cleaned up" because matching the reference's exact arithmetic is the point.
+                   All four are 0 when the lever is off or the bits are unset, so `x ^ 0 == x`
+                   makes the per-sample math below byte-identical to the pre-lever behaviour. */
+                uint32_t envmixXbitsRaw = w0 & 0xFu;
+                int32_t xorDryLeft = 0, xorDryRight = 0, xorWetLeft = 0, xorWetRight = 0;
+                if (gdx_audio_hle_envmix_xbits() && envmixXbitsRaw != 0u) {
+                    xorWetLeft  = 0 - (int32_t)((w0 & 0x8u) >> 1); /* mupen's xors[2], our x0 (bit3) */
+                    xorWetRight = 0 - (int32_t)((w0 & 0x4u) >> 1); /* mupen's xors[3], our x1 (bit2) */
+                    xorDryLeft  = 0 - (int32_t)((w0 & 0x2u) >> 1); /* mupen's xors[0], our x2 (bit1) */
+                    xorDryRight = 0 - (int32_t)(w0 & 0x1u);        /* mupen's xors[1], our x3 (bit0) */
+                } else {
+                    envmixXbitsRaw = 0u; /* lever off: tell the fast kernel nothing changed */
+                }
 
                 sGdxUnlockStage.currentTarget = GdxUnlockStageFindCommandTarget(&cmds[i]);
 
@@ -1986,6 +2469,15 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
 
                 GdxUnlockStageCapturePreEnvelope(dmemSrc, sampleCount);
 
+                if (fast) {
+                    const uint32_t dests[4] = { dryLeftDmem, dryRightDmem, wetLeftDmem, wetRightDmem };
+                    if (HleFastTook(gdx_hlefast_envmix(&fctx, dmemSrc, sampleCount, dests, curVolL,
+                                                       curVolR, curReverb, envRampLeft,
+                                                       envRampRight, envRampReverb,
+                                                       envmixXbitsRaw))) {
+                        numBlocks = 0; /* handled: skip the reference loop below */
+                    }
+                }
                 for (blk = 0; blk < numBlocks; blk++) {
                     uint32_t n;
                     for (n = 0; n < 8u && sIdx < sampleCount; n++, sIdx++) {
@@ -1994,26 +2486,27 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                            `targetVol <<= 4` before packing ENVSETUP1/2 (playback.c's Q12 value
                            times 16, full volume 0xFFF0). A >>12 here overdrives every
                            normal-volume voice 16x into rail-to-rail clipping. */
-                        int32_t dl = (s * curVolL) >> 16;
-                        int32_t dr = (s * curVolR) >> 16;
+                        int32_t dl = ((s * curVolL) >> 16) ^ xorDryLeft;
+                        int32_t dr = ((s * curVolR) >> 16) ^ xorDryRight;
                         /* nead semantics (mupen64plus-rsp-hle alist.c#L512-562 envmix_nead): wet
                            CASCADES the DRY-SCALED sample per channel -- wetL off dl, wetR off dr
                            -- not the raw input shared across both. curReverb is already in the
                            a<<8 (Q16) space set up by ENVSETUP1, so it uses the same >>16 shift as
-                           dl/dr. */
-                        int32_t wetL = (dl * curReverb) >> 16;
-                        int32_t wetR = (dr * curReverb) >> 16;
+                           dl/dr. The wet cascade uses the POST-xor dl/dr, matching mupen's own
+                           `l2 = ((l*env_values[2])>>16) ^ xors[2]` (l is already xors[0]'d). */
+                        int32_t wetL = ((dl * curReverb) >> 16) ^ xorWetLeft;
+                        int32_t wetR = ((dr * curReverb) >> 16) ^ xorWetRight;
 
                         GdxUnlockStageCaptureEnvelopeSample(sIdx, dl, dr);
 
-                        DmemSetS16(dryLeftDmem + sIdx * 2u,
-                                   ClampS16(DmemGetS16(dryLeftDmem + sIdx * 2u) + dl));
-                        DmemSetS16(dryRightDmem + sIdx * 2u,
-                                   ClampS16(DmemGetS16(dryRightDmem + sIdx * 2u) + dr));
-                        DmemSetS16(wetLeftDmem + sIdx * 2u,
-                                   ClampS16(DmemGetS16(wetLeftDmem + sIdx * 2u) + wetL));
-                        DmemSetS16(wetRightDmem + sIdx * 2u,
-                                   ClampS16(DmemGetS16(wetRightDmem + sIdx * 2u) + wetR));
+                        MixBusWrite(dryLeftDmem + sIdx * 2u,
+                                    DmemGetS16(dryLeftDmem + sIdx * 2u) + dl);
+                        MixBusWrite(dryRightDmem + sIdx * 2u,
+                                    DmemGetS16(dryRightDmem + sIdx * 2u) + dr);
+                        MixBusWrite(wetLeftDmem + sIdx * 2u,
+                                    DmemGetS16(wetLeftDmem + sIdx * 2u) + wetL);
+                        MixBusWrite(wetRightDmem + sIdx * 2u,
+                                    DmemGetS16(wetRightDmem + sIdx * 2u) + wetR);
                     }
                     curVolL += envRampLeft;
                     curVolR += envRampRight;
@@ -2065,9 +2558,11 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                                   (unsigned)gain, (unsigned)size, (unsigned)dmem);
                     GdxRsCapDump("T1");
                 }
-                for (k = 0; k < numSamples; k++) {
-                    int32_t s = DmemGetS16(dmem + k * 2u);
-                    DmemSetS16(dmem + k * 2u, ClampS16((s * gain) >> 4));
+                if (!(fast && HleFastTook(gdx_hlefast_hilogain(&fctx, dmem, numSamples, gain)))) {
+                    for (k = 0; k < numSamples; k++) {
+                        int32_t s = DmemGetS16(dmem + k * 2u);
+                        DmemSetS16(dmem + k * 2u, ClampS16((s * gain) >> 4));
+                    }
                 }
                 break;
             }
@@ -2081,6 +2576,7 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 uint32_t countOrBuf = w0 & 0xFFFFu;
                 if (f == 2u) {
                     void* coefSrc = GdxAudioResolveAddr(w1, "FILTER-coef");
+                    gdx_ndsphash_fold_load(coefSrc, sizeof(pendingFilterCoef)); /* [ndsphash] */
                     if (coefSrc != NULL) {
                         memcpy(pendingFilterCoef, coefSrc, sizeof(pendingFilterCoef));
                         pendingFilterHaveCoef = 1;
@@ -2090,8 +2586,13 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                     /* nofilter bypass: leave the note buffer unfiltered. */
                 } else {
                     int16_t* state = (int16_t*)GdxAudioResolveAddr(w1, "FILTER-state");
-                    RunFilter(countOrBuf, pendingFilterSizeBytes, f, state,
-                              pendingFilterHaveCoef ? pendingFilterCoef : NULL);
+                    gdx_ndsphash_fold_load(state, sizeof(pendingFilterCoef)); /* [ndsphash] */
+                    const int16_t* coefOrNull = pendingFilterHaveCoef ? pendingFilterCoef : NULL;
+                    if (!(fast && !gdx_dev_gate(GDX_GATE_NO_HLE_FILTER) &&
+                          HleFastTook(gdx_hlefast_filter(&fctx, countOrBuf, pendingFilterSizeBytes, f,
+                                                         state, coefOrNull)))) {
+                        RunFilter(countOrBuf, pendingFilterSizeBytes, f, state, coefOrNull);
+                    }
                     /* [spike] the filter runs in place on the note buffer. */
                     if (sSpikeLogsFilter < 16 && gdx_diag_audio_enabled()) {
                         int si = GdxSpikeScan(countOrBuf, pendingFilterSizeBytes / 2u);
@@ -2124,6 +2625,12 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                 }
                 break;
         }
+        if (costArmed) {
+            HleCostChargeOp(op, w0, w1, &pendingBuf, pendingFilterSizeBytes);
+        }
+    }
+    if (costArmed) {
+        gdx_hle_cost_run_end();
     }
 
     /* [audio-hle] periodic receipt (~4 s at 128 runs): last list length, cumulative voice
@@ -2135,6 +2642,224 @@ void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
                       (unsigned)gdx_watch_hle_runs, (unsigned)count, (unsigned)sGdxHleAdpcmOps,
                       (unsigned)sGdxHleEnvmixOps, (unsigned)sGdxHleNzSaves);
     }
+    if ((gdx_watch_hle_runs & 0x1FF) == 1u && gdx_diag_audio_enabled() && sHleFastLever) {
+        HleFastLogPaths();
+    }
     sGdxUnlockStage.rangeCount = 0;
     sGdxUnlockStage.commandList = 0;
+
+    /* [ndsphash] seal (key, value) for this tick and, at mode 2, stream the pair. */
+    gdx_ndsphash_task_end();
+    if (gdx_audiomix_armed) {
+        gdx_audiomix_task_end(); /* [audiomix] roll the tick into the session census */
+    }
+}
+
+/* ---- [debug] audio_simd_verify: the fast kernels checked against the reference ON THE DEVICE
+ *
+ * hle_fast_tests.c proves the fast path equal to the reference over synthetic lists, running the
+ * packed algorithm on C emulations of the ARMv6 instructions; the ndsphash emulator gate proves it
+ * over the game's own lists on an emulated ARM11. This closes the last gap -- the real silicon's
+ * SMLAD/QADD16/SSAT on the real game's lists: one tick in N is rendered twice, reference first on a
+ * saved copy of every input it can touch, then fast for real, and every output is compared.
+ *
+ * What a tick can touch: DMEM (+ the last-writer map), the codebook and loop registers, and the
+ * host buffers the list names as write targets -- ADPCM/S8DEC/RESAMPLE state (32 B), FILTER state
+ * (16 B), and every SAVEBUFF destination. All of it is snapshotted into static scratch; a tick
+ * whose targets do not fit is skipped, never half-checked. Diagnostic captures that run inside the
+ * kernels ([ndsphash] folds, [audiomix]) would count twice, so a verify tick is skipped while
+ * either is armed. Receipt: `[audio-simd] verify ticks=N skipped=M mismatches=K` every 256
+ * checked ticks, and a first-mismatch line naming the region and byte. Cost: that tick's synth
+ * runs twice. DEFAULT 0 (off). */
+#define HLE_VERIFY_TARGETS 128u
+#define HLE_VERIFY_SCRATCH 0x6000u
+
+typedef struct HleVerifyTarget {
+    uint8_t* host;
+    uint32_t bytes;
+    uint32_t offset; /* into the scratch buffers */
+} HleVerifyTarget;
+
+static int sHleVerifyEvery = 0;
+static uint32_t sHleVerifyTick = 0;
+static HleVerifyTarget sHleVerifyTargets[HLE_VERIFY_TARGETS];
+static uint32_t sHleVerifyTargetCount = 0;
+static uint8_t sHleVerifyInputs[HLE_VERIFY_SCRATCH];
+static uint8_t sHleVerifyRefOut[HLE_VERIFY_SCRATCH];
+static uint8_t sHleVerifyDmemIn[GDX_DMEM_SIZE];
+static uint8_t sHleVerifyDmemRef[GDX_DMEM_SIZE];
+static uint8_t sHleVerifyLastOpIn[GDX_DMEM_SIZE >> 4];
+static uint8_t sHleVerifyLastOpRef[GDX_DMEM_SIZE >> 4];
+static uint8_t sHleVerifyBookIn[GDX_ADPCM_BOOK_MAX_BYTES];
+static GdxHleFastBook sHleVerifyFastBookIn;
+
+void gdx_audio_hle_set_verify(int everyN) {
+    sHleVerifyEvery = (everyN > 0) ? everyN : 0;
+}
+
+void gdx_audio_hle_verify_counts(uint32_t* checked, uint32_t* skipped, uint32_t* mismatches) {
+    *checked = sHleVerifyChecked;
+    *skipped = sHleVerifySkipped;
+    *mismatches = sHleVerifyMismatches;
+}
+
+static uint32_t HleVerifyTargetBytes(uint32_t op, uint32_t w0) {
+    switch (op) {
+        case GDX_A_ADPCM:
+        case GDX_A_S8DEC:
+        case GDX_A_RESAMPLE:
+            return 32u;
+        case GDX_A_FILTER:
+            return (((w0 >> 16) & 0xFFu) == 2u) ? 0u : 16u;
+        case GDX_A_SAVEBUFF:
+            return ((w0 >> 16) & 0xFFu) << 4;
+        default:
+            return 0u;
+    }
+}
+
+/* Every host buffer the list can write, resolved exactly as the ops will resolve them. */
+static int HleVerifyCollectTargets(const GdxAcmd* cmds, uint32_t count) {
+    uint32_t used = 0;
+    uint32_t i;
+    sHleVerifyTargetCount = 0;
+    for (i = 0; i < count; i++) {
+        const uint32_t op = (cmds[i].w0 >> 24) & 0xFFu;
+        const uint32_t bytes = HleVerifyTargetBytes(op, cmds[i].w0);
+        uint8_t* host;
+        if (bytes == 0u) {
+            continue;
+        }
+        host = (uint8_t*)GdxAudioResolveAddr(cmds[i].w1, "VERIFY-target");
+        if (host == NULL) {
+            continue;
+        }
+        if (sHleVerifyTargetCount >= HLE_VERIFY_TARGETS || used + bytes > HLE_VERIFY_SCRATCH) {
+            return 0;
+        }
+        sHleVerifyTargets[sHleVerifyTargetCount].host = host;
+        sHleVerifyTargets[sHleVerifyTargetCount].bytes = bytes;
+        sHleVerifyTargets[sHleVerifyTargetCount].offset = used;
+        sHleVerifyTargetCount++;
+        used += bytes;
+    }
+    return 1;
+}
+
+static void HleVerifyCopyTargets(uint8_t* scratch, int toScratch) {
+    uint32_t t;
+    for (t = 0; t < sHleVerifyTargetCount; t++) {
+        const HleVerifyTarget* v = &sHleVerifyTargets[t];
+        if (toScratch) {
+            memcpy(scratch + v->offset, v->host, v->bytes);
+        } else {
+            memcpy(v->host, scratch + v->offset, v->bytes);
+        }
+    }
+}
+
+/* Restore in REVERSE so overlapping targets end with the earliest (pre-run) snapshot on top;
+   every snapshot of one location was taken before the run, so any order is correct -- reverse
+   is simply the one that needs no argument. */
+static void HleVerifyRestoreInputs(uint32_t bookLen, const int16_t* loopState) {
+    uint32_t t = sHleVerifyTargetCount;
+    while (t > 0u) {
+        const HleVerifyTarget* v = &sHleVerifyTargets[--t];
+        memcpy(v->host, sHleVerifyInputs + v->offset, v->bytes);
+    }
+    memcpy(sDmem, sHleVerifyDmemIn, GDX_DMEM_SIZE);
+    memcpy(sDmemLastOp, sHleVerifyLastOpIn, sizeof(sDmemLastOp));
+    memcpy(sAdpcmBook, sHleVerifyBookIn, sizeof(sAdpcmBook));
+    sAdpcmBookLen = bookLen;
+    sAdpcmBookFast = sHleVerifyFastBookIn;
+    sPendingLoopState = loopState;
+}
+
+static int HleVerifyFirstDiff(const uint8_t* a, const uint8_t* b, uint32_t n) {
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        if (a[i] != b[i]) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* After the fast run: compare its outputs with the reference run's. */
+static void HleVerifyCompare(void) {
+    int where = HleVerifyFirstDiff(sDmem, sHleVerifyDmemRef, GDX_DMEM_SIZE);
+    const char* region = "dmem";
+    uint32_t t;
+    if (where < 0) {
+        where = HleVerifyFirstDiff(sDmemLastOp, sHleVerifyLastOpRef, sizeof(sDmemLastOp));
+        region = "lastop";
+    }
+    for (t = 0; where < 0 && t < sHleVerifyTargetCount; t++) {
+        const HleVerifyTarget* v = &sHleVerifyTargets[t];
+        where = HleVerifyFirstDiff(v->host, sHleVerifyRefOut + v->offset, v->bytes);
+        region = "target";
+    }
+    sHleVerifyChecked++;
+    if (where >= 0) {
+        sHleVerifyMismatches++;
+        if (sHleVerifyMismatches <= 4u) {
+            gdx_port_logf("[audio-simd] verify MISMATCH #%u tick=%u region=%s byte=%d\n",
+                          (unsigned)sHleVerifyMismatches, (unsigned)sHleVerifyTick, region, where);
+        }
+    }
+    if ((sHleVerifyChecked & 0xFFu) == 0u) {
+        gdx_port_logf("[audio-simd] verify ticks=%u skipped=%u mismatches=%u (1 in %d)\n",
+                      (unsigned)sHleVerifyChecked, (unsigned)sHleVerifySkipped,
+                      (unsigned)sHleVerifyMismatches, sHleVerifyEvery);
+    }
+}
+
+static int HleVerifyThisTick(void) {
+    if (sHleVerifyEvery <= 0 || !sHleFastLever) {
+        return 0;
+    }
+    sHleVerifyTick++;
+    return (sHleVerifyTick % (uint32_t)sHleVerifyEvery) == 0u;
+}
+
+/* One tick rendered twice: reference on the saved inputs, then fast for real. */
+static void HleRunVerified(const void* dataPtr, unsigned int dataSizeBytes) {
+    const GdxAcmd* cmds = (const GdxAcmd*)dataPtr;
+    const uint32_t count = dataSizeBytes / (uint32_t)sizeof(GdxAcmd);
+    const uint32_t bookLen = sAdpcmBookLen;
+    const int16_t* loopState = sPendingLoopState;
+    const uint32_t adpcmOps = sGdxHleAdpcmOps;
+    const uint32_t envmixOps = sGdxHleEnvmixOps;
+    const uint32_t nzSaves = sGdxHleNzSaves;
+    if (gdx_ndsphash_enabled() || gdx_audiomix_armed || !HleVerifyCollectTargets(cmds, count)) {
+        sHleVerifySkipped++;
+        HleRunList(dataPtr, dataSizeBytes, 1, 1);
+        return;
+    }
+    HleVerifyCopyTargets(sHleVerifyInputs, 1);
+    memcpy(sHleVerifyDmemIn, sDmem, GDX_DMEM_SIZE);
+    memcpy(sHleVerifyLastOpIn, sDmemLastOp, sizeof(sDmemLastOp));
+    memcpy(sHleVerifyBookIn, sAdpcmBook, sizeof(sAdpcmBook));
+    sHleVerifyFastBookIn = sAdpcmBookFast;
+
+    HleRunList(dataPtr, dataSizeBytes, 0, 0); /* the reference, unrecorded */
+    HleVerifyCopyTargets(sHleVerifyRefOut, 1);
+    memcpy(sHleVerifyDmemRef, sDmem, GDX_DMEM_SIZE);
+    memcpy(sHleVerifyLastOpRef, sDmemLastOp, sizeof(sDmemLastOp));
+
+    HleVerifyRestoreInputs(bookLen, loopState);
+    sGdxHleAdpcmOps = adpcmOps; /* the shadow run's receipt counts do not count */
+    sGdxHleEnvmixOps = envmixOps;
+    sGdxHleNzSaves = nzSaves;
+    HleRunList(dataPtr, dataSizeBytes, 1, 1); /* the fast path, for real */
+    HleVerifyCompare();
+}
+
+void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes) {
+    AcmdDumpTick(dataPtr, dataSizeBytes); /* AUDIOFIX round 3 Task 2 */
+    if (HleVerifyThisTick()) {
+        HleRunVerified(dataPtr, dataSizeBytes);
+        return;
+    }
+    HleRunList(dataPtr, dataSizeBytes, sHleFastLever, 1);
 }

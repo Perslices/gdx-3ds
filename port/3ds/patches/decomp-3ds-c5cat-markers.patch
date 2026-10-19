@@ -1,0 +1,151 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5577,6 +5577,27 @@
+ extern GfxPool D_1000000;
+ 
+ #ifdef NON_MATCHING
++#ifdef PORT
++/* C5 STAGE 0 "[c5cat]" scene-category markers -- same macro and contract as race.c (see the
++ * comment there); ids must match GDX3DS_C5CAT_* in port/3ds/gdx3ds_mainprof.h. */
++extern int gdx_c5cat_armed(void);
++#define GDX_C5CAT_MISC 1
++#define GDX_C5CAT_MACH 5
++#define GDX_C5CAT_SHD 7
++#define GDX_C5CAT_FX 8
++#define GDX_C5CAT_HUD 9
++#define GDX_C5CAT(cat)                                                              \
++    do {                                                                            \
++        if (gdx_c5cat_armed()) {                                                    \
++            gfx->words.w0 = ((u32) G_NOOP << 24) | (0x61u << 16) | GDX_C5CAT_##cat; \
++            gfx->words.w1 = 0;                                                      \
++            gfx++;                                                                  \
++        }                                                                           \
++    } while (0)
++#else
++#define GDX_C5CAT(cat)
++#endif
++
+ Gfx* Racer_Draw(Gfx* gfx, s32 playerIndex) {
+     s32 var_s3; // sp5CC
+     s32 var_s4; // sp5C8
+@@ -5632,6 +5653,7 @@
+     s32 gdxLod6Skip; /* O3DS-SCENE-LOD: port hook gdx_rival_lod6_skip, read once per Racer_Draw */
+ #endif
+ 
++    GDX_C5CAT(MACH);
+     camera = &gCameras[playerIndex];
+ 
+     sp56C = (camera->basis.x.x * 100.0f) - camera->eye.x;
+@@ -5983,6 +6005,7 @@
+             }
+         }
+     }
++    GDX_C5CAT(SHD);
+     if (gRaceIntroTimer < 280) {
+         gSPDisplayList(gfx++, D_303A758);
+         if (gGameMode == GAMEMODE_GP_END_CS) {
+@@ -6051,6 +6074,7 @@
+         gRacers[0].speed = gRacers[1].speed = gRacers[2].speed = gRacers[3].speed = 0.0f;
+     }
+ 
++    GDX_C5CAT(MACH);
+     gSPDisplayList(gfx++, D_303A7D8);
+ 
+     for (racer = sLastRacer; racer >= gRacers; racer--) {
+@@ -6280,6 +6304,7 @@
+     sp568 = camera->basis.y.y;
+     sp564 = camera->basis.y.z;
+ 
++    GDX_C5CAT(FX);
+     gSPDisplayList(gfx++, aSetupBoosterDL);
+ 
+     if (!gGamePaused) {
+@@ -6912,6 +6937,7 @@
+ #include "gdx3ds_fx_shim_end.h"
+ #endif
+ 
++    GDX_C5CAT(HUD);
+ #ifndef EXPANSION_KIT
+     if (gRaceIntroTimer != 0) {
+ #else
+@@ -7246,6 +7272,7 @@
+         }
+     }
+ 
++    GDX_C5CAT(MISC);
+     return gfx;
+ }
+ #else
+diff --git a/src/overlays/ovl_i2/race.c b/src/overlays/ovl_i2/race.c
+--- a/src/overlays/ovl_i2/race.c
++++ b/src/overlays/ovl_i2/race.c
+@@ -139,6 +139,31 @@
+ 
+ extern Gfx D_8076CE28[];
+ extern Gfx D_8076CF10[];
++
++#ifdef PORT
++/* C5 STAGE 0 (port/3ds/gdx3ds_mainprof.h, "[c5cat]"): scene-category markers for the Old 3DS
++ * per-category CPU timers. When the port's clock is armed (`[debug] gputrace=1` or
++ * `mainprof=1`) each GDX_C5CAT writes ONE G_NOOP whose w0 carries p=0x61 and the category id;
++ * the owned walker switches its timing bucket when it reaches it. Unarmed, nothing is written
++ * and the display list is byte-identical. A G_NOOP draws nothing on either interpreter. Ids
++ * must match GDX3DS_C5CAT_* in port/3ds/gdx3ds_mainprof.h (racer.c carries the same macro). */
++extern int gdx_c5cat_armed(void);
++#define GDX_C5CAT_MISC 1
++#define GDX_C5CAT_SKY 2
++#define GDX_C5CAT_TRK 3
++#define GDX_C5CAT_DRESS 4
++#define GDX_C5CAT_HUD 9
++#define GDX_C5CAT(cat)                                                              \
++    do {                                                                            \
++        if (gdx_c5cat_armed()) {                                                    \
++            gfx->words.w0 = ((u32) G_NOOP << 24) | (0x61u << 16) | GDX_C5CAT_##cat; \
++            gfx->words.w1 = 0;                                                      \
++            gfx++;                                                                  \
++        }                                                                           \
++    } while (0)
++#else
++#define GDX_C5CAT(cat)
++#endif
+ 
+ Gfx* Race_Draw(Gfx* gfx) {
+ 
+@@ -192,9 +217,13 @@
+     gEffectsVtxEndPtr = &gGfxPool->effectsVtxBuffer[0x7FF];
+     switch (gNumPlayers) {
+         case 1:
++            GDX_C5CAT(SKY);
+             gfx = Background_Draw(gfx, 0, SCISSOR_BOX_FULL_SCREEN);
++            GDX_C5CAT(TRK);
+             gfx = Course_Draw(gfx, 0);
++            GDX_C5CAT(DRESS);
+             gfx = Course_GadgetsDraw(gfx, 0);
++            GDX_C5CAT(MISC);
+             break;
+         case 2:
+             gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_HALF);
+@@ -250,7 +279,9 @@
+             gSPMatrix(gfx++, &D_1000000.unk_20208[0], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+             gfx = Camera_Draw(gfx, SCISSOR_BOX_FULL_SCREEN, 0);
+             gfx = Racer_Draw(gfx, 0);
++            GDX_C5CAT(HUD);
+             gfx = Menus_Player1SpecialDraw(gfx, 0);
++            GDX_C5CAT(MISC);
+             break;
+         case 2:
+             gSPPerspNormalize(gfx++, gCameras[0].perspectiveScale);
+@@ -296,5 +327,12 @@
+             break;
+     }
+ 
++#ifdef PORT
++    GDX_C5CAT(HUD);
++    gfx = Menus_Draw(gfx);
++    GDX_C5CAT(MISC);
++    return gfx;
++#else
+     return Menus_Draw(gfx);
++#endif
+ }

@@ -150,17 +150,36 @@ add_library(gdx3ds_gfx STATIC
     gdx3ds_track_templates.c # [native] track: index-template decoder + golden table
     gdx3ds_track_replay.cpp  # [native] track: Interpreter::GdxTrackMarker (marker replay)
     gdx3ds_native_tri.cpp    # [native] shared exact/fast triangle replay (track + fx)
+    gdx3ds_track_retained.cpp # [native] track_retained: course runs as eye-rebased gpuxf draws (C5 S3)
+    gdx3ds_track_resident.cpp # [native] track_resident: load-time course bake, resident rings (C5 S3c)
     gdx3ds_native_cfg.c      # [native] ini section reader (all master, boot receipt)
     gdx3ds_cov.c             # COVERAGE (B15/B43): [cov] per-frame feature census ([debug] cov).
                              # Here, not in the exe, because gdx3ds-dl-tests links this library
                              # too and every hook in it resolves gdx3ds_cov_mark.
     gdx3ds_fx_sink.c         # [native] fx: game-side effects recorder (gdx3ds_fx_shim.h)
     gdx3ds_fx_replay.cpp     # [native] fx: Interpreter::GdxFxMarker (marker replay)
+    gdx3ds_hud_capture.c     # [native] hud_batch: game-side HUD display-list compaction (0x5E runs);
+                             # also [native] ni_menu (gdxmenu_capture, folded in W5 -- was its own TU)
+    gdx3ds_dress_sink.c      # [native] gadget_batch/dress_retained/fxshd_direct: levers + gadget recorder (C5 S3b)
+    gdx3ds_gad_replay.cpp    # [native] gadget_batch: the gadget runs' marker replay (C5 S3b)
+    gdx3ds_sky_capture.c     # [native] sky_retain / skyclock: Background_Draw's 0x65 markers + capture
     gdx3ds_seam_lus.cpp      # [native] GdxInterpSeam over the vendored LUS interpreter (marker + DL hook entries)
     gdx3ds_gpu_prof.c # stream gpuprof: per-frame GPU timing + fill-rate telemetry
+    gdx3ds_pace.c # n60gp: swap-anchored vblank gate ([debug] pace_swapgate) + [pace] receipt
+    gdx3ds_c3d_diet.c # c5submit (r60 P3a): [native] c3d_diet levers over the vendored citro3d
+    gdx3ds_overlap.c  # C5 Stage 4 [overlap]: mid-frame GX queue kicks ([debug] overlap_kick)
+    gdx3ds_gputl.c    # n60gpu: [debug] gputl -- per-eye GPU timeline from GSP completion stamps (hardware receipt)
+    gdx3ds_gpucensus.c # n60gpu: [debug] gpucensus -- GPU work census per eye / category, fill counts
+    nrr/gdx3ds_nrr_crumb.c # n60hwdiag: [debug] nrr_crumbs + nrr_bisect_cycle + gxq_watch_ms (in gfx: the harness links it too)
+    gdx3ds_replay.cpp # C6 [replay]: pose-replay, "60 Hz motion" ([native] replay, default 0)
+    gdx3ds_replay_tags.c # C6 [replay]: the interpreter-facing hook table + vertex tags (host-linkable)
+    gdx3ds_hitch_ev.c # HITCH: per-frame event counters (here for gdx3ds-dl-tests, like gdx3ds_cov.c)
     gdx3ds_stereo.cpp # stream S: stereo foundation (config-gated, default off)
+    gdx3ds_stereo_frame.cpp # n60stereo: the stereo frame replay ([native] stereo_replay)
+    gdx3ds_skylate.cpp # n60tail: [native] sky_late -- the sky's lists after the opaque track (stencil)
     gdx3ds_mesh.cpp   # [native] machines: retained machine meshes (07-machines-plan)
     gdx3ds_mesh_walk.c
+    gdx3ds_xf_census.c # [debug] xf_census: float24 shader-precision census (o3dsgpuxf)
 )
 target_include_directories(gdx3ds_gfx PUBLIC ../include)
 target_include_directories(gdx3ds_gfx PRIVATE ${GDX3DS_LUS_INCLUDES})
@@ -174,9 +193,10 @@ set_target_properties(gdx3ds_gfx PROPERTIES
     CXX_EXTENSIONS ON
 )
 target_link_libraries(gdx3ds_gfx PRIVATE gdx3ds_gfx_shbin)
-# citro3d ships with libctru under ${CTR_ROOT}; propagate to whoever links us.
+# citro3d: the vendored build (port/3ds/CMakeLists.txt GDX_3DS_VENDOR_CITRO3D) or the prebuilt
+# one under ${CTR_ROOT}; propagate to whoever links us.
 target_link_libraries(gdx3ds_gfx PUBLIC
-    "${CTR_ROOT}/lib/libcitro3d.a"
+    ${GDX3DS_CITRO3D_LIB}
     "${CTR_ROOT}/lib/libctru.a"
     m
 )
@@ -199,8 +219,32 @@ add_library(gdx3ds_n64 OBJECT
     n64/gdx_rsp.cpp
     n64/gdx_tri.cpp
     n64/gdx_rect.cpp
+    n64/gdx_texskip.cpp      # [native] machines_texskip (C5 Stage 1)
+    n64/gdx_machsplit.cpp    # [debug] machsplit: the [c5cat] mach split (c5mach2)
+    n64/gdx_nirace.cpp       # nirace: the race walk between the NRR markers (trace, compiled spans)
+    n64/gdx_nicensus.cpp     # [debug] nicensus: per-mode census of what is still interpreted (nicensus)
+    n64/gdx_nicourse.cpp     # [native] ni_course: the course preview's model runs from resident meshes (nicourse)
+    n64/gdx_setload.cpp      # [native] machines_loadmemo: set-list loads memoised (c5mach2)
+    n64/gdx_hud_replay.cpp   # [native] hud_batch: the HUD capture's 0x5E marker replay + source/hash memos
+    n64/gdx_hud_direct.cpp   # [native] hud_direct: TMEM debt, per-source hash memo, direct HUD rects (C5-S2b)
+    n64/gdx_hud_retain.cpp   # [native] hudelem census + hud_retain run-level retention (c5hud3)
+    n64/gdx_nrr_hud.cpp      # [native] nrr_hud: the NRR HUD decoder + inventory census (n60hud)
+    n64/gdx_sky_retain.cpp   # [native] sky_retain / skyclock: the sky's 0x65 census + retained replay (c5sky)
+    n64/gdx_nrr_sky.cpp      # [native] nrr_sky: the NRR sky -- learned state blocks + packed draws (n60sky)
+    n64/gdx_nrr_fx.cpp       # [native] nrr_shd / nrr_fx: shadows, boost flames, effects -- learned sprite blocks (n60fx)
+    n64/gdx_dlmemo.cpp       # [native] dlmemo / deadsetup: cross-task G_DL resolve memo, dead setup lists (c5dlmemo)
     n64/gdx_seam_owned.cpp   # [native] GdxInterpSeam over the owned interpreter (track/fx/machines hooks)
     n64/gdx_rt_glue.cpp
+    # [native] nrr (n60, docs/research/native/n60-design.md): the Compact Native Race Renderer.
+    # Core + categories are OBJECTS of the executable: the core reaches each category's init
+    # through a weak reference (nrr/gdx3ds_nrr.h "how to add a category"). Add categories here.
+    nrr/gdx3ds_nrr_game.c    # core, game half: levers, snapshot frames, 0x63 marker, consume plumbing
+    nrr/gdx3ds_nrr.cpp       # core, render half: hand-off, state blocks, ring, draws, [nrr] receipts
+    nrr/gdx3ds_nrr_direct.cpp # [native] nrr_direct=1: precomputed GPU command words, no citro3d context update
+    nrr/gdx3ds_nrr_dxverify.cpp # [native] nrr_direct=2: per-draw register-file compare of the direct words (debug)
+    nrr/gdx3ds_nrr_selftest.cpp # [native] nrr_selftest: debug-only end-to-end hand-off quad
+    nrr/gdx3ds_nrr_mach.cpp  # [native] nrr_mach (n60mach): BODY consumer snapshot, cold recorder, the hot draw
+    nrr/gdx3ds_nrr_trk_draw.cpp # [native] nrr_trk (n60trk): resident-ring draws of the lean walk's runs
 )
 target_include_directories(gdx3ds_n64 PUBLIC n64)
 target_include_directories(gdx3ds_n64 PRIVATE
@@ -209,7 +253,14 @@ target_include_directories(gdx3ds_n64 PRIVATE
     ../../                           # port/: gdx_dlsrc_bridge.h
     ${GDX3DS_LUS_INCLUDES}
 )
-target_compile_definitions(gdx3ds_n64 PRIVATE F3DEX_GBI_2)
+# B11o (docs/research/native/ekwidget-progress.md): gdx_rect.cpp's scissor pillar-safe
+# widening and gdx_rt_glue.cpp's [debug] ek_widget_scissor lever are both inside
+# `#ifdef EXPANSION_KIT`, so with the option OFF this expands to nothing and both TUs
+# preprocess exactly as they did before -- which is what keeps the shipped .3dsx
+# byte-identical. gdx3ds_glue already takes the same generator expression.
+target_compile_definitions(gdx3ds_n64 PRIVATE F3DEX_GBI_2
+    $<$<BOOL:${GDX_3DS_EXPANSION_KIT}>:EXPANSION_KIT=1>
+)
 target_compile_options(gdx3ds_n64 PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fexceptions -frtti>
 )

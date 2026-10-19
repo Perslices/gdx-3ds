@@ -1,0 +1,12 @@
+# item3: storm2 timing, force_lap2=1, SHOTs at lap1->lap2.
+# Verifies top-screen boost msg in SPLIT/ALL_BOTTOM placement.
+ticks
+20 A 2980
+3000 A 2980
+3400 SHOT card
+6000 A 2980
+6200 SHOT drive1
+6260 SHOT before_lap2
+6340 SHOT after_lap2
+6420 SHOT after_lap2b
+9000 A 2980

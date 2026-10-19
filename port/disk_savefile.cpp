@@ -23,6 +23,7 @@
 
 #include "disk_savefile.h"
 #include "port_log.h"
+#include "gdx_save_replace.h"
 #ifdef EXPANSION_KIT
 #include "gdx_disk_stream.h"   /* B11c: the streamed-read overlay reports its own byte count */
 #ifdef GDX_PLATFORM_3DS
@@ -278,6 +279,38 @@ void insertRange(uint32_t offset, const unsigned char* data, uint32_t len) {
     }
 }
 
+/* --- sidecar replace (n60save) ------------------------------------------------ */
+
+#ifndef _WIN32
+int sidecarRename(void* ctx, const char* from, const char* to) {
+    (void)ctx;
+    return rename(from, to);
+}
+
+int sidecarRemove(void* ctx, const char* path) {
+    (void)ctx;
+    return remove(path);
+}
+
+int sidecarExists(void* ctx, const char* path) {
+    (void)ctx;
+    struct stat st;
+    return stat(path, &st) == 0 ? 1 : 0;
+}
+
+/* .tmp -> .gdd keeping the previous .gdd as the rolling .bak. Validity is the loader's CRC. */
+bool replaceSidecarFromTmp() {
+    GdxSaveFsOps ops;
+    ops.rename_file = sidecarRename;
+    ops.remove_file = sidecarRemove;
+    ops.file_exists = sidecarExists;
+    ops.file_valid = nullptr;
+    ops.ctx = nullptr;
+    return gdx_save_replace(&ops, g_tmpPath.c_str(), g_gddPath.c_str(), g_bakPath.c_str(), 1, 1, nullptr) ==
+           GDX_SAVE_REPLACE_OK;
+}
+#endif
+
 /* --- sidecar load ----------------------------------------------------------- */
 
 enum class LoadStatus { Loaded, Missing, BadMagic, BadVersion, HashMismatch, BadCrc, BadRange, Io };
@@ -490,6 +523,17 @@ void gdx_disk_save_init(const char* diskName, const unsigned char* pristine, uns
                       statusText(primary));
     }
 
+    /* N60SAVE: a power cut between rolling .gdd to .bak and promoting .tmp leaves the newest
+     * complete copy in .tmp; the CRC and fingerprint checks make it as safe to load as .gdd. */
+    LoadStatus staged = loadSidecar(g_tmpPath, g_ranges);
+    if (staged == LoadStatus::Loaded) {
+        g_sidecarPresent = true;
+        gdx_port_logf("[disk-save] recovered from staged %s: %zu record(s), disk fingerprint OK\n", g_tmpPath.c_str(),
+                      g_ranges.size());
+        return;
+    }
+    g_ranges.clear();
+
     LoadStatus backup = loadSidecar(g_bakPath, g_ranges);
     if (backup == LoadStatus::Loaded) {
         g_sidecarPresent = true;
@@ -598,12 +642,15 @@ void gdx_disk_save_flush(void) {
         return;
     }
 #else
-    rename(g_gddPath.c_str(), g_bakPath.c_str()); /* best-effort; missing .gdd is fine */
-    if (rename(g_tmpPath.c_str(), g_gddPath.c_str()) != 0) {
+    /* N60SAVE: rename() never replaces an existing file on the 3DS SD archive, so the old
+     * "rename .gdd -> .bak (best effort), rename .tmp -> .gdd" lost every flush from the third
+     * on (.bak existed, so the roll failed, so the promote failed). gdx_save_replace removes the
+     * stale .bak first and keeps a complete copy on disk after every step; the load below also
+     * accepts a CRC-valid .tmp (a cut between the roll and the promote). */
+    if (!replaceSidecarFromTmp()) {
         g_lastFlushOk = false;
-        gdx_port_logf("[disk-save] WARNING: could not replace %s; save not persisted (backup intact)\n",
-                      g_gddPath.c_str());
-        remove(g_tmpPath.c_str());
+        gdx_port_logf("[disk-save] WARNING: could not replace %s (errno=%d); save not persisted (backup intact)\n",
+                      g_gddPath.c_str(), errno);
         return;
     }
 #endif

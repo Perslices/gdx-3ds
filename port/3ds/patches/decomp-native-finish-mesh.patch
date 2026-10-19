@@ -1,0 +1,18 @@
+--- a/src/overlays/ovl_i3/menus.c
++++ b/src/overlays/ovl_i3/menus.c
+@@ -1743,6 +1743,15 @@
+         if (gdx_finish_scope_marker(gfx, 1)) {
+             gfx++;
+         }
++        {
++            /* n60finish [native] finish_mesh (port/3ds/gfx/gdx3ds_dress_sink.c): a G_NOOP p=0x6A
++               marker hands the next G_DL to the mesh registry, which draws the banner as a
++               retained GPU-transform mesh. Written only while the lever is on. */
++            extern int gdx_finish_mesh_marker(void* slot);
++            if (gdx_finish_mesh_marker(gfx)) {
++                gfx++;
++            }
++        }
+         gSPDisplayList(gfx++, aFinishDL);
+         if (gdx_finish_scope_marker(gfx, 0)) {
+             gfx++;

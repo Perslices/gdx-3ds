@@ -9,6 +9,7 @@
  */
 
 #include "gdx3ds_config.h"
+#include "gdx3ds_preset_n60.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +47,20 @@ static int file_contains(const char* needle) {
     fclose(f);
     buf[n] = '\0';
     return strstr(buf, needle) != NULL;
+}
+
+/* Whole-file slurp for exact byte-for-byte comparisons (comment/case preservation, and the
+ * "nothing dirty -> file untouched" guarantee can't be proven by substring checks alone). */
+static size_t slurp(const char* path, char* buf, size_t cap) {
+    size_t n;
+    FILE* f = fopen(path, "r");
+    if (f == NULL) {
+        return (size_t) -1;
+    }
+    n = fread(buf, 1, cap - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return n;
 }
 
 int main(void) {
@@ -94,6 +109,165 @@ int main(void) {
     check(gdx3ds_config_save(kPath) == 0, "save after the middle removal");
     check(file_contains("a = 1") && file_contains("c = 3") && !file_contains("b = 2"),
           "the saved ini keeps a and c and drops b");
+
+    /* n3ds: the preset defaults layer. No resolver = exactly the old lookups. */
+    write_ini("[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "preset: load without a preset key");
+    check(gdx3ds_config_get_int("native", "nrr", 0) == 0, "preset: no resolver, nrr reads the fallback");
+    gdx3ds_config_set_preset_resolver(&gdx3ds_preset_resolve);
+    check(gdx3ds_config_preset_count() == 0, "preset: resolver set, no [perf] preset key = no table");
+    check(gdx3ds_config_get_int("native", "nrr", 0) == 0, "preset: no table, nrr reads the fallback");
+    write_ini("[perf]\npreset = off\n[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "preset: load preset=off");
+    check(gdx3ds_config_preset_count() == 0 && gdx3ds_config_get_int("native", "nrr", 0) == 0,
+          "preset: off selects no table");
+    write_ini("[perf]\npreset = N60\n[debug]\nrenderthread = 2\n[native]\nnrr_direct = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "preset: load preset=N60");
+    check(gdx3ds_config_preset_count() > 50, "preset: n60 table active (case-insensitive name)");
+    check(gdx3ds_config_get_int("native", "nrr", 0) == 1, "preset: nrr defaults to 1");
+    check(gdx3ds_config_get_int("native", "nrr_draw", 0) == 15, "preset: nrr_draw defaults to 15");
+    check(strcmp(gdx3ds_config_get_string("debug", "frameskip", "0"), "race0") == 0,
+          "preset: frameskip defaults to race0");
+    check(gdx3ds_config_get_bool("stereo", "enabled", 0) == 1, "preset: get_bool reads the preset");
+    check(gdx3ds_config_get_int("debug", "renderthread", 1) == 2, "preset: an explicit ini key wins");
+    check(gdx3ds_config_get_int("native", "nrr_direct", 0) == 2, "preset: an explicit ini key wins (native)");
+    check(gdx3ds_config_get_int("native", "not_a_preset_key", 7) == 7, "preset: unknown keys read the fallback");
+    check(gdx3ds_config_entry_count() == 3, "preset: preset values are not table entries");
+    check(gdx3ds_config_override("native", "nrr", "0") == 0 && gdx3ds_config_get_int("native", "nrr", 1) == 0,
+          "preset: an override wins");
+    check(gdx3ds_config_set_string("perf", "preset", "off") == 0 && gdx3ds_config_preset_count() == 0 &&
+              gdx3ds_config_get_int("native", "nrr_draw", 0) == 0,
+          "preset: switching the key off at run time drops the table");
+    check(gdx3ds_config_set_string("perf", "preset", "n3ds60") == 0 && gdx3ds_config_preset_count() > 50,
+          "preset: alias n3ds60");
+    check(gdx3ds_config_save(kPath) == 0 && !file_contains("nrr_draw") && file_contains("preset = n3ds60"),
+          "preset: save writes the ini table only");
+    gdx3ds_config_set_preset_resolver(NULL);
+    check(gdx3ds_config_preset_count() == 0 && gdx3ds_config_get_int("native", "nrr_draw", 0) == 0,
+          "preset: clearing the resolver drops the layer");
+
+
+    /* n60lead: capacity 256 and LOUD overflow (no silent drop). */
+    {
+        FILE* fp = fopen(kPath, "w");
+        int i;
+        const char* first = NULL;
+        check(fp != NULL, "capacity: temp ini opens");
+        if (fp != NULL) {
+            fprintf(fp, "[debug]\n");
+            for (i = 0; i < 200; i++) {
+                fprintf(fp, "k%03d = %d\n", i, i);
+            }
+            fprintf(fp, "[variant.z]\n");
+            for (i = 200; i < 300; i++) {
+                fprintf(fp, "k%03d = %d\n", i, i);
+            }
+            fclose(fp);
+        }
+        gdx3ds_config_set_preset_resolver(NULL);
+        check(gdx3ds_config_load(kPath) == 0, "capacity: 300-key ini loads");
+        check(gdx3ds_config_entry_capacity() == 256, "capacity: table holds 256");
+        check(gdx3ds_config_entry_count() == 256, "capacity: 256 entries kept");
+        check(gdx3ds_config_get_int("debug", "k199", -1) == 199, "capacity: key 200 of 300 kept (old cap 128 dropped it)");
+        check(gdx3ds_config_get_int("variant.z", "k255", -1) == 255, "capacity: key 256 kept");
+        check(gdx3ds_config_overflow(&first) == 44, "capacity: the 44 keys past 256 are COUNTED");
+        check(first != NULL && strcmp(first, "variant.z.k256") == 0, "capacity: the first dropped key is named");
+        check(gdx3ds_config_set_int("debug", "brand_new", 1) == 2 && gdx3ds_config_overflow(NULL) == 45,
+              "capacity: a set into a full table is counted too");
+        fp = fopen(kPath, "w");
+        if (fp != NULL) {
+            fprintf(fp, "[debug]\nx = 1\n");
+            fclose(fp);
+        }
+        check(gdx3ds_config_load(kPath) == 0 && gdx3ds_config_overflow(NULL) == 0, "capacity: a reload clears the count");
+        {
+            int before = gdx3ds_config_overflow(NULL);
+            int refused = 0;
+            for (i = 0; i < 60; i++) {
+                char k[16];
+                snprintf(k, sizeof(k), "o%02d", i);
+                refused += gdx3ds_config_override("debug", k, "1") == 2 ? 1 : 0;
+            }
+            check(refused > 0 && refused <= 60 - 48 + 24 && gdx3ds_config_overflow(NULL) == before + refused,
+                  "capacity: override table >= 48, every refused override is counted");
+        }
+    }
+
+    /* --- hw bug n60-3d8, item 2: a legitimate setting save must patch ONLY the changed
+     * key's line, preserving every comment, the original section-name case, and every
+     * unrelated key -- and must never let [hud] reach this file, new or pre-existing. ---- */
+    {
+        static const char* kFixture =
+            "; G-Diffuser Old 3DS -- this header must survive a save untouched.\n"
+            "; second comment line, also untouched.\n"
+            "\n"
+            "[debug]\n"
+            "gputl = 0 ; trailing note\n"
+            "verbose = 0\n"
+            "\n"
+            "[variant.V]\n"
+            "native.lcd_vram = 1\n"
+            "\n"
+            "[hud]\n"
+            "placement = 1\n";
+        char before[4096];
+        char after[4096];
+
+        write_ini(kFixture);
+        check(gdx3ds_config_load(kPath) == 0, "n60-3d8#2: load the realistic fixture");
+
+        /* a) nothing dirty -> save must not touch the file AT ALL. */
+        check(slurp(kPath, before, sizeof(before)) != (size_t) -1, "n60-3d8#2: slurp before");
+        check(gdx3ds_config_save(kPath) == 0, "n60-3d8#2: save with nothing dirty returns 0");
+        check(slurp(kPath, after, sizeof(after)) != (size_t) -1, "n60-3d8#2: slurp after no-op save");
+        check(strcmp(before, after) == 0,
+              "n60-3d8#2: a save with no pending set/unset leaves the file byte-identical");
+
+        /* b) a real, legitimate change (one DISP-tab-style key) touches ONLY that line. */
+        check(gdx3ds_config_set_int("debug", "verbose", 1) == 0, "n60-3d8#2: set debug.verbose=1");
+        check(gdx3ds_config_save(kPath) == 0, "n60-3d8#2: save after one legitimate set");
+        check(file_contains("; G-Diffuser Old 3DS -- this header must survive a save untouched."),
+              "n60-3d8#2: the top-of-file comment survives");
+        check(file_contains("; second comment line, also untouched."),
+              "n60-3d8#2: the second comment line survives");
+        check(file_contains("[variant.V]"), "n60-3d8#2: [variant.V]'s ORIGINAL case survives");
+        check(file_contains("native.lcd_vram = 1"), "n60-3d8#2: an untouched key in another section survives");
+        check(file_contains("verbose = 1"), "n60-3d8#2: the changed key took its new value");
+        check(!file_contains("verbose = 0"), "n60-3d8#2: the changed key's old value is gone");
+
+        /* c) [hud] must never appear in the saved file again, even though it was in the
+         * fixture on disk -- a real save drops any pre-existing [hud] block entirely. */
+        check(!file_contains("[hud]"), "n60-3d8#2: a pre-existing [hud] section is dropped on save");
+        check(!file_contains("placement"), "n60-3d8#2: [hud] placement does not survive as a stray key");
+
+        /* d) setting [hud] placement (as gdx3ds_bottomhud.c's cycle_mode does, to keep the
+         * shared table consistent for readers) must NOT make it into a later save either,
+         * even though that save is for a genuinely unrelated, legitimate key. */
+        check(gdx3ds_config_set_int("hud", "placement", 2) == 0, "n60-3d8#2: set hud.placement=2 (RAM)");
+        check(gdx3ds_config_set_int("display", "border_mode", 3) == 0, "n60-3d8#2: a real DISP-tab change");
+        check(gdx3ds_config_save(kPath) == 0, "n60-3d8#2: save with both a hud key and a real key dirty");
+        check(!file_contains("[hud]") && !file_contains("placement"),
+              "n60-3d8#2: [hud] still never reaches gdiffuser.ini, even mixed with a real save");
+        check(file_contains("border_mode = 3"), "n60-3d8#2: the real key in that same save DID take effect");
+
+        /* e) a hud-only dirty set, with NO other legitimate change, must not touch the file
+         * at all (the exact shape of the n60-3d8 hardware bug: cycling the HUD mode, then
+         * something else saving, must never be how [hud] reaches gdiffuser.ini). */
+        check(slurp(kPath, before, sizeof(before)) != (size_t) -1, "n60-3d8#2: slurp before hud-only set");
+        check(gdx3ds_config_set_int("hud", "placement", 0) == 0, "n60-3d8#2: set hud.placement=0 (RAM only)");
+        check(gdx3ds_config_save(kPath) == 0, "n60-3d8#2: save with ONLY a hud key dirty returns 0");
+        check(slurp(kPath, after, sizeof(after)) != (size_t) -1, "n60-3d8#2: slurp after hud-only save");
+        check(strcmp(before, after) == 0,
+              "n60-3d8#2: a hud-only dirty set never rewrites the file, byte-identical");
+
+        /* f) a brand new key in a brand new section still gets appended (the loader's own
+         * documented "unknown sections/keys are stored, not rejected" contract, unchanged). */
+        check(gdx3ds_config_set_int("newsection", "newkey", 7) == 0, "n60-3d8#2: set a brand new key");
+        check(gdx3ds_config_save(kPath) == 0, "n60-3d8#2: save with a brand new section/key");
+        check(file_contains("[newsection]") && file_contains("newkey = 7"),
+              "n60-3d8#2: a brand new section/key is appended");
+        check(file_contains("[variant.V]"), "n60-3d8#2: appending a new section still preserves old case");
+    }
 
     remove(kPath);
     if (sFailures == 0) {

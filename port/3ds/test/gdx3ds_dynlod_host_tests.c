@@ -47,7 +47,7 @@ u64 gdx3ds_test_tick = 0;
 
 /* Captured receipt lines: the test asserts that every transition is logged WITH the
  * averages that caused it, which is what makes a hardware log decodable. */
-#define GDX_DYNLOD_TEST_TIER_MAX 2 /* mirrors GDX_DYNLOD_TIER_MAX: NATIVE/REDUCED/MINIMAL */
+#define GDX_DYNLOD_TEST_TIER_CEIL 3 /* mirrors GDX_DYNLOD_TIER_CEIL: NATIVE/REDUCED/MINIMAL/LOW */
 
 #define LOG_CAP 4096
 static char sLog[LOG_CAP][160];
@@ -101,6 +101,12 @@ int gdx3ds_config_get_int(const char* section, const char* key, int fallback) {
 
 int gdx3ds_config_get_bool(const char* section, const char* key, int fallback) {
     return gdx3ds_config_get_int(section, key, fallback);
+}
+
+/* gdx3ds_perf_preset.c stand-in: no preset, so a [perf] key reads exactly as the ini (the
+ * preset module has its own host test, gdx3ds_perf_preset_host_tests.c). */
+int gdx3ds_perf_get_int(const char* key, int stockDefault) {
+    return gdx3ds_config_get_int("perf", key, stockDefault);
 }
 
 static int sFloor = 0;
@@ -163,6 +169,16 @@ typedef struct {
     int lowerMaxOverIni;
 } Case;
 
+/* C4p, the Old 3DS preset: its RAISE line and ceiling as the ini would carry them, and the
+   floor the preset sets, applied by CountTransitions to every case while set. All-zero = the
+   shipped defaults (every case before section 5c). Kept out of Case so the positional
+   initialisers above stay complete. */
+static struct {
+    int hiX10Ini;
+    int tierMaxIni;
+    int floor;
+} sBand = {0, 0, 0};
+
 /* Frame index inside the measured window, for the bimodal plant. */
 static int sFrameIdx = 0;
 
@@ -189,7 +205,7 @@ static void RunFrame(const Case* c) {
  * settle, so the measured window starts from a known tier instead of from boot. */
 static void PrimeToTier(const Case* c, int target) {
     Case hot = *c;
-    hot.baseX10 = 400; /* a race-start storm frame: well over any RAISE line */
+    hot.baseX10 = 1000; /* a storm frame: over any RAISE line, the Old 3DS preset's 45.0 included */
     hot.savingX10PerTier = 0;
     hot.sigmaX10 = 0;
     hot.spikePermil = 0;
@@ -210,6 +226,13 @@ static int CountTransitions(const char* label, const Case* c, u32 seed, int quie
     if (c->setMaxOver) {
         CfgSet("perf", "rival_auto_lower_maxover", c->lowerMaxOverIni);
     }
+    if (sBand.hiX10Ini != 0) {
+        CfgSet("perf", "rival_auto_hi_x10", sBand.hiX10Ini);
+    }
+    if (sBand.tierMaxIni != 0) {
+        CfgSet("perf", "rival_tier_max", sBand.tierMaxIni);
+    }
+    sFloor = sBand.floor;
     gdx3ds_dynlod_test_reset();
     sRng = seed;
     sLogN = 0;
@@ -263,7 +286,7 @@ static int WorstOverSeeds(const Case* c, int* outWorstEndTier, int* outBestEndTi
     int worst = 0;
     int endTier = 0;
     int worstEnd = 0;
-    int bestEnd = GDX_DYNLOD_TEST_TIER_MAX;
+    int bestEnd = GDX_DYNLOD_TEST_TIER_CEIL; /* min over seeds: start above any tier */
     for (int i = 0; i < SEEDS; i++) {
         const int t = CountTransitions(c->name, c, kSeeds[i], 1, &endTier);
         if (t > worst) {
@@ -585,6 +608,61 @@ int main(void) {
     Check(gdx3ds_dynlod_effective_level(2) == 2, "the tier can never fall below the user's floor");
     Check(gdx3ds_dynlod_tier() == 2, "a raised floor snaps the tier up");
     printf("  floor=2 on 5.0 ms frames: tier=%d\n", gdx3ds_dynlod_tier());
+    sFloor = 0;
+
+    /* --- 5b. rival_tier_max: 2 unless asked, 3 reachable only when asked ------ */
+    printf("tier max:\n");
+    CfgClear();
+    CfgSet("perf", "rival_detail_auto", 1);
+    gdx3ds_dynlod_test_reset();
+    Case storm = {"storm", 0, 400, 0, 0, 0, 0, 0, 500, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < 500; i++) {
+        RunFrame(&storm);
+    }
+    Check(gdx3ds_dynlod_tier_max() == 2, "the shipped ceiling is MINIMAL");
+    Check(gdx3ds_dynlod_tier() == 2, "without rival_tier_max the controller must stop at MINIMAL");
+    printf("  default: tierMax=%d tier after 500 storm frames=%d\n", gdx3ds_dynlod_tier_max(),
+           gdx3ds_dynlod_tier());
+    CfgClear();
+    CfgSet("perf", "rival_detail_auto", 1);
+    CfgSet("perf", "rival_tier_max", 3);
+    gdx3ds_dynlod_test_reset();
+    for (int i = 0; i < 500; i++) {
+        RunFrame(&storm);
+    }
+    Check(gdx3ds_dynlod_tier_max() == 3, "rival_tier_max=3 must open LOW");
+    Check(gdx3ds_dynlod_tier() == 3, "with rival_tier_max=3 a storm must reach LOW");
+    printf("  rival_tier_max=3: tier after 500 storm frames=%d\n", gdx3ds_dynlod_tier());
+    CfgClear();
+    CfgSet("perf", "rival_detail_auto", 1);
+    CfgSet("perf", "rival_tier_max", 9);
+    gdx3ds_dynlod_test_reset();
+    Check(gdx3ds_dynlod_tier_max() == 3, "rival_tier_max is clamped to the tiers the decomp hook knows");
+
+    /* --- 5c. the Old 3DS preset's band, under an Old 3DS plant --------------- */
+    /* gdx3ds_perf_preset.c: floor REDUCED, ceiling LOW, hi 45.0 / lo 30.0. The plants are the
+     * hardware windows of hw-c4run2-0929 (o3dslod-progress.md §2): a 30-machine GP race at
+     * 81 ms with tier 2 (so ~88 at tier 0 with the emulator's measured ~3.5 ms/tier), a
+     * one-machine race at 41 ms whose cost no rival tier can move, and a menu at 27 ms. The
+     * gate is the same as everywhere: a controller that tracks load, not one that hunts. */
+    printf("old 3ds preset band (hi 45.0 lo 30.0 floor 1 max 3):\n");
+    sBand.hiX10Ini = 450;
+    sBand.tierMaxIni = 3;
+    sBand.floor = 1;
+    Case o3dsGp = {"o3ds-gp", 300, 880, 35, 60, 15, 200, 0, 1000, 2, 0, 0, 0, 0, 0, 0};
+    t = WorstOverSeeds(&o3dsGp, &worstEnd, &bestEnd);
+    Check(t <= o3dsGp.maxTransitions, "an O3DS GP race must ratchet to LOW (two steps), not hunt");
+    Check(bestEnd == 3, "an O3DS GP race must end at LOW on every seed");
+    Case o3dsTt = {"o3ds-tt", 300, 410, 0, 40, 15, 200, 0, 1000, 2, 0, 0, 0, 0, 0, 0};
+    t = WorstOverSeeds(&o3dsTt, &worstEnd, &bestEnd);
+    Check(t <= o3dsTt.maxTransitions, "a one-machine O3DS race must not re-tier the field");
+    Case o3dsMenu = {"o3ds-menu", 300, 270, 0, 20, 0, 0, 3, 1000, 2, 0, 0, 0, 0, 0, 0};
+    t = CountTransitions("o3ds-menu", &o3dsMenu, kSeeds[0], 0, &endTier);
+    Check(endTier == 1, "a quiet O3DS menu must give detail back down to the preset floor");
+    Check(t == 2, "a quiet O3DS menu must lower exactly twice, LOW -> MINIMAL -> REDUCED");
+    sBand.hiX10Ini = 0;
+    sBand.tierMaxIni = 0;
+    sBand.floor = 0;
     sFloor = 0;
 
     /* --- 6. every transition must be decodable from a hardware log ---------- */

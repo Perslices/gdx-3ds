@@ -1,0 +1,119 @@
+diff --git a/src/overlays/ovl_i3/menus.c b/src/overlays/ovl_i3/menus.c
+index e935486..7f2e8d6 100644
+--- a/src/overlays/ovl_i3/menus.c
++++ b/src/overlays/ovl_i3/menus.c
+@@ -5588,6 +5588,14 @@ Gfx* Menus_Draw(Gfx* gfx) {
+     /* Deliberately a separate CVar for split-screen; see gdx_widescreen_split_ui_active. */
+     s32 gdxWideSplitHud = gdx_widescreen_split_ui_active();
+     u32 gdxRaceAnchor;
++    /* nibottom Phase 2: the bottom-screen DASH's placement lever. Read once per frame, same
++     * reasoning as gdxPhotoActive/gdxWideHud above (every guard below must pair with the same
++     * answer even if the lever flips mid-build). Both predicates already fold in the numPlayers>1
++     * force-ALL_TOP rule (gdx_hud_placement.h), so this call site never re-derives it. */
++    extern int gdx_hud_top_suppressed(int numPlayers);     // port/input_bridge.c
++    extern int gdx_hud_minimap_suppressed(int numPlayers); // port/input_bridge.c
++    s32 gdxHudTopSuppressed = gdx_hud_top_suppressed(gNumPlayers);
++    s32 gdxHudMapSuppressed = gdx_hud_minimap_suppressed(gNumPlayers);
+ #endif
+ 
+     gRacersRemaining = gTotalRacers - gRacersRetired;
+@@ -5673,14 +5681,33 @@ Gfx* Menus_Draw(Gfx* gfx) {
+             if (!((gNumPlayers == 1) && (sPlayerFinishState[0] == PLAYER_FINISH_SUCCESS_COMPLETE)) &&
+                 !((gNumPlayers == 1) && (gCameras[playerIndex].mode == CAMERA_MODE_FINISHED_LOSER) &&
+                   (sPlayerLoserFinishTimer[0] >= 300))) {
++#ifdef PORT
++                if (!gdxHudTopSuppressed) {
++                    gfx = Hud_DrawHud(gfx);
++                } else {
++                    /* COORDINATOR FIX (hw bug n60-3d7, item 3): the top HUD's drawing is
++                     * suppressed here, but Hud_DrawHud's own Hud_UpdatePlayerHudInfo call is
++                     * the ONLY place the "YOU GOT BOOST POWER"/"FINAL LAP" announcer voice
++                     * lines and their message-timer bookkeeping run -- see
++                     * Hud_AdvanceLapAnnouncementsOnly's own comment (hud.c). Keep that logic
++                     * alive even with the drawing gone. */
++                    extern void Hud_AdvanceLapAnnouncementsOnly(s32); // hud.c
++                    Hud_AdvanceLapAnnouncementsOnly(0);
++                }
++#else
+                 gfx = Hud_DrawHud(gfx);
++#endif
+             }
+             for (i = 0; i < gNumPlayers; i++) {
+                 if (!((gNumPlayers == 1) && ((sPlayerFinishState[i] == PLAYER_FINISH_SUCCESS_COMPLETE) ||
+                                              ((gCameras[playerIndex].mode == CAMERA_MODE_FINISHED_LOSER) &&
+                                               (sPlayerLoserFinishTimer[0] >= 300))))) {
+-                    if (gNumPlayers == 1) {
++                    if (gNumPlayers == 1
+ #ifdef PORT
++                        && !gdxHudTopSuppressed
++#endif
++                    ) {
++#ifdef PORT
+                         if (gdxWideHud) {
+                             gSPSetExtraGeometryMode(gfx++, G_EX_WIDESCREEN_ANCHOR_LEFT);
+                         }
+@@ -5693,7 +5720,11 @@ Gfx* Menus_Draw(Gfx* gfx) {
+ #endif
+                     }
+                     if ((gGameMode != GAMEMODE_DEATH_RACE) && (sPlayerGameoverState[i] == PLAYER_GAMEOVER_NONE) &&
+-                        !(gRacers[i].stateFlags & RACER_STATE_FINISHED)) {
++                        !(gRacers[i].stateFlags & RACER_STATE_FINISHED)
++#ifdef PORT
++                        && !gdxHudMapSuppressed
++#endif
++                    ) {
+ #ifdef PORT
+                         gdxRaceAnchor = GdxRaceMinimapAnchor(gNumPlayers, i, gdxWideHud, gdxWideSplitHud);
+                         if (gdxRaceAnchor != 0) {
+@@ -5707,14 +5738,30 @@ Gfx* Menus_Draw(Gfx* gfx) {
+                         }
+ #endif
+                     }
+-                    if (gNumPlayers == 3) {
++                    if ((gNumPlayers == 3)
++#ifdef PORT
++                        && !gdxHudMapSuppressed
++#endif
++                    ) {
+                         /* The fourth minimap goes in 3P's empty bottom-right quadrant
+                            (sPlayerMinimapPositions[2][3] = {210,152}), mid-column rather than on
+                            an edge and with no 3D view to align against. Left on the stock centred
+                            path: anchoring it would only move it away from the other three. */
+                         gfx = Minimap_DrawCourseMinimap(gfx, gNumPlayers - 1, 3);
+                     }
++                    /* COORDINATOR FIX (hw bug n60-3d7, item 4): "the race-position '2/30
++                     * racers' counter... stayed on the top screen" in hidden-HUD (ALL_BOTTOM)
++                     * mode. Hud_DrawPosition is pure drawing (its one piece of state,
++                     * sPositionScales[], is a local finish-animation scale read nowhere else
++                     * -- grepped), so unlike item 3's Hud_DrawHud this is safe to skip
++                     * outright with no logic-extraction needed. DASH already shows the
++                     * player's own position as a big ordinal on the portrait widget
++                     * (gdx3ds_bottomhud.c); this just stops the top screen from also
++                     * drawing it when that screen is supposed to be hidden-HUD. */
+ #ifdef PORT
++                    if (!gdxHudTopSuppressed) {
++#endif
++#ifdef PORT
+                     gdxRaceAnchor = GdxRacePositionAnchor(gNumPlayers, i, gdxWideHud, gdxWideSplitHud);
+                     if (gdxRaceAnchor != 0) {
+                         gSPSetExtraGeometryMode(gfx++, gdxRaceAnchor);
+@@ -5724,11 +5771,18 @@ Gfx* Menus_Draw(Gfx* gfx) {
+ #ifdef PORT
+                     if (gdxRaceAnchor != 0) {
+                         gSPClearExtraGeometryMode(gfx++, gdxRaceAnchor);
++                    }
++#endif
++#ifdef PORT
+                     }
+ #endif
+                 }
+                 if (((gNumPlayers != 1) || (sPlayerGameoverState[i] == PLAYER_GAMEOVER_NONE)) &&
+-                    !(gRacers[i].stateFlags & RACER_STATE_FINISHED)) {
++                    !(gRacers[i].stateFlags & RACER_STATE_FINISHED)
++#ifdef PORT
++                    && !gdxHudTopSuppressed /* item 4: kph speedometer moves to the DASH */
++#endif
++                ) {
+ #ifdef PORT
+                     gdxRaceAnchor = GdxRaceSpeedAnchor(gNumPlayers, i, gdxWideHud, gdxWideSplitHud);
+                     if (gdxRaceAnchor != 0) {

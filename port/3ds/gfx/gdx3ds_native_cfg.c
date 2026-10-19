@@ -94,7 +94,7 @@ int gdx3ds_native_fx_mask(void) {
 
 void gdx3ds_native_boot_receipt(void) {
     static int sDone = 0;
-    char buf[320];
+    char buf[416];
     if (sDone || !gdx3ds_native_ready() || &gdx_dbg_logf == NULL) {
         return;
     }
@@ -103,10 +103,12 @@ void gdx3ds_native_boot_receipt(void) {
      * as written), so the receipt says what runs, not what the ini spelled. */
     snprintf(buf, sizeof(buf),
              "[native] all=%d interp=%d machines=%d track=%d fx_sink=%d fx_sprites=%d fx_hud=%d ownfold=%d fx=%d "
-             "census trk=%d fx=%d ncensus=%d (resolved: all=tier2 only, interp explicit; ini latched at boot)%s",
+             "gpuxf=%d trkrr=%d trkres=%d trkmat=%d trknc=%d trkop=%d census trk=%d fx=%d ncensus=%d (resolved: all=tier2 only, interp explicit; ini latched at boot)%s",
              gdx3ds_native_raw("all", 0), gdx3ds_native_lever("interp", 0), gdx3ds_native_lever("machines", 0),
              gdx3ds_native_lever("track", 0), gdx3ds_native_lever("fx_sink", 0), gdx3ds_native_lever("fx_sprites", 0),
              gdx3ds_native_lever("fx_hud", 0), gdx3ds_native_lever("ownfold", 0), gdx3ds_native_fx_mask(),
+             gdx3ds_native_raw("gpuxf", 0), gdx3ds_native_raw("track_retained", 0), gdx3ds_native_raw("track_resident", 0),
+             gdx3ds_native_raw("track_mattab", 0), gdx3ds_native_raw("track_nearclip", 0), gdx3ds_native_raw("track_opfold", 0),
              gdx3ds_native_raw("trkcensus", 0), gdx3ds_native_raw("fxcensus", 0), gdx3ds_native_raw("ncensus", 0),
              gdx3ds_native_verify_forces_fold_off()
                  ? " [fx_hud+ownfold forced 0: interp_verify compares batch for batch, so neither side may fold]"

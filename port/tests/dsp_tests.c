@@ -28,6 +28,11 @@
 #include <string.h>
 #include <math.h>
 
+/* [audiomix] the mix-bus headroom census (port/gdx_audio_mix_census.c).  TESTs 21-23 arm it
+   through its public API and assert on the snapshot, so this suite gates the instrument AND
+   the mix semantics it measures with one binary. */
+#include "gdx_audio_mix_census.h"
+
 // Authoritative RSP resample coefficients, transcribed from the same canonical source
 // n64_audio_hle.c uses (mupen64plus-rsp-hle RESAMPLE_LUT / Project64 AziAudio
 // Mupen64plusHLE/audio.c, extracted from the aspMain ucode data section). This test-local copy
@@ -116,7 +121,11 @@ static int16_t RefClampS16(int32_t v) {
    it only means the probes may log, which is harmless bounded noise in a test run. */
 int gGdxRaceActive = 1;
 
-#define GDX_TEST_MAX_REGIONS 256
+/* AUDIOFIX round 4 bumped this from 256: TestAdpcmScaleClampLever's 4 permanent slots (reused
+   across all 10 scale/lever combinations, NOT 10 x 4 -- see its own comment) left the suite with
+   no margin at all, exiting with "out of test region slots" mid-MIX-test. Host-test-only
+   infrastructure, never shipped. */
+#define GDX_TEST_MAX_REGIONS 320
 typedef struct {
     uint32_t base;
     void* host;
@@ -166,6 +175,19 @@ int CVarGetInteger(const char* name, int defaultValue) {
 // No header declares this: n64_audio_hle.c defines it with external linkage and there is no
 // prototype file, so the harness declares it itself.
 extern void gdx_audio_hle_run(const void* dataPtr, unsigned int dataSizeBytes);
+
+/* n64_audio_hle.c now carries the [ndsphash] taps (port/gdx_ndsp_hash.c), whose receipts go
+   through the port's log sink.  This harness links neither n64_sched.c nor a console, and the
+   instrument is never configured on here, so a sink that discards is the whole requirement --
+   its own suite (gdx3ds_ndsphash_tests) is where the output format is asserted. */
+void gdx_dbg_logf(const char* fmt, ...) { (void)fmt; }
+
+/* Same story for port_log.h's diag gate, which n64_audio_hle.c's receipts consult. It has
+   never been resolvable in a standalone link of this harness -- the CMake target inherits it
+   from the wider port library -- so the [ndsphash] work that first compiled this file outside
+   CMake supplies it here, which is what lets tools/ci-3ds.sh run the DSP kernel suite at all.
+   0 = quiet: every caller is a diagnostic print, never a computation. */
+int gdx_diag_audio_enabled(void) { return 0; }
 
 // Layout-identical to n64_audio_hle.c's private GdxAcmd (two uint32_t), which is all
 // gdx_audio_hle_run cares about -- it never sees this struct's name.
@@ -264,6 +286,17 @@ static Cmd MkEnvMixer(uint32_t dmemSrc, uint32_t sampleCount, uint32_t swapLR,
            (((wetLeft >> 4) & 0xFFu) << 8) | ((wetRight >> 4) & 0xFFu);
     return c;
 }
+/* Same as MkEnvMixer, plus abi.h aEnvMixer's x0<<3 | x1<<2 | x2<<1 | x3<<0 nibble -- the bits
+   [debug] envmix_xbits reads (n64_audio_hle.c's GDX_A_ENVMIXER case). A separate helper rather
+   than a new MkEnvMixer parameter, so every existing call site (and every pre-fix test's
+   expected values) stays untouched. */
+static Cmd MkEnvMixerXBits(uint32_t dmemSrc, uint32_t sampleCount, uint32_t swapLR,
+                           uint32_t dryLeft, uint32_t dryRight, uint32_t wetLeft, uint32_t wetRight,
+                           uint32_t xbits) {
+    Cmd c = MkEnvMixer(dmemSrc, sampleCount, swapLR, dryLeft, dryRight, wetLeft, wetRight);
+    c.w0 |= (xbits & 0xFu);
+    return c;
+}
 /* count8 = groups of 8 samples (abi.h's aAddMixer packs `count>>4`, the same convention as
    A_MIXER's count8 above). a4 is deliberately not exposed: the interpreter does not read it --
    gainless unity add, matching mupen's alist_add. */
@@ -271,6 +304,16 @@ static Cmd MkAddMixer(uint32_t count8, uint32_t dmemIn, uint32_t dmemOut) {
     Cmd c;
     c.w0 = (OP_ADDMIXER << 24) | ((count8 & 0xFFu) << 16);
     c.w1 = ((dmemIn & 0xFFFFu) << 16) | (dmemOut & 0xFFFFu);
+    return c;
+}
+
+/* A_INTERLEAVE: w0 = op | (perChannelBytes>>4)<<16 | dmemOut; w1 = dmemL<<16 | dmemR.
+   Field layout verified against n64_audio_hle.c's GDX_A_INTERLEAVE case. */
+#define OP_INTERLEAVE 13u
+static Cmd MkInterleave(uint32_t dmemOut, uint32_t dmemL, uint32_t dmemR, uint32_t perChannelBytes) {
+    Cmd c;
+    c.w0 = (OP_INTERLEAVE << 24) | (((perChannelBytes >> 4) & 0xFFu) << 16) | (dmemOut & 0xFFFFu);
+    c.w1 = ((dmemL & 0xFFFFu) << 16) | (dmemR & 0xFFFFu);
     return c;
 }
 
@@ -329,6 +372,42 @@ static void PackAdpcmFrame(uint8_t out9[9], uint8_t header, const int8_t nibbles
         uint8_t hi = (uint8_t)(nibbles[i * 2] & 0xF);
         uint8_t lo = (uint8_t)(nibbles[i * 2 + 1] & 0xF);
         out9[1 + i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+// A REAL order-2 VADPCM codebook is a MATRIX, not two numbers, and this generator is the reason
+// two tests in this file used to fail against a CORRECT decoder (A17 / dspclick-progress.md).
+//
+// aspMain decodes an 8-sample sub-block in closed form -- one pass, no per-sample recursion
+// (n64_audio_hle.c RunAdpcm's block path, mirroring mupen64plus-rsp-hle adpcm_predict_frame):
+//     y[i] = (row0[i]*hist2 + row1[i]*hist1 + SUM_{k<i} row1[i-1-k]*e[k] + (e[i]<<11)) >> 11
+// That equals the AR recursion y[n] = (a1*y[n-1] + a2*y[n-2])/2048 + e[n] ONLY when the book's
+// eight COLUMNS carry the predictor's IMPULSE RESPONSE, which is exactly what the SDK's encoder
+// bakes into every real soundfont book:
+//     H[0] = 2048 (Q11 one), H[m] = (a1*H[m-1] + a2*H[m-2]) / 2048
+//     row1[i] = H[i+1]           (hist1's weight i steps out, AND the residual convolution kernel)
+//     row0[i] = a2 * H[i] / 2048 (hist2's weight i steps out)
+//
+// Filling ONLY column 0 (`book[0] = a2; book[8] = a1;` and fifteen zeros) is therefore a MALFORMED
+// codebook for the shipped decode: it decodes as a 2-tap FIR, not the intended order-2 recursion.
+// It happens to be exact for the LEGACY per-sample sequential path (GDX_SEQ_ADPCM=1), which is why
+// the mistake reads as correct -- but that path is dev-gated and unreachable in Release, so an
+// analytic multi-sample expectation built on a column-0-only book asserts against a decoder the
+// game never runs. Any test here that predicts more than sample 0 from the history MUST build its
+// book through this function. TEST 20 is the negative control that keeps that true.
+static void MakeOrder2Book(int16_t book[16], int32_t a1 /* Q11 weight on hist1 */,
+                           int32_t a2 /* Q11 weight on hist2 */) {
+    int32_t h[9]; /* h[m] = Q11 impulse response, m = 0..8 */
+    int i;
+    h[0] = 2048;
+    for (i = 1; i <= 8; i++) {
+        int32_t hm1 = h[i - 1];
+        int32_t hm2 = (i >= 2) ? h[i - 2] : 0;
+        h[i] = (a1 * hm1 + a2 * hm2) / 2048;
+    }
+    for (i = 0; i < 8; i++) {
+        book[0 + i] = (int16_t)((a2 * h[i]) / 2048); /* tap0: hist2 (older) */
+        book[8 + i] = (int16_t)h[i + 1];             /* tap1: hist1 (newest) + residual kernel */
     }
 }
 
@@ -738,11 +817,13 @@ static int TestAdpcmLoopWrapResampleContinuity(void) {
     Cmd cmds[4];
     int i, h1, h2, endH1, endH2;
 
-    /* Integrator codebook: BookCoef(0,0,0)=book[0] weights hist2 (=0), BookCoef(0,1,0)=book[8]
-       weights hist1 (=2048 == Q11 unity, 2048>>11 == *1). So predicted == hist1. */
-    memset(book, 0, sizeof(book));
-    book[0] = 0;
-    book[8] = 2048;
+    /* Integrator predictor: a1 (hist1) = Q11 unity, a2 (hist2) = 0, so the recursion is
+       decoded[n] = decoded[n-1] + residual[n]. Built as a FULL 8-column matrix -- the reference
+       below predicts all 48 samples from the history, and only a real book matrix makes the shipped
+       block-convolution decode equal that recursion (see MakeOrder2Book). This test asserted
+       against a column-0-only book until A17/dspclick; that book decodes as a 2-tap FIR and made a
+       correct decoder look like a loop-wrap click. */
+    MakeOrder2Book(book, 2048, 0);
 
     /* Full-period sine residuals (period 16, two periods over the 32-sample body): each period sums
        to exactly 0, so the integrator returns to its start -> seamless periodic loop. Amplitude 3
@@ -1364,6 +1445,168 @@ static int TestEnvMixerConstantGain(void) {
 }
 
 // =================================================================================================
+// TEST 9b -- [debug] envmix_xbits (AUDIOFIX round 4): abi.h's aEnvMixer macro packs four more
+// bits (x0..x3, w0 bits 3..0) that this interpreter historically never read. mupen64plus-rsp-hle's
+// alist_process_nead_fz -- the ground-truthed F-Zero X ucode, docs/research/native/
+// audiofix-progress.md SS13 -- XORs them into the envelope mix: xors[2]=wet-left(our x0),
+// xors[3]=wet-right(our x1), xors[0]=dry-left(our x2), xors[1]=dry-right(our x3), each
+// `0 - ((w0 & mask) >> shift)` (NOT a clean sign negate -- magnitudes 4/2/1/1 when set). Checks,
+// independently of n64_audio_hle.c's own arithmetic: (1) the lever OFF ignores every nibble value,
+// bit-identical to every build before this one; (2) each bit ON, alone and combined, matches the
+// hand-derived mupen formula; (3) the packed/SIMD kernel always DECLINES when any bit is set,
+// never trying to carry these semantics itself (n64_audio_hle_fast.c's gdx_hlefast_envmix).
+// =================================================================================================
+/* srcAddr/dryLAddr/dryRAddr/wetLAddr/wetRAddr are pre-registered (RegisterRegion) by the caller
+   and reused across every call: this runs a dozen times across the test below, and DmemLoad/
+   DmemSave each burn a fresh, never-freed slot of the harness's fixed GDX_TEST_MAX_REGIONS
+   table (shared across the whole binary) -- registering once up front is what keeps this test
+   from starving the suite's later tests of region slots. */
+static void EnvMixerXBitsCase(uint32_t xbits, int leverOn, uint32_t srcAddr, const int16_t* src,
+                              uint32_t dryLAddr, uint32_t dryRAddr, uint32_t wetLAddr,
+                              uint32_t wetRAddr, int16_t* dryL, int16_t* dryR, int16_t* wetL,
+                              int16_t* wetR) {
+    extern void gdx_audio_hle_set_envmix_xbits(int on);
+    const uint32_t curVolLeft = 0x8000u;  /* Q16 0.5x, same fixture as TestEnvMixerConstantGain */
+    const uint32_t curVolRight = 0x4000u; /* Q16 0.25x */
+    const uint32_t reverbVol2 = 128u;     /* ENVSETUP1's "a" field -> 0.5x in the wet cascade */
+    Cmd cmds[3];
+
+    gdx_audio_hle_set_envmix_xbits(leverOn);
+
+    cmds[0] = MkClearBuff(0x0D40, 16); RunCmds(cmds, 1);
+    cmds[0] = MkClearBuff(0x0D80, 16); RunCmds(cmds, 1);
+    cmds[0] = MkClearBuff(0x0DC0, 16); RunCmds(cmds, 1);
+    cmds[0] = MkClearBuff(0x0E00, 16); RunCmds(cmds, 1);
+    cmds[0] = MkClearBuff(0x0D00, 16); RunCmds(cmds, 1);
+    cmds[0] = MkLoadBuff(0x0D00, 16, srcAddr); RunCmds(cmds, 1);
+
+    cmds[0] = MkEnvSetup1(reverbVol2, 0, 0, 0);
+    cmds[1] = MkEnvSetup2(curVolLeft, curVolRight);
+    cmds[2] = MkEnvMixerXBits(0x0D00, 8, 0, 0x0D40, 0x0D80, 0x0DC0, 0x0E00, xbits);
+    RunCmds(cmds, 3);
+
+    cmds[0] = MkSaveBuff(0x0D40, 16, dryLAddr); RunCmds(cmds, 1);
+    cmds[0] = MkSaveBuff(0x0D80, 16, dryRAddr); RunCmds(cmds, 1);
+    cmds[0] = MkSaveBuff(0x0DC0, 16, wetLAddr); RunCmds(cmds, 1);
+    cmds[0] = MkSaveBuff(0x0E00, 16, wetRAddr); RunCmds(cmds, 1);
+    (void)src; (void)dryL; (void)dryR; (void)wetL; (void)wetR; /* written through their addrs */
+}
+
+static int TestEnvMixerXBitsSignNegateFix(void) {
+    extern void gdx_audio_hle_set_fast(int on);
+    extern void gdx_hlefast_path_counts(uint32_t out[8]);
+    const uint32_t curVolLeft = 0x8000u, curVolRight = 0x4000u;
+    const int32_t reverbQ16 = (int32_t)128u << 8;
+    /* x0=bit3 (wet-left), x1=bit2 (wet-right -- the bit real reverb-send bytes >=128 set,
+       synthesis.c:467), x2=bit1 (dry-left), x3=bit0 (dry-right), then all four together. */
+    static const uint32_t kBits[5] = { 0x8u, 0x4u, 0x2u, 0x1u, 0xFu };
+    static const char* const kNames[5] = {
+        "x0 (wet-left)", "x1 (wet-right, real-content bit)", "x2 (dry-left)", "x3 (dry-right)",
+        "x0|x1|x2|x3 (all four)"
+    };
+    int16_t src[8];
+    int16_t dryL[8], dryR[8], wetL[8], wetR[8];
+    uint32_t srcAddr, dryLAddr, dryRAddr, wetLAddr, wetRAddr;
+    int i, b;
+
+    for (i = 0; i < 8; i++) {
+        src[i] = (int16_t)(i * 1000);
+    }
+    /* Registered ONCE: every case below reuses these five addrs (see EnvMixerXBitsCase's own
+       comment on why -- the harness's RegisterRegion table is a fixed, never-freed budget
+       shared by the whole test binary). */
+    srcAddr = RegisterRegion(src, sizeof(src));
+    dryLAddr = RegisterRegion(dryL, sizeof(dryL));
+    dryRAddr = RegisterRegion(dryR, sizeof(dryR));
+    wetLAddr = RegisterRegion(wetL, sizeof(wetL));
+    wetRAddr = RegisterRegion(wetR, sizeof(wetR));
+
+    for (b = 0; b < 5; b++) {
+        int16_t expDryL[8], expDryR[8], expWetL[8], expWetR[8];
+        char label[128];
+
+        /* envmix_xbits=0: every nibble value must be ignored -- the pre-fix shipped behaviour. */
+        for (i = 0; i < 8; i++) {
+            expDryL[i] = (int16_t)(((int32_t)src[i] * (int32_t)curVolLeft) >> 16);
+            expDryR[i] = (int16_t)(((int32_t)src[i] * (int32_t)curVolRight) >> 16);
+            expWetL[i] = (int16_t)(((int32_t)expDryL[i] * reverbQ16) >> 16);
+            expWetR[i] = (int16_t)(((int32_t)expDryR[i] * reverbQ16) >> 16);
+        }
+        EnvMixerXBitsCase(kBits[b], 0 /* lever off */, srcAddr, src, dryLAddr, dryRAddr, wetLAddr,
+                          wetRAddr, dryL, dryR, wetL, wetR);
+        snprintf(label, sizeof(label), "envmix_xbits=0, nibble=%s: bits ignored (old behaviour) dry-left", kNames[b]);
+        CheckS16Array(label, expDryL, dryL, 8, 0);
+        snprintf(label, sizeof(label), "envmix_xbits=0, nibble=%s: bits ignored (old behaviour) dry-right", kNames[b]);
+        CheckS16Array(label, expDryR, dryR, 8, 0);
+        snprintf(label, sizeof(label), "envmix_xbits=0, nibble=%s: bits ignored (old behaviour) wet-left", kNames[b]);
+        CheckS16Array(label, expWetL, wetL, 8, 0);
+        snprintf(label, sizeof(label), "envmix_xbits=0, nibble=%s: bits ignored (old behaviour) wet-right", kNames[b]);
+        CheckS16Array(label, expWetR, wetR, 8, 0);
+
+        /* envmix_xbits=1: matches mupen64plus-rsp-hle's alist_envmix_nead xor formula, derived
+           here independently of n64_audio_hle.c's own arithmetic. */
+        {
+            int32_t xorWetLeft  = 0 - (int32_t)((kBits[b] & 0x8u) >> 1); /* mupen's xors[2] */
+            int32_t xorWetRight = 0 - (int32_t)((kBits[b] & 0x4u) >> 1); /* mupen's xors[3] */
+            int32_t xorDryLeft  = 0 - (int32_t)((kBits[b] & 0x2u) >> 1); /* mupen's xors[0] */
+            int32_t xorDryRight = 0 - (int32_t)(kBits[b] & 0x1u);        /* mupen's xors[1] */
+            for (i = 0; i < 8; i++) {
+                int32_t dl = ((((int32_t)src[i] * (int32_t)curVolLeft) >> 16) ^ xorDryLeft);
+                int32_t dr = ((((int32_t)src[i] * (int32_t)curVolRight) >> 16) ^ xorDryRight);
+                int32_t wl = (((dl * reverbQ16) >> 16) ^ xorWetLeft);
+                int32_t wr = (((dr * reverbQ16) >> 16) ^ xorWetRight);
+                expDryL[i] = (int16_t)dl;
+                expDryR[i] = (int16_t)dr;
+                expWetL[i] = (int16_t)wl;
+                expWetR[i] = (int16_t)wr;
+            }
+        }
+        EnvMixerXBitsCase(kBits[b], 1 /* lever on */, srcAddr, src, dryLAddr, dryRAddr, wetLAddr,
+                          wetRAddr, dryL, dryR, wetL, wetR);
+        snprintf(label, sizeof(label), "envmix_xbits=1, nibble=%s (mupen alist_envmix_nead xor) dry-left", kNames[b]);
+        CheckS16Array(label, expDryL, dryL, 8, 0);
+        snprintf(label, sizeof(label), "envmix_xbits=1, nibble=%s (mupen alist_envmix_nead xor) dry-right", kNames[b]);
+        CheckS16Array(label, expDryR, dryR, 8, 0);
+        snprintf(label, sizeof(label), "envmix_xbits=1, nibble=%s (mupen alist_envmix_nead xor) wet-left", kNames[b]);
+        CheckS16Array(label, expWetL, wetL, 8, 0);
+        snprintf(label, sizeof(label), "envmix_xbits=1, nibble=%s (mupen alist_envmix_nead xor) wet-right", kNames[b]);
+        CheckS16Array(label, expWetR, wetR, 8, 0);
+    }
+
+    /* Fast-kernel decline: [debug] audio_simd must never carry these semantics in the packed
+       kernel -- gdx_hlefast_envmix declines (returns 0) whenever its xorBits argument is
+       nonzero, the same "prove or decline" contract as every other op in n64_audio_hle_fast.c.
+       Forced on for this sub-check only (ENVMIX_PACKED=index 4, ENVMIX_SCALAR=index 5 of
+       GdxHleFastPath), then restored to whatever GDX_TEST_HLE_FAST selected for every later
+       test in this binary. */
+    {
+        const char* fastEnv = getenv("GDX_TEST_HLE_FAST");
+        const int fastOn = (fastEnv != NULL && fastEnv[0] == '1') ? 1 : 0;
+        uint32_t before[8], after[8];
+
+        gdx_audio_hle_set_fast(1);
+
+        gdx_hlefast_path_counts(before);
+        EnvMixerXBitsCase(0x0u /* control: inert nibble, lever on */, 1, srcAddr, src, dryLAddr,
+                          dryRAddr, wetLAddr, wetRAddr, dryL, dryR, wetL, wetR);
+        gdx_hlefast_path_counts(after);
+        CheckEq32("envmix_xbits control (nibble=0): fast kernel path count DID advance (packed or scalar ran)",
+                  1, ((after[4] + after[5]) > (before[4] + before[5])) ? 1 : 0);
+
+        gdx_hlefast_path_counts(before);
+        EnvMixerXBitsCase(0x4u /* x1: the bit real reverb-send content sets */, 1, srcAddr, src,
+                          dryLAddr, dryRAddr, wetLAddr, wetRAddr, dryL, dryR, wetL, wetR);
+        gdx_hlefast_path_counts(after);
+        CheckEq32("envmix_xbits=1, x1 set: fast kernel DECLINED (path counts unchanged, reference ran)",
+                  (int64_t)before[4] + (int64_t)before[5], (int64_t)after[4] + (int64_t)after[5]);
+
+        gdx_audio_hle_set_fast(fastOn);
+    }
+
+    return 1;
+}
+
+// =================================================================================================
 // TEST 10 -- A_MIXER saturation. Real aMix SATURATES on hardware: the RSP stores through a
 // saturating vector op and DMEM only ever holds s16. Mixing two near-full-scale buffers at
 // near-unity gain overflows that range, and a missing clamp would silently WRAP a huge positive sum
@@ -1513,6 +1756,110 @@ static int TestAdpcmExtremeCoefficientAndMaxScaleSaturates(void) {
        INT32_MIN before the shift, producing -32768: a full-scale POLARITY FLIP, not a clean clip. */
     CheckEq32("order-2 predictor + max scale(15): saturates to +32767, no int32-overflow polarity flip",
               32767, out[0]);
+
+    return 1;
+}
+
+// =================================================================================================
+// TEST 13b -- [debug] adpcm_scale_clamp (AUDIOFIX round 4): A_ADPCM's frame header packs SCALE
+// into the high nibble (RunAdpcm's `shift`), a raw 4-bit field this interpreter has always used
+// unclamped (`nibble << shift`). mupen64plus-rsp-hle's reference (src/audio.h
+// adpcm_predict_sample, src/alist.c adpcm_predict_frame_4bits: `rshift = (scale < 12) ? 12 -
+// scale : 0`) nets out to `nibble << scale` ONLY for scale < 12 -- for scale 12..15 the `rshift`
+// clamp to 0 caps the EFFECTIVE shift at exactly 12 no matter how far past 12 the nibble goes.
+// Found against docs/research/native/audiofix-progress.md's round-4 fresh-capture diff (SS17):
+// a real scale-13 frame in race-mutecity-start's own audio data, 2x overshoot (-16384 vs mupen's
+// -8192). Zeroing the book coefficients isolates the residual term (predicted=0), so
+// out[0] == nibble << effective_shift exactly, closed-form, no saturation ambiguity below scale
+// 15 (nibble=1 keeps every unclamped shift <= 15 within int32 and only scale=15 needs the
+// existing ClampS16 saturate, checked separately from the clamp itself). Checks: (1) lever OFF
+// is bit-identical to every build before this one, scale 11..15 all still shift by their raw
+// value (NOT yet mupen-reference-exact); (2) lever ON matches mupen for scale < 12 (unchanged)
+// AND clamps scale 12..15 to the SAME effective shift of 12.
+// =================================================================================================
+/* Registered ONCE by the caller and reused across every scale/lever combination this test tries
+   (10 calls) -- matching EnvMixerXBitsCase's own note just above TEST 9b: DmemLoad/DmemSave/
+   RegisterRegion each burn a fresh, never-freed slot of the harness's fixed 256-entry region
+   table, and this suite has no room for 10 calls x 4 slots each. */
+static int32_t AdpcmScaleClampCase(uint32_t scale, int leverOn, uint32_t bookAddr, int16_t* book,
+                                   uint32_t stateAddr, int16_t* state, uint32_t framePaddedAddr,
+                                   uint8_t* framePadded, uint32_t outAddr, int16_t* out) {
+    uint8_t frame[9];
+    int8_t nibbles[16];
+    Cmd cmds[3];
+    extern void gdx_audio_hle_set_adpcm_scale_clamp(int on);
+
+    gdx_audio_hle_set_adpcm_scale_clamp(leverOn);
+
+    memset(book, 0, 16 * sizeof(int16_t)); /* both predictor rows zero: predicted == 0 */
+    memset(state, 0, 16 * sizeof(int16_t)); /* hist1/hist2 == 0, same reason */
+
+    memset(nibbles, 0, sizeof(nibbles));
+    nibbles[0] = 1; /* smallest positive nibble: residual == 1 << effective_shift, no sign noise */
+    PackAdpcmFrame(frame, (uint8_t)((scale << 4) & 0xF0u) /* predIdx=0 */, nibbles);
+    memset(framePadded, 0, 16);
+    memcpy(framePadded, frame, 9);
+
+    cmds[0] = MkClearBuff(0x0F80, 16);
+    cmds[1] = MkLoadBuff(0x0F80, 16, framePaddedAddr);
+    RunCmds(cmds, 2);
+    cmds[0] = MkLoadAdpcm(16 * sizeof(int16_t), bookAddr);
+    cmds[1] = MkSetBuff(0x0F80, 0x0FC0, 32 /* 16 samples */);
+    cmds[2] = MkAdpcm(0 /* A_CONTINUE: hist1/hist2 read from the zeroed state tail */, stateAddr);
+    RunCmds(cmds, 3);
+    /* SAVEBUFF writes directly into `out`'s already-registered host memory -- no DmemSave
+       (and its own fresh RegisterRegion call) needed per invocation. */
+    cmds[0] = MkSaveBuff(0x0FC0 + 32, 32, outAddr);
+    RunCmds(cmds, 1);
+
+    gdx_audio_hle_set_adpcm_scale_clamp(0); /* restore the default so later tests see lever-off */
+    return out[0];
+}
+
+static int TestAdpcmScaleClampLever(void) {
+    uint32_t scale;
+    char label[160];
+    int16_t book[16], state[16], out[32];
+    uint8_t framePadded[16];
+    uint32_t bookAddr = RegisterRegion(book, sizeof(book));
+    uint32_t stateAddr = RegisterRegion(state, sizeof(state));
+    uint32_t framePaddedAddr = RegisterRegion(framePadded, sizeof(framePadded));
+    uint32_t outAddr = RegisterRegion(out, sizeof(out));
+
+    /* Lever OFF: unclamped, every scale shifts by its own raw value (pre-fix behaviour,
+       bit-identical to every build before this round). scale=15 saturates (1<<15 == 32768,
+       clamped to INT16_MAX by the existing ClampS16 -- not this lever's concern). */
+    for (scale = 11; scale <= 14; scale++) {
+        int32_t got = AdpcmScaleClampCase(scale, 0, bookAddr, book, stateAddr, state,
+                                          framePaddedAddr, framePadded, outAddr, out);
+        int32_t want = (int32_t)1 << scale;
+        snprintf(label, sizeof(label),
+                 "adpcm_scale_clamp=0, scale=%u: unclamped shift (pre-fix, 1<<%u)", scale, scale);
+        CheckEq32(label, want, got);
+    }
+    {
+        int32_t got = AdpcmScaleClampCase(15, 0, bookAddr, book, stateAddr, state,
+                                          framePaddedAddr, framePadded, outAddr, out);
+        CheckEq32("adpcm_scale_clamp=0, scale=15: unclamped shift saturates (1<<15, ClampS16)",
+                  32767, got);
+    }
+
+    /* Lever ON: scale < 12 unchanged (matches mupen already); scale 12..15 all clamp to the
+       SAME effective shift of 12 (1<<12 == 4096), exactly mupen's `rshift` clamp. */
+    {
+        int32_t got = AdpcmScaleClampCase(11, 1, bookAddr, book, stateAddr, state,
+                                          framePaddedAddr, framePadded, outAddr, out);
+        CheckEq32("adpcm_scale_clamp=1, scale=11 (< 12): unchanged, matches mupen already",
+                  (int32_t)1 << 11, got);
+    }
+    for (scale = 12; scale <= 15; scale++) {
+        int32_t got = AdpcmScaleClampCase(scale, 1, bookAddr, book, stateAddr, state,
+                                          framePaddedAddr, framePadded, outAddr, out);
+        snprintf(label, sizeof(label),
+                 "adpcm_scale_clamp=1, scale=%u (>= 12): clamped to effective shift 12 (mupen's rshift=0)",
+                 scale);
+        CheckEq32(label, 4096, got);
+    }
 
     return 1;
 }
@@ -1766,6 +2113,88 @@ static int TestEnvMixerNeadRampAndRegression(void) {
 }
 
 // =================================================================================================
+// TEST 4f -- [debug] audio_rs_align (o3dscrackle): a resample split across two command lists, each
+// given EXACTLY the input samples the RSP consumes followed by garbage, must equal one unsplit
+// resample. That is the ROM's contract (AudioSynth_ProcessNote sizes the load from pitch * count,
+// because the RSP's window x[c-4..c-1] never reads past its cursor -- mupen64plus-rsp-hle
+// alist_resample `ipos -= 4`, Project64 RESAMPLE `srcPtr -= 4`). Mode 1 must meet it bit for bit.
+// Mode 0 (the historical x[c-1..c+2] window) reads two samples of garbage on the first list's
+// last outputs: the tick-boundary step [audiocrk] measured. Its failure is asserted too, so this
+// test keeps its teeth if someone "fixes" the garbage away.
+// =================================================================================================
+static void ResampleSplitCase(int align, uint32_t pitch, int16_t* single, int16_t* split) {
+    extern void gdx_audio_hle_set_rs_align(int on);
+    int16_t stream[96];
+    int16_t buf[48];
+    int16_t state[16];
+    uint32_t consumed;
+    int i;
+    for (i = 0; i < 96; i++) {
+        stream[i] = (int16_t)(6000 * ((i % 11) - 5) + 37 * i); /* busy content, no plateaus */
+    }
+    gdx_audio_hle_set_rs_align(align);
+    /* unsplit: 32 outputs over the whole stream (taps never run off its end) */
+    memset(state, 0, sizeof(state));
+    {
+        uint32_t stateAddr = RegisterRegion(state, sizeof(state));
+        Cmd cmds[2];
+        DmemLoad(0x0800, stream, sizeof(stream));
+        cmds[0] = MkSetBuff(0x0800, 0x0900, 64 /* 32 output samples */);
+        cmds[1] = MkResample(1 /* A_INIT */, pitch, stateAddr);
+        RunCmds(cmds, 2);
+        DmemSave(0x0900, single, 64);
+    }
+    /* split: 16 + 16 outputs, each list's input = the consumed samples, then 0x7FFF garbage */
+    consumed = (16u * (pitch << 1)) >> 16; /* A_INIT starts the accumulator at 0 */
+    memset(state, 0, sizeof(state));
+    {
+        uint32_t stateAddr = RegisterRegion(state, sizeof(state));
+        Cmd cmds[2];
+        for (i = 0; i < 48; i++) {
+            buf[i] = (i < (int)consumed) ? stream[i] : (int16_t)0x7FFF;
+        }
+        DmemLoad(0x0800, buf, sizeof(buf));
+        cmds[0] = MkSetBuff(0x0800, 0x0900, 32);
+        cmds[1] = MkResample(1 /* A_INIT */, pitch, stateAddr);
+        RunCmds(cmds, 2);
+        DmemSave(0x0900, split, 32);
+        for (i = 0; i < 48; i++) {
+            buf[i] = stream[consumed + (uint32_t)i];
+        }
+        DmemLoad(0x0800, buf, sizeof(buf));
+        cmds[0] = MkSetBuff(0x0800, 0x0900, 32);
+        cmds[1] = MkResample(0 /* A_CONTINUE */, pitch, stateAddr);
+        RunCmds(cmds, 2);
+        DmemSave(0x0900, split + 16, 32);
+    }
+    gdx_audio_hle_set_rs_align(0);
+}
+
+static int TestResampleAlignSplitContract(void) {
+    static const uint32_t kPitches[3] = { 0x8000u, 0x9000u, 0x6000u };
+    int16_t single[32];
+    int16_t split[32];
+    int p;
+    for (p = 0; p < 3; p++) {
+        char label[96];
+        int differs = 0;
+        int i;
+        ResampleSplitCase(1, kPitches[p], single, split);
+        snprintf(label, sizeof(label), "rs_align=1 pitch 0x%04X: split == unsplit (no lookahead)",
+                 (unsigned)kPitches[p]);
+        CheckS16Array(label, single, split, 32, 0);
+        ResampleSplitCase(0, kPitches[p], single, split);
+        for (i = 0; i < 32; i++) {
+            differs |= (single[i] != split[i]);
+        }
+        snprintf(label, sizeof(label), "rs_align=0 pitch 0x%04X: split reads the garbage (the defect)",
+                 (unsigned)kPitches[p]);
+        CheckEq32(label, 1, differs);
+    }
+    return 1;
+}
+
+// =================================================================================================
 // TEST 16 -- A_RESAMPLE count rounding. RunResample rounds its requested byte count up to a whole
 // 8-sample (16-byte) granule (mupen alist.c#L621-639's `(count+0xf)&~0xf`), so a caller requesting
 // a NON-16-byte-aligned count still gets the FULL rounded output written, and the persisted state
@@ -1879,8 +2308,8 @@ static int TestAddMixerGainlessUnityAdd(void) {
 }
 
 // =================================================================================================
-// TEST 18 -- ADPCM deferred clamping, loud-transient parity. An INTEGRATOR codebook (predicted ==
-// hist1 exactly, book[8]=Q11-unity, book[0]=0) with 5 consecutive strongly-positive residuals
+// TEST 18 -- ADPCM deferred clamping, loud-transient parity. An INTEGRATOR predictor (a1 = Q11
+// unity on hist1, a2 = 0), as a FULL book matrix, with 5 consecutive strongly-positive residuals
 // pushes the running RAW sum past +32767 MID-FRAME, then a negative residual pulls it back down --
 // to a value an always-clamp integrator can never reach, since it permanently re-bases off the
 // clamped ceiling the instant it first clips. Both an OLD-style (always clamp) and the NEW
@@ -1897,9 +2326,11 @@ static int TestAdpcmDeferredClampingLoudTransient(void) {
     int32_t hOld, hNew; /* running integrator state: CLAMPED for hOld, RAW for hNew */
     int i;
 
-    memset(book, 0, sizeof(book));
-    book[0] = 0;    /* hist2 weight -- unused (isolates a pure hist1 integrator) */
-    book[8] = 2048; /* hist1 weight, Q11-unity -> predicted == hist1 exactly */
+    /* Full 8-column integrator matrix. A column-0-only book (what this test used before
+       A17/dspclick) decodes as a 2-tap FIR under the shipped block-convolution path, which cannot
+       express an intra-frame overshoot at all -- so the clamping semantics under test were
+       unobservable and a correct decoder failed. See MakeOrder2Book. */
+    MakeOrder2Book(book, 2048, 0);
 
     memset(nibbles, 0, sizeof(nibbles));
     for (i = 0; i < 5; i++) nibbles[i] = 7; /* +7<<10 = +7168 each, 5x pushes the sum past 32767 */
@@ -2035,6 +2466,468 @@ static int TestAdpcmLastFramePreambleContract(void) {
     return 1;
 }
 
+// =================================================================================================
+// TEST 20 -- the codebook-matrix contract, and where deferred clamping actually ENDS (A17).
+//
+// This is the regression guard for the mistake that made two of this suite's tests read as a
+// decoder bug (dspclick-progress.md). Everything here uses the INTEGRATOR predictor (a1 = Q11
+// unity, a2 = 0), whose recursion decoded[n] = decoded[n-1] + residual[n] is EXACT in integers, so
+// the reference models below are plain accumulators -- independent of the block-convolution
+// formula rather than a restatement of it.
+//
+// (a) NEGATIVE CONTROL: the same predictor written as a column-0-only book (`book[8] = 2048`, the
+//     shape that is exact for the LEGACY sequential path) must NOT decode as an integrator under
+//     the shipped path. If this ever starts matching, either the decode regressed to the
+//     per-sample form or someone "simplified" MakeOrder2Book away, and the analytic expectations in
+//     TESTs 4d/18 quietly stop testing what they say.
+// (b) The real book matrix DOES decode as the integrator recursion, bit-exact.
+// (c) WHERE the deferred clamp ends: aspMain carries the RAW running value through an 8-sample
+//     SUB-BLOCK and re-enters the next sub-block from the CLAMPED output (mupen64plus-rsp-hle:
+//     `l1 = dst[6]; l2 = dst[7]`). The crafted frame overshoots +32767 twice -- once mid-sub-block
+//     (recovered raw, i=5) and once ACROSS the 7->8 sub-block boundary -- so all three candidate
+//     semantics give different bytes and the shipped one is pinned to exactly one of them.
+// =================================================================================================
+static int TestAdpcmBookMatrixAndSubBlockClampBoundary(void) {
+    int16_t bookFull[16], bookCol0Only[16];
+    int8_t nibbles[16];
+    uint8_t frame[9], framePadded[16];
+    int16_t outFull[16], outCol0[16];
+    int16_t modelSubBlock[16]; /* raw within a sub-block, clamped at the 8-sample boundary */
+    int16_t modelFrameRaw[16]; /* raw across all 16 samples (what TEST 18's model name implies) */
+    int16_t modelAlwaysClamp[16]; /* clamped every sample (the pre-A4 behaviour) */
+    int32_t e[16];
+    int i;
+
+    MakeOrder2Book(bookFull, 2048, 0);
+    memset(bookCol0Only, 0, sizeof(bookCol0Only));
+    bookCol0Only[8] = 2048; /* the malformed shape: column 0 only */
+
+    /* shift = 10, so residual = nibble << 10. Overshoot +32767 at i=4, recover at i=5 (observable
+       ONLY if the frame body carries the raw value), overshoot again at i=6/7, then pull back at
+       i=8 -- the first sample of the NEXT sub-block. */
+    memset(nibbles, 0, sizeof(nibbles));
+    nibbles[0] = 7; nibbles[1] = 7; nibbles[2] = 7; nibbles[3] = 7; nibbles[4] = 7;
+    nibbles[5] = -8;
+    nibbles[6] = 7; nibbles[7] = 7;
+    nibbles[8] = -8;
+    for (i = 0; i < 16; i++) {
+        e[i] = (int32_t)nibbles[i] << 10;
+    }
+    PackAdpcmFrame(frame, 0xA0 /* shift=10 (0xA), predIdx=0 */, nibbles);
+    memset(framePadded, 0, sizeof(framePadded));
+    memcpy(framePadded, frame, 9);
+
+    /* --- Independent reference models (pure integer accumulators). --- */
+    {
+        int32_t raw = 0;
+        for (i = 0; i < 16; i++) {
+            if (i == 8) {
+                raw = (int32_t)modelSubBlock[7]; /* re-enter from the CLAMPED sub-block output */
+            }
+            raw += e[i];
+            modelSubBlock[i] = RefClampS16(raw);
+        }
+    }
+    {
+        int32_t raw = 0;
+        for (i = 0; i < 16; i++) {
+            raw += e[i];
+            modelFrameRaw[i] = RefClampS16(raw);
+        }
+    }
+    {
+        int32_t h = 0;
+        for (i = 0; i < 16; i++) {
+            modelAlwaysClamp[i] = RefClampS16(h + e[i]);
+            h = (int32_t)modelAlwaysClamp[i];
+        }
+    }
+
+    /* --- Decode the same frame twice: correct matrix, then the malformed column-0-only book. --- */
+    {
+        uint32_t fullAddr = RegisterRegion(bookFull, sizeof(bookFull));
+        uint32_t col0Addr = RegisterRegion(bookCol0Only, sizeof(bookCol0Only));
+        int16_t state[16];
+        uint32_t stateAddr;
+        Cmd cmds[3];
+
+        memset(state, 0, sizeof(state));
+        stateAddr = RegisterRegion(state, sizeof(state));
+        DmemLoad(0x0B00, framePadded, 16);
+        cmds[0] = MkLoadAdpcm(sizeof(bookFull), fullAddr);
+        cmds[1] = MkSetBuff(0x0B00, 0x0B40, 32 /* 16 samples */);
+        cmds[2] = MkAdpcm(1 /* A_INIT */, stateAddr);
+        RunCmds(cmds, 3);
+        DmemSave(0x0B40 + 32, outFull, 32);
+
+        memset(state, 0, sizeof(state));
+        stateAddr = RegisterRegion(state, sizeof(state));
+        DmemLoad(0x0B00, framePadded, 16);
+        cmds[0] = MkLoadAdpcm(sizeof(bookCol0Only), col0Addr);
+        cmds[1] = MkSetBuff(0x0B00, 0x0BC0, 32);
+        cmds[2] = MkAdpcm(1 /* A_INIT */, stateAddr);
+        RunCmds(cmds, 3);
+        DmemSave(0x0BC0 + 32, outCol0, 32);
+    }
+
+    /* (b) The real book matrix decodes as the order-2 recursion, with the sub-block clamp boundary. */
+    CheckS16Array("block decode with a REAL book matrix == integrator recursion", modelSubBlock,
+                  outFull, 16, 0);
+
+    /* (a) NEGATIVE CONTROL: the column-0-only book must NOT behave as that integrator. */
+    {
+        int differs = 0;
+        for (i = 0; i < 16; i++) {
+            if (outCol0[i] != modelSubBlock[i]) { differs = 1; break; }
+        }
+        gSubChecks++;
+        if (!differs) {
+            gSubFails++;
+            printf("       MISMATCH: a column-0-only codebook decoded as a full order-2 integrator "
+                   "-- the book MATRIX is no longer load-bearing (see MakeOrder2Book)\n");
+        }
+    }
+
+    /* (c) The crafted frame separates all three clamping semantics, so (b) is not vacuous: the
+           shipped decode must differ from BOTH the frame-wide-raw and the always-clamp models. */
+    {
+        int diffRaw = 0, diffAlways = 0;
+        for (i = 0; i < 16; i++) {
+            if (modelSubBlock[i] != modelFrameRaw[i]) { diffRaw = 1; }
+            if (modelSubBlock[i] != modelAlwaysClamp[i]) { diffAlways = 1; }
+        }
+        gSubChecks++;
+        if (!diffRaw) {
+            gSubFails++;
+            printf("       MISMATCH: frame does not straddle the 8-sample sub-block clamp boundary "
+                   "-- the sub-block-vs-frame-raw distinction is untested\n");
+        }
+        gSubChecks++;
+        if (!diffAlways) {
+            gSubFails++;
+            printf("       MISMATCH: frame does not exercise deferred clamping at all -- "
+                   "always-clamp would pass this test\n");
+        }
+    }
+
+    return 1;
+}
+
+
+// =================================================================================================
+// TEST 21 -- THE MIX. dspclick-progress.md §6.2: "the suite tests kernels, never the MIX. Several
+// voices summing into a saturating bus is audible as crackle with every kernel bit-exact." This is
+// that test, and it is also the gate on port/gdx_audio_mix_census.c, the [debug] audiomix census.
+//
+// The shape under test is the countdown's: a small number of LOUD, simultaneous voices landing on
+// one dry bus, against sustained music's many quiet ones. Two things are asserted, and they are
+// different claims:
+//
+//   (a) SEMANTICS. The bus SATURATES, it does not wrap. The RSP's mix ops store through a
+//       saturating vector op and DMEM only ever holds s16 (mupen64plus-rsp-hle's envmix_nead ends
+//       every destination in clamp_s16), so `bus = clamp(bus + voice)` per voice IS the console.
+//       A wrap here would flip a loud sum's sign -- an instant, maximally audible crackle on
+//       exactly the loudest content, which is the reported symptom.
+//   (b) MEASUREMENT. The census counts that saturation exactly: every pre-clamp accumulator, the
+//       peak, and the headroom histogram. [audioring]'s `level peak=` is taken on the DELIVERED
+//       stream, where a clipped sample and a merely-loud one are the same byte pair, which is why
+//       it has never caught this.
+// =================================================================================================
+#define MIX_SRC   0x0E40u
+#define MIX_DRYL  0x0A00u
+#define MIX_DRYR  0x0A40u
+#define MIX_WETL  0x0A80u
+#define MIX_WETR  0x0AC0u
+#define MIX_OUT   0x0B00u
+#define MIX_N     8
+
+/* One "tick": four cleared buses, a flat envelope (no ramp, no reverb send), `voices` copies of
+   the same loud source mixed into the same dry pair, then the interleave the census taps. */
+static int BuildLoudMixTick(Cmd* cmds, int voices, uint32_t vol) {
+    int n = 0;
+    int v;
+    cmds[n++] = MkClearBuff(MIX_DRYL, MIX_N * 2);
+    cmds[n++] = MkClearBuff(MIX_DRYR, MIX_N * 2);
+    cmds[n++] = MkClearBuff(MIX_WETL, MIX_N * 2);
+    cmds[n++] = MkClearBuff(MIX_WETR, MIX_N * 2);
+    cmds[n++] = MkEnvSetup1(0 /* reverb vol */, 0, 0, 0); /* no wet send, no ramps */
+    cmds[n++] = MkEnvSetup2(vol, vol);
+    for (v = 0; v < voices; v++) {
+        cmds[n++] = MkEnvMixer(MIX_SRC, MIX_N, 0, MIX_DRYL, MIX_DRYR, MIX_WETL, MIX_WETR);
+    }
+    cmds[n++] = MkInterleave(MIX_OUT, MIX_DRYL, MIX_DRYR, MIX_N * 2);
+    return n;
+}
+
+/* The reference census: the same arithmetic the interpreter must do, written out independently.
+   Bucket edges are UPPER edges and EXCLUSIVE -- see gdx_audio_mix_census.c. */
+static const uint32_t kRefBucketEdge[7] = { 4096u, 8192u, 16384u, 24576u, 32768u, 40960u, 49152u };
+
+static unsigned int RefBucket(uint32_t mag) {
+    unsigned int i;
+    for (i = 0; i < 7u; i++) {
+        if (mag < kRefBucketEdge[i]) {
+            return i;
+        }
+    }
+    return 7u;
+}
+
+typedef struct {
+    uint64_t adds, sat, hr[8], outs, railed;
+    uint32_t peak, railRun, outPeak;
+    int16_t finalDryL[MIX_N];
+} RefMix;
+
+static void RefRecordAdd(RefMix* r, int32_t pre) {
+    uint32_t mag = (pre < 0) ? (uint32_t)(-pre) : (uint32_t)pre;
+    r->adds++;
+    r->hr[RefBucket(mag)]++;
+    if (mag > r->peak) {
+        r->peak = mag;
+    }
+    if ((pre > 32767) || (pre < -32768)) {
+        r->sat++;
+    }
+}
+
+static void RefRecordOut(RefMix* r, int32_t v, uint32_t* run) {
+    uint32_t mag = (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
+    r->outs++;
+    if (mag > r->outPeak) {
+        r->outPeak = mag;
+    }
+    if ((v >= 32767) || (v <= -32768)) {
+        r->railed++;
+        (*run)++;
+        if (*run > r->railRun) {
+            r->railRun = *run;
+        }
+    } else {
+        *run = 0u;
+    }
+}
+
+static void RefLoudMixTick(RefMix* r, const int16_t* src, int voices, uint32_t vol) {
+    int32_t busL[MIX_N], busR[MIX_N], busWL[MIX_N], busWR[MIX_N];
+    uint32_t run = 0u;
+    int v, i;
+
+    memset(r, 0, sizeof(*r));
+    for (i = 0; i < MIX_N; i++) {
+        busL[i] = 0; busR[i] = 0; busWL[i] = 0; busWR[i] = 0;
+    }
+    for (v = 0; v < voices; v++) {
+        for (i = 0; i < MIX_N; i++) {
+            int32_t dl = ((int32_t)src[i] * (int32_t)vol) >> 16;
+            int32_t dr = dl;
+            int32_t wl = 0; /* envReverbVol2 == 0: the wet cascade contributes nothing */
+            int32_t wr = 0;
+            RefRecordAdd(r, busL[i] + dl);  busL[i]  = RefClampS16(busL[i] + dl);
+            RefRecordAdd(r, busR[i] + dr);  busR[i]  = RefClampS16(busR[i] + dr);
+            RefRecordAdd(r, busWL[i] + wl); busWL[i] = RefClampS16(busWL[i] + wl);
+            RefRecordAdd(r, busWR[i] + wr); busWR[i] = RefClampS16(busWR[i] + wr);
+        }
+    }
+    for (i = 0; i < MIX_N; i++) {
+        RefRecordOut(r, busL[i], &run);
+        RefRecordOut(r, busR[i], &run);
+        r->finalDryL[i] = (int16_t)busL[i];
+    }
+}
+
+/* Runs one tick with the census armed and compares every counter against the reference. */
+static void CheckMixTick(const char* label, const int16_t* src, int voices, uint32_t vol) {
+    Cmd cmds[8 + 16];
+    GdxAudioMixStats st;
+    RefMix ref;
+    int16_t dryL[MIX_N];
+    int n;
+    int i;
+    char desc[128];
+
+    RefLoudMixTick(&ref, src, voices, vol);
+
+    DmemLoad(MIX_SRC, src, MIX_N * 2);      /* unarmed: setup must not enter the census */
+    n = BuildLoudMixTick(cmds, voices, vol);
+
+    gdx_audiomix_configure(1, 0);           /* arm; mode 1 = counters only, sink is a stub here */
+    RunCmds(cmds, n);
+    gdx_audiomix_snapshot(&st);
+    gdx_audiomix_configure(0, 0);           /* disarm before the read-back task */
+
+    DmemSave(MIX_DRYL, dryL, MIX_N * 2);
+
+    snprintf(desc, sizeof(desc), "%s: census adds", label);      CheckEq32(desc, (int64_t)ref.adds, (int64_t)st.adds);
+    snprintf(desc, sizeof(desc), "%s: census sat", label);       CheckEq32(desc, (int64_t)ref.sat, (int64_t)st.sat);
+    snprintf(desc, sizeof(desc), "%s: census peak", label);      CheckEq32(desc, (int64_t)ref.peak, (int64_t)st.peak);
+    snprintf(desc, sizeof(desc), "%s: census outs", label);      CheckEq32(desc, (int64_t)ref.outs, (int64_t)st.outs);
+    snprintf(desc, sizeof(desc), "%s: census railed", label);    CheckEq32(desc, (int64_t)ref.railed, (int64_t)st.railed);
+    snprintf(desc, sizeof(desc), "%s: census railrun", label);   CheckEq32(desc, (int64_t)ref.railRun, (int64_t)st.railRun);
+    snprintf(desc, sizeof(desc), "%s: census outpeak", label);   CheckEq32(desc, (int64_t)ref.outPeak, (int64_t)st.outPeak);
+    snprintf(desc, sizeof(desc), "%s: census tasks", label);     CheckEq32(desc, 1, (int64_t)st.tasks);
+    snprintf(desc, sizeof(desc), "%s: census voicesmax", label); CheckEq32(desc, voices, (int64_t)st.voicesMax);
+    for (i = 0; i < 8; i++) {
+        snprintf(desc, sizeof(desc), "%s: census hr[%d] (UPPER edge)", label, i);
+        CheckEq32(desc, (int64_t)ref.hr[i], (int64_t)st.hr[i]);
+    }
+    /* The semantics half: DMEM must hold the SATURATED bus, never a wrapped one. */
+    CheckS16Array(label, ref.finalDryL, dryL, MIX_N, 0);
+}
+
+static int TestMixBusHeadroomCensus(void) {
+    int16_t loud[MIX_N];
+    int i;
+
+    for (i = 0; i < MIX_N; i++) {
+        loud[i] = 26000; /* ~0.79 full scale, one countdown-grade voice */
+    }
+
+    /* (a) FOUR loud voices: the second one already puts the bus past full scale and the clamp
+       eats the rest. This is the shape the countdown makes. */
+    CheckMixTick("MIX 4 loud voices @0xFFF0", loud, 4, 0xFFF0u);
+
+    /* (b) The NEGATIVE CONTROL, and it is the reason a green `sat=0` on a real run means
+       anything at all: the same four voices at 1/8 volume never reach the rail, and the census
+       must report exactly zero saturation and zero railed output. An instrument that cannot
+       report clean is not a measurement. */
+    {
+        GdxAudioMixStats st;
+        Cmd cmds[8 + 16];
+        int n;
+        DmemLoad(MIX_SRC, loud, MIX_N * 2);
+        n = BuildLoudMixTick(cmds, 4, 0x2000u);
+        gdx_audiomix_configure(1, 0);
+        RunCmds(cmds, n);
+        gdx_audiomix_snapshot(&st);
+        gdx_audiomix_configure(0, 0);
+        CheckEq32("MIX quiet control: sat == 0", 0, (int64_t)st.sat);
+        CheckEq32("MIX quiet control: railed == 0", 0, (int64_t)st.railed);
+        CheckEq32("MIX quiet control: sattasks == 0", 0, (int64_t)st.satTasks);
+        /* 26000 * 0x2000 >> 16 = 3250 per voice, four of them = 13000: comfortably clean, and
+           the histogram must say so rather than merely not complaining. */
+        CheckEq32("MIX quiet control: peak == 4 x 3250", 13000, (int64_t)st.peak);
+        CheckEq32("MIX quiet control: nothing at or above full scale",
+                  0, (int64_t)(st.hr[5] + st.hr[6] + st.hr[7]));
+    }
+
+    /* (c) The same four loud voices, checked cell by cell against the reference. */
+    CheckMixTick("MIX 4 loud voices, re-run", loud, 4, 0xFFF0u);
+
+    /* (d) TWO voices, still loud enough to clip exactly once per sample: pins that `sat` tracks
+       the number of ADDS that clipped, not the number of clipped output samples. */
+    CheckMixTick("MIX 2 loud voices @0xFFF0", loud, 2, 0xFFF0u);
+
+    return 1;
+}
+
+// =================================================================================================
+// TEST 22 -- the structural bound the mix topology imposes, which is worth pinning because it is
+// what makes `peak` a bounded number rather than an unbounded one: the bus is CLAMPED after every
+// single voice, so the accumulator entering the next voice is already s16. No number of voices,
+// however loud, can push a pre-clamp bus value past 2x full scale minus one (32767 + 32767).
+//
+// This matters for reading a real capture. A mix that overflows by 6 dB and a mix that overflows
+// by 40 dB report the SAME `peak` here, because the clamp between voices throws the difference
+// away. `sat` (how many adds clipped) and `railrun` (how long the output sat on the rail) are the
+// numbers that still carry magnitude; `peak` alone must never be quoted as "how overdriven".
+// =================================================================================================
+static int TestMixSaturationBound(void) {
+    int16_t loud[MIX_N];
+    GdxAudioMixStats st;
+    Cmd cmds[8 + 40];
+    int i;
+    int n;
+
+    for (i = 0; i < MIX_N; i++) {
+        loud[i] = 32767;
+    }
+    DmemLoad(MIX_SRC, loud, MIX_N * 2);
+    n = BuildLoudMixTick(cmds, 32, 0xFFF0u); /* 32 full-scale voices on one bus */
+    gdx_audiomix_configure(1, 0);
+    RunCmds(cmds, n);
+    gdx_audiomix_snapshot(&st);
+    gdx_audiomix_configure(0, 0);
+
+    CheckEq32("MIX bound: 32 full-scale voices still cannot exceed 2x FS - 1",
+              1, (int64_t)(st.peak <= 65534u));
+    gSubChecks++;
+    if (st.peak < 32768u) {
+        gSubFails++;
+        printf("       MISMATCH: MIX bound: 32 full-scale voices did not clip at all (peak=%u)\n",
+               (unsigned)st.peak);
+    }
+    CheckEq32("MIX bound: voicesmax", 32, (int64_t)st.voicesMax);
+    CheckEq32("MIX bound: worst-task voices", 32, (int64_t)st.worstVoices);
+    CheckEq32("MIX bound: worst-task sat == session sat (one task)",
+              (int64_t)st.sat, (int64_t)st.worstSat);
+    CheckEq32("MIX bound: every output sample railed", 16, (int64_t)st.railed);
+    CheckEq32("MIX bound: the rail is CONTIGUOUS (one run of 16)", 16, (int64_t)st.railRun);
+    return 1;
+}
+
+// =================================================================================================
+// TEST 23 -- the histogram's edges, pinned. Every bucket label is its UPPER edge and the edge is
+// EXCLUSIVE. This project has already published a histogram read as lower edges once, and the
+// misreading reached the user; TEST 23 is the tripwire, so a future "tidy-up" of the ladder cannot
+// silently shift every bucket by one.
+//
+// Driven through A_ADDMIXER (gainless clamped add), whose pre-clamp value is exactly out + in, so
+// an arbitrary target is reachable with two s16 operands and no scaling to reason about.
+// =================================================================================================
+static void CheckBucketOf(int32_t target, unsigned int expectBucket, int expectSat) {
+    int16_t inBuf[8], outBuf[8];
+    GdxAudioMixStats st;
+    Cmd cmd;
+    int32_t half = target / 2;
+    int32_t rest = target - half;
+    unsigned int i;
+    unsigned int got = 99u;
+    char desc[128];
+
+    for (i = 0; i < 8u; i++) {
+        inBuf[i] = (int16_t)half;
+        outBuf[i] = (int16_t)rest;
+    }
+    DmemLoad(0x0E40, inBuf, 16);
+    DmemLoad(0x0E80, outBuf, 16);
+    cmd = MkAddMixer(1 /* count8 -> 8 samples */, 0x0E40, 0x0E80);
+
+    gdx_audiomix_configure(1, 0);
+    RunCmds(&cmd, 1);
+    gdx_audiomix_snapshot(&st);
+    gdx_audiomix_configure(0, 0);
+
+    for (i = 0; i < 8u; i++) {
+        if (st.hr[i] == 8u) {
+            got = i;
+        }
+    }
+    snprintf(desc, sizeof(desc), "headroom bucket of pre-clamp %ld", (long)target);
+    CheckEq32(desc, (int64_t)expectBucket, (int64_t)got);
+    snprintf(desc, sizeof(desc), "saturation flag at pre-clamp %ld", (long)target);
+    CheckEq32(desc, expectSat ? 8 : 0, (int64_t)st.sat);
+}
+
+static int TestMixHeadroomBucketEdges(void) {
+    static const int32_t kEdge[7] = { 4096, 8192, 16384, 24576, 32768, 40960, 49152 };
+    int i;
+
+    for (i = 0; i < 7; i++) {
+        /* One below the edge stays in bucket i; the edge itself falls into bucket i+1. */
+        CheckBucketOf(kEdge[i] - 1, (unsigned int)i, (kEdge[i] - 1) > 32767);
+        CheckBucketOf(kEdge[i], (unsigned int)(i + 1), kEdge[i] > 32767);
+    }
+    /* Magnitude, not sign: a negative bus lands in the same bucket as its positive twin. */
+    CheckBucketOf(-(kEdge[2]), 3u, 0);
+    /* The clamp's ASYMMETRY, which the census must honour: -32768 is representable and is NOT
+       a clipped sample, while -32769 is. An off-by-one here would report a permanent low-level
+       clip rate on any bus that ever reaches the negative rail. */
+    CheckBucketOf(-32768, 5u, 0);
+    CheckBucketOf(-32769, 5u, 1);
+    return 1;
+}
+
 typedef int (*TestFn)(void);
 typedef struct {
     const char* name;
@@ -2062,21 +2955,38 @@ int main(void) {
         { "FILTER: cross-call continuity (tail carried, no LUT averaging)", TestFilterContinuity },
         { "FILTER: protocol-level low-pass (identity unity, row-5 LP, state carry)", TestFilterLowpassProtocol },
         { "ENVMIXER: constant envelope, nead cascade (wet off dry, per channel)", TestEnvMixerConstantGain },
+        { "ENVMIXER: [debug] envmix_xbits x0-x3 sign-negate fix (mupen nead parity, round 4)", TestEnvMixerXBitsSignNegateFix },
         { "MIXER: near-full-scale accumulate saturates, no wraparound",   TestMixerSaturation },
         { "ADPCM: order-2 predictor INDEX selection (predIdx != 0)",      TestAdpcmPredictorIndexSelection },
         { "ADPCM: extreme coef + max scale(15), no int32-overflow flip",  TestAdpcmExtremeCoefficientAndMaxScaleSaturates },
+        { "ADPCM: [debug] adpcm_scale_clamp caps scale>=12 at shift 12 (mupen parity, round 4)", TestAdpcmScaleClampLever },
         { "REVERB: A_MIXER decay op never grows (Mute City tunnel boom)", TestReverbDecayNoGrowth },
         { "SETLOOP: persists across separate gdx_audio_hle_run calls (A1)", TestSetLoopPersistsAcrossCalls },
         { "ENVMIXER: per-block ramp stepping + wet cascade + full-vol regression (A2)", TestEnvMixerNeadRampAndRegression },
         { "RESAMPLE: count-rounding continuity, non-16-aligned split (A5)", TestResampleCountRoundingContinuity },
+        { "RESAMPLE: audio_rs_align=1 split == unsplit, no lookahead (o3dscrackle)", TestResampleAlignSplitContract },
         { "ADDMIXER: gainless unity add, matches mupen alist_add (A6)",   TestAddMixerGainlessUnityAdd },
         { "ADPCM: deferred clamping, loud-transient parity (A4)",         TestAdpcmDeferredClampingLoudTransient },
         { "ADPCM: last-frame preamble output layout + state persistence", TestAdpcmLastFramePreambleContract },
+        { "ADPCM: book MATRIX contract + sub-block clamp boundary (A17)", TestAdpcmBookMatrixAndSubBlockClampBoundary },
+        { "MIX: multi-voice bus headroom census, saturate-not-wrap (A18)", TestMixBusHeadroomCensus },
+        { "MIX: per-voice clamp bounds the bus at 2x full scale (A18)",   TestMixSaturationBound },
+        { "MIX: headroom histogram edges are UPPER and EXCLUSIVE (A18)",  TestMixHeadroomBucketEdges },
     };
     const int numTests = (int)(sizeof(tests) / sizeof(tests[0]));
     int i;
     int failedTests = 0;
 
+    /* C4k: GDX_TEST_HLE_FAST=1 runs every test below on the [debug] audio_simd fast kernels
+       (n64_audio_hle_fast.c). tools/ci-3ds.sh runs the suite both ways: the correctness claims
+       this file makes must hold on the path the Old 3DS ships, not only on the reference. */
+    {
+        extern void gdx_audio_hle_set_fast(int on);
+        const char* fastEnv = getenv("GDX_TEST_HLE_FAST");
+        const int fastOn = (fastEnv != NULL && fastEnv[0] == '1') ? 1 : 0;
+        gdx_audio_hle_set_fast(fastOn);
+        printf("HLE kernels: %s\n", fastOn ? "fast (audio_simd=1)" : "reference (audio_simd=0)");
+    }
     printf("=== G-Diffuser DSP unit-test harness (port/n64_audio_hle.c) ===\n\n");
 
     for (i = 0; i < numTests; i++) {

@@ -1,0 +1,73 @@
+# ek-widgetdrop: OPERATE the course editor -- move the cursor onto the CREATE
+# top-bar item, press A to drop its menu open, then B to close it.
+#
+# EXPANSION-KIT-ONLY AND DISK-ONLY, exactly as ek-courseedit.gdxs explains:
+# main_menu.c:222's EK arm bounces the cursor off MODE_COURSE_EDIT (4) whenever
+# gLeoDriveConnectionState == 0. NOT a corpus replay, SHOTs hand-placed -- what is
+# being proved is that a specific widget state exists and what it looks like.
+#
+# B11o. ektranslate's biggest stated gap was "nothing was OPERATED in either
+# editor": both prior EK replays enter a screen and sit there. This one opens a
+# drop-down, which is the only way to reach func_xk1_800276B0's narrow-scissor arm
+# (expansion_kit/A3AE0.c:1033).
+#
+# Derivation of every number below, from the decomp's own data:
+#  - cursor starts at (160, 120)          course_edit/188850.c:47
+#  - stick step is 0.05*stick/2 px/tick   course_edit/188850.c:1009
+#    so stickX=-80 is -2 px/tick and stickY=+80 is -2 px/tick
+#  - 56 ticks left  : x 160 -> 48
+#  - 46 ticks up    : y 120 -> 28
+#  - CREATE is gCourseEditWidget item 0, hit box x [24,72) y [20,36)
+#    (A3AE0.c:759 left=24 top=20 xStep=48, hit test A3AE0.c:816)
+#    so (48, 28) is the centre of item 0 in both axes.
+#  - A there opens gCreateWidget (left=24, top=36, 6 items, yStep=16).
+#  - B closes it (A3AE0.c func_xk1_80027B74, via 19DD60.c:275).
+build native/ekwidget
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=1 bridgemain=1 det=1
+note CREATE drop-down: gCreateWidget left=24 top=36 yStep=16, 6 items 48x16.
+at 350
+wait 1
+at 400
+press START 15 0
+at 600
+wait 1
+shot menu_before
+at 660
+press DOWN 12 0
+at 760
+wait 1
+shot menu_cursor
+at 820
+press A 12 0
+at 1100
+wait 1
+shot editor
+at 1200
+stick -80 0 56
+at 1300
+stick 0 80 46
+at 1400
+wait 1
+shot cursor_create
+at 1440
+press A 12 0
+at 1560
+wait 1
+shot drop_open_0
+at 1800
+wait 1
+shot drop_open_1
+at 2100
+wait 1
+shot drop_open_2
+at 2300
+press B 12 0
+at 2450
+wait 1
+shot drop_closed_0
+at 2700
+wait 1
+shot drop_closed_1
+len 2900

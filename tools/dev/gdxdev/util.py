@@ -63,7 +63,7 @@ def repo_root():
 
 
 def default_track():
-    """Track name = worktree basename (PROTOCOL.md: one worktree per track)."""
+    """Track name = worktree basename (PROTOCOL.md: ~/code/gdx-3ds/<name>)."""
     return os.path.basename(repo_root())
 
 

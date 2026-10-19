@@ -22,8 +22,19 @@
 #include <3ds.h>
 
 #include "gdx3ds_config.h"          /* gdx3ds_os PUBLIC include dir */
+#include "gdx3ds_vram_guard.h"       /* n60boot: bottom CPU writers check for VRAM */
+#include "gdx3ds_frameskip.h"       /* drawn = host iterations - skipped; the mode label */
 #include "gfx/gdx3ds_gpu_prof.h"    /* gdx3ds_gpuprof_hud_sample */
 
+/* hw bug n60-3d8, item 3: the real branch@hash now comes from this generated, build-time
+ * header (port/3ds/cmake/gdx3ds_gen_build_id.cmake) instead of a configure-time -D; the
+ * __has_include guard + #ifndef below is a safety net for a build that never generated or
+ * wired up the include path for it. */
+#if defined(__has_include)
+#if __has_include("gdx3ds_build_id.h")
+#include "gdx3ds_build_id.h"
+#endif
+#endif
 #ifndef GDX3DS_BUILD_ID
 #define GDX3DS_BUILD_ID "unknown-build"
 #endif
@@ -36,10 +47,24 @@ static int sEnabled = 0;
 static u64 sWindowStartTick = 0;
 static u32 sWindowHostFrames = 0;
 static unsigned sWindowStartGameFrames = 0;
+static unsigned long sWindowStartSkipped = 0;
 
 /* Print one HUD row: CSI H to the row's column 1 (window-relative), content
  * padded/truncated to the console width so stale characters never survive. */
 extern void gdx3ds_console_passthrough(int on) __attribute__((weak));
+/* n60hwdiag (gfx/nrr/gdx3ds_nrr_crumb.c): "b3 s3:mach" while the boot-cycling bisect runs, else "". */
+extern const char* gdx3ds_nrr_crumb_tag(void) __attribute__((weak));
+extern const char* gdx3ds_launch_tag(void) __attribute__((weak));
+
+/* The row's lead tag: the launch variant ("[N]", n60launch) then the NRR bisect's boot/subset
+ * (n60hwdiag); "" when neither is on. */
+static const char* RowTag(void) {
+    static char tag[48];
+    const char* launch = gdx3ds_launch_tag != NULL ? gdx3ds_launch_tag() : "";
+    const char* nrr = gdx3ds_nrr_crumb_tag != NULL ? gdx3ds_nrr_crumb_tag() : "";
+    snprintf(tag, sizeof(tag), "%s%s%s", launch, (launch[0] && nrr[0]) ? " " : "", nrr);
+    return tag;
+}
 
 static void HudPaintRow(int row, const char* text) {
     char line[64];
@@ -87,13 +112,14 @@ void gdx3ds_fps_hud_init(void) {
     /* Own the bottom-screen console. Re-running consoleInit after the backend's
      * debug.console init is harmless (it re-clears an empty screen — nothing has
      * printed yet at this point in boot) and gives us the PrintConsole*. */
+    gdx3ds_vram_guard_bottom_cpu_write("fps hud"); /* n60boot */
     sHudConsole = consoleInit(GFX_BOTTOM, NULL);
     if (gdx3ds_menu_enabled()) {
         /* MENU owns the layout: it inits right after this and paints everything
          * (fps row included) itself. Skip the legacy 3-row paint. */
         return;
     }
-    HudPaint("fps --.-  game --.-",
+    HudPaint("drawn --.- game --.-",
              "",
              "build " GDX3DS_BUILD_ID);
 }
@@ -121,15 +147,48 @@ int gdx3ds_fps_hud_get_enabled(void) {
     return sEnabled;
 }
 
+/* Frames per second x10 over `ms` (one decimal, integer-only). */
+static unsigned long RateX10(unsigned long count, u32 ms) {
+    return count * 10000ul / ms;
+}
+
+/* "drawn 22.4 game 59.9 steady D3": DRAWN = host iterations that presented a frame (a
+ * FRAMESKIP skip iteration runs the logic tick but presents nothing); GAME = the decomp's
+ * logic-frame rate (gGameFrameCount); then the frameskip mode. */
+static void FormatFpsRow(char* row, size_t cap, unsigned gameFrameCount, u32 elapsedMs) {
+    char mode[16];
+    const unsigned long skipped = gdx3ds_frameskip_skipped_total() - sWindowStartSkipped;
+    const unsigned long drawn = skipped < sWindowHostFrames ? sWindowHostFrames - skipped : 0;
+    const unsigned long drawnX10 = RateX10(drawn, elapsedMs);
+    const unsigned long gameX10 = RateX10((unsigned long)(gameFrameCount - sWindowStartGameFrames), elapsedMs);
+    gdx3ds_frameskip_mode_label(mode, sizeof(mode));
+    const char* tag = RowTag();
+    /* n60hwdiag: the bisect's boot/subset tag leads, so a 40-column row never cuts it */
+    snprintf(row, cap, "%s%sdrawn %lu.%lu game %lu.%lu %s", tag, tag[0] ? " " : "", drawnX10 / 10, drawnX10 % 10,
+             gameX10 / 10, gameX10 % 10, mode);
+}
+
 void gdx3ds_fps_hud_tick(unsigned gameFrameCount) {
     if (!sEnabled) {
         return;
     }
     const u64 now = svcGetSystemTick();
     if (sWindowStartTick == 0) {
+        /* n60hwdiag: the bisect's boot/subset tag on screen from the first frame */
+        const char* tag = RowTag();
+        if (tag[0] != '\0') {
+            char row[64];
+            snprintf(row, sizeof(row), "%s drawn --.- game --.-", tag);
+            if (gdx3ds_menu_enabled()) {
+                gdx3ds_menu_set_fps_line(row);
+            } else {
+                HudPaint(row, NULL, NULL);
+            }
+        }
         /* First tick: baseline only (boot time must not dilute the first rate). */
         sWindowStartTick = now;
         sWindowStartGameFrames = gameFrameCount;
+        sWindowStartSkipped = gdx3ds_frameskip_skipped_total();
         return;
     }
     sWindowHostFrames++;
@@ -138,14 +197,8 @@ void gdx3ds_fps_hud_tick(unsigned gameFrameCount) {
         return;
     }
 
-    /* Rates in tenths (fps = frames * 1000 / ms, x10 for one decimal). */
-    const unsigned long hostFpsX10 = (unsigned long)sWindowHostFrames * 10000ul / elapsedMs;
-    const unsigned long gameFpsX10 =
-        (unsigned long)(gameFrameCount - sWindowStartGameFrames) * 10000ul / elapsedMs;
-
     char row1[48];
-    snprintf(row1, sizeof(row1), "fps %lu.%lu  game %lu.%lu",
-             hostFpsX10 / 10, hostFpsX10 % 10, gameFpsX10 / 10, gameFpsX10 % 10);
+    FormatFpsRow(row1, sizeof(row1), gameFrameCount, elapsedMs);
 
     if (gdx3ds_menu_enabled()) {
         /* MENU owns the console: hand the fps line over; it repaints row 1 on its
@@ -176,4 +229,5 @@ void gdx3ds_fps_hud_tick(unsigned gameFrameCount) {
     sWindowStartTick = now;
     sWindowHostFrames = 0;
     sWindowStartGameFrames = gameFrameCount;
+    sWindowStartSkipped = gdx3ds_frameskip_skipped_total();
 }

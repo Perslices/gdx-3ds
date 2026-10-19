@@ -1,0 +1,76 @@
+diff --git a/src/overlays/ovl_i3/hud.c b/src/overlays/ovl_i3/hud.c
+index bc08b2e..020c87b 100644
+--- a/src/overlays/ovl_i3/hud.c
++++ b/src/overlays/ovl_i3/hud.c
+@@ -614,6 +614,71 @@ Gfx* Hud_UpdatePlayerHudInfo(Gfx* gfx, s32 numPlayersIndex, s32 playerIndex) {
+     return gfx;
+ }
+ 
++#ifdef PORT
++/* COORDINATOR FIX (hw bug n60-3d7, item 3): "the YOU GOT BOOST POWER top-screen message AND its
++ * voice line were missing" in SPLIT/ALL_BOTTOM placement. Root cause: menus.c's suppression of
++ * the top HUD in those modes skips the ENTIRE Hud_DrawHud call, which is the only call site for
++ * Hud_UpdatePlayerHudInfo above -- and that "drawing" function is actually where the real side
++ * effects live: the newLap edge-detect that sets lapFlashTimer/lapIntervalCounter/
++ * gPlayerLapNumbers (which menus.c's OWN, never-suppressed Menus_DrawPlayerBoosterOk/
++ * Menus_DrawPlayerFinalLap calls read to decide whether to draw their message), and the
++ * Audio_TriggerSystemSE(NA_SE_17/18) announcer voice lines for the 2nd-lap/final-lap moments.
++ * Suppressing the draw silently dropped all of that too. Fix: menus.c now calls this instead of
++ * Hud_DrawHud when the top HUD is suppressed -- every side effect from Hud_UpdatePlayerHudInfo's
++ * newLap branch and its per-frame lapFlashTimer decrement, reproduced verbatim, with NO drawing
++ * at all (not even the gDPPipeSync/gDPSetRenderMode state-only commands, which have no observable
++ * effect without a draw call following them, and not func_i3_8012F450's unk_0C timer, which only
++ * feeds a draw this path never makes). Pure logic/audio, safe to run unconditionally regardless
++ * of whether the top HUD is visible. */
++void Hud_AdvanceLapAnnouncementsOnly(s32 playerIndex) {
++    s32 lap;
++    bool newLap;
++
++    if (gGameMode == GAMEMODE_DEATH_RACE) {
++        return;
++    }
++
++    lap = gRacers[playerIndex].lap;
++    newLap = false;
++
++    if (gGameMode == GAMEMODE_PRACTICE) {
++        if (gRacers[playerIndex].startNewPracticeLap) {
++            newLap = true;
++        }
++    } else if (gPlayerLapNumbers[playerIndex] < lap) {
++        newLap = true;
++    }
++
++    if (newLap) {
++        gRacers[playerIndex].startNewPracticeLap = false;
++        gPlayerLapNumbers[playerIndex] = lap;
++
++        D_i3_80141EA8[playerIndex].lapFlashTimer = D_i3_8013EFFC;
++        if ((gRacers[playerIndex].position != 1) || (gGameMode == GAMEMODE_TIME_ATTACK)) {
++            D_i3_80141EA8[playerIndex].lapIntervalCounter = 90;
++        }
++        if ((lap == 2) && !sSecondLapStarted && gEnableRaceSfx && (gGameMode != GAMEMODE_PRACTICE)) {
++            Audio_TriggerSystemSE(NA_SE_17);
++            sSecondLapStarted = true;
++        }
++        if ((lap == gTotalLapCount) && !sFinalLapStarted && gEnableRaceSfx && (gGameMode != GAMEMODE_PRACTICE)) {
++            Audio_TriggerSystemSE(NA_SE_18);
++            sFinalLapStarted = true;
++        }
++    }
++
++    if (D_i3_80141EA8[playerIndex].lapFlashTimer == D_i3_8013EFFC) {
++        sPreviousLapTimes[playerIndex] = gRacers[playerIndex].lapTimes[(lap + 1) % 3];
++    }
++
++    if (D_i3_80141EA8[playerIndex].lapFlashTimer > 0) {
++        if (!gGamePaused) {
++            D_i3_80141EA8[playerIndex].lapFlashTimer--;
++        }
++    }
++}
++#endif
++
+ Gfx* Hud_DrawEnergyBar(Gfx* gfx, s32 numPlayersIndex, s32 playerIndex) {
+     s32 i;
+     s32 energyWidth;

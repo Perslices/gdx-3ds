@@ -104,3 +104,16 @@ size_t gdx3ds_tex_upload_clamp_bytes(size_t want) {
     }
     return sCapBytes;
 }
+
+/* N60TEX [debug] tex_fast (default 0): the table/word forms of the texture decoders and the
+ * upload's texel writer -- identical bytes, fewer instructions (gfx/gdx3ds_texswz.h,
+ * gfx/n64/gdx_texcache.cpp). Read once, after the ini is loaded (the first upload). */
+static int sTexFast = -1;
+
+int gdx3ds_tex_fast_enabled(void) {
+    if (sTexFast < 0) {
+        sTexFast = gdx3ds_config_get_int("debug", "tex_fast", 0) != 0;
+        gdx_dbg_logf("[tex-fast] init tex_fast=%d\n", sTexFast);
+    }
+    return sTexFast;
+}

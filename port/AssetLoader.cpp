@@ -13,6 +13,9 @@
 
 #include "gdx_stall.h" // A10: the archive read (SD + inflate) is the load-stall leaf
 #include "port_log.h" // gdx_port_logf (bounded archive-read failure diagnostics)
+#if defined(GDX_PLATFORM_3DS)
+#include "3ds/include/gdx3ds_hitch.h" // HITCH: archive reads (SD + inflate) per frame
+#endif
 
 namespace {
 
@@ -139,6 +142,12 @@ extern "C" int GDiffuser_LoadArchiveFileBytes(const char* key, void* out, size_t
     gdx_stall_begin(GDX_STALL_FS);
     auto file = rm->LoadFileProcess(std::string(key));
     gdx_stall_end();
+#if defined(GDX_PLATFORM_3DS)
+    gdx3ds_hitch_add(GDX_HITCH_EV_ARC_LOAD, 1u);
+    if ((file != nullptr) && (file->Buffer != nullptr)) {
+        gdx3ds_hitch_add(GDX_HITCH_EV_ARC_LOAD_BYTES, (uint32_t) file->Buffer->size());
+    }
+#endif
     if ((file == nullptr) || (file->Buffer == nullptr)) {
         return archiveFail((file == nullptr) ? "LoadFileProcess-null (entry missing?)" : "null-buffer");
     }

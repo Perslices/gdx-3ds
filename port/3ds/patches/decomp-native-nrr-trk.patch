@@ -1,0 +1,28 @@
+diff --git a/src/game/course.c b/src/game/course.c
+--- a/src/game/course.c
++++ b/src/game/course.c
+@@ -5061,6 +5061,14 @@
+     D_800F8958[0].chunk = D_800F8958[1].chunk = NULL;
+     D_800F89C0 = 0;
+ 
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++    /* n60 [native] nrr_trk (port/3ds/gfx/nrr/gdx3ds_nrr_trk.h): the lean walk runs this loop's state
++       machine (every walk global, the texture-state GBI) and writes resident template ops instead of
++       vertices; 0 = not taken (lever off, not the 1P race scope, verify), and the stock loop runs. */
++    if (gdxtrk_nrr_walk(sSegmentChunkGroups, segmentChunkGroupEnd)) {
++        goto gdx_nrr_walked;
++    }
++#endif
+     while (true) {
+         var_fv1 = -10000.0f;
+ 
+@@ -5084,6 +5092,9 @@
+         }
+         furthestChunkGroup->averageDepth = -20000.0f;
+     }
++#if defined(PORT) && defined(GDX_NATIVE_TRACK)
++gdx_nrr_walked:
++#endif
+ 
+     if (D_800F892C == 1) {
+         gSPTexture(sCourseDisp++, 0, 0, 0, 1, G_OFF);

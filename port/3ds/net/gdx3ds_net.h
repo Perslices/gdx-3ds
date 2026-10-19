@@ -2,15 +2,24 @@
  *
  * Turns the hardware loop from "carry an SD card" into "push over WiFi": a log link that
  * mirrors the filelog sink to the host, and a control listener that accepts PING / file
- * pushes / RELOAD (self-relaunch through Luma's hb:ldr) / CAPTURE / REPLAY / INI / QUIT.
+ * pushes / pulls (GET, confined to sdmc:/3ds/gdiffuser/) / RELOAD (self-relaunch through
+ * Luma's hb:ldr) / CAPTURE / REPLAY / INI / QUIT.
  *
  * KILLSWITCH — sdmc:/3ds/gdiffuser/gdiffuser.ini:
  *
  *   [net]
- *   enabled  = 0                          ; MASTER SWITCH, DEFAULT OFF. 0 = this whole TU
- *                                         ; is inert: no SOC buffer, no thread, no socket,
- *                                         ; no [net] receipt, and the [watchdog] line keeps
- *                                         ; its pre-hwlink shape (no net= field).
+ *   enabled  = 0                          ; MASTER SWITCH. DEFAULT IS CONDITIONAL: ON when
+ *                                         ; hbmenu's netloader (3dslink) launched us
+ *                                         ; (__3dslink_host nonzero at gdx3ds_net_init time
+ *                                         ; -- see "Bring-up" below), OFF for a plain
+ *                                         ; hbmenu/SD/CIA launch with no netloader involved.
+ *                                         ; An EXPLICIT `enabled = 0` or `= 1` in the ini
+ *                                         ; always wins over either default -- the ini is
+ *                                         ; never second-guessed, only its ABSENCE is. 0
+ *                                         ; (explicit or defaulted) = this whole TU is
+ *                                         ; inert: no SOC buffer, no thread, no socket, no
+ *                                         ; [net] receipt, and the [watchdog] line keeps its
+ *                                         ; pre-hwlink shape (no net= field).
  *   port     = 17492                      ; control listener (TCP, 0.0.0.0)
  *   log_port = 17491                      ; log link (LINK3DS_COMM_PORT — `3dslink -s`
  *                                         ; and tools/dev/hw.py log both speak it)

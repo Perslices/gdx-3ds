@@ -1,0 +1,27 @@
+--- a/src/overlays/ovl_i3/menus.c
++++ b/src/overlays/ovl_i3/menus.c
+@@ -1733,7 +1733,24 @@
+     Matrix_SetLockedLookAt(gGfxPool->unk_21988, NULL, 0.07f, 0.07f, 0.07f, lookAt.x, lookAt.y, lookAt.z, up.x, up.y,
+                            up.z, pos.x, pos.y, pos.z);
+     gSPMatrix(gfx++, gGfxPool->unk_21988, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_MODELVIEW);
++#if defined(PORT) && defined(GDX_NATIVE_DRESS)
++    /* n60lap [native] finish_direct (port/3ds/gfx/gdx3ds_dress_sink.c): the FINISH banner's twelve
++       texture loads per frame (two textures, alternating) go through the effects section's
++       direct-load scope -- resolved once, TMEM left as debt, the import's hash memoised per
++       source. Markers written only while the lever is armed: off, the list is unchanged. */
++    {
++        extern int gdx_finish_scope_marker(void* slot, int open);
++        if (gdx_finish_scope_marker(gfx, 1)) {
++            gfx++;
++        }
++        gSPDisplayList(gfx++, aFinishDL);
++        if (gdx_finish_scope_marker(gfx, 0)) {
++            gfx++;
++        }
++    }
++#else
+     gSPDisplayList(gfx++, aFinishDL);
++#endif
+     gSPPopMatrix(gfx++, G_MTX_MODELVIEW);
+     gSPPopMatrix(gfx++, G_MTX_MODELVIEW);
+ 

@@ -1,0 +1,55 @@
+# race-gp-finish: a FINISHED Grand Prix race (n60lap's GP finish scratch, committed by n60finish).
+# The menu walk and race start of explosion-pileup.gdxs up to tick 3300 (GP, JACK cup, MUTE CITY,
+# the 30-machine pack), then NO pad input until the results: NEEDS `--ini debug.autodrive=1` (the
+# CPU driver steers player 1 through the 3 laps, decomp-3ds-autodrive.patch). The finish line is
+# crossed near tick ~9900: the spinning 3D FINISH banner (Menus_DrawFinish / aFinishDL) draws
+# until ~10450, then the GP lap-times screen, the results and the standings; A every 400 ticks
+# from 10600 walks the post-race screens.
+# SHOT PLACEMENT IS NOT AUTHORED HERE (NEXT.md B15/B43): the .gdxrec carries the schedule.
+build native/n60finish (input of n60lap-gpfin, native/explosions@e2691f9)
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 rival_detail_auto=0 stereo=1 fh_every=0
+
+at 400
+press START 15 0
+at 800
+press A 15 0
+at 1100
+press A 15 0
+at 1400
+press A 15 0
+at 1700
+press A 15 0
+at 2000
+press A 15 0
+at 2300
+press A 15 0
+at 2600
+press A 15 0
+at 2900
+press A 15 0
+at 3200
+press A 15 0
+at 3300
+at 10600
+press A 15 0
+at 11000
+press A 15 0
+at 11400
+press A 15 0
+at 11800
+press A 15 0
+at 12200
+press A 15 0
+at 12600
+press A 15 0
+at 13000
+press A 15 0
+at 13400
+press A 15 0
+at 13800
+press A 15 0
+at 14200
+press A 15 0
+len 15000

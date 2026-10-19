@@ -129,8 +129,6 @@ pads = 1           ; DEV ONLY. Number of controller ports to report (1-4). The 3
                    ;     pad. 1 is the hardware behaviour, byte for byte. Receipt: [input] pads=
 
 [native]           ; the native renderer levers (read once at boot; 0 = the exact prior path)
-                   ; full reference, including the compatibility and census keys not listed
-                   ; here: docs/NATIVE-RENDERER.md §2
 all = 0            ; master for the TIER-2 levers only (machines, track, fx_sink, fx_sprites,
                    ;     fx_hud): 1 = each of those that is 0/absent reads as 1 (a lever set to
                    ;     2 keeps verify). Never touches interp.
@@ -173,23 +171,6 @@ The boot log states every lever once, as RESOLVED (the `all` master already appl
 (resolved: all=tier2 only, interp explicit; ...)`, and the interpreter path once:
 `[native] interp= path=lus|owned ... hooks=`. The DBG tab shows the same state on its
 NATIVE rows.
-
-### Memory, disk and Expansion Kit keys
-
-Three more groups of `[debug]` keys exist on this branch and are documented in one place,
-`docs/NATIVE-RENDERER.md` §2.6, rather than repeated here:
-
-- **Memory.** `audio_stream` (stream the 10.25 MB sample bank off the heap) and `tex_upload_kb`
-  (cap the 4 MiB texture staging reservation). Both default to the historical behaviour. With
-  `-DGDX_3DS_RDRAM_MB=8` they are what makes the shipped build fit an Old 3DS heap grant — a
-  configuration that has been measured under a simulated grant and **never run on an Old 3DS**.
-- **Disk.** `disk_stream = 2` serves a 64DD image off the SD card with no resident copy, plus
-  its cache and receipt keys. Only meaningful in an Expansion Kit build.
-- **Expansion Kit.** `ek_english` applies the baked English text pack over a Japanese disk.
-
-The Expansion Kit itself is `-DGDX_3DS_EXPANSION_KIT=ON`, which produces a **different binary of
-the whole game**, not the shipped one plus overlays, and needs your own ~64.9 MB `.ndd` at
-runtime. Read `docs/NATIVE-RELEASE-NOTES.md` §2 and §8 before building it.
 
 ## 6. Controls
 
@@ -282,7 +263,7 @@ Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MS
    ```
    (`git clone --recurse-submodules` still works and just fetches more than the 3DS lane uses.)
 3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
-   deltas are the 24 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
+   deltas are the 52 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
    tree in the order listed in `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that
    idempotently and then builds:
    ```sh

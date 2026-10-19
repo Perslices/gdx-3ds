@@ -88,9 +88,10 @@ def _add_model(p):
     from . import retro
     p.add_argument("--model", dest="model", default=None,
                    choices=sorted(retro.MODELS),
-                   help="emulated system model: %s (default: the core's own, New 3DS). "
-                        "--model old is the Old 3DS lane; it forces the core-options "
-                        "redirect, so --gfx starts being honoured too."
+                   help="emulated system model: %s (default: the core's own, New 3DS; "
+                        "every run now writes the per-instance core-options redirect, so "
+                        "this is a label on the same value the core already defaults to). "
+                        "--model old is the Old 3DS lane."
                         % ", ".join("%s (%s)" % (k, v)
                                     for k, v in sorted(retro.MODELS.items())))
 

@@ -37,6 +37,8 @@ typedef struct GdxRtCallbacks {
 /* Reads the ini, creates the thread. Returns the mode (0 = sequential path). Logs `[rt] ...`. */
 int gdx3ds_rt_init(const GdxRtCallbacks* cb);
 int gdx3ds_rt_mode(void);
+/* 1 once gdx3ds_rt_init has run (the mode is final). */
+int gdx3ds_rt_inited(void);
 
 /* ---- per-iteration protocol (main thread) ---- */
 void gdx3ds_rt_join_idle(void);    /* loop top / teardown: wait until the ring is drained */

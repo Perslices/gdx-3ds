@@ -1,0 +1,61 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5724,7 +5724,10 @@
+  * (a racer whose (slot, LOD, pass) has no complete record yet, crashed machines, the LOD-6 speck,
+  * time-attack ghosts) is written as the stock commands, in stock order, after the marker; the
+  * marker arms the port's recorder for them, which is how a record is made.
+- * Returns NULL (the section builds the stock way) in the GP ending cutscene / course editor. */
++ * Also covers the GP ending cutscene (GAMEMODE_GP_END_CS): its racers are placed by the same
++ * Racer_Init/Course_Init path a real race uses, so the section's snapshot is exactly as valid
++ * (nimach, 2026-10-15; nicensus measured ~1240 cmds/f of stock-walked machine-body geometry here
++ * before this). Returns NULL (the section builds the stock way) in the EK course editor only. */
+ static void Racer_NrrMachPoses(void) {
+     Racer* racer;
+ 
+@@ -5948,13 +5951,15 @@
+     u32 bodyLegacyMask = 0;
+ 
+     (void) sec;
+-#ifndef EXPANSION_KIT
+-    if (gGameMode == GAMEMODE_GP_END_CS) {
+-#else
+-    if (gGameMode == GAMEMODE_GP_END_CS || gGameMode == GAMEMODE_COURSE_EDIT) {
+-#endif
++#ifdef EXPANSION_KIT
++    /* nimach (native-review-2026-10-15.md / nicensus, 2026-10-15): GAMEMODE_GP_END_CS no longer
++     * declines here -- its racers are placed by the same Racer_Init/Course_Init path a real race
++     * uses (EndingCutscene_Init calls both), so this section's snapshot is exactly as valid as
++     * it is mid-race. The course editor still has no racers in the sense this section expects. */
++    if (gGameMode == GAMEMODE_COURSE_EDIT) {
+         return NULL;
+     }
++#endif
+     f->n = 0;
+     lod6Skip = gdx_rival_lod6_skip();
+     /* N60PREWARM: in the race's opaque appear frame, the stock draws of every (machine, LOD, pass) without a
+
+diff --git a/src/overlays/ending/ending.c b/src/overlays/ending/ending.c
+--- a/src/overlays/ending/ending.c
++++ b/src/overlays/ending/ending.c
+@@ -700,7 +700,20 @@
+     gSPMatrix(gfx++, D_1000000.unk_20208, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+ 
+     gfx = Camera_Draw(gfx, SCISSOR_BOX_FULL_SCREEN, 0);
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++    /* nimach (native-review-2026-10-15.md follow-up, decomp-native-gp-end-mach.patch): this call
++     * is outside Race_Draw's RHEAD..TRANS bracket, so c5tick's BODY consume never opens for it on
++     * its own (gdx3ds_c5tick.c gdx_dl_skip: sRaceScope stays 0 here). gdx_dl_scene_mach gives the
++     * mach c5tick BODY consumer (Racer_NrrMachStub, [native] nrr_mach) a chance to claim it; it is
++     * a scope of its own, separate from niview's gdx_dl_scene (Records_Draw's flyby), so arming it
++     * here can never reach into that unrelated scene. */
++    extern void gdx_dl_scene_mach(int on);
++    gdx_dl_scene_mach(1);
++    gfx = Racer_Draw(gfx, 0);
++    gdx_dl_scene_mach(0);
++#else
+     gfx = Racer_Draw(gfx, 0);
++#endif
+     gfx = EndingCutsceneEffects_DrawPodiumRacerCharacters(gfx);
+     return EndingCutscene_DrawScrollingResults(gfx);
+ }

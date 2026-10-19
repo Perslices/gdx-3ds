@@ -1,0 +1,41 @@
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -4987,6 +4987,10 @@
+     }
+ }
+ 
++#if defined(PORT) && defined(__3DS__)
++extern int gdx_autodrive_racer(int racerId); /* port/3ds/gdx3ds_autodrive.c, [debug] autodrive */
++#endif
++
+ void Racer_UpdateMovement(Racer* racer) {
+     Controller dummyController;
+     f32 preInputEnergy;
+@@ -5004,8 +5008,26 @@
+                 racer->unk_2A4--;
+             }
+         }
++        GDX_LSPLIT(PHYS);
++        Racer_UpdateFromControls(racer, &dummyController);
++#if defined(PORT) && defined(__3DS__)
++    } else if (gdx_autodrive_racer(racer->id)) {
++        /* N60TEX [debug] autodrive (port/3ds/gdx3ds_autodrive.c): the CPU driver steers player 1
++           so a replay can finish a race on the emulator lane. Measurement only; default off.
++           Throttle and steering only (no boosts or attacks) and the energy kept full, so the
++           machine is never retired before the finish line. */
++        GDX_LSPLIT(AI);
++        Cpu_GenerateInputs(racer, &dummyController);
++        dummyController.buttonCurrent &= BTN_A;
++        dummyController.buttonPressed &= BTN_A;
++        dummyController.buttonReleased &= BTN_A;
++        racer->energy = racer->maxEnergy;
+         GDX_LSPLIT(PHYS);
+         Racer_UpdateFromControls(racer, &dummyController);
++        racer->unk_33C = -racer->segmentPositionInfo.segmentDisplacement.x * racer->segmentBasis.z.x -
++                         racer->segmentPositionInfo.segmentDisplacement.y * racer->segmentBasis.z.y -
++                         racer->segmentPositionInfo.segmentDisplacement.z * racer->segmentBasis.z.z;
++#endif
+     } else {
+         GDX_LSPLIT(PHYS);
+         Racer_UpdateFromControls(racer, &gControllers[gPlayerControlPorts[racer->id]]);

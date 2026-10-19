@@ -53,6 +53,50 @@ All in `gdx3ds_stereo.{h,cpp}` plus minimal hooks in `gfx_citro3d.cpp`
   `[stereo]` lines mark enable + first activation. Harness dumps
   `sceneNN_r.bmp` right-eye readbacks (`gdx3ds_stereo_read_right`).
 
+## Frame replay (n60stereo; `gdx3ds_stereo_frame.cpp`, `[native] stereo_replay`, default 1)
+
+The per-draw loop above costs two raw target switches and up to two projection uploads per draw.
+The frame replay makes the right eye with almost no CPU: every draw of the frame's *body* is
+emitted ONCE, eye-independent, and the right eye is the same command lists submitted again.
+
+- **Shader** (`shader.v.pica`): the incoming clip vector (the legacy packed vertex, or gpuxf's
+  packed clip `r2`) is skewed on x by `steye * dot(stk, clip)` before the projection, i.e. the
+  same `base · S` ComputeEyeMatrix folds into the matrix. `stk` is a per-draw, eye-INDEPENDENT row
+  (`Gdx3dsStereo::ClassRow`): SCENE `(0,0,k,-k·dc)`, SKY_DEEP `(0,0,0,sep)`, ANCHORED
+  `(0,0,0,k·(d-dc))`, UI / mono / offscreen `0` -- `k`, `sep`, `dc` exactly ComputeEyeMatrix's.
+  `steye` is `-1` / `+1` / `0` and is written RAW, never through citro3d (citro3d never re-sends a
+  register it never sent, so no state re-emission can put a stale eye inside the body). With
+  `steye = 0` the skew adds exactly 0: mono output is bit-for-bit unchanged (gated).
+- **Enter** (`ReplayEnter`, from `gdx3ds_nrr_bk_frame_active`: the first NRR hand-off of a frame
+  with the slider up): the open command list (draws so far took the per-draw loop: both eyes done)
+  ends with `steye = -1` + the main target's framebuffer words and is submitted; from here the
+  frame is the body. Every citro3d state group and uniform is re-emitted at the body's first word
+  (`C3Dgdx_FlushState`), so the body runs the same from any GPU state but the framebuffer / steye.
+- **Per draw**: DrawTriangles (legacy draws inside the body) and the NRR core (citro3d path and
+  direct words, `NrrCoreC3dStereo` / `NrrCoreDxStereo`; `nrr_direct=2` verifies the register) set
+  `stk` from the draw's class: the per-draw loop's classification (bridge override, ortho
+  heuristic `w == 1`, [anchor] prim-depth rects incl. the NRR HUD's -- `NrrStereoAnchor` --,
+  texture passes mono). One 8-word uniform write when the class row changes.
+- **Frame end** (`ReplayFrameEnd`, after the `[overlap]` drain, before `C3D_FrameEnd`): close the
+  body, add a prologue list (right target's framebuffer words, `steye = +1`), re-add the body's GX
+  queue entries (command lists as they are; GX memory fills of the main target retargeted to the
+  right target, other fills repeated; texture copies / transfers / DMA -- captures and uploads --
+  NOT repeated: they are mono, as in the per-draw loop), an epilogue (`steye = 0`), then
+  C3D_FrameEnd queues both display transfers. A main-target rebind after a texture pass inside the
+  body gets its framebuffer words in a list of its own, swapped for the right target's in the
+  replay (`swaps=`).
+- **Receipt**: `[stereo] replay frames= stereo= replayed= refused= full= lists/f= fills/f= skip/f=
+  swaps= chunks/f= chunkskip= noflush/f= gx/f= enter_us= (sync ) chunk_us= end_us=` every 256 frames
+  with stereo on (`gx/f` = GX queue entries of a replayed frame before its display transfers).
+- **No re-flush** (`[native] stereo_noreflush`, default 1, n60st3): a replayed command list is
+  re-added with word 7 (GSP's data-cache flush of the list) cleared -- its own entry ran first in the
+  same queue and flushed the same, never rewritten, bytes. Exact; `noflush/f=` counts them. Slider 0 never enters (mono).
+- **Limits**: the body's texture uploads are not repeated, so a texture slot rewritten inside the
+  body (after a draw that sampled its old content) would show the new content in the right eye
+  for that frame; the GX queue holds 32 entries (a frame that cannot fit the replay counts
+  `full=` and its right eye holds only what was drawn before the body); a frame whose replay could not be entered
+  (`refused=`: a taskless hold present, no queue room) keeps the NRR categories off for that frame.
+
 ## Remaining work (in dependency order)
 
 1. ~~**Proper off-axis projection math**~~ — DONE (stream S2, route a): the

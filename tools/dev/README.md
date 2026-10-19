@@ -418,6 +418,16 @@ tools/dev/gdx-dev retro run <3dsx> --3d   # stereoscopic — see "Stereoscopic 3
 `--gfx vulkan|opengl|software`, case-insensitive. With no flag the lane tries Vulkan, then
 OpenGL, then Software.
 
+**`OpenGL` is not a legal `citra_graphics_api` value on the pinned 2126.0 core** (verified
+by extracting the core's own option strings, emufix 2026-10-16: the "Graphics API" option
+declares exactly `Vulkan` and `Software`). `--gfx opengl` still changes RetroArch's OWN
+`video_driver` (to `glcore`, which is real and does change the host presentation backend),
+but the CORE's internal renderer silently falls back to its option default (`Vulkan`)
+either way — unchanged by the core_options fix below, since this was *already* the
+behaviour (the option was never read at all before the fix, and now that it is read, an
+illegal value still falls back to the default). Only `vulkan` and `software` are honoured
+by the core itself.
+
 **Recommendation: leave it alone — the default (Vulkan first) is the stable one here.**
 Measured 2026-09-13, five consecutive 60 s boots per renderer on clean instances:
 
@@ -492,10 +502,12 @@ tools/dev/gdx-dev retro run <3dsx> --model old --replay race-mutecity-start \
 ```
 
 NEXT.md C4. The core declares `citra_is_new_3ds` ("System Model") with the legal pair
-`"New 3DS"` / `"Old 3DS"`. Without `--model` **not one byte changes** and no core-options
-redirect is written, so every baseline taken on this lane before the flag existed stays
-valid; with it, the redirect is written and `--gfx` starts being honoured too (the same
-re-baseline `--3d` carries).
+`"New 3DS"` / `"Old 3DS"`. **Since emufix (2026-10-16) the per-instance core-options
+redirect is written on EVERY run**, mono included (see the core_options warning below) --
+without `--model` the EFFECTIVE model is unchanged (still New 3DS, the core's own compiled
+default, now PINNED explicitly rather than merely inherited); with `--model old` it is
+"Old 3DS" instead. `--gfx` and `--model` both reach the core on every run now, not just
+under `--3d`.
 
 Three things it is not:
 
@@ -564,21 +576,55 @@ shared release core other agents are mid-run on alone. Two cores are two emulato
 **a `--3d` run's hashes compare only with another `--3d` run's** — the same-platform rule
 one level down.
 
-> ⚠ **Lane-wide, still open: `core_options_path` does not work.** RetroArch 1.22 only
-> consults it when `global_core_options` is true; otherwise it uses a per-core
-> `<rgui_config_directory>/<corename>/<corename>.opt`, which by default is the **shared**
-> `~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt`. Measured: a legal
-> `citra_layout_option = "side_by_side"` in the instance file still arrived at the core as
-> `"default"`, and the frontend log says `Saved core options file to
-> .../RetroArch/config/Azahar/Azahar.opt`. **Every `retro run` to date has therefore run on
-> the core's compiled defaults, and `--gfx` has never reached the core** (it only changed
-> RetroArch's own `video_driver`). The defaults happen to be New 3DS + Vulkan, which is why
-> the lane worked. `--3d` fixes it for itself by pointing `rgui_config_directory` at the
-> instance; fixing it for the mono lane changes what that lane runs and needs its own
-> re-baseline. Three values in `CORE_OPTIONS_TEMPLATE` are also not legal for their options
-> (`citra_is_new_3ds = "enabled"` — the legal pair is `"New 3DS"`/`"Old 3DS"` —
-> `"1x (Native)"`, `"Default Top-Bottom Screen"`); they resolve to the defaults, which is
-> the only reason nothing broke.
+> ⚠ **`core_options_path` does not work — FIXED for every run, emufix 2026-10-16.**
+> RetroArch 1.22 only consults `core_options_path` when `global_core_options` is true;
+> otherwise it uses a per-core `<rgui_config_directory>/<corename>/<corename>.opt`, which
+> by default is the **shared** `~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt`
+> -- the user's own Qt-seeded preferences file, read AND (RetroArch rewrites it on exit)
+> WRITTEN by every concurrent instance that omits the redirect. Measured originally
+> (2026-09-23): a legal `citra_layout_option = "side_by_side"` in the instance file still
+> arrived at the core as `"default"`, and the frontend log said `Saved core options file to
+> .../RetroArch/config/Azahar/Azahar.opt`. Every `retro run` before this fix therefore ran
+> on the core's compiled defaults, and `--gfx`/`--model` never reached the core (only
+> RetroArch's own `video_driver` changed). `--3d` alone used to fix this for itself by
+> pointing `rgui_config_directory` at the instance; **`write_config` now does this for
+> EVERY run**, mono included, so no lane ever touches the shared Azahar.opt again, and
+> `--gfx`/`--model` reach the core on a plain run too. Three values the mono template used
+> to write were also illegal for their options (verified against the core's own option
+> strings, extracted from the installed `azahar_libretro.dylib`):
+> `citra_is_new_3ds = "enabled"` (legal pair `"New 3DS"`/`"Old 3DS"`),
+> `citra_resolution_factor = "1x (Native)"` (legal: `"1"`, `"2"`, … -- short indices, not
+> the RGUI display labels), `citra_layout_option = "Default Top-Bottom Screen"` (legal:
+> `"default"`, `"single_screen"`, `"large_screen"`, `"side_by_side"` -- again the short
+> keys, not the labels). They silently fell back to the option default, which happened to
+> match the values the fixed template now writes explicitly -- see `CORE_OPTIONS_TEMPLATE`
+> in `gdxdev/retro.py`, now a single template shared by every run instead of two
+> near-duplicate ones (one illegal, one legal).
+>
+> **This was investigated as the cause of the mono lane's intermittent host
+> `EXC_BAD_ACCESS`/SIGBUS/SIGSEGV boot crash ("last guest frame ~38", "RetroArch exited
+> after 4s") -- it is NOT the (sole) cause.** The crash reproduces under BOTH the old and
+> the fixed tooling (captured live during this fix's own verification: `Unhandled
+> EXC_BAD_ACCESS at pc 0x00006d00000007` / `0x00000400000010` / `0x00007800000080` --
+> near-null or ASLR'd host addresses, zero guest `[fatal]` lines every time, the guest log
+> advancing cleanly past the reported frame). This matches `docs/research/native/nimenu-
+> progress.md` §9.7's independent, already-closed investigation: the crash reproduces even
+> with **zero concurrent RetroArch instances**, is host-process (not guest), and predates
+> every change on this lane. Root cause is a RetroArch/MoltenVK Vulkan-path boot race in
+> the azahar-libretro core itself, independent of which core-options values it reads --
+> out of this harness's reach to fix. The existing retry-and-fall-back-renderer logic
+> (`EARLY_CRASH_ATTEMPTS`, `GFX_ORDER`) already absorbs it into a recovered PASS/TIMEOUT
+> rather than a hard FAIL in every case observed. The core_options fix above is still worth
+> having on its own merits (it stops the shared-file contention and makes `--gfx`/`--model`
+> actually work), but do not expect it to change the crash rate.
+>
+> **Behaviour preserved, confirmed by exact comparison.** `[debug] det=1` plus the staged
+> replay's own `seed1`/`seed2` (printed in its `[rec] WARNING seed1/seed2` lines) make a
+> run deterministic; without them `[fh]`/`[gstate]` differ run-to-run regardless of any
+> code change (non-seeded RNG), which is not evidence of anything. With them pinned, one
+> `race-gp2-sector` replay to `[debug] quit_at_tick=800`, same binary
+> (`e04261246cc1b6a8…`), old tooling vs the fixed tooling: **8/8 `[fh]` hashes identical,
+> 802/802 `[gstate]` hashes identical.**
 
 ### `fhdiff --eye both`
 

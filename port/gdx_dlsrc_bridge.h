@@ -46,6 +46,21 @@ int gdx_gfx_job_root_list(GdxGfxJob* job, GdxDlSrcList* out);
 int gdx_gfx_job_resolve_list(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull,
                              GdxDlSrcList* out);
 
+/* [native] dlmemo (docs/research/native/c5dlmemo-progress.md §1). The same resolve, plus
+ * *memoOk: 0 = not memoisable; 1 = its answer is a function of the operand, the key below and
+ * the list's own opcode bytes up to its terminator; 2 = the same plus the w0 words of the list's
+ * first *sniffCmds commands (the raw class's big-endian sniff, at most 64). */
+int gdx_gfx_job_resolve_list_memo(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull,
+                                  GdxDlSrcList* out, int* memoOk, uint32_t* sniffCmds);
+typedef struct GdxDlMemoKey {
+    uintptr_t seg[16];      /* the running thread's segment view, all 16 slots */
+    uint32_t tablesVersion; /* gGdxResolveTablesVersion: the append-only range / asset tables */
+    uint32_t epoch;         /* the segment-reload seqlock; odd = a reload in flight */
+    uint32_t seg9State;     /* gdx_mode_segment9_state() */
+    uintptr_t rootBegin, rootEnd; /* the task's root range (per-entry exclusion, not a key) */
+} GdxDlMemoKey;
+void gdx_gfx_job_list_memo_key(GdxGfxJob* job, GdxDlMemoKey* out);
+
 /* Data operand (VTX / MTX / MOVEMEM / DMA_IO / SETTIMG / SETCIMG / SETZIMG / LOADTLUT
  * sources). requiredBytes = the full payload the caller will read; the resolver's readability
  * gates reject short matches. Returns the host pointer or 0 (unresolved, or a segment reload

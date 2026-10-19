@@ -41,6 +41,21 @@ bool DlSrc::ResolveList(const Cmd& c, ListRef& out) const {
     return true;
 }
 
+bool DlSrc::ResolveListMemoOk(const Cmd& c, ListRef& out, int* memoOk, uint32_t* sniffCmds) const {
+    GdxDlSrcList l = {};
+    const bool host = IsHostPtr(c);
+    *memoOk = 0;
+    if (gdx_gfx_job_resolve_list_memo(mJob, c.w1, host ? 1 : 0, host ? c.w1 : 0, &l, memoOk, sniffCmds) == 0) {
+        return false;
+    }
+    FillRef(out, l);
+    return true;
+}
+
+void DlSrc::MemoKey(GdxDlMemoKey* out) const {
+    gdx_gfx_job_list_memo_key(mJob, out);
+}
+
 uintptr_t DlSrc::ResolveData(const Cmd& c, size_t requiredBytes, bool preferPhysical, uintptr_t sourceHint) const {
     const bool host = IsHostPtr(c);
     return gdx_gfx_job_resolve_data(mJob, c.w1, host ? 1 : 0, host ? c.w1 : 0, requiredBytes,

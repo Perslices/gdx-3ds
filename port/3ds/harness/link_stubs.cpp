@@ -124,6 +124,11 @@ extern "C" size_t gdx3ds_tex_upload_clamp_bytes(size_t want) {
     return want;
 }
 
+/* N60TEX [debug] tex_fast: the harness keeps the reference texel writer. */
+extern "C" int gdx3ds_tex_fast_enabled(void) {
+    return 0;
+}
+
 extern "C" int gdx_workshop_texture_dump_enabled(void) {
     return 0;
 }

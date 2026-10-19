@@ -25,6 +25,7 @@
  * runs the game fibers); no locking anywhere.
  */
 #include "gdx3ds_gpu_prof.h"
+#include "gdx3ds_pace.h"                /* n60gp: [debug] pace_swapgate */
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -33,6 +34,11 @@
 
 #include <3ds.h>
 #include <citro3d.h>
+
+#include "../gdx3ds_mainprof.h"          /* C4I: the [mprof] bucket ids the [oth] split uses */
+#include "../include/gdx3ds_filelog.h"   /* C4I: GdxFilelogCost for the [othx] lg columns */
+#include "../include/gdx3ds_audio.h"     /* C4K: GDX3DS_AUDIO_SAMPLE_RATE for [synx] need= */
+#include "../include/gdx3ds_hitch.h"     /* HITCH: per-frame event counters */
 
 /* Stream B's config surface (port/3ds/os/gdx3ds_config.h) — weak so the DL-test
  * harness, which links gdx3ds_gfx without gdx3ds_os, still links; the gate then
@@ -172,6 +178,252 @@ long long gdx3ds_prof_now(void) {
     return (long long)svcGetSystemTick();
 }
 
+/* --------------------------------------------------------------------------------
+ * C4I [oth]/[othx] — split oth= (contract in the header). The C3D frame window is cut
+ * into [mprof] buckets by snapshotting the main-thread clock at its two edges; the
+ * cross-cut ledgers (gsp flushes, filelog cost) are plain counters. All static: the
+ * Old 3DS has ~126 KB of heap to spare and this must cost none of it. */
+uint64_t gdx3ds_prof_gsp_ticks[GDX3DS_PROF_GSP_COUNT];
+uint32_t gdx3ds_prof_gsp_calls[GDX3DS_PROF_GSP_COUNT];
+uint64_t gdx3ds_prof_gsp_bytes[GDX3DS_PROF_GSP_COUNT];
+
+/* Weak: the DL harness links this TU without gdx3ds_mainprof.c / gdx3ds_filelog.c; every
+ * frame is then unsplit and the lg columns read 0. */
+extern unsigned long gdx3ds_mprof_snapshot(uint64_t* out, int count) __attribute__((weak));
+extern void gdx3ds_filelog_cost_arm(int on) __attribute__((weak));
+extern void gdx3ds_filelog_cost_totals(GdxFilelogCost* out) __attribute__((weak));
+/* port/gdx_audio_thread.cpp: the game fiber's waits on the audio ctx mutex, and the producer
+ * ticks that hold it. Weak for the same harness reason. */
+extern void gdx_audio_ctx_ledger_arm(int on) __attribute__((weak));
+extern void gdx_audio_ctx_ledger_totals(uint64_t* waitTicks, unsigned long* locks,
+                                        unsigned long* contended, uint64_t* holdTicks,
+                                        unsigned long* holds, uint64_t* synthTicks)
+    __attribute__((weak));
+/* C4K [synx]/[synop] (port/gdx_audio_hle_cost.c): the HLE synth's CPU vs wall split, per op
+ * class. Same gate, same window as [othx]. Weak for the same harness reason. */
+extern void gdx_hle_cost_arm(int on, long long (*now)(void), double tickHz) __attribute__((weak));
+extern int gdx_hle_cost_format(int index, char* out, size_t cap, unsigned long frameNo, int simd,
+                               unsigned outputRateHz) __attribute__((weak));
+extern void gdx_hle_cost_request_publish(unsigned long frameNo) __attribute__((weak));
+extern int gdx_audio_hle_fast_enabled(void) __attribute__((weak));
+
+static uint64_t sOthSnapOpen[GDX3DS_MPROF_COUNT];  /* clock at the fresh FrameBegin */
+static unsigned long sOthGenOpen = 0;              /* its iteration generation, 0 = none */
+static uint64_t sOthFrameTicks[GDX3DS_MPROF_COUNT]; /* this frame's window share per bucket */
+static int sOthFrameSplit = 0;
+static uint64_t sOthWinTicks[GDX3DS_MPROF_COUNT];
+static uint64_t sOthWinInterp = 0;  /* Σ interpreter section ticks over the SPLIT frames */
+static unsigned sOthWinSplit = 0;
+static float sOthWinFend = 0.0f;    /* Σ (proc − build) ms over every frame */
+static GdxFilelogCost sOthLogPrev;
+typedef struct OthAudioCtx {
+    uint64_t waitTicks;
+    unsigned long locks;
+    unsigned long contended;
+    uint64_t holdTicks;
+    unsigned long holds;
+    uint64_t synthTicks;
+} OthAudioCtx;
+static OthAudioCtx sOthActxPrev;
+static float sOthTickCostUs = 0.0f;
+
+static void OthArm(int on) {
+    if (&gdx3ds_filelog_cost_arm != NULL) {
+        gdx3ds_filelog_cost_arm(on);
+    }
+    if (&gdx_audio_ctx_ledger_arm != NULL) {
+        gdx_audio_ctx_ledger_arm(on);
+    }
+    if (&gdx_hle_cost_arm != NULL) {
+        gdx_hle_cost_arm(on, gdx3ds_prof_now, (double)SYSCLOCK_ARM11);
+    }
+}
+
+/* C4K: [synx] + [synop1..3], the synth ledger's last published window, then ask the producer
+ * to publish the next one. The window is at most one [othx] window stale; its own f= says how
+ * many frames it spanned. */
+static void OthEmitSynthCost(void) {
+    char line[224];
+    const int simd = (&gdx_audio_hle_fast_enabled != NULL) ? gdx_audio_hle_fast_enabled() : 0;
+    if (&gdx_hle_cost_format == NULL || &gdx_hle_cost_request_publish == NULL) {
+        return;
+    }
+    for (int i = 0; gdx_hle_cost_format(i, line, sizeof(line), sFrameCount, simd,
+                                        GDX3DS_AUDIO_SAMPLE_RATE) > 0; i++) {
+        GpuProfLog("%s", line);
+    }
+    gdx_hle_cost_request_publish(sFrameCount);
+}
+
+static OthAudioCtx OthReadAudioCtx(void) {
+    OthAudioCtx now;
+    memset(&now, 0, sizeof(now));
+    if (&gdx_audio_ctx_ledger_totals != NULL) {
+        gdx_audio_ctx_ledger_totals(&now.waitTicks, &now.locks, &now.contended, &now.holdTicks,
+                                    &now.holds, &now.synthTicks);
+    }
+    return now;
+}
+
+/* One svcGetSystemTick, in µs: the unit cost every [prof] section pays twice. */
+static void OthCalibrateTickCost(void) {
+    enum { kReads = 256 };
+    const u64 t0 = svcGetSystemTick();
+    for (int i = 0; i < kReads; i++) {
+        (void)gdx3ds_prof_now();
+    }
+    const u64 t1 = svcGetSystemTick();
+    sOthTickCostUs = TicksToMs(t1 - t0) * 1000.0f / (float)kReads;
+}
+
+static unsigned long OthSnapshot(uint64_t* out) {
+    if (&gdx3ds_mprof_snapshot == NULL) {
+        return 0;
+    }
+    return gdx3ds_mprof_snapshot(out, GDX3DS_MPROF_COUNT);
+}
+
+/* Fresh C3D_FrameBegin returned: the window opens. */
+static void OthOpenWindow(void) {
+    sOthFrameSplit = 0;
+    sOthGenOpen = OthSnapshot(sOthSnapOpen);
+}
+
+/* C3D_FrameEnd is about to run: the window closes. The split is kept only when both edges
+ * read the same host iteration's clock (same generation, same thread). */
+static void OthCloseWindow(void) {
+    uint64_t snapClose[GDX3DS_MPROF_COUNT];
+    if (sOthGenOpen == 0) {
+        return;
+    }
+    const unsigned long genClose = OthSnapshot(snapClose);
+    const int sameIteration = genClose == sOthGenOpen;
+    sOthGenOpen = 0;
+    if (!sameIteration) {
+        return;
+    }
+    for (int b = 0; b < GDX3DS_MPROF_COUNT; b++) {
+        sOthFrameTicks[b] = snapClose[b] - sOthSnapOpen[b];
+    }
+    sOthFrameSplit = 1;
+}
+
+static uint64_t OthFrameInterpTicks(void) {
+    uint64_t sum = 0;
+    for (int s = 0; s < GDX3DS_PROF_SEC_COUNT; s++) {
+        if (s != GDX3DS_PROF_BR) {
+            sum += gdx3ds_prof_sec_ticks[s];
+        }
+    }
+    return sum;
+}
+
+/* frame_end_post, BEFORE ProfFoldFrame resets the section scratch. */
+static void OthFoldFrame(float procMs, float buildMs) {
+    sOthWinFend += procMs - buildMs;
+    if (!sOthFrameSplit) {
+        return;
+    }
+    for (int b = 0; b < GDX3DS_MPROF_COUNT; b++) {
+        sOthWinTicks[b] += sOthFrameTicks[b];
+    }
+    sOthWinInterp += OthFrameInterpTicks();
+    sOthWinSplit++;
+    sOthFrameSplit = 0;
+}
+
+static float OthBucketMs(int b, float inv) {
+    return TicksToMs(sOthWinTicks[b]) * inv;
+}
+
+static void OthEmitSplit(unsigned n, float othMs) {
+    const float inv = 1.0f / (float)n;
+    static const int kRest[] = { GDX3DS_MPROF_BRM, GDX3DS_MPROF_SUB, GDX3DS_MPROF_APT,
+                                 GDX3DS_MPROF_PACE, GDX3DS_MPROF_INP, GDX3DS_MPROF_BEG,
+                                 GDX3DS_MPROF_JDP, GDX3DS_MPROF_JTOP };
+    static const int kNamed[] = { GDX3DS_MPROF_LOGIC, GDX3DS_MPROF_DLB, GDX3DS_MPROF_AUD,
+                                  GDX3DS_MPROF_LSEG, GDX3DS_MPROF_SLA, GDX3DS_MPROF_SEG,
+                                  GDX3DS_MPROF_DMA, GDX3DS_MPROF_VI, GDX3DS_MPROF_DISP,
+                                  GDX3DS_MPROF_END, GDX3DS_MPROF_TAIL };
+    float named[sizeof(kNamed) / sizeof(kNamed[0])];
+    float sumNamed = 0.0f;
+    for (unsigned i = 0; i < sizeof(kNamed) / sizeof(kNamed[0]); i++) {
+        named[i] = OthBucketMs(kNamed[i], inv);
+        if (kNamed[i] == GDX3DS_MPROF_END) {
+            named[i] += OthBucketMs(GDX3DS_MPROF_R_SWAP, inv); /* C5 Stage 0 carve-out */
+        }
+        sumNamed += named[i];
+    }
+    float rest = 0.0f;
+    for (unsigned i = 0; i < sizeof(kRest) / sizeof(kRest[0]); i++) {
+        rest += OthBucketMs(kRest[i], inv);
+    }
+    const float fend = sOthWinFend * inv;
+    /* C5 STAGE 0: the [c5cat] render sub-buckets are carved out of stask; fold them back. */
+    const float tsk = TicksToMs(gdx3ds_mprof_stask_folded(sOthWinTicks)) * inv -
+                      TicksToMs(sOthWinInterp) * inv;
+    const float idle = OthBucketMs(GDX3DS_MPROF_OTH, inv);
+    const float res = othMs - (fend + tsk + sumNamed + idle + rest);
+    GpuProfLog("[oth] frame=%lu n=%u sp=%u oth=%.2f | fend=%.2f tsk=%.2f logic=%.2f dlb=%.2f "
+               "aud=%.2f lseg=%.2f sla=%.2f seg=%.2f dma=%.2f vi=%.2f disp=%.2f end=%.2f "
+               "tail=%.2f idle=%.2f rest=%.2f res=%.2f",
+               sFrameCount, n, sOthWinSplit, othMs, fend, tsk, named[0], named[1], named[2],
+               named[3], named[4], named[5], named[6], named[7], named[8], named[9], named[10],
+               idle, rest, res);
+}
+
+static void OthEmitCrossCuts(unsigned n) {
+    const float inv = 1.0f / (float)n;
+    GdxFilelogCost now;
+    memset(&now, 0, sizeof(now));
+    if (&gdx3ds_filelog_cost_totals != NULL) {
+        gdx3ds_filelog_cost_totals(&now);
+    }
+    const float lgM = TicksToMs(now.mainTicks - sOthLogPrev.mainTicks) * inv;
+    const float lgO = TicksToMs(now.otherTicks - sOthLogPrev.otherTicks) * inv;
+    const float lgF = TicksToMs(now.flushTicks - sOthLogPrev.flushTicks) * inv;
+    const unsigned long nM = now.mainLines - sOthLogPrev.mainLines;
+    const unsigned long nO = now.otherLines - sOthLogPrev.otherLines;
+    const unsigned long nF = now.flushes - sOthLogPrev.flushes;
+    sOthLogPrev = now;
+    const OthAudioCtx actx = OthReadAudioCtx();
+    const float ctxWait = TicksToMs(actx.waitTicks - sOthActxPrev.waitTicks) * inv;
+    const float ctxCont = (float)(actx.contended - sOthActxPrev.contended) * inv;
+    const float ctxLocks = (float)(actx.locks - sOthActxPrev.locks) * inv;
+    const float ctxHold = TicksToMs(actx.holdTicks - sOthActxPrev.holdTicks) * inv;
+    const float ctxHolds = (float)(actx.holds - sOthActxPrev.holds) * inv;
+    const float ctxSynth = TicksToMs(actx.synthTicks - sOthActxPrev.synthTicks) * inv;
+    sOthActxPrev = actx;
+    const int v = GDX3DS_PROF_GSP_VBO;
+    const int t = GDX3DS_PROF_GSP_TEX;
+    GpuProfLog("[othx] frame=%lu n=%u | vbo=%.2f/%.1f/%.0f tex=%.2f/%.1f/%.0f | lgM=%.2f/%.1f "
+               "lgO=%.2f/%.1f lgF=%.2f/%lu | actx=%.2f/%.1f/%.1f hold=%.2f/%.1f syn=%.2f | tick=%.2f",
+               sFrameCount, n, TicksToMs(gdx3ds_prof_gsp_ticks[v]) * inv,
+               (float)gdx3ds_prof_gsp_calls[v] * inv, (double)gdx3ds_prof_gsp_bytes[v] * inv / 1024.0,
+               TicksToMs(gdx3ds_prof_gsp_ticks[t]) * inv, (float)gdx3ds_prof_gsp_calls[t] * inv,
+               (double)gdx3ds_prof_gsp_bytes[t] * inv / 1024.0, lgM, (float)nM * inv, lgO,
+               (float)nO * inv, lgF, nF, ctxWait, ctxCont, ctxLocks, ctxHold, ctxHolds,
+               ctxSynth, sOthTickCostUs);
+}
+
+static void OthResetWindow(void) {
+    memset(sOthWinTicks, 0, sizeof(sOthWinTicks));
+    sOthWinInterp = 0;
+    sOthWinSplit = 0;
+    sOthWinFend = 0.0f;
+    memset(gdx3ds_prof_gsp_ticks, 0, sizeof(gdx3ds_prof_gsp_ticks));
+    memset(gdx3ds_prof_gsp_calls, 0, sizeof(gdx3ds_prof_gsp_calls));
+    memset(gdx3ds_prof_gsp_bytes, 0, sizeof(gdx3ds_prof_gsp_bytes));
+}
+
+/* [oth] + [othx] for the window [prof] just covered; othMs is [prof]'s own oth=. */
+static void OthEmitWindow(unsigned n, float othMs) {
+    OthEmitSplit(n, othMs);
+    OthEmitCrossCuts(n);
+    OthEmitSynthCost();
+    OthResetWindow();
+}
+
 /* Window sums, [0] = steady frames, [1] = storm frames (draws > threshold). */
 static u64 sProfWinTicks[2][GDX3DS_PROF_SEC_COUNT];
 static unsigned long sProfWinCalls[2][GDX3DS_PROF_SEC_COUNT];
@@ -197,7 +449,7 @@ static void ProfFoldFrame(unsigned frameDraws, float procMs) {
     sProfWinFrames[storm]++;
 }
 
-static void ProfEmitLine(const char* tag, const u64 ticks[GDX3DS_PROF_SEC_COUNT],
+static float ProfEmitLine(const char* tag, const u64 ticks[GDX3DS_PROF_SEC_COUNT],
                          const unsigned long calls[GDX3DS_PROF_SEC_COUNT], u64 vtxN, float procSum,
                          unsigned n) {
     const float inv = 1.0f / (float)n;
@@ -219,6 +471,7 @@ static void ProfEmitLine(const char* tag, const u64 ticks[GDX3DS_PROF_SEC_COUNT]
                (unsigned long)(vtxN / n), calls[GDX3DS_PROF_VTX] / n, calls[GDX3DS_PROF_TRI] / n,
                calls[GDX3DS_PROF_IMP] / n, calls[GDX3DS_PROF_DRW] / n, calls[GDX3DS_PROF_MTX] / n,
                calls[GDX3DS_PROF_RUN] / n);
+    return oth;
 }
 
 /* Emit [prof] (whole window) + [prof!] (storm frames only, if any), then reset. */
@@ -234,10 +487,11 @@ static void ProfEmitWindow(void) {
         allCalls[s] = sProfWinCalls[0][s] + sProfWinCalls[1][s];
     }
     gdx3ds_prof_last_nd = (unsigned)(allCalls[GDX3DS_PROF_DRW] / n);
-    ProfEmitLine("", allTicks, allCalls, sProfWinVtx[0] + sProfWinVtx[1],
-                 sProfWinProc[0] + sProfWinProc[1], n);
+    const float othMs = ProfEmitLine("", allTicks, allCalls, sProfWinVtx[0] + sProfWinVtx[1],
+                                     sProfWinProc[0] + sProfWinProc[1], n);
+    OthEmitWindow(n, othMs); /* C4I: [oth] partition + [othx] cross-cuts, same window */
     if (sProfWinFrames[1] > 0) {
-        ProfEmitLine("!", sProfWinTicks[1], sProfWinCalls[1], sProfWinVtx[1], sProfWinProc[1],
+        (void)ProfEmitLine("!", sProfWinTicks[1], sProfWinCalls[1], sProfWinVtx[1], sProfWinProc[1],
                      sProfWinFrames[1]);
     }
     memset(sProfWinTicks, 0, sizeof(sProfWinTicks));
@@ -292,6 +546,7 @@ static void ProfEmitWindow(void) {
 void gdx3ds_gpuprof_set_enabled(int on) {
     sChecked = 1;
     sEnabled = on ? 1 : 0;
+    OthArm(sEnabled);
     if (!sEnabled) {
         gdx3ds_prof_active = 0; /* hook sites stop accumulating immediately */
     }
@@ -317,7 +572,10 @@ static void GpuProfEnsureInit(void) {
         sEnabled = gdx3ds_config_get_int("debug", "gputrace", 0) != 0;
     }
     if (sEnabled) {
-        GpuProfLog("[gpu] tracing enabled (debug.gputrace=1)");
+        OthArm(1);
+        OthCalibrateTickCost();
+        GpuProfLog("[gpu] tracing enabled (debug.gputrace=1); [oth] split armed, tick=%.2fus",
+                   (double)sOthTickCostUs);
     }
 }
 
@@ -387,22 +645,37 @@ void gdx3ds_gpuprof_frame_begin(int reentry) {
     if (!sEnabled) {
         /* CADENCE: same adaptive skip as the profiled path below — the fix must not
          * depend on gputrace being armed. */
-        C3D_FrameBegin(GpuProfSkipVblankSync() ? 0 : C3D_FRAME_SYNCDRAW);
+        const u64 tw0 = svcGetSystemTick();
+        if (gdx3ds_pace_armed()) {
+            gdx3ds_pace_frame_begin(GpuProfSkipVblankSync, NULL, NULL); /* n60gp: swap gate / receipt */
+        } else {
+            C3D_FrameBegin(GpuProfSkipVblankSync() ? 0 : C3D_FRAME_SYNCDRAW);
+        }
         sCadPrevFreshBeginTick = svcGetSystemTick();
+        gdx3ds_hitch_add(GDX_HITCH_EV_GSP_WAIT_TICKS, (uint32_t)(sCadPrevFreshBeginTick - tw0)); /* HITCH */
         return;
     }
     /* [prof] hot-path gate: latched here (render thread, never mid-frame) so the
      * hook sites see a plain int that flips only at a fresh frame boundary. */
     gdx3ds_prof_active = sEnabled;
     const u64 t0 = svcGetSystemTick();
-    if (!GpuProfSkipVblankSync()) {
-        C3D_FrameSync();             /* the SYNCDRAW component: vblank pacing wait */
+    u64 tVbl = 0;
+    u64 tP3d = 0;
+    if (gdx3ds_pace_armed()) {
+        gdx3ds_pace_frame_begin(GpuProfSkipVblankSync, &tP3d, &tVbl); /* n60gp: queue wait, then vblank */
+    } else {
+        if (!GpuProfSkipVblankSync()) {
+            C3D_FrameSync();             /* the SYNCDRAW component: vblank pacing wait */
+        }
+        const u64 t1 = svcGetSystemTick();
+        tVbl = t1 - t0;
+        C3D_FrameBegin(0);               /* gxCmdQueueWait: previous frame's GPU work */
+        tP3d = svcGetSystemTick() - t1;
     }
-    const u64 t1 = svcGetSystemTick();
-    C3D_FrameBegin(0);               /* gxCmdQueueWait: previous frame's GPU work */
     const u64 t2 = svcGetSystemTick();
-    sWaitVblMs = TicksToMs(t1 - t0); /* ~0 on frames where the adaptive skip fired */
-    sWaitP3dMs = TicksToMs(t2 - t1);
+    gdx3ds_hitch_add(GDX_HITCH_EV_GSP_WAIT_TICKS, (uint32_t)(t2 - t0)); /* HITCH */
+    sWaitVblMs = TicksToMs(tVbl); /* ~0 on frames where the adaptive skip fired */
+    sWaitP3dMs = TicksToMs(tP3d);
     sFrameStartTick = t2;
     sCadPrevFreshBeginTick = t2;
     /* Fresh frame always opens a pass on the screen target (C3D_FrameDrawOn fb0). */
@@ -414,13 +687,18 @@ void gdx3ds_gpuprof_frame_begin(int reentry) {
     sFrameTexBytes = 0;
     sFrameVerts = 0;
     sFrameUniqueTex = 0;
+    OthOpenWindow(); /* C4I: the build window opens here (t2) */
 }
 
 void gdx3ds_gpuprof_frame_end_pre(void) {
+    if (gdx3ds_pace_armed()) {
+        gdx3ds_pace_frame_end_guard(); /* n60gp: the swap gate's present guard */
+    }
     if (!sEnabled) {
         return;
     }
     sBuildMs = TicksToMs(svcGetSystemTick() - sFrameStartTick);
+    OthCloseWindow(); /* C4I: ... and closes here */
 }
 
 static void GpuProfEmit(const char* tagFmtPrefix, unsigned nFrames, float wall, float build, float proc,
@@ -480,6 +758,7 @@ void gdx3ds_gpuprof_frame_end_post(unsigned frameDraws, unsigned frameTris) {
     /* [prof] fold this frame's section scratch (storm split keys on this frame's
      * draw-call count — the 30-machine race-start burst runs draws well past the
      * threshold while menus/steady race sit under it). */
+    OthFoldFrame(proc, sBuildMs); /* before ProfFoldFrame resets the section scratch */
     ProfFoldFrame(frameDraws, proc);
 
     /* SELECT-PERF: fold this frame's import / SETTIMG-resolution deltas into the
@@ -557,6 +836,8 @@ void gdx3ds_gpuprof_note_readback(unsigned pixels) {
 }
 
 void gdx3ds_gpuprof_note_tex_upload(unsigned bytes) {
+    gdx3ds_hitch_add(GDX_HITCH_EV_TEX_UP, 1u); /* HITCH: every standalone + atlas upload lands here */
+    gdx3ds_hitch_add(GDX_HITCH_EV_TEX_UP_BYTES, bytes);
     if (!sEnabled) {
         return;
     }

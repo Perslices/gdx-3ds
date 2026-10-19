@@ -203,6 +203,21 @@ void windowAudit(uint32_t off, uint32_t len, const void* dst, int ok) {
     censusRecord(off, len, dst, ok);
 }
 
+/* A12b boot-window bypass state. Separate from s_streaming: this arms ONLY when the C4d
+ * stream did NOT, because the two are alternatives (C4d serves every read for the whole
+ * session and never preloads audio_table, so it has no in-flight wait to bypass). */
+int s_bootBypass = 0;
+double s_bootBypassT0 = 0.0;
+
+/* gdx_segment_source's bypass hook: family-relative offset, same addressing the resident
+ * payload serves. Refusal leaves `dst` untouched (gdx_block_cache.h's contract), on which the
+ * ordinary in-flight wait runs exactly as before. Deliberately NOT censused here: a
+ * bypass-served read still returns through GdxSegmentSourceReadImpl's audit arm when the
+ * census is armed, so counting it here would double-count it. */
+int bootBypassRead(uint32_t off, uint32_t len, void* dst) {
+    return gdx_o2r_stream_read(off, len, dst);
+}
+
 } // namespace
 
 extern "C" {
@@ -225,7 +240,7 @@ int gdx_audio_diet_init(const GdxAudioDietConfig* cfg, const char* const* paths,
         while ((1u << blockLog2) < (kb * 1024u) && blockLog2 < 18u) {
             blockLog2++;
         }
-        const unsigned int cacheKb = s_cfg.cacheKb ? s_cfg.cacheKb : 512u;
+        const unsigned int cacheKb = s_cfg.cacheKb ? s_cfg.cacheKb : 1024u;
         unsigned int blocks = (cacheKb * 1024u) >> blockLog2;
         if (blocks < 4u) {
             blocks = 4u;
@@ -233,9 +248,13 @@ int gdx_audio_diet_init(const GdxAudioDietConfig* cfg, const char* const* paths,
         s_streaming = gdx_o2r_stream_open(paths, pathCount, GDX_AUDIO_TABLE_ENTRY_KEY,
                                           GDX_AUDIO_TABLE_ENTRY_BYTES,
                                           GDX_AUDIO_TABLE_PAYLOAD_OFFSET, blockLog2, blocks);
-        gdx_port_logf("[audio-diet] stream %s (%s) cacheKB=%u blockKB=%u\n",
+        if (s_streaming) {
+            gdx_o2r_stream_set_readahead(s_cfg.readAhead);
+        }
+        gdx_port_logf("[audio-diet] stream %s (%s) cacheKB=%u blockKB=%u readahead=%u\n",
                       s_streaming ? "armed" : "REFUSED", gdx_o2r_stream_refusal(),
-                      gdx_o2r_stream_cache_bytes() / 1024u, (1u << blockLog2) / 1024u);
+                      gdx_o2r_stream_cache_bytes() / 1024u, (1u << blockLog2) / 1024u,
+                      gdx_o2r_stream_readahead());
     }
 
     if (s_streaming || s_cfg.census > 0) {
@@ -243,6 +262,62 @@ int gdx_audio_diet_init(const GdxAudioDietConfig* cfg, const char* const* paths,
                                   s_cfg.census > 0 ? windowAudit : nullptr);
     }
     return s_streaming;
+}
+
+int gdx_audio_diet_boot_bypass_arm(const GdxAudioDietConfig* cfg, const char* const* paths,
+                                   unsigned int pathCount) {
+    if (cfg == nullptr || !cfg->bootBypass) {
+        /* Always a receipt: a run's log must say which side of the A/B it is, and "no line"
+         * is indistinguishable from "the code did not run". */
+        gdx_port_logf("[audio-boot] bypass off (audio_boot_bypass=0): reads wait for residency\n");
+        return 0;
+    }
+    if (s_streaming) {
+        /* C4d owns the stream singleton AND audio_table is never preloaded under it, so
+         * there is no in-flight wait to bypass. Not a failure; say so and stay out. */
+        gdx_port_logf("[audio-boot] bypass not needed (audio_stream=1 serves every read)\n");
+        return 0;
+    }
+    unsigned int kb = cfg->bootBypassKb ? cfg->bootBypassKb : 64u;
+    unsigned int blockLog2 = 12u; /* 4 KiB blocks: the six boot DMAs are small and scattered,
+                                   * and a 16 KiB block would read 4x what they ask for */
+    unsigned int blocks = (kb * 1024u) >> blockLog2;
+    if (blocks < 4u) {
+        blocks = 4u;
+    }
+    const int armed = gdx_o2r_stream_open(paths, pathCount, GDX_AUDIO_TABLE_ENTRY_KEY,
+                                          GDX_AUDIO_TABLE_ENTRY_BYTES,
+                                          GDX_AUDIO_TABLE_PAYLOAD_OFFSET, blockLog2, blocks);
+    gdx_port_logf("[audio-boot] bypass %s (%s) cacheKB=%u blockKB=%u\n",
+                  armed ? "armed" : "REFUSED", gdx_o2r_stream_refusal(),
+                  gdx_o2r_stream_cache_bytes() / 1024u, (1u << blockLog2) / 1024u);
+    if (!armed) {
+        /* Refused (no archive, entry deflated, size disagrees): the unchanged wait path
+         * serves. A refusal costs boot time, never correctness. */
+        return 0;
+    }
+    s_bootBypass = 1;
+    s_bootBypassT0 = gdx_host_ms_now();
+    GdxSegmentSourceSetBypass(GDX_AUDIO_TABLE_ROM_BASE, GDX_AUDIO_TABLE_BYTES, bootBypassRead);
+    return 1;
+}
+
+void gdx_audio_diet_boot_bypass_release(void) {
+    if (!s_bootBypass) {
+        return;
+    }
+    s_bootBypass = 0;
+    /* Retract first so no new reader can enter, then wait out any reader already inside the
+     * stream before closing it (gdx_o2r_stream_close does not take the stream's own lock). */
+    GdxSegmentSourceSetBypass(0u, 0u, nullptr);
+    GdxSegmentSourceDrainBypass();
+    unsigned int served = 0, bytes = 0, declined = 0;
+    GdxSegmentSourceBypassStats(&served, &bytes, &declined);
+    char stats[288];
+    gdx_port_logf("[audio-boot] bypass released served=%u bytes=%u declined=%u window_ms=%d %s\n",
+                  served, bytes, declined, (int)(gdx_host_ms_now() - s_bootBypassT0),
+                  gdx_o2r_stream_format_stats(stats, (unsigned int)sizeof(stats)));
+    gdx_o2r_stream_close();
 }
 
 int gdx_audio_diet_streaming(void) {

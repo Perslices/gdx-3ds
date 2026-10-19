@@ -7,11 +7,13 @@ foreign agent's key, and the log parser reproduces hand-computed numbers.
 """
 
 import argparse
+import binascii
 import io
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -957,25 +959,44 @@ class Stereo3dTest(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    def test_core_options_file_is_untouched_without_3d(self):
-        """Not one byte differs for a run that did not ask for 3D."""
+    def test_core_options_redirect_applies_to_a_plain_mono_run(self):
+        """emufix (2026-10-16): a plain run (no --3d, no --model) used to write NO
+        redirect, so it read/wrote the SHARED Azahar.opt like every other concurrent
+        instance -- a torn or half-written shared file handed to a booting core was the
+        mono lane's ~50% early-crash rate. The redirect, and the private per-instance
+        options file, must now land for every run, with values the core actually
+        declares (not the old illegal "1x (Native)" / "Default Top-Bottom Screen" /
+        "enabled" guesses, which silently fell back to the option default)."""
         from gdxdev import retro
         d = tempfile.mkdtemp()
         try:
             inst = retro.Instance("t3d")
             inst.dir = d
             retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib")
-            self.assertEqual(util.read_text(inst.core_options),
-                             retro.CORE_OPTIONS_TEMPLATE % {"gfx": "Vulkan"})
-            self.assertNotIn("rgui_config_directory", util.read_text(inst.cfg))
-            self.assertFalse(os.path.exists(os.path.join(d, "config", "Azahar",
-                                                         "Azahar.opt")))
+            self.assertIn("rgui_config_directory", util.read_text(inst.cfg),
+                          "mono runs must get their own private core-options file, "
+                          "exactly like --3d, or they fall back to the shared one")
+            opt_path = os.path.join(d, "config", "Azahar", "Azahar.opt")
+            self.assertTrue(os.path.exists(opt_path),
+                            "the file RetroArch actually reads must exist for a plain run")
+            opt = util.read_text(opt_path)
+            self.assertIn('citra_is_new_3ds = "New 3DS"', opt,
+                          "the old mono value, \"enabled\", is not legal and silently "
+                          "fell back to the option default")
+            self.assertIn('citra_resolution_factor = "1"', opt,
+                          "\"1x (Native)\" is not a legal value for this option")
+            self.assertIn('citra_layout_option = "default"', opt,
+                          "\"Default Top-Bottom Screen\" is not a legal value for this option")
+            self.assertIn('citra_graphics_api = "Vulkan"', opt)
+            # Both files get the SAME text -- one template, written to both places, not
+            # two near-duplicate ones that can drift apart.
+            self.assertEqual(util.read_text(inst.core_options), opt)
 
             retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib",
                                three_d=("side-by-side", 100))
             # The file RetroArch actually reads (core_options_path is inert; see
             # CFG_3D_EXTRA). Both halves have to be there or the option never lands.
-            opt = util.read_text(os.path.join(d, "config", "Azahar", "Azahar.opt"))
+            opt = util.read_text(opt_path)
             self.assertIn('citra_render_3d = "side-by-side"', opt)
             self.assertIn('citra_factor_3d = "100"', opt)
             self.assertIn('citra_is_new_3ds = "New 3DS"', opt,
@@ -986,28 +1007,51 @@ class Stereo3dTest(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_core_options_never_touch_the_shared_file(self):
+        """The fix must redirect every run's options into ITS OWN instance directory,
+        never into ~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt --
+        the file the user's own Azahar Qt lane and every OTHER concurrent instance share."""
+        from gdxdev import retro
+        d = tempfile.mkdtemp()
+        try:
+            inst = retro.Instance("tshared")
+            inst.dir = d
+            retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib")
+            cfg_text = util.read_text(inst.cfg)
+            m = [l for l in cfg_text.splitlines() if l.startswith("rgui_config_directory")]
+            self.assertEqual(len(m), 1)
+            self.assertIn(d, m[0], "the redirect must point inside THIS instance's dir")
+            self.assertNotIn("RetroArch/config/Azahar", m[0])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
 
 class RetroModelTest(unittest.TestCase):
     """`--model old`: the Old 3DS lane (NEXT.md C4).
 
     Three properties, each of which has already burned somebody on this lane:
-    (a) with no --model NOTHING changes, so every baseline taken before the flag stays
-    valid; (b) the value written is one the CORE DECLARES ("Old 3DS", not "disabled"),
+    (a) with no --model the EFFECTIVE model is unchanged -- still New 3DS, the core's own
+    compiled default, now written explicitly rather than left unset (emufix, 2026-10-16:
+    the redirect itself is written on every run, mono included, to stop the lane sharing
+    ~/Library/Application Support/RetroArch/config/Azahar/Azahar.opt across concurrent
+    instances); (b) the value written is one the CORE DECLARES ("Old 3DS", not "disabled"),
     because an illegal value silently falls back to the option default and the run would
     quietly be a New 3DS run wearing an Old 3DS label; (c) the manifest's platform.model
     follows the flag, since that field is what any later comparison reads.
     """
 
-    def test_no_model_writes_no_redirect(self):
+    def test_no_model_still_writes_the_redirect_with_the_default(self):
         from gdxdev import retro
         d = tempfile.mkdtemp()
         try:
             inst = retro.Instance("tmodel")
             inst.dir = d
             retro.write_config(inst, gfx="Vulkan", core="/tmp/none.dylib")
-            self.assertNotIn("rgui_config_directory", util.read_text(inst.cfg))
-            self.assertFalse(os.path.exists(os.path.join(d, "config", "Azahar",
-                                                         "Azahar.opt")))
+            self.assertIn("rgui_config_directory", util.read_text(inst.cfg))
+            opt = util.read_text(os.path.join(d, "config", "Azahar", "Azahar.opt"))
+            self.assertIn('citra_is_new_3ds = "New 3DS"', opt,
+                          "no --model must still PIN the core's own default explicitly, "
+                          "not merely rely on it, now that the file is read")
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -1880,6 +1924,225 @@ class GuestIniDelProtocolTest(unittest.TestCase):
         self.assertIn("gdx3ds_config_host_tests", ci)
 
 
+class HwPutGetTest(unittest.TestCase):
+    """Host side of `hw.py put` / `hw.py get` (n60lead hwlink round): a generic file push
+    (reused by `replay` already) and the new pull. Transport stubbed, same shape as
+    HwIniDeleteTest -- nothing here may touch the console."""
+
+    def setUp(self):
+        self.sent = []
+        test = self
+
+        class FakeControl(object):
+            def __init__(self, ip, port=None, timeout=None):
+                test.sent.append(("connect", ip))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def command(self, line):
+                test.sent.append(line)
+                return "OK"
+
+            def put_file(self, line, path):
+                test.sent.append(("put", line, path))
+                return "OK PUT sdmc:" + line.split(None, 1)[1]
+
+            def get_file(self, sdmc_path, out_path):
+                test.sent.append(("get", sdmc_path, out_path))
+                with open(out_path, "wb") as f:
+                    f.write(b"fake")
+                return 4
+
+        self._real_control = hw.Control
+        self._real_load_ip = hw.load_ip
+        hw.Control = FakeControl
+        hw.load_ip = lambda explicit: explicit or "10.0.0.1"
+        self._stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        self._tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        sys.stdout = self._stdout
+        hw.Control = self._real_control
+        hw.load_ip = self._real_load_ip
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _put_args(self, **kw):
+        base = {"ip": None, "file": None, "dest": None}
+        base.update(kw)
+        return type("A", (), base)()
+
+    def _get_args(self, **kw):
+        base = {"ip": None, "path": None, "out": None}
+        base.update(kw)
+        return type("A", (), base)()
+
+    def test_put_pushes_the_exact_dest(self):
+        local = os.path.join(self._tmp, "new.ini")
+        with open(local, "w") as f:
+            f.write("[net]\nenabled = 1\n")
+        self.assertEqual(
+            hw.cmd_put(self._put_args(file=local, dest="/3ds/gdiffuser/gdiffuser.ini")), 0)
+        self.assertEqual(
+            self.sent, [("connect", "10.0.0.1"),
+                       ("put", "PUT /3ds/gdiffuser/gdiffuser.ini", local)])
+
+    def test_put_refuses_a_relative_dest(self):
+        local = os.path.join(self._tmp, "new.ini")
+        open(local, "w").close()
+        with self.assertRaises(SystemExit):
+            hw.cmd_put(self._put_args(file=local, dest="3ds/gdiffuser/gdiffuser.ini"))
+        self.assertEqual(self.sent, [], "must not connect before dying")
+
+    def test_put_refuses_a_missing_local_file(self):
+        with self.assertRaises(SystemExit):
+            hw.cmd_put(self._put_args(file=os.path.join(self._tmp, "nope"),
+                                      dest="/3ds/gdiffuser/gdiffuser.ini"))
+        self.assertEqual(self.sent, [])
+
+    def test_get_pulls_under_the_gdiffuser_prefix(self):
+        out = os.path.join(self._tmp, "log.txt")
+        self.assertEqual(
+            hw.cmd_get(self._get_args(path="/3ds/gdiffuser/log.txt", out=out)), 0)
+        self.assertEqual(self.sent, [("connect", "10.0.0.1"),
+                                     ("get", "/3ds/gdiffuser/log.txt", out)])
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"fake")
+
+    def test_get_refuses_a_path_outside_the_sandbox(self):
+        """Mirrors the console's own confinement (netPathUnderGdiffuser) so a caller finds
+        out from `hw.py` itself, not a round trip to the console just to get ERR GET."""
+        with self.assertRaises(SystemExit):
+            hw.cmd_get(self._get_args(path="/3ds/G-Diffuser-3DS.3dsx"))
+        self.assertEqual(self.sent, [], "must not connect before dying")
+
+    def test_get_default_out_is_under_artifacts(self):
+        # Redirect hw.REPO to a scratch dir for this one case: with no --out, cmd_get's
+        # default path is REPO/artifacts/<basename>, and a real run would otherwise write
+        # (via FakeControl.get_file, which actually touches disk like the real one does)
+        # straight into this checkout's own artifacts/ directory.
+        real_repo = hw.REPO
+        hw.REPO = self._tmp
+        try:
+            hw.cmd_get(self._get_args(path="/3ds/gdiffuser/log.txt"))
+        finally:
+            hw.REPO = real_repo
+        got_out = [c for c in self.sent if isinstance(c, tuple) and c[0] == "get"][0][2]
+        self.assertEqual(os.path.basename(got_out), "log.txt")
+        self.assertEqual(os.path.basename(os.path.dirname(got_out)), "artifacts")
+        self.assertTrue(got_out.startswith(self._tmp), "must not default into the real repo")
+
+    # ---- end to end through hw.main(), so the parser itself is covered ----------
+    def test_main_put(self):
+        local = os.path.join(self._tmp, "new.ini")
+        open(local, "w").close()
+        self.assertEqual(hw.main(["put", local, "/3ds/gdiffuser/gdiffuser.ini"]), 0)
+        self.assertEqual(self.sent, [("connect", "10.0.0.1"),
+                                     ("put", "PUT /3ds/gdiffuser/gdiffuser.ini", local)])
+
+    def test_main_get(self):
+        out = os.path.join(self._tmp, "log.txt")
+        self.assertEqual(hw.main(["get", "/3ds/gdiffuser/log.txt", "--out", out]), 0)
+        self.assertEqual(self.sent, [("connect", "10.0.0.1"),
+                                     ("get", "/3ds/gdiffuser/log.txt", out)])
+
+
+class HwGetFramingTest(unittest.TestCase):
+    """Control.get_file's wire framing against a REAL socket (a connected
+    socket.socketpair stands in for the console): 'OK GET <size> <crc32hex>\\n' followed by
+    exactly <size> raw bytes, including when a single recv() handed read_line() part of
+    that payload along with the reply line -- the leftover-buffer case `get_file` has to
+    seed `data` from rather than drop."""
+
+    def _control_fed(self, wire_bytes):
+        """`mine` plays the console's half of the control socket. `theirs` stays open
+        until the test ends (closing it right away, before get_file sends its own `GET
+        ...` command line, would EPIPE that send on a connected SOCK_STREAM pair --
+        closing a peer breaks writes to it immediately, not just reads from it)."""
+        c = hw.Control.__new__(hw.Control)
+        mine, theirs = socket.socketpair()
+        c.sock = mine
+        c.buf = b""
+        theirs.sendall(wire_bytes)
+        self.addCleanup(theirs.close)
+        self.addCleanup(mine.close)
+        return c
+
+    def _out_path(self):
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def test_payload_arriving_with_the_reply_line_is_not_dropped(self):
+        payload = b"[net] init port=17492...\n[net] link up build=abc\n"
+        crc = binascii.crc32(payload) & 0xFFFFFFFF
+        wire = ("OK GET %d %08X\n" % (len(payload), crc)).encode("ascii") + payload
+        c = self._control_fed(wire)
+        out = self._out_path()
+        size = c.get_file("/3ds/gdiffuser/log.txt", out, progress=False)
+        self.assertEqual(size, len(payload))
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_crc_mismatch_raises_and_still_leaves_no_partial_claim(self):
+        payload = b"corrupted on the wire"
+        wire = ("OK GET %d %08X\n" % (len(payload), 0)).encode("ascii") + payload
+        c = self._control_fed(wire)
+        with self.assertRaises(IOError):
+            c.get_file("/3ds/gdiffuser/log.txt", self._out_path(), progress=False)
+
+    def test_err_reply_raises_without_touching_the_output_file(self):
+        c = self._control_fed(b"ERR GET not-found-or-unreadable sdmc:/3ds/gdiffuser/x\n")
+        out = self._out_path()
+        os.unlink(out)
+        with self.assertRaises(IOError):
+            c.get_file("/3ds/gdiffuser/x", out, progress=False)
+        self.assertFalse(os.path.exists(out), "a refused GET must not create the output file")
+
+
+class GuestGetProtocolTest(unittest.TestCase):
+    """The guest half, checked at the source so host and console cannot drift (same spirit
+    as GuestIniDelProtocolTest above, for the new GET command)."""
+
+    def _src(self, rel):
+        p = os.path.join(util.repo_root(), rel)
+        if not os.path.exists(p):
+            self.skipTest("%s not present" % rel)
+        return util.read_text(p)
+
+    def test_net_handles_get(self):
+        net = self._src("port/3ds/net/gdx3ds_net.c")
+        self.assertIn("REQ_GET", net)
+        self.assertIn('strcmp(tok[0], "GET")', net)
+        self.assertIn("netPathUnderGdiffuser", net)
+        self.assertIn("netGetFileForHost", net)
+
+    def test_get_is_confined_to_the_same_prefix_hw_py_checks(self):
+        net = self._src("port/3ds/net/gdx3ds_net.c")
+        hwsrc = self._src("tools/dev/hw.py")
+        self.assertIn('#define NET_GET_PREFIX "/3ds/gdiffuser/"', net)
+        self.assertIn('"/3ds/gdiffuser/"', hwsrc)
+
+    def test_get_runs_on_the_main_thread_via_the_request_queue(self):
+        """Not handled straight on the net thread like PUT/RELOAD: GET's target can be
+        log.txt, which another thread may be appending to right now (see the comment above
+        netGetFileForHost). It must go through the same REQ_* hand-off as INI/CAPTURE."""
+        net = self._src("port/3ds/net/gdx3ds_net.c")
+        i = net.index('strcmp(tok[0], "GET")')
+        j = net.index("netPostRequest(REQ_GET", i)
+        self.assertGreater(j, i)
+
+    def test_get_is_size_capped(self):
+        net = self._src("port/3ds/net/gdx3ds_net.c")
+        self.assertIn("NET_GET_CAP", net)
+        self.assertIn("too-large", net)
+
+
 class DelegateTest(unittest.TestCase):
     def test_missing_peer_exits_7(self):
         from gdxdev import delegate
@@ -2582,6 +2845,9 @@ class IniSpecTypoTest(unittest.TestCase):
     def test_ordinary_specs_still_parse(self):
         self.assertEqual(inifile.parse_spec("native.all=1"), ("native", "all", "1"))
         self.assertEqual(inifile.parse_spec("det=1"), (inifile.DEFAULT_SECTION, "det", "1"))
+        # n60launch: [variant.N] sections carry a dot of their own.
+        self.assertEqual(inifile.parse_spec("variant.N.ndsp_core1=1"), ("variant.N", "ndsp_core1", "1"))
+        self.assertEqual(inifile.parse_spec("variant.P.native.all=0"), ("variant.P", "native.all", "0"))
         # A path value keeps working -- only '=' and ',' are refused.
         self.assertEqual(inifile.parse_spec("debug.input_replay=race-mutecity-start"),
                          ("debug", "input_replay", "race-mutecity-start"))
@@ -3208,6 +3474,32 @@ def _import_lodburst():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+class LaunchVariantGuestLogTest(unittest.TestCase):
+    """n60launch: a launch-variant boot writes log-<X>.txt, not log.txt; the harness follows it."""
+
+    def _inst(self, d):
+        class _Inst:
+            def gdx_dir(self_inner):
+                return d
+        return _Inst()
+
+    def test_follows_this_boots_variant_log(self):
+        from gdxdev import retro
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            inst = self._inst(d)
+            old = os.path.join(d, "log-P.txt")
+            open(old, "w").write("earlier boot")
+            os.utime(old, (time.time() - 600, time.time() - 600))
+            open(os.path.join(d, "log-N-prev.txt"), "w").write("prev")
+            retro._BOOT_STARTED["t"] = time.time()
+            self.assertEqual(retro._guest_log_path(inst), os.path.join(d, "log.txt"))
+            open(os.path.join(d, "log-N.txt"), "w").write("this boot")
+            self.assertEqual(retro._guest_log_path(inst), os.path.join(d, "log-N.txt"))
+            open(os.path.join(d, "log.txt"), "w").write("main")
+            self.assertEqual(retro._guest_log_path(inst), os.path.join(d, "log.txt"))
 
 
 if __name__ == "__main__":

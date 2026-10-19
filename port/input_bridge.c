@@ -50,6 +50,7 @@
 #include "fzx_game.h" // GameMode values + GET_MODE (in-race safety checks)
 #include "gdx_input_script.h" // GDX_INPUT_SCRIPT: dev-only deterministic input playback (see file header)
 #include "gdx_input_rec.h"    // ORACLE: .gdxrec record/replay stage of the unified injector
+#include "gdx_hud_placement.h" // nibottom Phase 2: the HUD placement lever predicates below
 #include "port_log.h"
 
 #include <stdbool.h>
@@ -499,6 +500,14 @@ int gdx_widescreen_ui_active(void) {
 int gdx_widescreen_split_ui_active(void) {
     return gdx_widescreen_ui_active() && CVarGetInteger("gEnhancements.Graphics.WidescreenSplitUI", 1);
 }
+
+// nibottom Phase 2 / nihudtop Phase 3: the bottom-screen DASH HUD's placement lever, the
+// per-element top-screen predicate built on it, and the CUSTOM-mask override hook all moved to
+// their own translation unit, port/gdx_hud_placement.c -- it has no LUS/controller dependencies,
+// unlike the rest of this file, so it (and only it) can be compiled standalone for
+// port/tests/gdx_hud_placement_host_tests.c the same way gdx3ds_native_cfg.c / gdx3ds_dynlod.c
+// already are. See that file for gdx_hud_placement_mode/_effective_mode/_element_on_top/
+// _top_element_mask/_top_suppressed/_minimap_suppressed/_set_custom_top_mask/_name.
 
 // Race-entry wipe suppression. The wipe curtain is what puts the black staircase wedges on the
 // screen corners through the intro/countdown (probe-confirmed 2026-08-08: nothing else draws the

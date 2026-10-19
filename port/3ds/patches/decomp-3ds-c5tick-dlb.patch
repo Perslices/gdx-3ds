@@ -1,0 +1,449 @@
+--- a/src/game/game.c
++++ b/src/game/game.c
+@@ -894,10 +894,24 @@
+ 
+ extern s16 D_i2_80106DA0;
+ 
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++#include "gdx3ds_dlb_shim.h" /* C5TICK: dlb section markers (decomp-3ds-c5tick-dlb.patch) */
++#else
++#define GDX_DLB(sec)
++#endif
++
+ Gfx* func_80069698(Gfx* gfx) {
+ 
++    GDX_DLB(OTHER);
+     if ((gGameModeChangeState != GAMEMODE_CHANGE_INIT) && D_i2_80106DA0) {
+         gfx = sGamemodeDrawFuncs[GET_MODE(gGameMode)](gfx);
+     }
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++    GDX_DLB(TRANS);
++    gfx = Transition_Draw(gfx);
++    GDX_DLB(END);
++    return gfx;
++#else
+     return Transition_Draw(gfx);
++#endif
+ }
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5620,6 +5620,14 @@
+ #else
+ #define GDX_HUD_REGION_BEGIN(var)
+ #define GDX_HUD_CAPTURE(var, kind)
++#endif
++
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++#include "gdx3ds_dlb_shim.h" /* C5TICK: dlb section markers + hollow ticks (decomp-3ds-c5tick-dlb.patch) */
++#else
++#define GDX_DLB(sec)
++#define GDX_DL_SKIP(sec, view) 0
++#define GDX_DL_SKIP_LABEL(label) label:;
+ #endif
+ 
+ Gfx* Racer_Draw(Gfx* gfx, s32 playerIndex) {
+@@ -5678,6 +5686,7 @@
+ #endif
+ 
+     GDX_C5CAT(MACH);
++    GDX_DLB(VIS);
+     camera = &gCameras[playerIndex];
+ 
+     sp56C = (camera->basis.x.x * 100.0f) - camera->eye.x;
+@@ -6030,6 +6039,20 @@
+         }
+     }
+     GDX_C5CAT(SHD);
++    GDX_DLB(SHD);
++    /* C5TICK: GDX_DL_SKIP(sec) is 1 when this section's display list will never be walked (a
++       hollow tick, [debug] dl_hollow) or a native path has taken it over. Only the four
++       sections below may skip: they write the display list, the GfxPool and per-frame draw
++       scratch (the *MatrixInit flags and modelMatrix, which the racer update resets every tick
++       and which only Racer_Draw reads). The visibility pass above and the HUD tail (countdown
++       and approach-warning sounds, BGM start, soundEffectFlags) always run. Proof:
++       decomp-3ds-c5tick-dlb.patch in port/3ds/patches/README.md. */
++    if (GDX_DL_SKIP(SHD, playerIndex)) {
++        if (gRaceIntroTimer >= 280) {
++            gRacers[0].speed = gRacers[1].speed = gRacers[2].speed = gRacers[3].speed = 0.0f;
++        }
++        goto gdx_after_shd;
++    }
+     GDX_HUD_REGION_BEGIN(gdxShadowStart);
+     if (gRaceIntroTimer < 280) {
+         gSPDisplayList(gfx++, D_303A758);
+@@ -6100,7 +6123,28 @@
+     }
+ 
+     GDX_HUD_CAPTURE(gdxShadowStart, SHADOW);
++GDX_DL_SKIP_LABEL(gdx_after_shd);
+     GDX_C5CAT(MACH);
++    GDX_DLB(BODY);
++    if (GDX_DL_SKIP(BODY, playerIndex)) {
++        playerRacer = &gRacers[playerIndex];
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++        /* The machines' poses stay available without the body pass ([debug] dl_hollow_poses,
++           default 1): the same model matrices the pass would have built (GfxPool Mtx +
++           racer->modelMatrix) for every visible machine, for a stage that re-submits the last
++           frame's geometry with each tick's poses. */
++        if (gdx_dl_poses()) {
++            for (racer = sLastRacer; racer >= gRacers; racer--) {
++                if ((racer->machineLod != 0) && !racer->modelMatrixInit) {
++                    Matrix_ScaleFrom3DMatrix(&gGfxPool->unk_20308[racer->id], &racer->modelMatrix, D_800CE748,
++                                             D_800CE74C, D_800CE750, &racer->modelBasis, &racer->modelPos);
++                    racer->modelMatrixInit = true;
++                }
++            }
++        }
++#endif
++        goto gdx_after_body;
++    }
+     gSPDisplayList(gfx++, D_303A7D8);
+ 
+     for (racer = sLastRacer; racer >= gRacers; racer--) {
+@@ -6323,6 +6367,7 @@
+             gSPDisplayList(gfx++, D_800CDDB0[racer->machineIndex * 6 + racer->machineLod - 1]);
+         }
+     }
++GDX_DL_SKIP_LABEL(gdx_after_body);
+     sp560 = camera->basis.z.x;
+     sp55C = camera->basis.z.y;
+     sp558 = camera->basis.z.z;
+@@ -6331,6 +6376,10 @@
+     sp564 = camera->basis.y.z;
+ 
+     GDX_C5CAT(FX);
++    GDX_DLB(BOOST);
++    if (GDX_DL_SKIP(BOOST, playerIndex)) {
++        goto gdx_after_boost;
++    }
+     GDX_HUD_REGION_BEGIN(gdxFxStart);
+     gSPDisplayList(gfx++, aSetupBoosterDL);
+ 
+@@ -6581,6 +6630,11 @@
+         }
+     }
+     GDX_HUD_CAPTURE(gdxFxStart, FX);
++GDX_DL_SKIP_LABEL(gdx_after_boost);
++    GDX_DLB(EFX);
++    if (GDX_DL_SKIP(EFX, playerIndex)) {
++        goto gdx_after_efx;
++    }
+ #if defined(PORT) && defined(GDX_NATIVE_FX)
+ #include "gdx3ds_fx_shim_begin.h"
+     GDXFX_BEGIN(playerIndex);
+@@ -6964,8 +7018,10 @@
+     GDXFX_END();
+ #include "gdx3ds_fx_shim_end.h"
+ #endif
++GDX_DL_SKIP_LABEL(gdx_after_efx);
+ 
+     GDX_C5CAT(HUD);
++    GDX_DLB(RHUD);
+     GDX_HUD_REGION_BEGIN(gdxHudStart);
+ #ifndef EXPANSION_KIT
+     if (gRaceIntroTimer != 0) {
+--- a/src/overlays/ovl_i2/race.c
++++ b/src/overlays/ovl_i2/race.c
+@@ -189,8 +189,16 @@
+ #define GDX_HUD_CAPTURE(var, kind)
+ #endif
+ 
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++#include "gdx3ds_dlb_shim.h" /* C5TICK: dlb section markers + hollow ticks (decomp-3ds-c5tick-dlb.patch) */
++#else
++#define GDX_DLB(sec)
++#define GDX_DL_SKIP(sec, view) 0
++#endif
++
+ Gfx* Race_Draw(Gfx* gfx) {
+ 
++    GDX_DLB(RHEAD);
+     if (D_i2_80106F10 != 0) {
+         D_i2_80106F10--;
+         gDPPipeSync(gfx++);
+@@ -242,48 +250,139 @@
+     switch (gNumPlayers) {
+         case 1:
+             GDX_C5CAT(SKY);
+-            gfx = Background_Draw(gfx, 0, SCISSOR_BOX_FULL_SCREEN);
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 0)) {
++                gfx = Background_Draw(gfx, 0, SCISSOR_BOX_FULL_SCREEN);
++            }
+             GDX_C5CAT(TRK);
+-            gfx = Course_Draw(gfx, 0);
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 0)) {
++                gfx = Course_Draw(gfx, 0);
++            }
+             GDX_C5CAT(DRESS);
+-            gfx = Course_GadgetsDraw(gfx, 0);
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 0)) {
++                gfx = Course_GadgetsDraw(gfx, 0);
++            }
+             GDX_C5CAT(MISC);
+             break;
+         case 2:
+-            gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_HALF);
+-            gfx = Course_Draw(gfx, 0);
+-            gfx = Course_GadgetsDraw(gfx, 0);
+-            gfx = Background_Draw(gfx, 1, SCISSOR_BOX_BOTTOM_HALF);
+-            gfx = Course_Draw(gfx, 1);
+-            gfx = Course_GadgetsDraw(gfx, 1);
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 0)) {
++                gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_HALF);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 0)) {
++                gfx = Course_Draw(gfx, 0);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 0)) {
++                gfx = Course_GadgetsDraw(gfx, 0);
++            }
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 1)) {
++                gfx = Background_Draw(gfx, 1, SCISSOR_BOX_BOTTOM_HALF);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 1)) {
++                gfx = Course_Draw(gfx, 1);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 1)) {
++                gfx = Course_GadgetsDraw(gfx, 1);
++            }
+             break;
+         case 3:
+-            gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_LEFT_QUARTER);
+-            gfx = Course_Draw(gfx, 0);
+-            gfx = Course_GadgetsDraw(gfx, 0);
+-            gfx = Background_Draw(gfx, 1, SCISSOR_BOX_BOTTOM_LEFT_QUARTER);
+-            gfx = Course_Draw(gfx, 1);
+-            gfx = Course_GadgetsDraw(gfx, 1);
+-            gfx = Background_Draw(gfx, 2, SCISSOR_BOX_TOP_RIGHT_QUARTER);
+-            gfx = Course_Draw(gfx, 2);
+-            gfx = Course_GadgetsDraw(gfx, 2);
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 0)) {
++                gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_LEFT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 0)) {
++                gfx = Course_Draw(gfx, 0);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 0)) {
++                gfx = Course_GadgetsDraw(gfx, 0);
++            }
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 1)) {
++                gfx = Background_Draw(gfx, 1, SCISSOR_BOX_BOTTOM_LEFT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 1)) {
++                gfx = Course_Draw(gfx, 1);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 1)) {
++                gfx = Course_GadgetsDraw(gfx, 1);
++            }
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 2)) {
++                gfx = Background_Draw(gfx, 2, SCISSOR_BOX_TOP_RIGHT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 2)) {
++                gfx = Course_Draw(gfx, 2);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 2)) {
++                gfx = Course_GadgetsDraw(gfx, 2);
++            }
+             break;
+         case 4:
+-            gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_LEFT_QUARTER);
+-            gfx = Course_Draw(gfx, 0);
+-            gfx = Course_GadgetsDraw(gfx, 0);
+-            gfx = Background_Draw(gfx, 1, SCISSOR_BOX_BOTTOM_LEFT_QUARTER);
+-            gfx = Course_Draw(gfx, 1);
+-            gfx = Course_GadgetsDraw(gfx, 1);
+-            gfx = Background_Draw(gfx, 2, SCISSOR_BOX_TOP_RIGHT_QUARTER);
+-            gfx = Course_Draw(gfx, 2);
+-            gfx = Course_GadgetsDraw(gfx, 2);
+-            gfx = Background_Draw(gfx, 3, SCISSOR_BOX_BOTTOM_RIGHT_QUARTER);
+-            gfx = Course_Draw(gfx, 3);
+-            gfx = Course_GadgetsDraw(gfx, 3);
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 0)) {
++                gfx = Background_Draw(gfx, 0, SCISSOR_BOX_TOP_LEFT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 0)) {
++                gfx = Course_Draw(gfx, 0);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 0)) {
++                gfx = Course_GadgetsDraw(gfx, 0);
++            }
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 1)) {
++                gfx = Background_Draw(gfx, 1, SCISSOR_BOX_BOTTOM_LEFT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 1)) {
++                gfx = Course_Draw(gfx, 1);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 1)) {
++                gfx = Course_GadgetsDraw(gfx, 1);
++            }
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 2)) {
++                gfx = Background_Draw(gfx, 2, SCISSOR_BOX_TOP_RIGHT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 2)) {
++                gfx = Course_Draw(gfx, 2);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 2)) {
++                gfx = Course_GadgetsDraw(gfx, 2);
++            }
++            GDX_DLB(SKY);
++            if (!GDX_DL_SKIP(SKY, 3)) {
++                gfx = Background_Draw(gfx, 3, SCISSOR_BOX_BOTTOM_RIGHT_QUARTER);
++            }
++            GDX_DLB(TRK);
++            if (!GDX_DL_SKIP(TRK, 3)) {
++                gfx = Course_Draw(gfx, 3);
++            }
++            GDX_DLB(DRESS);
++            if (!GDX_DL_SKIP(DRESS, 3)) {
++                gfx = Course_GadgetsDraw(gfx, 3);
++            }
+             break;
+     }
+ 
++    GDX_DLB(RMID);
+     gSPLoadUcodeL(gfx++, gspF3DFLX2_Rej_fifo);
+     gfx = Segment_SetTableAddresses(gfx);
+     gSPClipRatio(gfx++, FRUSTRATIO_3);
+@@ -301,11 +400,16 @@
+         case 1:
+             gSPPerspNormalize(gfx++, gCameras[0].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[0], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_FULL_SCREEN, 0);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 0)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_FULL_SCREEN, 0);
++            }
+             gfx = Racer_Draw(gfx, 0);
++            GDX_DLB(RMID);
+             GDX_C5CAT(HUD);
+             {
+                 GDX_HUD_REGION_BEGIN(gdxHudStart);
++                GDX_DLB(P1HUD);
+                 gfx = Menus_Player1SpecialDraw(gfx, 0);
+                 GDX_HUD_CAPTURE(gdxHudStart, HUD);
+             }
+@@ -314,44 +418,80 @@
+         case 2:
+             gSPPerspNormalize(gfx++, gCameras[0].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[0], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_HALF, 0);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 0)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_HALF, 0);
++            }
+             gfx = Racer_Draw(gfx, 0);
++            GDX_DLB(RMID);
+             gSPPerspNormalize(gfx++, gCameras[1].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[1], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_HALF, 1);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 1)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_HALF, 1);
++            }
+             gfx = Racer_Draw(gfx, 1);
++            GDX_DLB(RMID);
+             break;
+         case 3:
+             gSPPerspNormalize(gfx++, gCameras[0].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[0], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_LEFT_QUARTER, 0);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 0)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_LEFT_QUARTER, 0);
++            }
+             gfx = Racer_Draw(gfx, 0);
++            GDX_DLB(RMID);
+             gSPPerspNormalize(gfx++, gCameras[1].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[1], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_LEFT_QUARTER, 1);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 1)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_LEFT_QUARTER, 1);
++            }
+             gfx = Racer_Draw(gfx, 1);
++            GDX_DLB(RMID);
+             gSPPerspNormalize(gfx++, gCameras[2].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[2], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_RIGHT_QUARTER, 2);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 2)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_RIGHT_QUARTER, 2);
++            }
+             gfx = Racer_Draw(gfx, 2);
++            GDX_DLB(RMID);
+             break;
+         case 4:
+             gSPPerspNormalize(gfx++, gCameras[0].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[0], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_LEFT_QUARTER, 0);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 0)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_LEFT_QUARTER, 0);
++            }
+             gfx = Racer_Draw(gfx, 0);
++            GDX_DLB(RMID);
+             gSPPerspNormalize(gfx++, gCameras[1].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[1], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_LEFT_QUARTER, 1);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 1)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_LEFT_QUARTER, 1);
++            }
+             gfx = Racer_Draw(gfx, 1);
++            GDX_DLB(RMID);
+             gSPPerspNormalize(gfx++, gCameras[2].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[2], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_RIGHT_QUARTER, 2);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 2)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_TOP_RIGHT_QUARTER, 2);
++            }
+             gfx = Racer_Draw(gfx, 2);
++            GDX_DLB(RMID);
+             gSPPerspNormalize(gfx++, gCameras[3].perspectiveScale);
+             gSPMatrix(gfx++, &D_1000000.unk_20208[3], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_PROJECTION);
+-            gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_RIGHT_QUARTER, 3);
++            GDX_DLB(CAM);
++            if (!GDX_DL_SKIP(CAM, 3)) {
++                gfx = Camera_Draw(gfx, SCISSOR_BOX_BOTTOM_RIGHT_QUARTER, 3);
++            }
+             gfx = Racer_Draw(gfx, 3);
++            GDX_DLB(RMID);
+             break;
+     }
+ 
+@@ -359,6 +499,7 @@
+     GDX_C5CAT(HUD);
+     {
+         GDX_HUD_REGION_BEGIN(gdxHudStart);
++        GDX_DLB(MENUS);
+         gfx = Menus_Draw(gfx);
+         GDX_HUD_CAPTURE(gdxHudStart, HUD);
+     }

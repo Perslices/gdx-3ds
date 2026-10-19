@@ -1,25 +1,89 @@
 ; port/3ds/gfx/shader.v.pica — G-Diffuser 3DS vertex shader (stream A).
 ;
-; The Fast3D interpreter hands the backend fully-transformed clip-space vertices
-; (GetClipParameters: z_is_from_0_to_1 = true, invertY = false), so this shader is a
-; pass-through plus the PICA fixup: the "projection" uniform carries the
-; landscape→portrait rotation (3DS top-screen framebuffers are 240x400 portrait) and
-; the [0,w] → [0,-w] depth remap. gfx_citro3d.cpp owns the matrix values.
+; Two vertex families share this program; the bool uniform `xfon` selects between them.
 ;
-; Fixed input layout (gfx_citro3d.cpp repacks the interpreter's variable-stride VBO
-; into this — see kVertexStrideFloats):
+; LEGACY (xfon = false, every draw but the one below): the interpreter hands the backend
+; fully-transformed clip-space vertices (GetClipParameters: z_is_from_0_to_1 = true,
+; invertY = false), so this is a pass-through plus the PICA fixup: the "projection" uniform
+; carries the landscape→portrait rotation (3DS top-screen framebuffers are 240x400 portrait)
+; and the [0,w] → [0,-w] depth remap. gfx_citro3d.cpp owns the matrix values.
 ;   v0 = position (x, y, z, w)  clip space
 ;   v1 = texcoord (u, v, 0, 0)  texel0, already rescaled for pow2 padding
 ;   v2 = color    (r, g, b, a)  the shader-input routed to GPU_PRIMARY_COLOR
 ;   v3 = texcoord (u, v, 0, 0)  texel1 (2-cycle adjacent-tile modes), rescaled too
 ;
+; GPUXF (xfon = true; [native] gpuxf=1, retained machine meshes only, gdx3ds_mesh.cpp):
+; the RAW 16-byte N64 Vtx is the vertex -- no CPU transform at all -- and this shader runs
+; the part of GfxSpVertex + PackVertex that the mesh path's gate proved in range: the MP
+; multiply, the x aspect scale, directional lighting (ambient + up to 3 lights), spherical
+; texgen, the RSP fog factor, the per-run UV affine + clamp, and the combiner input
+; selects. Every op here is float24; the per-draw gate (gdx3ds_mesh.cpp GpuXfGate) is what
+; makes that safe -- see docs/research/native/o3dsgpuxf-progress.md section 2.
+;   v0 = ob (x, y, z, flag)       GPU_SHORT x4
+;   v1 = tc (s, t, 0, 1)          GPU_SHORT x2
+;   v2 = cn (r|nx, g|ny, b|nz, a) GPU_UNSIGNED_BYTE x4 (normals re-signed below)
+; Selects are multiply-selects (x*1 + y*0), never lerps, so a selected value is exact.
+;
+; RETAINED ([native] machines_retained=1, C5 Stage 1, c5s1-progress.md): the same proc over a
+; GPU-RESIDENT copy of the mesh's raw Vtx (built once per bake, never re-uploaded). The one
+; per-vertex input the CPU used to patch into that copy -- the F3DFLX alpha byte, a DMEM LUT
+; lookup -- is computed here from the analytic form of the stock LUT (xflx + xlut0..2), and
+; only when the mesh path has verified that DMEM holds exactly that LUT.
+; Register/uniform layout change (c5s1): ONE vec4 uniform `xflx` appended after `xseli`
+; (27 consecutive gpuxf vec4s; gfx_citro3d.cpp kXfUniforms checks the allocation), three
+; constants xlut0..2; temporaries r8..r12 are reused before the lighting block reloads them.
+;
+; RESIDENT ([native] track_resident=1, C5 Stage 3c, c5s3c-progress.md): the course's ring
+; vertices live in a GPU-resident buffer in WORLD space (the game's own s16 positions), and the
+; per-pass eye offset rides the uniform `xoff`: r0.xyz = ob + xoff.xyz. Both are integers
+; (|ob| <= 32768, xoff = -eye rounded, |sum| < 2^17), so the float24 add is EXACT and the dp4
+; below sees bit-for-bit the eye-rebased vertex the per-frame stream would have carried.
+; Register/uniform layout change (c5s3c): ONE vec4 uniform `xoff` appended after `xflx`
+; (28 consecutive gpuxf vec4s). Every other gpuxf draw has xoff = 0 (Gdx3dsXfDraw is zeroed),
+; and ob + 0 is exact: their transforms are unchanged.
+;
 ; Reference architecture: mkst/sm64-port 3ds-port src/pc/gfx/shader.v.pica.
 
 ; Uniforms
 .fvec projection[4]
+; ---- gpuxf (packing: gfx_citro3d.cpp GpuXfUpload*) ----
+.fvec xmvp[4]      ; MP_matrix columns: component i = dot(xmvp[i], (ob, 1))
+.fvec xconv        ; (xScale, ySign, zA, 1): clip' = clip * xconv + clip.w * xconvw
+.fvec xconvw       ; (0, 0, zB, 0)
+.fvec xfog         ; (fog_mul, fog_offset, fogOn, 1 - fogOn)
+.fvec xamb         ; ambient rgb (0..255), w = lit
+.fvec xunlit       ; w = 1 - lit
+.fvec xldir[3]     ; light coeffs / 127 (xyz)
+.fvec xlcol[3]     ; light colours (0..255, xyz; zero for unused lights)
+.fvec xlook[2]     ; lookat coeffs / 127 (xyz)
+.fvec xtg          ; (texgenOn, texScaleS, texScaleT, 1 - texgenOn)
+.fvec xtcs         ; (texScaleS / 65536, texScaleT / 65536, 0, 0)
+.fvec xuva[2]      ; per unit: (a_u, a_v, b_u, b_v): u = min(U * a + b, clamp) + off
+.fvec xuvc[2]      ; per unit: (clamp_u, clamp_v, off_u, off_v)
+.fvec xcol         ; constant rgb (0..1) and constant alpha
+.fvec xsel         ; (colorFromShade, alphaFromVertex, 0, 0)
+.fvec xseli        ; (1 - colorFromShade, 1 - alphaFromVertex, 0, 0)
+.fvec xflx         ; [native] machines_retained: (alphaLight.xyz, flxOn) -- the F3DFLX alpha
+                   ; light in model space and the analytic-LUT select (0 = the vertex's cn.a)
+.fvec xoff         ; [native] track_resident: (-eye.xyz, 0), integers; 0 for every other draw
+; ---- stereo frame replay (n60stereo; gdx3ds_stereo.h, STEREO.md "frame replay") ----
+.fvec stk          ; per draw, eye-independent: the stereo class's skew row on the incoming clip
+                   ; vector -- x' = x + steye * dot(stk, clip). SCENE (0, 0, k, -k*dc), SKY_DEEP
+                   ; (0, 0, 0, sep), ANCHORED (0, 0, 0, k*(d - dc)), UI / mono / offscreen 0.
+.fvec steye        ; per eye list, NEVER written by citro3d (raw words outside the replayed body):
+                   ; x = -1 left, +1 right, 0 mono. With 0 the skew adds exactly 0: mono output is
+                   ; bit-for-bit what it was.
+.bool xfon
 
 ; Constants
 .constf myconst(0.0, 1.0, -1.0, 0.5)
+.constf xk(128.0, -256.0, 255.0, 0.00392156862745098)
+.constf xk2(0.25, 0.001, 0.0, 0.0)
+; F3DFLX alpha LUT (racer.c D_800CE3D0) as three bands of i = trunc(dot(n, alphaLight)):
+;   a = max(0, min(60, 10i - 230, 450 - 10i)) + max(0, 110 - 20|i - 100|) + max(0, 230 - 30|i - 117|)
+.constf xlut0(10.0, -230.0, 450.0, 60.0)
+.constf xlut1(100.0, 20.0, 110.0, 117.0)
+.constf xlut2(30.0, 230.0, 0.0, 0.0)
 .alias  zeros myconst.xxxx
 .alias  ones  myconst.yyyy
 
@@ -37,16 +101,176 @@
 
 .entry vmain
 .proc vmain
-	; outpos = projection * inpos (fixup matrix, see BuildFixupMatrix)
-	dp4 outpos.x, projection[0], inpos
-	dp4 outpos.y, projection[1], inpos
-	dp4 outpos.z, projection[2], inpos
-	dp4 outpos.w, projection[3], inpos
+	ifu xfon
+		call gpuxf
+	.else
+		; r0 = inpos with the stereo skew on x (steye = 0: x + 0, exact)
+		mov r0, inpos
+		dp4 r1.x, stk, r0
+		mad r0.x, r1.x, steye.x, r0.x
+		; outpos = projection * r0 (fixup matrix, see BuildFixupMatrix)
+		dp4 outpos.x, projection[0], r0
+		dp4 outpos.y, projection[1], r0
+		dp4 outpos.z, projection[2], r0
+		dp4 outpos.w, projection[3], r0
 
-	; pass through texcoords and vertex color
-	mov outtc0, intex
-	mov outclr, inclr
-	mov outtc1, intex1
-
+		; pass through texcoords and vertex color
+		mov outtc0, intex
+		mov outclr, inclr
+		mov outtc1, intex1
+	.end
 	end
+.end
+
+; ---- GPUXF: GfxSpVertex + PackVertex on the PICA ---------------------------------------
+.proc gpuxf
+	; r0 = (ob + xoff, 1): exact integer add (see RESIDENT above)
+	add r0.xyz, xoff, inpos
+	mov r0.w, ones
+
+	; r1 = raw clip = MP * ob (gdx3ds_vtx_transform's x/y/z/w before the aspect scale)
+	dp4 r1.x, xmvp[0], r0
+	dp4 r1.y, xmvp[1], r0
+	dp4 r1.z, xmvp[2], r0
+	dp4 r1.w, xmvp[3], r0
+
+	; r2 = packed clip (x * xScale, +-y, z * zA + w * zB: PackVertex), then the fixup
+	mul r2, xconv, r1
+	mad r2, r1.wwww, xconvw, r2
+	; stereo skew on the packed clip x (r3 is free until the fog block): steye = 0 adds exactly 0
+	dp4 r3.x, stk, r2
+	mad r2.x, r3.x, steye.x, r2.x
+	dp4 outpos.x, projection[0], r2
+	dp4 outpos.y, projection[1], r2
+	dp4 outpos.z, projection[2], r2
+	dp4 outpos.w, projection[3], r2
+
+	; ---- fog: r = (w > 0.001) ? clamp(z / w, -1, 1) : -1
+	;           a = trunc(clamp(r * fog_mul + fog_offset, 0, 255)) / 255
+	rcp r3.x, r1.w
+	mul r3.x, r1.z, r3.x
+	min r3.x, ones, r3.x
+	max r3.x, -ones, r3.x
+	mov r4, xk2
+	slt r3.y, r4.y, r1.w
+	add r3.x, ones, r3.x
+	mul r3.x, r3.y, r3.x
+	add r3.x, -ones, r3.x
+	mov r4, xfog
+	mul r3.x, r4.x, r3.x
+	add r3.x, r4.y, r3.x
+	max r3.x, zeros, r3.x
+	mov r5, xk
+	min r3.x, r5.z, r3.x
+	flr r3.x, r3.x
+	mul r3.x, r5.w, r3.x
+
+	; ---- normals: cn.xyz re-signed (u >= 128 ? u - 256 : u)
+	sge r6.xyz, inclr.xyz, r5.xxx
+	mad r6.xyz, r6.xyz, r5.yyy, inclr.xyz
+
+	; ---- F3DFLX alpha (machines_retained): i = flr(dot(n, A)); flr differs from the CPU's
+	; trunc only for negative i, where every band is 0 either way, and the CPU's clamp to
+	; [-128, 127] never reaches a band either. r3.w = LUT byte / 255.
+	dp3 r8.x, xflx, r6
+	flr r8.x, r8.x
+	mov r10, xlut0
+	mul r9.x, r10.x, r8.x
+	add r9.y, r10.y, r9.x
+	add r9.z, r10.z, -r9.x
+	min r9.y, r9.y, r9.z
+	min r9.y, r10.w, r9.y
+	max r9.y, zeros, r9.y
+	mov r11, xlut1
+	add r9.z, -r11.x, r8.x
+	max r9.z, r9.z, -r9.z
+	mul r9.z, r11.y, r9.z
+	add r9.z, r11.z, -r9.z
+	max r9.z, zeros, r9.z
+	add r9.y, r9.y, r9.z
+	add r9.z, -r11.w, r8.x
+	max r9.z, r9.z, -r9.z
+	mov r12, xlut2
+	mul r9.z, r12.x, r9.z
+	add r9.z, r12.y, -r9.z
+	max r9.z, zeros, r9.z
+	add r9.y, r9.y, r9.z
+	mul r3.w, r5.w, r9.y
+
+	; vertex alpha = fogOn ? fog factor : (flxOn ? LUT / 255 : cn.a / 255), multiply-selects
+	mov r10, xflx
+	add r10.x, ones, -r10.w
+	mul r3.y, r5.w, inclr.w
+	mul r3.y, r10.x, r3.y
+	mad r3.y, r3.w, r10.w, r3.y
+	mul r3.y, r4.w, r3.y
+	mad r3.z, r3.x, r4.z, r3.y
+
+	; ---- lighting: c = amb; per light c = trunc(c + max(I, 0) * col); min 255
+	mov r7.xyz, xamb.xyz
+	dp3 r8.x, xldir[0], r6
+	max r8.x, zeros, r8.x
+	mad r7.xyz, r8.xxx, xlcol[0].xyz, r7.xyz
+	flr r7.xyz, r7.xyz
+	dp3 r8.x, xldir[1], r6
+	max r8.x, zeros, r8.x
+	mad r7.xyz, r8.xxx, xlcol[1].xyz, r7.xyz
+	flr r7.xyz, r7.xyz
+	dp3 r8.x, xldir[2], r6
+	max r8.x, zeros, r8.x
+	mad r7.xyz, r8.xxx, xlcol[2].xyz, r7.xyz
+	flr r7.xyz, r7.xyz
+	min r7.xyz, r5.zzz, r7.xyz
+	; shade rgb = lit ? c : cn.rgb, then / 255
+	mov r9, xamb
+	mul r7.xyz, r9.www, r7.xyz
+	mov r9, xunlit
+	mad r7.xyz, inclr.xyz, r9.www, r7.xyz
+	mul r7.xyz, r5.www, r7.xyz
+
+	; ---- outclr: rgb = selC ? shade : const; a = selA ? vertex alpha : const
+	mov r9, xsel
+	mov r10, xseli
+	mul r11.xyz, xcol.xyz, r10.xxx
+	mad r11.xyz, r7.xyz, r9.xxx, r11.xyz
+	mul r11.w, xcol.w, r10.y
+	mad r11.w, r3.z, r9.y, r11.w
+	mov outclr, r11
+
+	; ---- texture coordinates, in the interpreter's short units
+	; plain: U = floor(tc * texScale / 65536)   (the arithmetic >> 16)
+	mul r12.xy, xtcs.xy, intex.xy
+	flr r12.xy, r12.xy
+	; n60atlas ([native] nrr_trk_atlas): U += flag * xoff.w -- the vertex's course-atlas slot column
+	; (flag = x0 in texels, xoff.w = 32 short units per texel); xoff.w = 0 on every other draw: + 0
+	mad r12.x, inpos.w, xoff.w, r12.x
+	; texgen: U = trunc((clamp(dot(n, lookat) / 127, -1, 1) + 1) / 4 * texScale)
+	dp3 r13.x, xlook[0], r6
+	dp3 r13.y, xlook[1], r6
+	min r13.xy, ones, r13.xy
+	max r13.xy, -ones, r13.xy
+	add r13.xy, ones, r13.xy
+	mov r4, xk2
+	mul r13.xy, r4.xx, r13.xy
+	mov r4, xtg
+	mul r13.xy, r4.yz, r13.xy
+	flr r13.xy, r13.xy
+	mul r12.xy, r4.ww, r12.xy
+	mad r12.xy, r13.xy, r4.xx, r12.xy
+
+	; unit 0 / unit 1: u = min(U * a + b, clamp) + off
+	mov r4, xuva[0]
+	mad r14.xy, r12.xy, r4.xy, r4.zw
+	mov r5, xuvc[0]
+	min r14.xy, r5.xy, r14.xy
+	add r14.xy, r5.zw, r14.xy
+	mov r14.zw, myconst.xy
+	mov outtc0, r14
+	mov r4, xuva[1]
+	mad r15.xy, r12.xy, r4.xy, r4.zw
+	mov r5, xuvc[1]
+	min r15.xy, r5.xy, r15.xy
+	add r15.xy, r5.zw, r15.xy
+	mov r15.zw, myconst.xy
+	mov outtc1, r15
 .end

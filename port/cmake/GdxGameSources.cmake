@@ -78,8 +78,17 @@ endif()
 # filenames, refuses the retail JP image by CRC-64). The 64DD IPL is deliberately NOT gated: the
 # drive firmware is Japanese by existence and carries no game audio.
 # The G-Diffuser-JP target always sets it — building that target is the opt-in.
+#
+# 3DS builds default ON: the console never reads a cartridge ROM (it boots archive-only from a
+# PC-side prebake, which keeps its own US-only gate), so the audio hazard above cannot arise
+# there, and the only retail Expansion Kit disk is the Japanese one.
+if(GDX_PLATFORM_3DS)
+    set(_gdx_allow_jp_default ON)
+else()
+    set(_gdx_allow_jp_default OFF)
+endif()
 option(GDX_ALLOW_JP_INPUTS
-       "Accept Japanese-region game data (JP cartridge ROM, retail JP Expansion Kit disk). DEV ONLY — the JP raw-ROM path has broken audio." OFF)
+       "Accept Japanese-region game data (JP cartridge ROM, retail JP Expansion Kit disk). Desktop: DEV ONLY — the JP raw-ROM path has broken audio. 3DS: ON by default." ${_gdx_allow_jp_default})
 if(GDX_ALLOW_JP_INPUTS)
     message(STATUS "G-Diffuser: GDX_ALLOW_JP_INPUTS=ON — Japanese ROM/disk inputs are ACCEPTED (experimental; JP audio is known-bad).")
     set(GDX_JP_INPUT_DEFS "GDX_ALLOW_JP_INPUTS=1")

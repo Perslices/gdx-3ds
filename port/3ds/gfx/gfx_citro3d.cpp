@@ -19,7 +19,10 @@
  *     x/y, and viewport/scissor rectangles are swapped to match.
  */
 #include "gfx_citro3d.h"
+#include "gdx3ds_xfprof.h"
 #include "gdx3ds_mesh.h" // [native] machines: indexed backend entry + frame cadence
+#include "nrr/gdx3ds_nrr_mach.h" // n60 NRR machines: the backend half (gfx_citro3d_nrrmach.inc)
+#include "gdx3ds_vtx_math.h" // [native] gpuxf: GDX3DS_CULL_* (the CPU cull modes the PICA mirrors)
 #include <cstddef>
 extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__((weak));
 
@@ -28,6 +31,17 @@ extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__(
 #include "gdx3ds_nativebatch.h" // Gdx_NativeBatch: shared native draw primitive ([native] track/machines)
 #include "gdx3ds_texclamp.h" // the pow2-pad / atlas-view UV clamp contract (host-tested)
 #include "gdx3ds_cov.h" // COVERAGE: [cov] per-frame feature census ([debug] cov)
+#include "gdx3ds_gputl.h" // n60gpu: [debug] gputl (per-eye GPU timeline from GSP completion stamps)
+#include "gdx3ds_skylate.h" // n60tail: [native] sky_late (the sky's lists after the opaque track)
+#include "gdx3ds_gpucensus.h" // n60gpu: [debug] gpucensus (GPU work census per eye / category)
+#include "gdx3ds_overlap.h" // C5 Stage 4 [overlap]: kick the GX queue mid-frame ([debug] overlap_kick)
+#include "nrr/gdx3ds_nrr_crumb.h" // n60hwdiag: durable crumbs around C3D_FrameBegin / C3D_FrameEnd
+#include "gdx3ds_c3d_diet.h" // c5submit (r60 P3a): [native] c3d_diet, the vendored citro3d submission diet
+#include "gdx3ds_replay.h"  // C6 [replay]: pose-replay, the per-draw uniform sites ([native] replay)
+#include "gdx3ds_hitch.h" // HITCH: per-frame event counters ([debug] hitch)
+#include "gdx3ds_texswz.h" // N60TEX: [debug] tex_fast texel writer
+#include "gdx3ds_hwprof.h" // hwprof [hwsite]: per-call micro-timers ([debug] hwsite, default 0)
+#include "gdx3ds_hotcold.h" // hotcold: GDX_COLD / GDX_UNLIKELY (per-function source attributes only)
 
 #include <cmath>
 #include <cstdarg>
@@ -38,6 +52,12 @@ extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__(
 extern "C" {
 #include "gdx3ds_gfx_shader_shbin.h"
 }
+
+/* nrr/gdx3ds_nrr_internal.h, defined below via gfx_citro3d_nrr.inc (included at the end of
+ * namespace Fast): forward-declared here so StartFrame() can call it eagerly (nimenu W1/M2,
+ * review finding M2). extern "C" linkage is namespace-independent, so this one declaration and
+ * the .inc's later in-namespace definition denote the same function. */
+extern "C" int gdx3ds_nrr_bk_frame_active(void);
 
 /* gbi.h (via fast/interpreter.h) defines these, but restate the two bits we use so
  * the mapping is obvious at the call site. */
@@ -50,7 +70,7 @@ extern "C" {
 
 /* Mirror every backend diagnostic onto the svc debug channel: stderr only reaches the
  * bottom-screen console, which is unreadable in headless Azahar runs (m1-boot-debug). */
-static void GfxC3dLogImpl(const char* fmt, ...) {
+GDX_COLD static void GfxC3dLogImpl(const char* fmt, ...) {
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
@@ -227,6 +247,7 @@ extern "C" void gdx3ds_fog_note_params(int mul, int off, int exact) {
 
 extern "C" void gdx3ds_texcache_note_import(void) {
     sTexCacheImports++;
+    gdx3ds_hitch_add(GDX_HITCH_EV_TEX_IMPORT, 1u); /* HITCH: per-frame event census */
 }
 
 extern "C" void gdx3ds_texcache_note_delete(unsigned evictedEntries) {
@@ -534,6 +555,7 @@ extern "C" void gdx3ds_texcache_note_miss(const void* addr, unsigned fmt, unsign
                                           unsigned lineBytes, unsigned sizeBytes, unsigned tileW, unsigned tileH,
                                           unsigned contentHash) {
     sTexCacheMisses++;
+    gdx3ds_hitch_add(GDX_HITCH_EV_TEX_MISS, 1u); /* HITCH */
     // Bounded key dumps, verbose/gputrace-gated (quiet mode): repeated lines for one addr
     // with a changing hash = unstable content key; repeated lines with the same hash =
     // eviction/invalidation churn. Race phase keeps the original 400-line lifetime
@@ -600,6 +622,14 @@ static bool GdxSkyClampFixEnabled() {
 
 /* [padgutter] killswitch: [debug] padgutter=0 or env GDX_PAD_GUTTER_OFF restores the
  * all-zero pow2 padding (see the gutter replication in UploadTexture). Default on. */
+/* N60TEX [debug] tex_fast (default 0): the texture upload's texel writer hoists the tile and
+ * Morton terms and loads a word per texel (gdx3ds_texswz.h); the decoders take their table
+ * forms (gdx_texcache.cpp). Same bytes, fewer instructions. */
+extern "C" int gdx3ds_tex_fast_enabled(void);
+static bool GdxTexFastEnabled() {
+    return gdx3ds_tex_fast_enabled() != 0;
+}
+
 static bool GdxPadGutterEnabled() {
     static const bool sOn = [] {
         const char* env = std::getenv("GDX_PAD_GUTTER_OFF");
@@ -730,6 +760,7 @@ static unsigned long sVboPackSplit = 0;
  * one-shot log and no counter at all, so a run that lost half a frame every frame looked
  * identical to a clean one on the receipt. */
 static unsigned long sVboDrawDropped = 0;
+static void* sReplayOuterCaller = nullptr; /* C6 [replay]: the packed/mesh/xf entry that led to DrawTriangles */
 /* Gdx_NativeBatchCommit refusals: the cursor could not advance, so the caller's appended
  * vertices are outside the flushed range. Unreachable while the begin reservation holds,
  * checked because the failure is silent corruption rather than loss. */
@@ -737,6 +768,39 @@ static unsigned long sNbCommitRefused = 0;
 
 /* [triloop] packed-draw telemetry for the [c3d] line (dPk). */
 static unsigned long sPackedDrawCalls = 0;
+static unsigned long sHsxLeanDraws = 0; /* [native] hudsky_emit: draws through DrawPackedLean */
+static unsigned long sHsxRuns = 0;      /* [native] hudsky_emit: programs run by HsxRun */
+/* [debug] hsx_gpuhash=1 (hudsky): fold the GPU command words every mono draw appends (state the
+ * draw flushes + the draw packets) into a per-frame hash, one [hsxg] line per frame. Two legs
+ * that differ only in a lever which claims "same draws, same state" must print the same lines.
+ * Read once; default 0 (no cost beyond one branch per draw). */
+static int sHsxGpuHash = -1;
+static uint32_t sHsxGpuFrameHash = 2166136261u;
+static uint32_t sHsxGpuFrameDraws = 0;
+static uint32_t sHsxGpuWrap = 0;
+static bool HsxGpuHashOn() {
+    if (sHsxGpuHash < 0) {
+        sHsxGpuHash = (&gdx3ds_config_get_int != nullptr && gdx3ds_config_get_int("debug", "hsx_gpuhash", 0) != 0) ? 1 : 0;
+    }
+    return sHsxGpuHash != 0;
+}
+static void HsxGpuHashFold(u32 w0, const float* verts, size_t nFloats) {
+    if (gpuCmdBuf == nullptr || gpuCmdBufOffset < w0) {
+        sHsxGpuWrap++; /* the buffer was split under the draw: not foldable */
+        return;
+    }
+    uint32_t h = sHsxGpuFrameHash;
+    for (u32 i = w0; i < gpuCmdBufOffset; i++) {
+        h = (h ^ gpuCmdBuf[i]) * 16777619u;
+    }
+    /* the vertex floats the draw reads (the command words carry only their address) */
+    const uint32_t* vw = reinterpret_cast<const uint32_t*>(verts);
+    for (size_t i = 0; verts != nullptr && i < nFloats; i++) {
+        h = (h ^ vw[i]) * 16777619u;
+    }
+    sHsxGpuFrameHash = h;
+    sHsxGpuFrameDraws++;
+}
 /* [native] indexed mesh draws this session (dNat on the [c3d] line). */
 static unsigned long sNativeDrawCalls = 0;
 /* [native] machines_verify capture hook (gdx3ds_mesh_backend_set_capture). */
@@ -811,7 +875,7 @@ inline bool VfyCmdCounts(uint32_t w0) {
            (op >= 0xF0 && op <= 0xFC);
 }
 
-void VfyRecord(uint32_t kind, uint32_t state, uint32_t vbo, const uint32_t* fields, const VfyBatchInfo* info = nullptr) {
+GDX_COLD void VfyRecord(uint32_t kind, uint32_t state, uint32_t vbo, const uint32_t* fields, const VfyBatchInfo* info = nullptr) {
     if (gdx3ds_verify_mode == 1) {
         sVfyInfo.push_back(info != nullptr ? *info : VfyBatchInfo{});
         sVfyRing.push_back(kind);
@@ -887,7 +951,7 @@ extern "C" void gdx3ds_verify_begin(int mode) {
     /* mode 0 leaves the counters for gdx3ds_verify_result */
 }
 
-extern "C" void gdx3ds_verify_note_tri(const Gdx3dsVerifyTri* t) {
+extern "C" GDX_COLD void gdx3ds_verify_note_tri(const Gdx3dsVerifyTri* t) {
     sVfyLastTri = *t;
 }
 
@@ -913,7 +977,7 @@ static inline void VfyBytes8(unsigned* out, const void* p, unsigned n) {
     memcpy(b, p, take);
     memcpy(out, b, 8);
 }
-extern "C" void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem,
+extern "C" GDX_COLD void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem,
                                          unsigned tmemBytes) {
     t->addr0 = reinterpret_cast<unsigned long>(addr);
     t->cls0 = (addr && gdx_gfx_classify_host_ptr) ? gdx_gfx_classify_host_ptr(t->addr0) : 0u;
@@ -927,7 +991,7 @@ extern "C" void gdx3ds_verify_tri_source(Gdx3dsVerifyTri* t, const void* addr, u
     VfyBytes8(t->tmemB0 + 2, tmem && tmemBytes >= 8u ? static_cast<const uint8_t*>(tmem) + (tmemBytes - 8u) : nullptr, 8u);
 }
 
-extern "C" void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem,
+extern "C" GDX_COLD void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, unsigned sizeBytes, const void* tmem,
                                           unsigned tmemBytes) {
     t->addr1 = reinterpret_cast<unsigned long>(addr);
     t->cls1 = (addr && gdx_gfx_classify_host_ptr) ? gdx_gfx_classify_host_ptr(t->addr1) : 0u;
@@ -935,7 +999,7 @@ extern "C" void gdx3ds_verify_tri_source1(Gdx3dsVerifyTri* t, const void* addr, 
     t->tmemHash1 = tmem ? VfyFnv(2166136261u, tmem, tmemBytes < kVfyTmemHashCap ? tmemBytes : kVfyTmemHashCap) : 0u;
 }
 
-extern "C" void gdx3ds_verify_note_cmd(unsigned w0, unsigned w1) {
+extern "C" GDX_COLD void gdx3ds_verify_note_cmd(unsigned w0, unsigned w1) {
     if (!VfyCmdCounts(w0)) return;
     if (gdx3ds_verify_mode == 1) {
         sVfyCmd.push_back(w0);
@@ -970,7 +1034,7 @@ extern "C" void gdx3ds_verify_note_cmd(unsigned w0, unsigned w1) {
     }
 }
 
-extern "C" void gdx3ds_verify_cmd_detail(char* buf, unsigned bufSize) {
+extern "C" GDX_COLD void gdx3ds_verify_cmd_detail(char* buf, unsigned bufSize) {
     if (bufSize == 0) return;
     const size_t n = sVfyCmd.size() / 2;
     snprintf(buf, bufSize,
@@ -985,7 +1049,7 @@ extern "C" int gdx3ds_verify_active(void) {
     return gdx3ds_verify_mode != 0;
 }
 
-extern "C" void gdx3ds_verify_tri_detail(char* buf, unsigned bufSize) {
+extern "C" GDX_COLD void gdx3ds_verify_tri_detail(char* buf, unsigned bufSize) {
     if (!sVfyMismatchInfoValid || bufSize == 0) {
         if (bufSize) buf[0] = 0;
         return;
@@ -1007,7 +1071,7 @@ extern "C" void gdx3ds_verify_tri_detail(char* buf, unsigned bufSize) {
              b.noop);
 }
 
-extern "C" void gdx3ds_verify_src_detail(char* buf, unsigned bufSize) {
+extern "C" GDX_COLD void gdx3ds_verify_src_detail(char* buf, unsigned bufSize) {
     if (!sVfyMismatchInfoValid || bufSize == 0) {
         if (bufSize) buf[0] = 0;
         return;
@@ -1036,7 +1100,7 @@ extern "C" void gdx3ds_verify_src_detail(char* buf, unsigned bufSize) {
  * sides differ; these say HOW: a byte-swapped pair is a byte-order difference (the bridge hands
  * LUS a persistent copy that is 16-bit-swapped for a native-RGBA16 source), anything else is
  * different content. Its own line because the src line is already at its buffer. */
-extern "C" void gdx3ds_verify_bytes_detail(char* buf, unsigned bufSize) {
+extern "C" GDX_COLD void gdx3ds_verify_bytes_detail(char* buf, unsigned bufSize) {
     if (!sVfyMismatchInfoValid || bufSize == 0) {
         if (bufSize) buf[0] = 0;
         return;
@@ -1055,7 +1119,7 @@ extern "C" void gdx3ds_verify_bytes_detail(char* buf, unsigned bufSize) {
              ib.texEnds0[0], ib.texEnds[0], a.rtLine0, b.rtLine0);
 }
 
-extern "C" void gdx3ds_verify_seq_detail(char* buf, unsigned bufSize) {
+extern "C" GDX_COLD void gdx3ds_verify_seq_detail(char* buf, unsigned bufSize) {
     if (bufSize == 0) return;
     buf[0] = 0;
     unsigned off = 0;
@@ -1072,7 +1136,7 @@ extern "C" void gdx3ds_verify_seq_detail(char* buf, unsigned bufSize) {
     }
 }
 
-extern "C" void gdx3ds_verify_first_detail(char* buf, unsigned bufSize) {
+extern "C" GDX_COLD void gdx3ds_verify_first_detail(char* buf, unsigned bufSize) {
     if (!sVfyMismatchInfoValid || bufSize == 0) {
         if (bufSize) buf[0] = 0;
         return;
@@ -1550,7 +1614,29 @@ void GfxRenderingAPIC3D::Init() {
         return;
     }
     // Precondition: stream B's OS layer has run gfxInitDefault() already.
-    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 2);
+    // n3dsfix (docs/research/native/hw-n60-3d7-analysis.md): a hardware A/B (preset=n60 +
+    // native.track_resident=0) proved this buffer is marginal on the title attract-demo's one
+    // full-30-machine GP frame (demo 3, course Big Blue) -- with track_resident off, the track's
+    // heavier fallback draw path overflows it and the GDX bounds-checked writer (gdx_submit.h's
+    // C3Dgdx_Reserve/PutChunk) correctly panics via svcBreak there. With track_resident on (the
+    // normal n60 preset), the same frame is instead where the undiagnosed hardware freeze has
+    // always reproduced -- consistent with this buffer being right at its edge either way. New3DS
+    // got x4 first (20+ MB linear free mid-race per [tex-keep]/[nrr] receipts, and the
+    // hardware-proven fix). Old3DS follow-up (docs/research/native/n3ds-cmdbuf-freeze.md): the
+    // [cmdbuf] hwm receipt (base.c's Gdx3dsCmdbufHwmNote) read words=91938/size=131072 (70.1%) on
+    // the SAME race-gp-finish GP start+prewarm through the Azahar --model old lane at the prior x2
+    // size -- already past the ~65-70% comfort line, and the N3DS case showed the emulator can
+    // UNDERSTATE a real hardware peak (it never reproduced that freeze at all), so 70% on the
+    // emulator is a lower bound, not the true number. O3DS's own [vram]/linear-free receipts on
+    // that same run never dropped below ~6.4 MB free mid-race, so matching New3DS's x4 here costs
+    // an affordable extra C3D_DEFAULT_CMDBUF_SIZE bytes of linearAlloc (one more step on top of
+    // x2's existing allocation) against that margin, and drops the measured peak to
+    // 91938/262144 = 35.1% -- comfortable slack for hardware being worse than the emulator, the
+    // same way the N3DS case was.
+    bool isNew3ds = false;
+    APT_CheckNew3DS(&isNew3ds);
+    (void)isNew3ds; // both models now take the same x4 multiplier; kept for a future re-divergence.
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 4);
     sGdxOracleApi = this; // ORACLE: the C capture entry point below reaches the backend via this
 
     // Framebuffer 0: the top screen. 240x400 because 3DS framebuffers are portrait.
@@ -1586,6 +1672,9 @@ void GfxRenderingAPIC3D::Init() {
     AttrInfo_AddLoader(attrInfo, 1, GPU_FLOAT, 2);
     AttrInfo_AddLoader(attrInfo, 2, GPU_FLOAT, 4);
     AttrInfo_AddLoader(attrInfo, 3, GPU_FLOAT, 2);
+    mAttrLegacy = *attrInfo;
+    XfInitLayout();
+    gdx3ds_replay_backend_bind(mProjectionUniformLoc, mXfUnifLoc); /* C6: the uniforms that carry a pose */
 
     // Clip fixup: x' = y, y' = -x (landscape → portrait), z' = z - w (see header).
     Mtx_Zeros(&mFixupMatrix);
@@ -1619,6 +1708,10 @@ void GfxRenderingAPIC3D::Init() {
     mTextures.reserve(512);
     mShaderPool.reserve(64); // census-predicted variant population (~40/session observed)
     mStereoEnabled = Gdx3dsStereo::Init(); // config-gated; off = zero further cost
+    /* n60stereo: the frame replay's shader registers (zeroed on the GPU in every mode). */
+    Gdx3dsStereo::ReplayInit(shaderInstanceGetUniformLocation(mShaderProgram.vertexShader, "stk"),
+                             shaderInstanceGetUniformLocation(mShaderProgram.vertexShader, "steye"),
+                             mFramebuffers.empty() ? nullptr : mFramebuffers[0].target);
     mInitialized = true;
     GFX_C3D_LOG("initialized (VBO pool %zu KiB, stereo %s)\n", kVboPoolBytes / 1024,
                 mStereoEnabled ? "on" : "off");
@@ -1678,8 +1771,17 @@ int DispModeLatched() {
         if (&gdx3ds_config_get_int == nullptr) {
             sDispMode = 0; /* DL harness: no config lib, stay authentic forever */
         } else if (&gdx3ds_config_loaded == nullptr || gdx3ds_config_loaded()) {
-            int m = gdx3ds_config_get_int("display", "border_mode", 0);
-            sDispMode = (m >= 0 && m <= 3) ? m : 0;
+            /* bleedfix: default FULL-BLEED (1) when the ini has no key yet, matching
+             * gdx3ds_menu.c's sDispMode init (5c973d25, "full-bleed display mode is the
+             * default (user hardware pick)"). That commit only updated the menu's own
+             * fallback, so a fresh/pre-border_mode ini rendered AUTHENTIC here while the
+             * menu's DSP tab already showed FULL-BLEED selected -- the menu's toggle is
+             * edge-triggered (TouchDisp: `if (sDispMode != m)`), so the first tap on the
+             * row that matched the menu's stale "already selected" state was a silent
+             * no-op: no gdx3ds_disp_set_mode() call, no ini write, no MenuLog line, and
+             * the renderer stayed authentic no matter how the DSP tab looked. */
+            int m = gdx3ds_config_get_int("display", "border_mode", 1);
+            sDispMode = (m >= 0 && m <= 3) ? m : 1;
         } else {
             return 0; /* INI not parsed yet: authentic until config-ready */
         }
@@ -1731,6 +1833,83 @@ extern "C" int gdx3ds_disp_get_mode(void) {
 }
 
 
+/* ------------------------------------------------------------------------------- */
+/* B11q frame-level stereo trace ([debug] stereo_trace = max lines, 0 = off).         */
+/* Per frame, per eye: cleared? bound? draws issued? queued for the display transfer? */
+/* Plus the non-draw content paths (framebuffer copies INTO the screen target), which  */
+/* are the only way a frame can present pixels it never drew.                          */
+/* ------------------------------------------------------------------------------- */
+namespace {
+long sStTraceBudget = -1; /* -1 = config unread */
+unsigned long sStClearMain = 0;  /* ClearFramebuffer on fb 0 */
+unsigned long sStClearOther = 0; /* ClearFramebuffer on a texture-backed fb */
+unsigned long sStClearRight = 0; /* ...of those, mirrored onto the right eye */
+unsigned long sStBindMain = 0;   /* StartDrawToFramebuffer(0) */
+unsigned long sStBindOther = 0;
+unsigned long sStCopyToMain = 0; /* CopyFramebuffer(dst == 0): content with no draw */
+unsigned long sStCopyOther = 0;
+
+bool StereoTraceOn() {
+    if (sStTraceBudget < 0) {
+        sStTraceBudget = (&gdx3ds_config_get_int != nullptr)
+                             ? (long)gdx3ds_config_get_int("debug", "stereo_trace", 0)
+                             : 0;
+        if (sStTraceBudget < 0) {
+            sStTraceBudget = 0;
+        }
+    }
+    return sStTraceBudget > 0;
+}
+
+void StereoTraceFrameReset() {
+    sStClearMain = sStClearOther = sStClearRight = 0;
+    sStBindMain = sStBindOther = 0;
+    sStCopyToMain = sStCopyOther = 0;
+}
+} // namespace
+
+/* C4I [othx] gsp ledger: every GSPGPU_FlushDataCache in this backend goes through here so a
+ * gputrace run can say what the flushes cost (the Old 3DS has no L2, so a flush is a
+ * candidate there that it never was on the New 3DS). Off: one int test, then the flush. */
+static void GdxHwsFlush(const void* addr, u32 size, int kind = GDX3DS_HWFL_OTHER) {
+    if (&gdx3ds_hws_gsp_flush_kind != nullptr) {
+        gdx3ds_hws_gsp_flush_kind(addr, size, kind); /* hwprof [hwsite]/[hwflush], [debug] flush_svc */
+    } else {
+        GSPGPU_FlushDataCache(addr, size);
+    }
+}
+
+static void GdxFlushDataCache(int kind, const void* addr, u32 size) {
+    const int hwfl = kind == GDX3DS_PROF_GSP_VBO ? GDX3DS_HWFL_VBO : GDX3DS_HWFL_TEX;
+    if (gdx3ds_prof_active == 0) {
+        GdxHwsFlush(addr, size, hwfl);
+        return;
+    }
+    const u64 t0 = svcGetSystemTick();
+    GdxHwsFlush(addr, size, hwfl);
+    gdx3ds_prof_gsp_ticks[kind] += svcGetSystemTick() - t0;
+    gdx3ds_prof_gsp_calls[kind]++;
+    gdx3ds_prof_gsp_bytes[kind] += size;
+}
+
+/* C5 STAGE 0 [c5cat] (port/3ds/gdx3ds_mainprof.h): C3D_FrameBegin's vblank sync and GPU queue
+ * drain get their own timing bucket. Weak: the DL harness links this backend without the clock. */
+extern "C" int gdx3ds_c5cat_enter(int cat) __attribute__((weak));
+extern "C" void gdx3ds_c5cat_leave(int prev) __attribute__((weak));
+
+static int C5CatEnterFrameBegin() {
+    if (&gdx3ds_c5cat_enter == nullptr) {
+        return -1;
+    }
+    return gdx3ds_c5cat_enter(10 /* GDX3DS_C5CAT_FBEG */);
+}
+
+static void C5CatLeave(int prev) {
+    if (prev >= 0 && &gdx3ds_c5cat_leave != nullptr) {
+        gdx3ds_c5cat_leave(prev);
+    }
+}
+
 void GfxRenderingAPIC3D::StartFrame() {
     if (!mInitialized) {
         return;
@@ -1738,6 +1917,7 @@ void GfxRenderingAPIC3D::StartFrame() {
     if (gdx3ds_verify_mode == 2) {
         return; /* [nverify] compare pass rides the recorded pass's open frame */
     }
+    ElideReset(); /* [native] machines_mattab: the first draw after a frame begin re-issues */
     if (!mFrameActive) {
         // First begin of this frame (the interpreter legitimately re-enters
         // StartFrame mid-frame: Interpreter::Run and the VI-fallback prologue).
@@ -1749,16 +1929,49 @@ void GfxRenderingAPIC3D::StartFrame() {
         mFrameBindMisses = 0;
         GdxPrimDiagFrameBegin();   // [prim] one-shot window arming (PRIM-COLOR diag)
         GdxLiveryDiagFrameBegin(); // [livery] one-shot window arming (SHIP-LIVERY-2 diag)
+        StereoTraceFrameReset(); /* B11q */
+        gdx3ds_overlap_frame_begin(); /* [overlap]: per-frame kick state (no-op unless armed) */
+        gdx3ds_c3d_diet_frame_begin(); /* c5submit: latches [native] c3d_diet once */
     }
     sGdxFogFrame++;
+    const int c5Prev = C5CatEnterFrameBegin();
+    const bool firstBegin = !mFrameActive;
+    if (GDX_NRR_CRUMBS_ON() && firstBegin) {
+        gdx3ds_nrr_crumb_frame_begin_pre();
+    }
     gdx3ds_gpuprof_frame_begin(mFrameActive ? 1 : 0); // owns C3D_FrameBegin(SYNCDRAW)
+    if (GDX_NRR_CRUMBS_ON() && firstBegin) {
+        gdx3ds_nrr_crumb_frame_begin_post();
+    }
+    if (firstBegin && (mFrameIndex == 600 || mFrameIndex == 4000)) { /* n60gpu: VRAM headroom (2 lines a run) */
+        GFX_C3D_LOG("[vram] frame=%lu free=%luK linear free=%luK\n", (unsigned long)mFrameIndex,
+                    (unsigned long)(vramSpaceFree() / 1024u), (unsigned long)(linearSpaceFree() / 1024u));
+    }
+    if (firstBegin) {
+        gdx3ds_gputl_frame_begin();     /* n60gpu: [debug] gputl accounts the previous frame's GPU timeline */
+        gdx3ds_gpucensus_frame_begin(); /* n60gpu: [debug] gpucensus (no-op unless armed) */
+    }
+    C5CatLeave(c5Prev);
+    if (firstBegin && gdx3ds_replay_on) {
+        gdx3ds_replay_frame_begin(); /* C6: a self-contained command list, a fresh site table */
+    }
     C3D_FrameDrawOn(mFramebuffers[0].target);
     if (mStereoEnabled) {
         // Slider poll + right-target frame queueing; re-binds the main target.
         Gdx3dsStereo::FrameBegin(mFramebuffers[0].target);
         mFrameDrawsRightEye = 0;
     }
+    Gdx3dsStereo::ReplayFrameBegin(); /* n60stereo: per-frame reset; steye = 0 when the GPU lost it */
+    gdx3ds_skylate_frame_begin((unsigned long)mFrameIndex); /* n60tail: [native] sky_late per-frame state */
     mCurrentFramebuffer = 0;
+    /* nimenu W1/M2 (review finding M2): decide THIS leg's n60stereo replay verdict now, instead of
+     * waiting for whichever NRR category's marker happens to hand off first. gdx3ds_nrr_bk_frame_active
+     * re-derives the exact same guard (mFrameActive/mCurrentFramebuffer/mStereoEnabled/Active()) every
+     * category already calls lazily, and ReplayEnter() is idempotent (sInBody), so this adds no new
+     * entry, only moves the first one earlier -- the tick-ahead game thread's sticky
+     * gdx3ds_stereo_nrr_ok() read is then stale for a shorter window, not a new one. Return value
+     * unused here; every real consumer calls this same function again at its own hand-off. */
+    (void) gdx3ds_nrr_bk_frame_active();
     mVboOffsetFloats = 0;
     mVboFlushedFloats = 0;
     mVboExhaustionLogged = false;
@@ -1789,10 +2002,21 @@ void GfxRenderingAPIC3D::StartFrame() {
  * ~190/frame on menus. */
 void GfxRenderingAPIC3D::FlushPendingVbo() {
     if (mVboFlushedFloats < mVboOffsetFloats) {
-        GSPGPU_FlushDataCache(mVboPool + mVboFlushedFloats,
-                              (u32)((mVboOffsetFloats - mVboFlushedFloats) * sizeof(float)));
+        GdxFlushDataCache(GDX3DS_PROF_GSP_VBO, mVboPool + mVboFlushedFloats,
+                          (u32)((mVboOffsetFloats - mVboFlushedFloats) * sizeof(float)));
         mVboFlushedFloats = mVboOffsetFloats;
     }
+}
+
+/* C5 Stage 4 [overlap] (gdx3ds_overlap.c): before a mid-frame kick submits the command list built
+ * so far, the VBO tail must reach RAM. 1 = a C3D frame is open and the tail is flushed. */
+extern "C" int gdx3ds_c3d_overlap_prepare(void) {
+    GfxRenderingAPIC3D* api = sGdxOracleApi;
+    if (api == nullptr || !api->DiagFrameActive()) {
+        return 0;
+    }
+    api->FlushPendingVbo();
+    return 1;
 }
 
 void GfxRenderingAPIC3D::EndFrame() {
@@ -1800,9 +2024,66 @@ void GfxRenderingAPIC3D::EndFrame() {
         return;
     }
     FlushPendingVbo();
+    if (HsxGpuHashOn()) { /* [debug] hsx_gpuhash: this frame's draw command words */
+        GFX_C3D_LOG("[hsxg] f=%lu h=%08lx d=%u wrap=%u lean=%lu runs=%lu\n", (unsigned long)mFrameIndex,
+                    (unsigned long)sHsxGpuFrameHash, (unsigned)sHsxGpuFrameDraws, (unsigned)sHsxGpuWrap,
+                    sHsxLeanDraws, sHsxRuns);
+        sHsxGpuFrameHash = 2166136261u;
+        sHsxGpuFrameDraws = 0;
+    }
+    /* B11q: read the queue state BEFORE C3D_FrameEnd consumes (and clears) it. */
+    if (StereoTraceOn()) {
+        --sStTraceBudget;
+        const int qL = (mFramebuffers[0].target != nullptr && mFramebuffers[0].target->used) ? 1 : 0;
+        const int qR = mStereoEnabled && Gdx3dsStereo::RightQueued() ? 1 : 0;
+        GFX_C3D_LOG("[stereotrace] frame=%lu act=%d bindL=%lu bindT=%lu clrL=%lu clrR=%lu clrT=%lu "
+                    "drawL=%lu drawR=%lu cpyL=%lu cpyT=%lu xferL=%d xferR=%d\n",
+                    (unsigned long)mFrameIndex,
+                    (mStereoEnabled && Gdx3dsStereo::Active()) ? 1 : 0, sStBindMain, sStBindOther,
+                    sStClearMain, sStClearRight, sStClearOther,
+                    (unsigned long)mFrameDrawsScreenFb, (unsigned long)mFrameDrawsRightEye,
+                    sStCopyToMain, sStCopyOther, qL, qR);
+    }
+    gdx3ds_skylate_frame_end(); /* n60tail: an unclosed sky / region keeps the original order */
+    gdx3ds_overlap_before_frame_end(); /* [overlap]: a kicked queue is drained + stopped first */
+    if (mStereoEnabled) {
+        Gdx3dsStereo::ReplayFrameEnd(); /* n60stereo: the right eye = the body re-submitted */
+    }
     gdx3ds_gpuprof_frame_end_pre();
-    C3D_FrameEnd(0);
+    if (gdx3ds_replay_on) {
+        gdx3ds_replay_frame_end_pre(); /* C6: the back buffer A's transfer targets, the swap fence */
+    }
+    if (GDX_NRR_CRUMBS_ON()) {
+        gdx3ds_nrr_crumb_frame_end_pre();
+    }
+    gdx3ds_gpucensus_before_frame_end(); /* n60gpu: fill-count modes patch the lists here (else no-op) */
+    C3D_FrameEnd((u8)gdx3ds_overlap_frame_end_flags()); /* 0 (stock) unless [debug] endflush_cmdlist */
+    if (gdx3ds_gputl_on()) { /* n60gpu: [debug] gputl classifies this frame's GX entries */
+        const C3D_RenderTarget* mt = mFramebuffers[0].target;
+        const C3D_RenderTarget* rt = mStereoEnabled ? Gdx3dsStereo::RightTarget() : nullptr;
+        gdx3ds_gputl_frame_end(mt != nullptr ? mt->frameBuf.colorBuf : nullptr,
+                               rt != nullptr ? rt->frameBuf.colorBuf : nullptr);
+    }
+    if (gdx3ds_gpucensus_mode() != 0) { /* n60gpu: [debug] gpucensus walks the queue just ended */
+        const C3D_RenderTarget* mt = mFramebuffers[0].target;
+        const C3D_RenderTarget* rt = mStereoEnabled ? Gdx3dsStereo::RightTarget() : nullptr;
+        gdx3ds_gpucensus_after_frame_end(mt != nullptr ? mt->frameBuf.colorBuf : nullptr,
+                                         mt != nullptr ? mt->frameBuf.depthBuf : nullptr,
+                                         rt != nullptr ? rt->frameBuf.colorBuf : nullptr,
+                                         rt != nullptr ? rt->frameBuf.depthBuf : nullptr);
+    }
+    if (GDX_NRR_CRUMBS_ON()) {
+        gdx3ds_nrr_crumb_frame_end_post();
+    }
+    if (gdx3ds_replay_on) {
+        gdx3ds_replay_frame_end_post((unsigned)mFrameDrawCalls); /* C6: keep A's GX queue */
+    }
     gdx3ds_gpuprof_frame_end_post(mFrameDrawCalls, mFrameTris);
+    gdx3ds_c3d_diet_frame_end(); /* c5submit: [c3ddiet]/[c3dprof] windows (verify/profile only) */
+    if (mStereoEnabled) {
+        /* B11q: the taskless-hold mark lives exactly one present. */
+        mStereoHoldFrames = Gdx3dsStereo::EndFrameHold();
+    }
     mFrameActive = false;
     // Present-path telemetry (bounded: ~1 svc line/sec at 60fps). C3D_FrameEnd
     // above queued the display transfer + swap for THIS frame's draws.
@@ -1895,8 +2176,9 @@ void GfxRenderingAPIC3D::EndFrame() {
         }
         if (mStereoEnabled && n > 0 && n < (int)sizeof(msg)) {
             // Stereo-only suffix: the off-state [c3d] line stays byte-identical.
-            n += std::snprintf(msg + n, sizeof(msg) - n, " eyeR=%lu stereo=%d",
-                               (unsigned long)mFrameDrawsRightEye, Gdx3dsStereo::Active() ? 1 : 0);
+            n += std::snprintf(msg + n, sizeof(msg) - n, " eyeR=%lu stereo=%d hold=%lu",
+                               (unsigned long)mFrameDrawsRightEye, Gdx3dsStereo::Active() ? 1 : 0,
+                               mStereoHoldFrames);
             if (sAnchorDraws > 0 && n > 0 && n < (int)sizeof(msg)) {
                 // [anchor] prim-depth ortho draws anchored to scene depth this window: count and
                 // the NDC depth range they were pinned to (race position markers -> their ships).
@@ -1970,7 +2252,7 @@ void GfxRenderingAPIC3D::ComputeVertexLayout(ShaderProgramC3D& prg) {
     prg.inputStride = (uint8_t)off;
 }
 
-void GfxRenderingAPIC3D::LogUnmappedCombiner(const ShaderProgramC3D& prg, const char* reason) {
+GDX_COLD void GfxRenderingAPIC3D::LogUnmappedCombiner(const ShaderProgramC3D& prg, const char* reason) {
     const auto key = std::make_pair(prg.id0, prg.id1);
     if (!mLoggedUnmappedIds.insert(key).second) {
         return;
@@ -2241,20 +2523,81 @@ uint32_t GfxRenderingAPIC3D::RefreshStageConstantsPacked(const ShaderProgramC3D&
 }
 
 void GfxRenderingAPIC3D::ApplyAlphaTest() {
-    if (mCurrentShader == nullptr) {
-        C3D_AlphaTest(false, GPU_ALWAYS, 0);
-        return;
+    bool on = false;
+    int func = GPU_ALWAYS;
+    int ref = 0;
+    if (mCurrentShader != nullptr) {
+        const CCFeatures& cc = mCurrentShader->cc;
+        if (cc.opt_texture_edge) {
+            on = true;
+            func = GPU_GEQUAL;
+            ref = 128;
+        } else if (cc.opt_alpha_threshold) {
+            // G_AC_THRESHOLD: compare against the SETBLENDCOLOR alpha, pushed per flush.
+            on = true;
+            func = GPU_GEQUAL;
+            ref = (int)(mCurrentAlphaCompareThreshold * 255.0f);
+        }
+        mAlphaCompareThresholdDirty = false;
     }
-    const CCFeatures& cc = mCurrentShader->cc;
-    if (cc.opt_texture_edge) {
-        C3D_AlphaTest(true, GPU_GEQUAL, 128);
-    } else if (cc.opt_alpha_threshold) {
-        // G_AC_THRESHOLD: compare against the SETBLENDCOLOR alpha, pushed per flush.
-        C3D_AlphaTest(true, GPU_GEQUAL, (int)(mCurrentAlphaCompareThreshold * 255.0f));
-    } else {
-        C3D_AlphaTest(false, GPU_ALWAYS, 0);
+    bool countOnly = false;
+    if (mAtValid && on == mAtOn && func == mAtFunc && ref == mAtRef && ElideOn(&countOnly)) {
+        mElideAt++;
+        if (!countOnly) {
+            return; /* [native] machines_mattab: C3D's effect block already holds exactly this */
+        }
     }
-    mAlphaCompareThresholdDirty = false;
+    C3D_AlphaTest(on, (GPU_TESTFUNC)func, ref);
+    mAtValid = true;
+    mAtOn = on;
+    mAtFunc = func;
+    mAtRef = ref;
+}
+
+/* ---- [native] machines_mattab: skip re-issuing identical state (Gdx3dsXfDraw::stateElide) ----
+ * Exact by construction: each skipped call would have stored into citro3d's context exactly what
+ * it already holds (the tracker records every call of that kind this backend makes, and nothing
+ * else in the port calls them), so the only difference is that the next draw does not re-emit an
+ * unchanged register block. Reset at every frame begin (the first draw of a frame re-issues). */
+void GfxRenderingAPIC3D::ElideReset() {
+    mBufLastVerts = nullptr;
+    mTexLastBound[0] = mTexLastBound[1] = nullptr;
+    mAtValid = false;
+}
+
+bool GfxRenderingAPIC3D::ElideOn(bool* countOnly) const {
+    const int level = mXf != nullptr ? mXf->stateElide : 0;
+    *countOnly = level == 2;
+    return level == 1 || level == 2;
+}
+
+void GfxRenderingAPIC3D::BindTexUnit(int unit, C3D_Tex* tex) {
+    bool countOnly = false;
+    if (mTexLastBound[unit] == tex && std::memcmp(tex, &mTexLastSnap[unit], sizeof(C3D_Tex)) == 0 &&
+        ElideOn(&countOnly)) {
+        mElideTex++;
+        if (!countOnly) {
+            return;
+        }
+    }
+    C3D_TexBind(unit, tex);
+    mTexLastBound[unit] = tex;
+    std::memcpy(&mTexLastSnap[unit], tex, sizeof(C3D_Tex));
+}
+
+void GfxRenderingAPIC3D::XfBindVertexBuffer(const void* verts, int stride) {
+    bool countOnly = false;
+    if (mBufLastVerts == verts && mBufLastStride == stride && ElideOn(&countOnly)) {
+        mElideVbo++;
+        if (!countOnly) {
+            return;
+        }
+    }
+    C3D_BufInfo* bufInfo = C3D_GetBufInfo();
+    BufInfo_Init(bufInfo);
+    BufInfo_Add(bufInfo, verts, stride, 3, 0x210);
+    mBufLastVerts = verts;
+    mBufLastStride = stride;
 }
 
 ShaderProgram* GfxRenderingAPIC3D::CreateAndLoadNewShader(uint64_t shaderId0, uint64_t shaderId1) {
@@ -2443,7 +2786,7 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
                 if (GdxPadGutterEnabled()) {
                     WritePadGutter(d, vw, vh, padW, padH, (v.cms & G_TX_CLAMP) != 0, (v.cmt & G_TX_CLAMP) != 0);
                 }
-                GSPGPU_FlushDataCache(tex.data, tex.size);
+                GdxFlushDataCache(GDX3DS_PROF_GSP_TEX, tex.data, tex.size);
                 v.tex = tex;
                 v.inited = true;
                 v.padWidth = padW;
@@ -2501,7 +2844,7 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
                 return false;
             }
             std::memset(pg.tex.data, 0, pg.tex.size);
-            GSPGPU_FlushDataCache(pg.tex.data, pg.tex.size);
+            GdxFlushDataCache(GDX3DS_PROF_GSP_TEX, pg.tex.data, pg.tex.size);
             pg.inited = true;
         }
         pg.refs = 0;
@@ -2515,20 +2858,10 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
     /* write content + replicated gutter */
     uint32_t* dst = (uint32_t*)pg.tex.data;
     const uint32_t tilesPerRow = kAtlasPageW >> 3;
-    for (int gy = -(int)kAtlasGutter; gy < (int)(h + kAtlasGutter); gy++) {
-        const uint32_t sy = (uint32_t)(gy < 0 ? 0 : (gy >= (int)h ? (int)h - 1 : gy));
-        const uint8_t* srcRow = rgba32 + (size_t)sy * w * 4;
-        const uint32_t rowFromTop = py + kAtlasGutter + (uint32_t)gy;
-        const uint32_t dy = kAtlasPageH - 1 - rowFromTop;
-        const uint32_t tileY = dy >> 3;
-        for (int gx = -(int)kAtlasGutter; gx < (int)(w + kAtlasGutter); gx++) {
-            const uint32_t sx = (uint32_t)(gx < 0 ? 0 : (gx >= (int)w ? (int)w - 1 : gx));
-            const uint8_t* p = srcRow + (size_t)sx * 4;
-            const uint32_t texel = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-            const uint32_t x = px + kAtlasGutter + (uint32_t)gx;
-            const uint32_t offset = ((tileY * tilesPerRow + (x >> 3)) << 6) | MortonInterleave(x, dy);
-            dst[offset] = texel;
-        }
+    if (GdxTexFastEnabled()) {
+        gdx3ds_swz_cell_fast(dst, rgba32, w, h, px, py, kAtlasGutter, kAtlasPageW, kAtlasPageH); /* N60TEX */
+    } else {
+        gdx3ds_swz_cell_ref(dst, rgba32, w, h, px, py, kAtlasGutter, kAtlasPageW, kAtlasPageH);
     }
     {
         /* flush the touched tile rows only: rows [top, bottom] of the cell in flipped space */
@@ -2537,8 +2870,8 @@ bool GfxRenderingAPIC3D::AtlasTryPlace(TextureC3D& t, const uint8_t* rgba32, uin
         const uint32_t tileRow0 = rowTop >> 3;
         const uint32_t tileRow1 = rowBot >> 3;
         const size_t bytesPerTileRow = (size_t)tilesPerRow * 64u * 4u;
-        GSPGPU_FlushDataCache((uint8_t*)pg.tex.data + (size_t)tileRow0 * bytesPerTileRow,
-                              (tileRow1 - tileRow0 + 1) * bytesPerTileRow);
+        GdxFlushDataCache(GDX3DS_PROF_GSP_TEX, (uint8_t*)pg.tex.data + (size_t)tileRow0 * bytesPerTileRow,
+                          (u32)((tileRow1 - tileRow0 + 1) * bytesPerTileRow));
     }
     if (t.inited) { /* recycled id that owned a standalone texture */
         C3D_TexDelete(&t.tex);
@@ -2717,6 +3050,9 @@ void GfxRenderingAPIC3D::EnsureMissingTexture() {
         return; /* 256 bytes refused: the heap is far past saving, leave the bind-miss as-is */
     }
     std::memset(mMissingTex.data, 0xFF, mMissingTex.size);
+    /* [overlap]/endflush_cmdlist: the one texture writer that relied on C3D_FrameEnd's
+     * whole-heap flush. Once, 256 bytes. */
+    GdxFlushDataCache(GDX3DS_PROF_GSP_TEX, mMissingTex.data, mMissingTex.size);
     C3D_TexSetFilter(&mMissingTex, GPU_NEAREST, GPU_NEAREST);
     C3D_TexSetWrap(&mMissingTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
     mMissingTexInited = true;
@@ -2742,7 +3078,22 @@ unsigned long gdx3ds_tex_upload_hwm_h = 0;
 unsigned long gdx3ds_tex_upload_count = 0;
 }
 
+namespace {
+/* N60TEX [debug] texburst: the backend share (alloc + swizzle + flush) of a miss's decode time. */
+struct TexUploadTicksScope {
+    uint64_t t0;
+    TexUploadTicksScope() : t0(gdx3ds_hitch_now()) {}
+    ~TexUploadTicksScope() {
+        gdx3ds_hitch_add(GDX_HITCH_EV_TEX_UP_TICKS, (uint32_t)(gdx3ds_hitch_now() - t0));
+    }
+    TexUploadTicksScope(const TexUploadTicksScope&) = delete;
+    TexUploadTicksScope& operator=(const TexUploadTicksScope&) = delete;
+};
+} // namespace
+
 void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width, uint32_t height) {
+    GdxHwsScope hws(GDX3DS_HWS_TEXUP); /* hwprof [hwsite] texup */
+    TexUploadTicksScope upTicks; /* N60TEX [texburst] upl= */
     {
         const unsigned long bytes = (unsigned long)width * (unsigned long)height * 4ul;
         gdx3ds_tex_upload_count++;
@@ -2753,6 +3104,9 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
         }
     }
     const uint32_t id = mBoundTextureIds[mLastSelectedTile];
+    if (id < mTextures.size()) {
+        mTextures[id].serial = ++mTexSerial; /* n60 nrr_trk: the content of this id changes */
+    }
     if (id >= mTextures.size() || width == 0 || height == 0) {
         mTexUploadFails++;
         sTexUpFailId++;
@@ -2792,6 +3146,7 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
     if (t.page >= 0) {
         AtlasRelease(t);
     }
+    gdx3ds_gpucensus_note_upload(rgba32Buf, width, height, mAtlasArm ? 1 : 0); /* n60gpu: no-op unless armed */
     if (mAtlasArm && AtlasTryPlace(t, rgba32Buf, width, height)) {
         return;
     }
@@ -2867,18 +3222,10 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
     // so N64 row y — V=0 is the texture's top — lands at padded row padH-1-y. The
     // padding rows then sit at the far end of the T range, outside [0, vScale].
     uint32_t* dst = (uint32_t*)t.tex.data;
-    const uint32_t tilesPerRow = padW >> 3;
-    for (uint32_t y = 0; y < height; y++) {
-        const uint8_t* srcRow = rgba32Buf + (size_t)y * width * 4;
-        const uint32_t dy = padH - 1 - y;
-        const uint32_t tileY = dy >> 3;
-        for (uint32_t x = 0; x < width; x++) {
-            const uint8_t* px = srcRow + (size_t)x * 4;
-            const uint32_t texel =
-                ((uint32_t)px[0] << 24) | ((uint32_t)px[1] << 16) | ((uint32_t)px[2] << 8) | px[3];
-            const uint32_t offset = ((tileY * tilesPerRow + (x >> 3)) << 6) | MortonInterleave(x, dy);
-            dst[offset] = texel;
-        }
+    if (GdxTexFastEnabled()) {
+        gdx3ds_swz_rows_fast(dst, rgba32Buf, width, height, padW, padH); /* N60TEX: same stores */
+    } else {
+        gdx3ds_swz_rows_ref(dst, rgba32Buf, width, height, padW, padH);
     }
     /* [padgutter] Replicate the content edge into the pow2 padding: the standalone path used
      * to memset(0) it, so GPU_LINEAR faded every clamped content edge into transparent black
@@ -2889,7 +3236,7 @@ void GfxRenderingAPIC3D::UploadTexture(const uint8_t* rgba32Buf, uint32_t width,
     if (GdxPadGutterEnabled()) {
         WritePadGutter(dst, width, height, padW, padH, (t.cms & G_TX_CLAMP) != 0, (t.cmt & G_TX_CLAMP) != 0);
     }
-    GSPGPU_FlushDataCache(t.tex.data, t.tex.size);
+    GdxFlushDataCache(GDX3DS_PROF_GSP_TEX, t.tex.data, t.tex.size);
 
     t.width = width;
     t.height = height;
@@ -2939,6 +3286,7 @@ void GfxRenderingAPIC3D::DeleteTexture(uint32_t texId) {
         return;
     }
     TextureC3D& t = mTextures[texId];
+    t.serial = ++mTexSerial; /* n60 nrr_trk */
     if (t.page >= 0) {
         AtlasRelease(t); /* [trectbatch] */
     }
@@ -3073,6 +3421,7 @@ void GfxRenderingAPIC3D::SetViewport(int x, int y, int width, int height) {
                 sVpVerbose = gdx3ds_config_get_int("debug", "verbose", 0) != 0 ? 1 : 0;
             }
             if (sVpVerbose != 0) {
+                [this, x, y, width, height, inside]() GDX_COLD { /* hotcold: [vp] receipt, out of line */
                 ++sVpLogs;
                 char line[160];
                 const int n = snprintf(line, sizeof(line), "[vp] f=%lu viewport x=%d y=%d w=%d h=%d inside=%d\n",
@@ -3080,6 +3429,7 @@ void GfxRenderingAPIC3D::SetViewport(int x, int y, int width, int height) {
                 if (n > 0 && &gdx3ds_filelog_write != nullptr) {
                     gdx3ds_filelog_write(line, (size_t)n);
                 }
+                }();
             }
         }
     }
@@ -3219,6 +3569,76 @@ void GfxRenderingAPIC3D::SetCurrentAlphaCompareThreshold(float threshold) {
 /* Draw                                                                             */
 /* ------------------------------------------------------------------------------- */
 
+/* hudsky: DrawTriangles' three latched switches, hoisted out of the function so the lean packed
+ * tail (gfx_citro3d_hsx.inc) reads the same latch. Same first-use latching as before. */
+#ifdef __3DS__
+static bool GdxDiagSkyOn() {
+    // Enable via env (desktop) OR the [debug] diag_sky INI key (see the [sky] block in DrawTriangles).
+    static const bool sOn = [] {
+        if (std::getenv("GDX_DIAG_SKY") != nullptr) {
+            return true;
+        }
+        if (&gdx3ds_config_get_int != nullptr) {
+            return gdx3ds_config_get_int("debug", "diag_sky", 0) != 0;
+        }
+        return false;
+    }();
+    return sOn;
+}
+#endif
+
+// C2 diagnostic kill-switch: a "gdx-nofog.txt" file at the SD root disables the PICA fog unit.
+static bool GdxNoFogFile() {
+    static const bool sOn = [] {
+        FILE* f = fopen("gdx-nofog.txt", "rb");
+        if (f != nullptr) {
+            fclose(f);
+            return true;
+        }
+        return false;
+    }();
+    return sOn;
+}
+
+/* [anchor] killswitch [debug] stereo_anchor (default 1). */
+static int GdxStereoAnchorOn() {
+    static int sOn = -1;
+    if (sOn < 0) {
+        sOn = gdx3ds_config_get_int("debug", "stereo_anchor", 1) != 0 ? 1 : 0;
+    }
+    return sOn;
+}
+
+/* n60stereo frame replay: the draw is emitted ONCE for both eyes, with its stereo class as the
+ * shader's stk row (the per-draw loop's classification: bridge override / ortho heuristic, [anchor]
+ * prim-depth rects, texture-backed passes mono). citro3d uploads stk with the draw when it changed. */
+void GfxRenderingAPIC3D::StereoReplayRow(bool texBacked, float clsW, bool anchoredDraw) {
+    int cls = Gdx3dsStereo::ClassifyDraw(clsW == 1.0f);
+    if (texBacked) {
+        cls = GDX3DS_STEREO_UI_ZERO_PARALLAX;
+    } else if (anchoredDraw) {
+        cls = GDX3DS_STEREO_ANCHORED;
+        Gdx3dsStereo::SetAnchorDepth(mCurrentPrimDepth);
+        sAnchorDraws++;
+        if (mCurrentPrimDepth < sAnchorDMin) {
+            sAnchorDMin = mCurrentPrimDepth;
+        }
+        if (mCurrentPrimDepth > sAnchorDMax) {
+            sAnchorDMax = mCurrentPrimDepth;
+        }
+    }
+    float row[4];
+    Gdx3dsStereo::ClassRow(cls, row);
+    const int loc = Gdx3dsStereo::ReplayStkLoc();
+    const C3D_FVec& cur = C3D_FVUnif[GPU_VERTEX_SHADER][loc];
+    if (cur.x != row[0] || cur.y != row[1] || cur.z != row[2] || cur.w != row[3]) {
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, loc, row[0], row[1], row[2], row[3]);
+    }
+    if (!texBacked) {
+        mFrameDrawsRightEye++;
+    }
+}
+
 void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t bufVboNumTris) {
     /* [prof] DRW: repack loop + state application + C3D submission. RAII so the
      * early-outs (no shader / stride mismatch / VBO exhaustion) still close the
@@ -3227,16 +3647,23 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         uint64_t t0 = 0, snap = 0;
         bool on;
         ProfDrwScope() : on(gdx3ds_prof_active != 0) {
-            if (on) {
+            if (GDX_UNLIKELY(on)) {
                 t0 = gdx3ds_prof_enter(&snap);
             }
         }
         ~ProfDrwScope() {
-            if (on) {
+            if (GDX_UNLIKELY(on)) {
                 gdx3ds_prof_exit(GDX3DS_PROF_DRW, t0, snap);
             }
         }
     } profDrwScope;
+    /* C6 [replay]: the pose this draw's vertices were produced with (consumed even on an
+     * early-out, so a dropped draw never lends its tag to the next one). */
+    const uint16_t replayTag = gdx3ds_replay_rec ? gdx3ds_replay_take_draw_tag() : 0;
+    if (replayTag == GDX_REPLAY_TAG_UNKNOWN && gdx3ds_replay_rec) {
+        gdx3ds_replay_note_untagged(__builtin_return_address(0), sReplayOuterCaller, (unsigned)bufVboNumTris);
+    }
+    sReplayOuterCaller = nullptr;
     if (!mInitialized || !mFrameActive || bufVboNumTris == 0) {
         return;
     }
@@ -3256,7 +3683,10 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                     bufVboNumTris);
         return;
     }
-    if (mVboOffsetFloats + numVerts * kOutStrideFloats + nativeIdxFloats > mVboPoolFloats) {
+    /* [native] gpuxf: the raw vertices were reserved once per mesh (NativeXfVertices); a run
+     * only consumes its index tail. */
+    const size_t vtxPoolFloats = mXf != nullptr ? 0 : numVerts * kOutStrideFloats;
+    if (GDX_UNLIKELY(mVboOffsetFloats + vtxPoolFloats + nativeIdxFloats > mVboPoolFloats)) {
         sVboDrawDropped++; /* GEOMLOSS: was logged once and counted nowhere */
         if (!mVboExhaustionLogged) {
             mVboExhaustionLogged = true;
@@ -3395,7 +3825,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                 C3D_TexSetFilter(bindTex, vf, vf);
             }
             C3D_TexSetWrap(bindTex, wrapS, wrapT);
-            C3D_TexBind(tile, bindTex);
+            BindTexUnit(tile, bindTex);
             gdx3ds_gpuprof_note_tex_bind(texId); // S12: distinct textures touched/frame
         } else {
             /* DROPSITES site 4. Pre-fix this branch bound NOTHING, so the PICA texunit kept the
@@ -3405,7 +3835,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
              * DEFINED, and bindMiss= still counts every occurrence. */
             mFrameBindMisses++;
             if (mMissingTexInited) {
-                C3D_TexBind(tile, &mMissingTex);
+                BindTexUnit(tile, &mMissingTex);
                 sTexMissingBinds++;
             }
             GFX_C3D_LOG("DROPSITE: shader wants texel%d but texture %u is not uploaded (bound the "
@@ -3467,7 +3897,9 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
             out[11] = 0.0f;
         }
     }
-    if (UvDiagOn() && AtlasDiagInWindow() && prg.cc.usedTextures[0] && numVerts > 0 && numVerts <= 12) {
+    if (mXf == nullptr && UvDiagOn() && AtlasDiagInWindow() && prg.cc.usedTextures[0] && numVerts > 0 &&
+        numVerts <= 12) {
+        [this, dst, numVerts]() GDX_COLD { /* hotcold: [uvdiag] receipt, out of line */
         const uint32_t texId0 = mBoundTextureIds[0];
         const TextureC3D* td = (texId0 < mTextures.size()) ? &mTextures[texId0] : nullptr;
         const float padW = td != nullptr ? (float)td->padWidth : 0.0f;
@@ -3494,10 +3926,12 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                     td != nullptr ? (unsigned)td->width : 0u, td != nullptr ? (unsigned)td->height : 0u,
                     padW, padH, ax, ay, x0, y0, x1, y1, s0, s1, t0, t1,
                     (unsigned long)bs, (unsigned long)bt, (unsigned)numVerts);
+        }();
     }
     /* [native] machines_verify: hand the final packed stream + material identity to the
      * mesh verifier; in capture-only mode stop here (no GPU state, no submit, no advance). */
-    if (sMeshCaptureFn != nullptr) {
+    if (sMeshCaptureFn != nullptr && mXf == nullptr) {
+        const bool captureSkip = [this, &prg, dst, numVerts, bufVboNumTris]() GDX_COLD -> bool {
         Gdx3dsMeshCapture cap;
         cap.verts = dst;
         cap.nVerts = (uint32_t)numVerts;
@@ -3512,7 +3946,9 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         cap.vtxColorInput = (int8_t)prg.vtxColorInput;
         cap.vtxAlphaInput = (int8_t)prg.vtxAlphaInput;
         sMeshCaptureFn(&cap, sMeshCaptureUser);
-        if (sMeshCaptureSkip) {
+        return sMeshCaptureSkip;
+        }();
+        if (captureSkip) {
             return;
         }
     }
@@ -3538,17 +3974,12 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         // and in the emulator — mirror the malloc-histogram "env wins over INI" bridge in
         // main_3ds.cpp). gdx3ds_config_get_int is weak so the gfx backend still links into
         // the DL-test harness (which has no config target), exactly as gdx3ds_gpu_prof.c does.
-        static const bool sDiagSky = [] {
-            if (std::getenv("GDX_DIAG_SKY") != nullptr) {
-                return true;
-            }
-            if (&gdx3ds_config_get_int != nullptr) {
-                return gdx3ds_config_get_int("debug", "diag_sky", 0) != 0;
-            }
-            return false;
-        }();
+        const bool sDiagSky = GdxDiagSkyOn(); /* hudsky: hoisted so the lean tail can test it */
         const bool raceActiveSky = (&gGdxRaceActive != nullptr) && (gGdxRaceActive != 0);
-        if (sDiagSky && raceActiveSky && bufVboNumTris == 2) {
+        if (sDiagSky && raceActiveSky && bufVboNumTris == 2 && mXf == nullptr) {
+            const float vScale0 = vScale[0];
+            const float vClampMax0 = vClampMax[0];
+            [this, &prg, bufVbo, numVerts, inStride, uvOff0, packed, vScale0, vClampMax0]() GDX_COLD {
             float sxMin = 1e9f, sxMax = -1e9f, syMin = 1e9f, syMax = -1e9f;
             float zwMin = 1e9f, zwMax = -1e9f;
             float pvMin = 1e9f, pvMax = -1e9f; // PADDED-space V (post-vScale, pre-fminf)
@@ -3566,7 +3997,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                 if (uvOff0 >= 0) {
                     // [triloop] packed layout carries the post-scale (and
                     // post-clamp) V at slot 5.
-                    const float pv = packed ? src[5] : src[uvOff0 + 1] * vScale[0];
+                    const float pv = packed ? src[5] : src[uvOff0 + 1] * vScale0;
                     if (pv < pvMin) pvMin = pv;
                     if (pv > pvMax) pvMax = pv;
                 }
@@ -3594,22 +4025,31 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                                 (int)prg.cc.usedTextures[0], zwMin, zwMax, sxMin, sxMax,
                                 syMin, syMax, 1.0f - syMax, 1.0f + syMin,
                                 (int)prg.fogBlendStage, tw, th, tpw, tph, pvMin, pvMax,
-                                vClampMax[0]);
+                                vClampMax0);
                 }
             }
+            }();
         }
     }
 #endif
 
+    const bool xfp = mXf != nullptr && gdx3ds_xfprof_inrun != 0; /* [debug] xfprof (c5mach2) */
+    if (GDX_UNLIKELY(xfp)) {
+        gdx3ds_xfprof_mark(XFP_B_TEX, svcGetSystemTick());
+    }
     const uint32_t constReappliedMask =
         packed ? RefreshStageConstantsPacked(prg, *mPackedAux) : RefreshStageConstants(prg, bufVbo);
+    if (GDX_UNLIKELY(xfp)) {
+        gdx3ds_xfprof_mark(XFP_B_CONST, svcGetSystemTick());
+    }
 
     // [livery] draw receipt (one-shot window, see GdxLiveryDiagFrameBegin): EVERY
     // textured draw's bound texture identities + first-vertex unit-0 UV + the
     // input-driven stage constant when one is bound (machine bodies: ENV colour,
     // r in the LOW byte). The texture names resolve through the id→name table the
     // import hook maintains, so warm-cache binds are named too.
-    if (sLiveryArmed && (prg.cc.usedTextures[0] || prg.cc.usedTextures[1])) {
+    if (sLiveryArmed && mXf == nullptr && (prg.cc.usedTextures[0] || prg.cc.usedTextures[1])) {
+        [this, &prg, bufVbo, bufVboNumTris, uvOff0, packed]() GDX_COLD {
         ++sLiveryDrawIndex;
         if (GdxLiveryTakeLine()) {
             char tbuf[2][64];
@@ -3646,12 +4086,14 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                 svcOutputDebugString(msg, (size_t)n);
             }
         }
+        }();
     }
 
     // [prim] draw receipt (one-shot window, see GdxPrimDiagFrameBegin): every draw
     // whose shader consumes an input-driven stage constant — machine bodies bind
     // their ENV body colour here (c0), so the player's body draw must log blue.
     if (sPrimDiagArmed && mLastDrawHadInputConst) {
+        [this, &prg, bufVboNumTris, constReappliedMask]() GDX_COLD {
         ++sPrimDiagDrawIndex;
         if (GdxPrimDiagTakeLine()) {
             unsigned texW = 0, texH = 0;
@@ -3670,6 +4112,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
                 svcOutputDebugString(msg, (size_t)n);
             }
         }
+        }();
     }
 
     ApplyAlphaTest();
@@ -3677,14 +4120,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
     // C2 diagnostic kill-switch: a "gdx-nofog.txt" file at the SD root disables the
     // PICA fog unit entirely, discriminating fog-unit output from combiner/shade
     // output in race captures. Checked once; delete the file to restore fog.
-    static const bool sGdxNoFog = [] {
-        FILE* f = fopen("gdx-nofog.txt", "rb");
-        if (f != nullptr) {
-            fclose(f);
-            return true;
-        }
-        return false;
-    }();
+    const bool sGdxNoFog = GdxNoFogFile(); /* hudsky: hoisted so the lean tail shares it */
     // Per-vertex fog blend (prg.fogBlendStage) runs entirely in the TexEnv chain and
     // must NOT also drive the depth-indexed hardware fog unit — that unit is the
     // original bug (F-Zero X's [0.95,1.0] clip-depth band saturates its LUT to full
@@ -3696,20 +4132,29 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         DisableFog();
     }
 
+    if (GDX_UNLIKELY(xfp)) {
+        gdx3ds_xfprof_mark(XFP_B_ATFOG, svcGetSystemTick());
+    }
     const bool texBacked = mCurrentFramebuffer >= 0 && mCurrentFramebuffer < (int)mFramebuffers.size() &&
                            mFramebuffers[mCurrentFramebuffer].texBacked;
 
     /* [native] every per-eye/mono submission below goes through this: an indexed mesh
      * draw issues C3D_DrawElements over the same bound VBO range, arrays otherwise. */
     const auto IssueDraw = [&]() {
+        GdxHwsScope hws(GDX3DS_HWS_DRAW); /* hwprof [hwsite] draw */
+        const u32 hsxW0 = gpuCmdBufOffset; /* [debug] hsx_gpuhash */
         if (mNativeActive) {
             C3D_DrawElements(GPU_TRIANGLES, (int)mNativeIdx.nIdx, C3D_UNSIGNED_SHORT, mNativeIdx.idx);
         } else {
             C3D_DrawArrays(GPU_TRIANGLES, 0, (int)numVerts);
         }
+        if (HsxGpuHashOn()) {
+            HsxGpuHashFold(hsxW0, mXf == nullptr ? dst : nullptr, mXf == nullptr ? vtxPoolFloats + nativeIdxFloats : 0);
+        }
     };
 
     if (gdx3ds_verify_mode != 0) { /* [nverify] one record per submitted batch; compare pass never draws */
+        const bool verifyNoDraw = [this, &prg, dst, numVerts, bufVboNumTris, packed]() GDX_COLD -> bool {
         uint32_t f[kVfyFields] = {};
         uint32_t h = 2166136261u;
         f[0] = VfyFnv(h, &prg.id0, 8);
@@ -3771,24 +4216,53 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         memcpy(info.vpf, vp, sizeof(info.vpf));
         memcpy(info.vis, vis, sizeof(info.vis));
         VfyRecord(1, state, vboHash, f, &info);
-        if (gdx3ds_verify_mode == 2) {
+        return gdx3ds_verify_mode == 2;
+        }();
+        if (verifyNoDraw) {
             return;
         }
     }
-    C3D_BufInfo* bufInfo = C3D_GetBufInfo();
-    BufInfo_Init(bufInfo);
-    BufInfo_Add(bufInfo, dst, kOutStrideFloats * sizeof(float), 4, 0x3210);
+    if (mXf != nullptr) {
+        /* [native] gpuxf: the raw 16-byte N64 Vtx (ob s16x4, tc s16x2, cn u8x4) and the
+         * shader's gpuxf proc; NativeXfDraw restores the legacy layout after the submit. */
+        XfBindVertexBuffer(mXf->verts, mXfPosFloat ? 24 : 16);
+        if (!mXfStateOn || mXfAttrF != mXfPosFloat) {
+            /* [native] track_retained: its near-plane polygons carry float3 positions */
+            C3D_SetAttrInfo(mXfPosFloat ? &mAttrXfF : &mAttrXf);
+            mXfAttrF = mXfPosFloat;
+        }
+        if (!mXfStateOn) {
+            C3D_BoolUnifSet(GPU_VERTEX_SHADER, mXfBoolLoc, true);
+            mXfStateOn = true;
+        }
+        XfUploadUniforms(*mXf);
+        if (gdx3ds_replay_rec && gdx3ds_replay_xf_needs_pose(replayTag)) {
+            ReplayDirtyXfPose(); /* C6: a new pose re-emits xmvp, the lights and xoff */
+        }
+        XfSetCull(mXf->cullMode);
+        if (GDX_UNLIKELY(xfp)) {
+            gdx3ds_xfprof_mark(XFP_B_XF, svcGetSystemTick());
+        }
+    } else {
+        if (mXfStateOn) {
+            XfRestore();
+        }
+        C3D_BufInfo* bufInfo = C3D_GetBufInfo();
+        BufInfo_Init(bufInfo);
+        BufInfo_Add(bufInfo, dst, kOutStrideFloats * sizeof(float), 4, 0x3210);
+        mBufLastVerts = nullptr;
+    }
+    /* Stereo / DISP classification input: the first vertex's packed clip w (a gpuxf draw has
+     * no clip-space vertex in the buffer; the mesh path hands the CPU value of the same one). */
+    const float clsW = mXf != nullptr ? mXf->clsW : bufVbo[3];
     /* MENU DISP: pick this draw's projection variant (scene vs UI, see the border-mode
      * block above). Texture-backed passes and mode 0 keep the plain fixup. */
     /* [anchor] killswitch [debug] stereo_anchor (default 1). */
-    static int sAnchorOn = -1;
-    if (sAnchorOn < 0) {
-        sAnchorOn = gdx3ds_config_get_int("debug", "stereo_anchor", 1) != 0 ? 1 : 0;
-    }
-    const bool anchoredDraw = sAnchorOn != 0 && !texBacked && prg.cc.opt_prim_depth && bufVbo[3] == 1.0f;
+    const int sAnchorOn = GdxStereoAnchorOn(); /* hudsky: hoisted so the lean tail shares it */
+    const bool anchoredDraw = sAnchorOn != 0 && !texBacked && prg.cc.opt_prim_depth && clsW == 1.0f;
     const C3D_Mtx* dispBase = &mFixupMatrix;
     if (!texBacked && DispModeLatched() > 0) {
-        const int dispCls = Gdx3dsStereo::ClassifyDraw(bufVbo[3] == 1.0f);
+        const int dispCls = Gdx3dsStereo::ClassifyDraw(clsW == 1.0f);
         dispBase = (dispCls == GDX3DS_STEREO_UI_ZERO_PARALLAX || anchoredDraw) ? &sDispProjUi : &sDispProjScene;
     }
     C3D_Mtx vpMtx;
@@ -3810,7 +4284,13 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         dispBase = &vpMtx;
         sDispProjLast = nullptr; /* never dedupe against a stack temporary */
     }
-    if (mStereoEnabled && Gdx3dsStereo::Active()) {
+    if (mStereoEnabled && Gdx3dsStereo::ReplayActive()) {
+        StereoReplayRow(texBacked, clsW, anchoredDraw); /* n60stereo: one emission, the class row */
+    }
+    if (mStereoEnabled && Gdx3dsStereo::Active() && !Gdx3dsStereo::ReplayActive()) {
+        if (gdx3ds_replay_rec) {
+            gdx3ds_replay_frame_bad(GDX_REPLAY_BAD_STEREO); /* C6: one eye's replay only */
+        }
         /* Per-eye draw loop (stereo foundation): re-issue the SAME repacked VBO
          * range per eye — only the target binding and the projection uniform
          * change (no CPU vertex re-copy; see gdx3ds_stereo.h). Offscreen
@@ -3823,7 +4303,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         } else {
             // Stereo class: bridge override, else ortho heuristic (clip w == 1
             // on vertex 0 -> HUD/menu content at zero parallax).
-            int cls = Gdx3dsStereo::ClassifyDraw(bufVbo[3] == 1.0f);
+            int cls = Gdx3dsStereo::ClassifyDraw(clsW == 1.0f);
             if (anchoredDraw) {
                 /* [anchor] a prim-depth ortho draw (race position markers: the game sets the
                  * machine's projected depth as prim depth before each marker rect) sits at that
@@ -3863,14 +4343,34 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
         }
         sDispProjLast = nullptr; // eye uploads overwrote the uniform: force re-upload
     } else {
+        if (gdx3ds_replay_rec && mXf == nullptr && gdx3ds_replay_legacy_needs_proj(replayTag)) {
+            sDispProjLast = nullptr; /* C6: a new pose re-emits the projection */
+        } else if (gdx3ds_replay_rec && mXf != nullptr && gdx3ds_replay_xf_needs_proj()) {
+            /* C6: the gpuxf path ends in the same `projection` (outpos = projection * xmvp * v); a
+             * replay patches that register per legacy pose, so an xf draw after a posed legacy draw
+             * carries its own copy of the unposed map instead of inheriting the patched one. */
+            sDispProjLast = nullptr;
+        }
         if (dispBase != sDispProjLast) {
             C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, mProjectionUniformLoc, dispBase);
             sDispProjLast = (dispBase == &vpMtx) ? nullptr : dispBase;
         }
-        IssueDraw();
+        if (gdx3ds_replay_rec) {
+            gdx3ds_replay_note_vtx0(bufVbo);
+            gdx3ds_replay_note_range(dst, (unsigned)(vtxPoolFloats + nativeIdxFloats));
+            u32* const w0 = gpuCmdBuf + gpuCmdBufOffset;
+            IssueDraw();
+            gdx3ds_replay_draw_post(replayTag, mXf != nullptr ? 1 : 0, w0, gpuCmdBuf + gpuCmdBufOffset,
+                                    mXf != nullptr ? mXfShadow : nullptr);
+        } else {
+            IssueDraw();
+        }
     }
 
-    mVboOffsetFloats += numVerts * kOutStrideFloats + nativeIdxFloats;
+    if (GDX_UNLIKELY(xfp)) {
+        gdx3ds_xfprof_mark(XFP_B_SUBMIT, svcGetSystemTick());
+    }
+    mVboOffsetFloats += vtxPoolFloats + nativeIdxFloats;
     if (mVboOffsetFloats > mVboHighWaterFloats) {
         mVboHighWaterFloats = mVboOffsetFloats; /* GEOMLOSS: peak pool use, [c3d] vboHW */
     }
@@ -3878,7 +4378,7 @@ void GfxRenderingAPIC3D::DrawTriangles(float bufVbo[], size_t bufVboLen, size_t 
     /* COVERAGE (NEXT.md B15/B43): the one place every draw of every path funnels through, so
      * this is where a frame's combiner / render-mode / texture-format vocabulary is recorded.
      * One branch on gdx3ds_cov_on when the census is off, which is every shipped run. */
-    if (gdx3ds_cov_on) {
+    if (GDX_UNLIKELY(gdx3ds_cov_on)) {
         CovNoteDraw(prg, texBacked, anchoredDraw, numVerts, bufVboNumTris);
     }
     if (packed) {
@@ -3908,7 +4408,7 @@ static inline uint32_t CovLog2u(uint32_t v) {
     return n;
 }
 
-void GfxRenderingAPIC3D::CovNoteTexture(int unit, uint32_t texId) {
+GDX_COLD void GfxRenderingAPIC3D::CovNoteTexture(int unit, uint32_t texId) {
     /* value: unit | class | PICA format | pow2 extents | filter | wrap. This is the texture
      * VOCABULARY the frame binds, not the texture identity: two different course textures of
      * the same format and extent are the same coverage feature, because a SHOT that samples
@@ -3939,7 +4439,7 @@ void GfxRenderingAPIC3D::CovNoteTexture(int unit, uint32_t texId) {
                                        (cms << 6) | (cmt << 4)));
 }
 
-void GfxRenderingAPIC3D::CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw,
+GDX_COLD void GfxRenderingAPIC3D::CovNoteDraw(const ShaderProgramC3D& prg, bool texBacked, bool anchoredDraw,
                                      size_t numVerts, size_t numTris) {
     /* Combiner: the two 64-bit shader ids folded to 24 bits. A fold, not an identity — a
      * collision would merge two combiners into one coverage feature, which costs a sample, and
@@ -4094,7 +4594,8 @@ static uint32_t sNbStockHash = GDX_NATIVEBATCH_HASH_SEED;
 static uint32_t sNbStockTris = 0;
 
 void GfxRenderingAPIC3D::DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux) {
-    if (sNbStockArm && numTris != 0 && mVboOffsetFloats + numTris * 3 * kOutStrideFloats <= mVboPoolFloats) {
+    sReplayOuterCaller = __builtin_return_address(0); /* C6: names an untagged draw's path */
+    if (GDX_UNLIKELY(sNbStockArm) && numTris != 0 && mVboOffsetFloats + numTris * 3 * kOutStrideFloats <= mVboPoolFloats) {
         sNbStockHash = Gdx_NativeBatchHashBytes(mVboPool + mVboOffsetFloats,
                                                 numTris * 3 * kOutStrideFloats * sizeof(float), sNbStockHash);
         sNbStockTris += (uint32_t)numTris;
@@ -4149,6 +4650,7 @@ float* GfxRenderingAPIC3D::NativeMeshBegin(Gdx3dsVboPackParams* params, uint32_t
 }
 
 void GfxRenderingAPIC3D::NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux) {
+    sReplayOuterCaller = __builtin_return_address(0); /* C6: names an untagged draw's path */
     if (nIdx == 0 || nVerts == 0 || aux == nullptr) {
         return; /* nothing survived: the reservation is simply not consumed */
     }
@@ -4165,6 +4667,191 @@ void GfxRenderingAPIC3D::NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, ui
     mPackedAux = nullptr;
     mNativeActive = false;
     sNativeDrawCalls++;
+}
+
+/* ------------------------------------------------------------------------------- */
+/* [native] gpuxf: GPU-transformed mesh runs (gdx3ds_mesh.h Gdx3dsXfDraw)             */
+/* ------------------------------------------------------------------------------- */
+
+/* The gpuxf uniforms in shader.v.pica declaration order, with their vec4 counts. The upload
+ * writes Gdx3dsXfDraw's float block into consecutive registers, so the shader must have
+ * placed them consecutively (picasso allocates in declaration order); XfInitLayout checks. */
+static const struct {
+    const char* name;
+    int count;
+} kXfUniforms[] = { { "xmvp", 4 },  { "xconv", 1 }, { "xconvw", 1 }, { "xfog", 1 }, { "xamb", 1 },
+                    { "xunlit", 1 }, { "xldir", 3 }, { "xlcol", 3 },  { "xlook", 2 }, { "xtg", 1 },
+                    { "xtcs", 1 },  { "xuva", 2 },  { "xuvc", 2 },   { "xcol", 1 },  { "xsel", 1 },
+                    { "xseli", 1 }, { "xflx", 1 }, { "xoff", 1 } };
+/* c5s1: 26 -> 27 (`xflx`, the retained path's FLX alpha light + select, appended last).
+ * c5s3c: 27 -> 28 (`xoff`, [native] track_resident's exact eye offset, appended last). */
+constexpr int kXfUniformVec4s = 28;
+static_assert(offsetof(Gdx3dsXfDraw, off) - offsetof(Gdx3dsXfDraw, mvp) == (kXfUniformVec4s - 1) * 16,
+              "Gdx3dsXfDraw uniform block must be 28 consecutive vec4s in shader order");
+static_assert(sizeof(((GfxRenderingAPIC3D*)nullptr)->mXfShadow) == kXfUniformVec4s * 4 * sizeof(float),
+              "the gpuxf uniform shadow must hold every gpuxf vec4");
+
+void GfxRenderingAPIC3D::XfInitLayout() {
+    AttrInfo_Init(&mAttrXf);
+    AttrInfo_AddLoader(&mAttrXf, 0, GPU_SHORT, 4);         /* ob x y z + flag */
+    AttrInfo_AddLoader(&mAttrXf, 1, GPU_SHORT, 2);         /* tc s t */
+    AttrInfo_AddLoader(&mAttrXf, 2, GPU_UNSIGNED_BYTE, 4); /* cn (colour or normal) + alpha */
+    AttrInfo_Init(&mAttrXfF);                                /* [native] track_retained */
+    AttrInfo_AddLoader(&mAttrXfF, 0, GPU_FLOAT, 3);          /* position, rebased object space */
+    AttrInfo_AddLoader(&mAttrXfF, 1, GPU_FLOAT, 2);          /* tc s t (scaled shorts) */
+    AttrInfo_AddLoader(&mAttrXfF, 2, GPU_UNSIGNED_BYTE, 4);  /* cn */
+    mXfUnifLoc = -1;
+    const int base = shaderInstanceGetUniformLocation(mShaderProgram.vertexShader, "xmvp");
+    int expect = base;
+    bool ok = base >= 0;
+    for (const auto& u : kXfUniforms) {
+        const int loc = shaderInstanceGetUniformLocation(mShaderProgram.vertexShader, u.name);
+        if (loc != expect) {
+            ok = false;
+        }
+        expect += u.count;
+    }
+    mXfBoolLoc = shaderInstanceGetUniformLocation(mShaderProgram.vertexShader, "xfon");
+    if (mXfBoolLoc < 0) {
+        ok = false;
+    } else {
+        C3D_BoolUnifSet(GPU_VERTEX_SHADER, mXfBoolLoc, false);
+    }
+    mXfUnifLoc = ok ? base : -1;
+    GFX_C3D_LOG("[gpuxf] shader layout %s (xmvp=%d xfon=%d)\n", ok ? "ok" : "REFUSED", base, mXfBoolLoc);
+}
+
+/* C6 [replay]: the pose vec4s (xmvp 0-3, xldir 9-11, xlook 15-16, xflx 26, xoff 27) go out
+ * again at the next draw, so the draw's words carry its own pose. */
+void GfxRenderingAPIC3D::ReplayDirtyXfPose() {
+    static const int kPose[] = { 0, 1, 2, 3, 9, 10, 11, 15, 16, 26, 27 };
+    C3Dgdx_unifTouch = 1; /* n60draw: a hand-marked dirty register (citro3d uniforms.h) */
+    for (int k : kPose) {
+        C3D_FVUnifDirty[GPU_VERTEX_SHADER][mXfUnifLoc + k] = true;
+    }
+}
+
+void* GfxRenderingAPIC3D::ReplayMainColorBuf() {
+    if (mFramebuffers.empty() || mFramebuffers[0].target == nullptr) {
+        return nullptr;
+    }
+    return mFramebuffers[0].target->frameBuf.colorBuf;
+}
+
+void GfxRenderingAPIC3D::XfUploadUniforms(const Gdx3dsXfDraw& xf) {
+    const float* f = &xf.mvp[0][0];
+    for (int i = 0; i < kXfUniformVec4s; i++) {
+        const float* v = f + i * 4;
+        if (mXfShadowValid && std::memcmp(v, mXfShadow + i * 4, 4 * sizeof(float)) == 0) {
+            continue; /* the register already holds it (only gpuxf draws write these) */
+        }
+        C3D_FVUnifSet(GPU_VERTEX_SHADER, mXfUnifLoc + i, v[0], v[1], v[2], v[3]);
+        std::memcpy(mXfShadow + i * 4, v, 4 * sizeof(float));
+    }
+    mXfShadowValid = true;
+}
+
+/* [native] gpuxf_cullflip (default 0): swap the front/back mapping below if a hardware A/B
+ * ever shows the winding mirrored. The mapping: the CPU cull (gdx3ds_tri_cull) keeps CCW in
+ * game NDC (y up) for G_CULL_BACK; the fixup is a rotation (orientation-preserving) and the
+ * stereo shear / DISP scale / viewport fold are positive affine maps, so CCW survives to the
+ * PICA and G_CULL_BACK is GPU_CULL_BACK_CCW (the emulator A/B confirms it pixel for pixel). */
+static int GdxXfCullFlip() {
+    static int sFlip = -1;
+    if (sFlip < 0) {
+        sFlip = (&gdx3ds_config_get_int != nullptr && gdx3ds_config_get_int("native", "gpuxf_cullflip", 0) != 0) ? 1
+                                                                                                             : 0;
+    }
+    return sFlip;
+}
+
+void GfxRenderingAPIC3D::XfSetCull(int cullMode) {
+    GPU_CULLMODE mode = GPU_CULL_NONE;
+    if (cullMode == GDX3DS_CULL_BACK || cullMode == GDX3DS_CULL_FRONT) {
+        const bool cullFront = (cullMode == GDX3DS_CULL_FRONT) != (GdxXfCullFlip() != 0);
+        mode = cullFront ? GPU_CULL_FRONT_CCW : GPU_CULL_BACK_CCW;
+    }
+    if ((int)mode != mXfCull) {
+        C3D_CullFace(mode);
+        mXfCull = (int)mode;
+    }
+}
+
+void GfxRenderingAPIC3D::XfRestore() {
+    C3D_SetAttrInfo(&mAttrLegacy);
+    C3D_BoolUnifSet(GPU_VERTEX_SHADER, mXfBoolLoc, false);
+    if (mXfCull != (int)GPU_CULL_NONE) {
+        C3D_CullFace(GPU_CULL_NONE); /* legacy draws: the interpreter culls on the CPU */
+    }
+    mXfCull = (int)GPU_CULL_NONE;
+    mXfStateOn = false;
+}
+
+void* GfxRenderingAPIC3D::NativeXfVertices(uint32_t nVerts) {
+    if (!mInitialized || !mFrameActive || mXfUnifLoc < 0 || nVerts == 0) {
+        return nullptr;
+    }
+    const size_t floats = (size_t)nVerts * 4u; /* 16 bytes per Vtx keeps the pool 16-aligned */
+    if (mVboOffsetFloats + floats > mVboPoolFloats) {
+        return nullptr;
+    }
+    float* p = mVboPool + mVboOffsetFloats;
+    mVboOffsetFloats += floats;
+    if (mVboOffsetFloats > mVboHighWaterFloats) {
+        mVboHighWaterFloats = mVboOffsetFloats;
+    }
+    return p;
+}
+
+bool GfxRenderingAPIC3D::NativeXfParams(Gdx3dsVboPackParams* params) {
+    if (!mInitialized || !mFrameActive || mCurrentShader == nullptr || mXfUnifLoc < 0 || gdx3ds_verify_mode != 0 ||
+        sMeshCaptureFn != nullptr) {
+        return false;
+    }
+    const ShaderProgramC3D& prg = *mCurrentShader;
+    const bool skyClampFix = GdxSkyClampFixEnabled();
+    params->hasOff = 0;
+    for (int t = 0; t < 2; t++) {
+        params->used[t] = prg.cc.usedTextures[t] ? 1 : 0;
+        AtlasFillTexParams(t, params, skyClampFix);
+    }
+    params->shaderClampGate = skyClampFix ? 1 : 0;
+    params->vtxColorInput = (int8_t)prg.vtxColorInput;
+    params->vtxAlphaInput = (int8_t)prg.vtxAlphaInput;
+    params->wantVtxAlpha = (prg.inputSize == 4 && prg.vtxAlphaInput > 0) ? 1 : 0;
+    params->fogFactorToAlpha = (prg.fogBlendStage && prg.fogOffset >= 0) ? 1 : 0;
+    return true;
+}
+
+void GfxRenderingAPIC3D::NativeXfDraw(const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux,
+                                      const Gdx3dsXfDraw* xf) {
+    sReplayOuterCaller = __builtin_return_address(0); /* C6: names an untagged draw's path */
+    if (nIdx == 0 || aux == nullptr || xf == nullptr || xf->verts == nullptr) {
+        return;
+    }
+    /* [native] machines_retained: resident indices are drawn in place (no pool tail). */
+    const size_t idxFloats = xf->idxResident ? 0 : NativeIdxFloats(nIdx);
+    if (mVboOffsetFloats + idxFloats > mVboPoolFloats) {
+        sVboDrawDropped++;
+        return;
+    }
+    uint16_t* idxDst = const_cast<uint16_t*>(idx);
+    if (!xf->idxResident) {
+        idxDst = (uint16_t*)(mVboPool + mVboOffsetFloats);
+        std::memcpy(idxDst, idx, (size_t)nIdx * sizeof(uint16_t));
+    }
+    mNativeIdx.idx = idxDst;
+    mNativeIdx.nIdx = nIdx;
+    mNativeIdx.nVerts = xf->nVerts;
+    mNativeIdx.idxFloats = idxFloats;
+    mNativeActive = true;
+    mPackedAux = aux;
+    mXf = xf;
+    DrawTriangles((float*)idxDst, (size_t)xf->nVerts * kOutStrideFloats, nIdx / 3u);
+    mXf = nullptr;
+    mPackedAux = nullptr;
+    mNativeActive = false;
+    sNativeDrawCalls++; /* the gpuxf GPU state stays on until the next legacy draw */
 }
 
 /* ------------------------------------------------------------------------------- */
@@ -4275,6 +4962,7 @@ void GfxRenderingAPIC3D::UpdateFogState(const ShaderProgramC3D& prg, const float
         }
         if (raceActive2 && sFogDrawBudget > 0) {
             --sFogDrawBudget;
+            [&prg, bufVbo, numVerts, inStride, packedAux, a, b, fogColor]() GDX_COLD { /* hotcold */
             float ddMin = 1e30f, ddMax = -1e30f, ffMin = 1e30f, ffMax = -1e30f, wwMin = 1e30f,
                   wwMax = -1e30f;
             for (size_t v = 0; v < numVerts; v++) {
@@ -4298,6 +4986,7 @@ void GfxRenderingAPIC3D::UpdateFogState(const ShaderProgramC3D& prg, const float
                         sGdxFogFrame, (int)numVerts, sGdxFogParamsValid ? "ex" : "fit", (double)a,
                         (double)b, (double)ddMin, (double)ddMax, (double)ffMin, (double)ffMax,
                         (double)wwMin, (double)wwMax, (unsigned long)fogColor);
+            }();
         }
     }
 
@@ -4344,6 +5033,7 @@ void GfxRenderingAPIC3D::UpdateFogState(const ShaderProgramC3D& prg, const float
     }
     auto it = mFogLutCache.find(key);
     if (it == mFogLutCache.end()) {
+        it = [this, key, a, b]() GDX_COLD { /* hotcold: LUT-cache miss, out of line */
         if (mFogLutCache.size() >= 64) {
             mFogLutCacheOverflowPending = true; // cleared at the next StartFrame
         }
@@ -4359,7 +5049,8 @@ void GfxRenderingAPIC3D::UpdateFogState(const ShaderProgramC3D& prg, const float
         }
         C3D_FogLut lut;
         FogLut_FromArray(&lut, data);
-        it = mFogLutCache.emplace(key, lut).first;
+        return mFogLutCache.emplace(key, lut).first;
+        }();
     }
     C3D_FogLutBind(&it->second);
     mBoundFogKey = key;
@@ -4469,7 +5160,12 @@ void GfxRenderingAPIC3D::StartDrawToFramebuffer(int fbId, float noiseScale) {
     }
     if (mFrameActive) {
         C3D_FrameDrawOn(mFramebuffers[fbId].target);
+        if (mStereoEnabled) {
+            Gdx3dsStereo::ReplayNoteBind(fbId); /* n60stereo: the main target's words are per eye */
+        }
+        gdx3ds_skylate_note_bind(fbId); /* n60tail: a texture pass inside the sky / track keeps the order */
         mFrameFbBinds++;
+        if (fbId == 0) { sStBindMain++; } else { sStBindOther++; } /* B11q */
         const FramebufferC3D& fb = mFramebuffers[fbId];
         gdx3ds_gpuprof_note_pass(fb.texBacked ? 1 : 0,
                                  fb.texBacked ? (unsigned)fb.tex.width * fb.tex.height : 96000u);
@@ -4490,6 +5186,7 @@ void GfxRenderingAPIC3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, in
         fbDstId >= (int)mFramebuffers.size() || fbSrcId == fbDstId) {
         return;
     }
+    if (fbDstId == 0) { sStCopyToMain++; } else { sStCopyOther++; } /* B11q */
     FramebufferC3D& src = mFramebuffers[fbSrcId];
     FramebufferC3D& dst = mFramebuffers[fbDstId];
 
@@ -4523,7 +5220,7 @@ void GfxRenderingAPIC3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, in
     if (mFrameActive) {
         // Submit the queued 3D commands so the copy sees THIS frame's draws, not last frame's.
         FlushPendingVbo();
-        C3D_FrameSplit(0);
+        C3D_FrameSplit((u8)gdx3ds_overlap_split_flags()); /* [overlap]: 0 unless the queue is live */
     }
 
     /* Overlapping region, anchored at fb-x 0 AND fb-y 0 — harness-verified: the
@@ -4555,6 +5252,76 @@ void GfxRenderingAPIC3D::CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, in
     }
 }
 
+/* n60gpu: [native] zclear_elide (default 0). C3D_FrameBufClear queues its GX_MemoryFill WITHOUT
+ * splitting the open command list, so a clear runs on the GPU right after the entries queued before
+ * it -- not after the draws written since the last split. A depth-only clear of the main target is
+ * therefore a no-op when every entry queued since the previous depth clear of the main target is
+ * itself a memory fill (no command list ran in between, in GPU order): the depth buffer already holds
+ * kClearDepthFar everywhere. The race frame has exactly that shape -- StartFrame's colour+depth clear
+ * (+ the right eye's), then the game's z-buffer fill rectangle as a depth-only clear (+ the right
+ * eye's) before any list -- so the lever drops one GX entry and one 384 KB VRAM fill per eye per frame.
+ * Exact by construction (the skipped fill would rewrite the value already there). */
+extern "C" char __C3D_Context[]; /* citro3d's context: its first member is the frame's gxCmdQueue_s */
+namespace {
+int sZclrLever = -1;
+unsigned long sZclrFrame = ~0ul;  /* mFrameIndex of the last main depth clear */
+int sZclrEntry = -1;              /* queue index of that clear's fill entry */
+u32 sZclrDepthVa = 0;
+unsigned long sZclrCalls = 0, sZclrElided = 0, sZclrWin = 0;
+
+/* 1 = on; 2 = on in even blocks of 1024 frames, off in odd ones (a same-run hardware A/B: the
+ * [gputl] receipt prints the phase as zc=). */
+int ZclrLever() {
+    if (sZclrLever < 0) {
+        const int v = &gdx3ds_config_get_int != nullptr ? gdx3ds_config_get_int("native", "zclear_elide", 0) : 0;
+        sZclrLever = (v == 1 || v == 2) ? v : 0;
+        GFX_C3D_LOG("[zclr] init zclear_elide=%d (a main-target depth clear with only fills queued since the previous "
+                    "one is skipped%s)\n", sZclrLever, sZclrLever == 2 ? "; A/B: on in even 1024-frame blocks" : "");
+    }
+    return sZclrLever;
+}
+
+const gxCmdQueue_s* ZclrQueue() {
+    return reinterpret_cast<const gxCmdQueue_s*>(__C3D_Context);
+}
+
+/* The fill entry that cleared `depthVa` most recently, or -1 (scanned backwards from the end). */
+int ZclrLastFillOf(u32 depthVa) {
+    const gxCmdQueue_s* q = ZclrQueue();
+    for (int k = q->numEntries - 1; k >= 0; k--) {
+        const gxCmdEntry_s& e = q->entries[k];
+        if ((e.data[0] & 0xFFu) == 0x02u && (e.data[1] == depthVa || e.data[4] == depthVa)) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+bool ZclrRedundant(unsigned long frame, u32 depthVa) {
+    const gxCmdQueue_s* q = ZclrQueue();
+    if (sZclrFrame != frame || sZclrDepthVa != depthVa || sZclrEntry < 0 || sZclrEntry >= q->numEntries) {
+        return false;
+    }
+    const gxCmdEntry_s& own = q->entries[sZclrEntry];
+    if ((own.data[0] & 0xFFu) != 0x02u || (own.data[1] != depthVa && own.data[4] != depthVa)) {
+        return false; /* the queue was rebuilt since (a suspend): not our clear any more */
+    }
+    for (int k = sZclrEntry + 1; k < q->numEntries; k++) {
+        if ((q->entries[k].data[0] & 0xFFu) != 0x02u) {
+            return false; /* a command list (or a copy) runs between the two clears */
+        }
+    }
+    return true;
+}
+unsigned long sZclrFrameNow = 0; /* mFrameIndex, for the A/B phase */
+} // namespace
+
+/* n60gpu: the zclear_elide phase of the current frame (0 off, 1 on), for the [gputl] receipt. */
+extern "C" int gdx3ds_zclr_phase(void) {
+    const int lever = ZclrLever();
+    return lever == 1 ? 1 : (lever == 2 ? (int)(((sZclrFrameNow >> 10) & 1u) == 0u) : 0);
+}
+
 void GfxRenderingAPIC3D::ClearFramebuffer(bool color, bool depth) {
     if (mCurrentFramebuffer >= (int)mFramebuffers.size()) {
         return;
@@ -4577,9 +5344,35 @@ void GfxRenderingAPIC3D::ClearFramebuffer(bool color, bool depth) {
         flags = (C3D_ClearBits)(flags | C3D_CLEAR_DEPTH);
     }
     if (flags != 0) {
+        sZclrFrameNow = (unsigned long)mFrameIndex;
+        const bool mainDepth = depth && mCurrentFramebuffer == 0 && gdx3ds_zclr_phase() != 0 &&
+                               target->frameBuf.depthBuf != nullptr;
+        const u32 depthVa = mainDepth ? reinterpret_cast<u32>(target->frameBuf.depthBuf) : 0u;
+        if (depth && mCurrentFramebuffer == 0) {
+            gdx3ds_skylate_note_depth_clear(); /* n60tail: stencil 0 everywhere before the sky */
+        }
+        if (mainDepth && !color) {
+            sZclrCalls++;
+            if (ZclrRedundant((unsigned long)mFrameIndex, depthVa)) {
+                sZclrElided++; /* the right eye's twin is skipped with it (ClearRight below / the replay) */
+                if (++sZclrWin >= 512) {
+                    GFX_C3D_LOG("[zclr] frame=%lu depth-only main clears=%lu elided=%lu\n", (unsigned long)mFrameIndex,
+                                sZclrCalls, sZclrElided);
+                    sZclrWin = 0;
+                }
+                return;
+            }
+        }
         C3D_RenderTargetClear(target, flags, 0x000000FF /* opaque black */, kClearDepthFar);
+        if (mainDepth) {
+            sZclrFrame = (unsigned long)mFrameIndex;
+            sZclrDepthVa = depthVa;
+            sZclrEntry = ZclrLastFillOf(depthVa);
+        }
+        if (mCurrentFramebuffer == 0) { sStClearMain++; } else { sStClearOther++; } /* B11q */
         if (mStereoEnabled && mCurrentFramebuffer == 0) {
             Gdx3dsStereo::ClearRight(flags, 0x000000FF, kClearDepthFar); // no-op unless Active()
+            if (Gdx3dsStereo::Active()) { sStClearRight++; } /* B11q */
         }
     }
 }
@@ -4594,7 +5387,7 @@ bool GfxRenderingAPIC3D::ReadColorBufRgba16(u32* colorBuf, u32 fbW, u32 fbH, u32
     }
     if (mFrameActive) {
         FlushPendingVbo();
-        C3D_FrameSplit(0); // submit queued draws so the readback sees this frame's content
+        C3D_FrameSplit((u8)gdx3ds_overlap_split_flags()); // submit queued draws so the readback sees this frame's content
     }
     /* TRANSITION-GLITCH root cause: C3D_SyncDisplayTransfer is NOT synchronous while a C3D
      * frame is active — citro3d's implementation is `if (inFrame) { C3D_FrameSplit(0);
@@ -4788,8 +5581,12 @@ void GfxRenderingAPIC3D::SelectTextureFb(int fbId) {
         GFX_C3D_LOG("SelectTextureFb: fb %d is not texture-backed\n", fbId);
         return;
     }
-    C3D_TexBind(0, &mFramebuffers[fbId].tex);
+    BindTexUnit(0, &mFramebuffers[fbId].tex);
 }
+
+/* [native] hudsky_emit: the compact emitter's backend program + lean packed tail. */
+#include "gfx_citro3d_hsx.inc"
+#include "gfx_citro3d_nrr.inc" /* [native] nrr: the NRR core's backend bridge */
 
 } // namespace Fast
 
@@ -4828,6 +5625,9 @@ extern "C" void gdx3ds_atlas_arm(int on) {
 }
 extern "C" int gdx3ds_tex_page(uint32_t texId) {
     return GdxCitro3dRendererSingleton().TexPage(texId);
+}
+extern "C" uint32_t gdx3ds_tex_bytes(uint32_t texId) { /* N60TEX [debug] tex_keep */
+    return GdxCitro3dRendererSingleton().TexBytes(texId);
 }
 extern "C" void gdx3ds_atlas_stats(unsigned long out[5]) {
     GdxCitro3dRendererSingleton().AtlasStats(out);
@@ -4978,6 +5778,9 @@ extern "C" uint32_t Gdx_NativeBatchFlush(void) {
     if (tris != 0) {
         r.mVboOffsetFloats = sNb.startFloats;
         gdx3ds_stereo_set_draw_class(sNb.cls);
+        if (gdx3ds_replay_rec) {
+            gdx3ds_replay_set_draw_tag(gdx3ds_replay_nb_tag); /* C6: the native batch's pose */
+        }
         r.DrawPackedBatch(tris, &sNb.aux); /* advances the cursor to `end` on success */
         gdx3ds_stereo_set_draw_class(-1);
         r.mVboOffsetFloats = end;          /* the range is consumed even on a backend early-out */
@@ -5075,9 +5878,64 @@ extern "C" float* gdx3ds_mesh_backend_begin(Gdx3dsVboPackParams* params, uint32_
                                             uint32_t* capVerts) {
     return GdxCitro3dRendererSingleton().NativeMeshBegin(params, minVerts, maxIndices, capVerts);
 }
+/* C6 [replay]: a machine / track draw uses the interpreter's current matrix state (the mesh
+ * path latched it at the G_DL, the track pass at its marker); the backend checks that the gpuxf
+ * uniform really was built from it (gdx3ds_replay.cpp XfMatchesEntry). */
+static void ReplayTagCurrent(float xscale) {
+    if (gdx3ds_replay_rec) {
+        gdx3ds_replay_set_draw_tag(gdx3ds_replay_cur_tag(xscale));
+    }
+}
 extern "C" void gdx3ds_mesh_backend_draw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx,
                                          const Gdx3dsVboPackAux* aux) {
+    ReplayTagCurrent(gdx3ds_replay_rec ? gdx3ds_replay_mesh_xscale() : 1.0f);
+    if (gdx3ds_replay_rec) {
+        gdx3ds_replay_check_mesh_mp();
+    }
     GdxCitro3dRendererSingleton().NativeMeshDraw(nVerts, idx, nIdx, aux);
+}
+extern "C" void* gdx3ds_mesh_backend_xf_vertices(uint32_t nVerts) {
+    return GdxCitro3dRendererSingleton().NativeXfVertices(nVerts);
+}
+extern "C" int gdx3ds_mesh_backend_xf_params(Gdx3dsVboPackParams* params) {
+    return GdxCitro3dRendererSingleton().NativeXfParams(params) ? 1 : 0;
+}
+extern "C" void gdx3ds_mesh_backend_xf_draw(const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux,
+                                            const Gdx3dsXfDraw* xf) {
+    ReplayTagCurrent(1.0f);
+    GdxCitro3dRendererSingleton().NativeXfDraw(idx, nIdx, aux, xf);
+}
+extern "C" void gdx3ds_mesh_backend_elide_take(unsigned out[3]) {
+    Fast::GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    out[0] = r.mElideVbo;
+    out[1] = r.mElideTex;
+    out[2] = r.mElideAt;
+    r.mElideVbo = r.mElideTex = r.mElideAt = 0;
+}
+extern "C" void gdx3ds_mesh_backend_flush_resident(const void* p, uint32_t bytes) {
+    if (p != nullptr && bytes != 0) {
+        Fast::GdxHwsFlush(p, bytes, GDX3DS_HWFL_RES);
+    }
+}
+/* [native] track_retained (gdx3ds_track_retained.h): the gpuxf draw with float positions and UVs. */
+extern "C" void gdx3ds_track_backend_xf_draw_fpos(const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux,
+                                                  const Gdx3dsXfDraw* xf) {
+    Fast::GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    ReplayTagCurrent(1.0f);
+    r.mXfPosFloat = true;
+    r.NativeXfDraw(idx, nIdx, aux, xf);
+    r.mXfPosFloat = false;
+}
+/* C6 [replay]: the verify lane reads the main target back. */
+extern "C" void* gdx3ds_replay_backend_colorbuf(void) {
+    Fast::GfxRenderingAPIC3D& r = GdxCitro3dRendererSingleton();
+    return r.ReplayMainColorBuf();
+}
+extern "C" int gdx3ds_track_backend_viewport_folded(void) {
+    return GdxCitro3dRendererSingleton().mVpAffineActive ? 1 : 0;
+}
+extern "C" int gdx3ds_mesh_backend_xf_ready(void) {
+    return GdxCitro3dRendererSingleton().XfReady() ? 1 : 0;
 }
 extern "C" unsigned long gdx3ds_mesh_backend_linear_free_kib(void) {
     return (unsigned long)(linearSpaceFree() / 1024u);
@@ -5087,3 +5945,6 @@ extern "C" void gdx3ds_mesh_backend_set_capture(Gdx3dsMeshCaptureFn fn, void* us
     Fast::sMeshCaptureUser = user;
     Fast::sMeshCaptureSkip = skipSubmit != 0;
 }
+
+/* n60 NRR machines: the compact draw's backend half (capture + the hot run). */
+#include "gfx_citro3d_nrrmach.inc"

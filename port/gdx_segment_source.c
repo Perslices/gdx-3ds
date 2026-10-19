@@ -26,6 +26,7 @@ extern void gdx_alloc_fail(const char* site, size_t bytes);
 #include "port_log.h"
 #if defined(GDX_PLATFORM_3DS)
 #include "3ds/gdx3ds_mainprof.h" /* MAINPROF: the [mprof] dma bucket */
+#include "3ds/include/gdx3ds_hitch.h" /* HITCH: first-touch blob loads per frame */
 #endif
 
 #ifdef _WIN32
@@ -305,6 +306,10 @@ static int seg_ensure_loaded(GdxSegFamilySlot* slot) {
     slot->payload = buf + GDX_ARCHIVE_PAYLOAD_OFFSET;
     gdx_port_logf("[seg-src] blob loaded %s bytes=%u ms=%d", e->o2r_key, payloadSize,
                   (int)(gdx_host_ms_now() - t0));
+#if defined(GDX_PLATFORM_3DS)
+    gdx3ds_hitch_add(GDX_HITCH_EV_SEG_BLOB, 1u);
+    gdx3ds_hitch_add(GDX_HITCH_EV_SEG_BLOB_BYTES, payloadSize);
+#endif
     return 1;
 }
 
@@ -333,6 +338,126 @@ void GdxSegmentSourceSetWindow(uint32_t romBase, uint32_t span, GdxSegWindowRead
     SEG_RELEASE_FENCE();
     sWindowRead = readFn; /* published last: a reader that sees it also sees base/span */
     seg_unlock();
+}
+
+/* ---------------------------------------------------------------------------------------
+ * A12b BOOT-WINDOW IN-FLIGHT BYPASS (docs/research/native/bootstall-progress.md).
+ *
+ * THE STALL THIS EXISTS TO REMOVE. seg_ensure_loaded's in-flight wait is ALL-OR-NOTHING: a
+ * reader that arrives while another thread is mid-load (loadState 3) sleeps in 1 ms slices
+ * until the WHOLE family payload is published. For audio_blob/audio_table that is a
+ * 10,744,272-byte archive read, and the reader is the audio producer asking for a handful of
+ * small DMAs out of it (AudioLoad_RelocateFontAndPreloadSamples -> AudioLoad_SyncDma; 30-32
+ * reads totalling ~150 KB on the shipped build, six on EK). Measured on the shipped build at
+ * 215 ms in one producer tick, and by audioasync at 1.30 s on EK -- and the producer holds
+ * sAudioCtxMutex across its whole tick, which the GAME fiber takes in AudioThread_QueueCmd
+ * (decomp/src/audio/rom/lib/thread.c:333), so the boot thread stalls behind it too: the same
+ * event costs the game thread 270 ms, 259 ms of it unattributed. Residency is not what the reader needs: the
+ * consumer copies every byte through AudioLoad_DmaSampleData anyway (audiodiet section 3b),
+ * and the blob is STORED in the .o2r, so any byte of it is one fseek away.
+ *
+ * SO: while the payload is not yet published, offer the read to a bypass source instead of
+ * waiting for residency. The bypass serves the SAME bytes (audiodiet section 6.2 compared all
+ * 10,744,272 of them against the archive entry and found 0 mismatching chunks), so it is
+ * byte-correct at ANY time, not only in flight -- which is what makes the unlocked check
+ * below benign in both directions.
+ *
+ * SELF-DISARMING, which is why there is no lifecycle to get wrong. The check sits AFTER the
+ * lock-free published-payload fast path, so the instant the loader publishes `payload` every
+ * subsequent read takes the memcpy and never reaches here again. `inflight` lets the owner
+ * close its source without racing a reader already inside it. */
+static GdxSegBypassReadFn volatile sBypassRead;
+static uint32_t sBypassBase;
+static uint32_t sBypassSpan;
+static volatile unsigned int sBypassInflight;
+static unsigned int sBypassServed;   /* reads served instead of waiting for residency */
+static unsigned int sBypassBytes;
+static unsigned int sBypassDeclined; /* bypass armed but refused: fell through to the wait */
+
+void GdxSegmentSourceSetBypass(uint32_t romBase, uint32_t span, GdxSegBypassReadFn readFn) {
+    seg_lock();
+    if (readFn != NULL) {
+        sBypassBase = romBase;
+        sBypassSpan = span;
+        SEG_RELEASE_FENCE();
+        sBypassRead = readFn; /* published last: a reader that sees it also sees base/span */
+    } else {
+        sBypassRead = NULL; /* retracted first: no new reader can enter */
+        SEG_RELEASE_FENCE();
+    }
+    seg_unlock();
+}
+
+void GdxSegmentSourceDrainBypass(void) {
+    /* Called by the bypass owner AFTER GdxSegmentSourceSetBypass(.., NULL), before it closes
+     * the underlying source. Bounded in practice by one archive read; the counter only ever
+     * reaches 1 (the audio producer) in the measured boot. */
+    for (;;) {
+        unsigned int n;
+        seg_lock();
+        n = sBypassInflight;
+        seg_unlock();
+        if (n == 0u) {
+            return;
+        }
+        seg_sleep_brief();
+    }
+}
+
+void GdxSegmentSourceBypassStats(unsigned int* outServed, unsigned int* outBytes,
+                                 unsigned int* outDeclined) {
+    if (outServed != NULL) {
+        *outServed = sBypassServed;
+    }
+    if (outBytes != NULL) {
+        *outBytes = sBypassBytes;
+    }
+    if (outDeclined != NULL) {
+        *outDeclined = sBypassDeclined;
+    }
+}
+
+/* Serve `size` bytes at `romBase` from the bypass, or 0 to decline. Only called when the
+ * family's payload is not yet published. */
+static int seg_try_bypass(uint32_t romBase, uint32_t size, void* dst) {
+    GdxSegBypassReadFn fn;
+    int ok;
+
+    /* Range check UNLOCKED. base/span are published with a release fence BEFORE the function
+     * pointer, so a reader that has seen a non-NULL sBypassRead (the call-site gate) also sees
+     * the matching base/span. Doing this without the lock matters: during the boot window
+     * every OTHER family's first-touch read also arrives here, and they must not serialize on
+     * the segment lock just to discover they are out of range. */
+    SEG_ACQUIRE_FENCE();
+    if (size == 0u || romBase < sBypassBase || size > sBypassSpan ||
+        (uint32_t)(romBase - sBypassBase) > sBypassSpan - size) {
+        return 0;
+    }
+
+    seg_lock();
+    /* Re-read under the lock: the owner retracts the hook here, so a reader that raced the
+     * retraction must not call into a source that is about to be closed. */
+    fn = sBypassRead;
+    if (fn == NULL) {
+        seg_unlock();
+        return 0;
+    }
+    /* Pinned across the call so GdxSegmentSourceDrainBypass cannot close underneath it. */
+    sBypassInflight++;
+    seg_unlock();
+
+    ok = fn(romBase - sBypassBase, size, dst);
+
+    seg_lock();
+    sBypassInflight--;
+    if (ok) {
+        sBypassServed++;
+        sBypassBytes += size;
+    } else {
+        sBypassDeclined++;
+    }
+    seg_unlock();
+    return ok;
 }
 
 /* MAINPROF: the single ROM/archive read funnel -- Dma_RomCopy, MIO0 staging, asset byte
@@ -407,6 +532,14 @@ static int seg_read_resident(uint32_t romBase, uint32_t size, void* dst) {
                 }
                 break; /* slot exists but not yet loaded -> take the lock */
             }
+        }
+
+        /* A12b: the payload is not published. Before waiting for residency -- which, for
+         * audio_blob/audio_table, means waiting out a 10.7 MB archive read running on the
+         * boot preload worker -- offer the read to the boot-window bypass. One NULL compare
+         * when unarmed, which is every read once the loader has published. */
+        if (sBypassRead != NULL && seg_try_bypass(romBase, size, dst)) {
+            return 1;
         }
 
         seg_lock();

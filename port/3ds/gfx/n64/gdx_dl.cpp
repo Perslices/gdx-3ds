@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "gdx_log.h"
+#include "gdx3ds_hotcold.h" // hotcold: GDX_COLD / GDX_UNLIKELY (per-function attributes only)
 
 /* [native] dspcensus clock. Defined in gdx_rt_glue.cpp (3DS) / the host harness. `child`
  * mirrors gdx3ds_prof_child_ticks so a per-opcode timer can subtract the [prof] sections
@@ -23,6 +24,54 @@ namespace gdxn {
 static inline float Clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
+/* [dspx] one handler group's SELF time: wall minus the [prof] child sections entered inside it
+ * (read through gdx_ninterp_child_ticks, never published into it -- this runs inside the RUN
+ * bucket it is explaining), minus any nested DxScope the caller Exclude()s. Two clock reads per
+ * call and nothing at all when `on` is false. */
+class DxScope {
+  public:
+    DxScope(Counters& s, bool on, DxGroup g) : mS(s), mG(g), mOn(on) {
+        if (GDX_UNLIKELY(mOn)) {
+            Start();
+        }
+    }
+    ~DxScope() {
+        Stop();
+    }
+    /* Closes the scope once; returns the self ticks it recorded (0 when off). */
+    uint64_t Stop() {
+        if (GDX_LIKELY(!mOn)) {
+            return 0;
+        }
+        return StopOn();
+    }
+    void Exclude(uint64_t ticks) {
+        mExcluded += ticks;
+    }
+
+  private:
+    /* hotcold: the [dspx] clock reads, out of every Exec case and cold ([debug] dspx only). */
+    GDX_COLD void Start() {
+        mT0 = static_cast<uint64_t>(gdx_ninterp_now());
+        mC0 = gdx_ninterp_child_ticks();
+    }
+    GDX_COLD uint64_t StopOn() {
+        mOn = false;
+        const uint64_t gross = static_cast<uint64_t>(gdx_ninterp_now()) - mT0;
+        const uint64_t child = gdx_ninterp_child_ticks() - mC0;
+        uint64_t self = (child < gross) ? (gross - child) : 0;
+        self = (mExcluded < self) ? (self - mExcluded) : 0;
+        mS.dxTicks[mG] += self;
+        mS.dxCalls[mG]++;
+        return self;
+    }
+
+    Counters& mS;
+    DxGroup mG;
+    bool mOn;
+    uint64_t mT0 = 0, mC0 = 0, mExcluded = 0;
+};
 
 bool Interp::PushList(const ListRef& list) {
     if (mSp >= kCallStack) {
@@ -45,8 +94,20 @@ void Interp::Walk(const ListRef& root) {
     if (!PushList(root)) {
         return;
     }
+    if (GDX_UNLIKELY(mNiOn)) {
+        NrrRaceTaskBegin();           /* nirace [native] ni_race (gdx_nirace.cpp): the task's environment */
+        NrrRaceHotDrive(mStack[0], 0); /* the root's spans and markers (gdx_nirace.cpp) */
+    }
+    if (GDX_UNLIKELY(mNc != nullptr)) {
+        WalkNicensus(); /* [debug] nicensus (gdx_nicensus.cpp): measurement only */
+        return;
+    }
     if (mDspCensus) {
         WalkCensus();
+        return;
+    }
+    if (mMsOn) {
+        WalkMachSplit(); /* [debug] machsplit (gdx_machsplit.cpp) */
         return;
     }
     while (mSp > 0) {
@@ -66,13 +127,77 @@ void Interp::Walk(const ListRef& root) {
             mStats.droppedOps++;
             continue;
         }
-        if (mVerifyActive) { /* [nverify] diagnostic; free with interp_verify=0 */
+        if (GDX_UNLIKELY(mVerifyActive)) { /* [nverify] diagnostic; free with interp_verify=0 */
             mBackend->VerifyNoteCmd(c.w0, c.w1);
         }
         const int r = Exec(c, f, f3dXfer);
         if (r == 1) {
             mSp--;
         }
+    }
+}
+
+/* n60hudx [native] nrr_hud_kept: a G_DL recorded inside a HUD run (gdx3ds_hud_capture.c) is resolved
+ * exactly as Exec's G_DL resolves it -- the dlmemo or the bridge, then the G_DL hook -- without the
+ * deadsetup look-ahead (whose window is the walker's parent list, not a run). *hookTaken: the hook
+ * drew the list (Exec returns without entering it). false: the list does not resolve (Exec counts
+ * it as a no-op list and goes on). */
+GDX_COLD bool Interp::ResolveDlAsExec(const Cmd& c, ListRef& sub, bool* hookTaken) {
+    *hookTaken = false;
+    const bool resolved = (mDlMemoLevel != 0) ? ResolveListMemo(c, sub, false) : mSrc.ResolveList(c, sub);
+    if (!resolved) {
+        mStats.noopLists++;
+        return false;
+    }
+    if (mDlHook != nullptr) {
+        mDlHookSub = sub;
+        *hookTaken = mDlHook(mDlHookUser, sub.base, this) != 0;
+    }
+    return true;
+}
+
+/* The list walked to its end on top of the walker's stack, as Walk would after Exec pushed it (the
+ * same loop: reads, the F3D remap, Exec), returning when the stack is back where it was. */
+GDX_COLD void Interp::WalkNestedList(const ListRef& sub) {
+    const int depth = mSp;
+    if (!PushList(sub)) {
+        return;
+    }
+    while (mSp > depth) {
+        Frame& f = mStack[mSp - 1];
+        if (f.idx >= f.list.limit) {
+            mStats.runaway++;
+            mSp--;
+            continue;
+        }
+        Cmd c = ReadCmd(f.list, f.idx);
+        f.idx++;
+        mStats.op[Opcode(c.w0)]++;
+        mStats.cmds++;
+        size_t f3dXfer = 0;
+        if (f.list.isF3d && !RemapF3d(c, f.list, &f3dXfer)) {
+            mStats.droppedOps++;
+            continue;
+        }
+        if (GDX_UNLIKELY(mVerifyActive)) {
+            mBackend->VerifyNoteCmd(c.w0, c.w1);
+        }
+        if (GDX_UNLIKELY(mNc != nullptr)) {
+            NcNote(c, f.list.isF3d); /* [debug] nicensus */
+        }
+        const int r = Exec(c, f, f3dXfer);
+        if (r == 1) {
+            mSp--;
+        }
+    }
+}
+
+/* A recorded G_DL on the replay's stock path: Exec's G_DL, the list walked in place. */
+GDX_COLD void Interp::HudNestedDl(const Cmd& c) {
+    ListRef sub;
+    bool taken = false;
+    if (ResolveDlAsExec(c, sub, &taken) && !taken) {
+        WalkNestedList(sub);
     }
 }
 
@@ -242,6 +367,26 @@ void Interp::SetCombineWords(uint32_t w0, uint32_t w1) {
                      AlphaComb(C1(w1, 21, 3), C1(w1, 3, 3), C1(w1, 18, 3), C1(w1, 0, 3)));
 }
 
+/* hotcold: one [native] dspcensus>=2 G_DL phase lap (clock read + accumulate), cold. */
+static GDX_COLD uint64_t DlPhaseLap(Counters& s, int phase, uint64_t t0) {
+    const uint64_t t1 = static_cast<uint64_t>(gdx_ninterp_now());
+    s.phTicks[phase] += t1 - t0;
+    s.phCalls[phase]++;
+    return t1;
+}
+
+/* nimenu W4 (review §4 hot trims): shared with NrrRaceHotDrive's marker loop (gdx_nirace.cpp) --
+ * see the declaration (gdx_interp.h) for why the two independent `if`s below stay independent
+ * (HudHotClose runs whenever mNrrOpen regardless of whether a hook is registered). */
+void Interp::NrrNoopDispatch(uint32_t w0, uint32_t w1) {
+    if (GDX_UNLIKELY(mNrrOpen) && ((w0 >> 16) & 0xFFu) != 0x5Eu) {
+        NrrHudHotClose(); /* [native] nrr_hud: a marker hook may draw (track, fx, sky, kick) */
+    }
+    if (mNoopHook != nullptr) {
+        mNoopHook(mNoopHookUser, w0, w1, this);
+    }
+}
+
 int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
     const uint8_t op = Opcode(c.w0);
     switch (op) {
@@ -250,9 +395,20 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
         case OP_SPNOOP:
             /* == gfx_noop_handler_f3dex2 (the F3DEX2 table binds both opcodes to it): the
              * port's marker replay gets the two words as-is; p=7/8 (OPEN/CLOSE_DISPS) is
-             * bookkeeping the hook ignores, as the LUS handler's exec-stack does on this port. */
+             * bookkeeping the hook ignores, as the LUS handler's exec-stack does on this port.
+             * NrrNoopDispatch does the HudHotClose-then-hook pair (shared, nimenu W4); when a hook
+             * is registered its call is timed under the same DxScope as before -- HudHotClose's own
+             * (cheap) work now falls inside that same timed window too, which it did not before
+             * sharing, a minor and deliberate widening of what [dspx]'s TRK/FX buckets cover. */
             if (mNoopHook != nullptr) {
-                mNoopHook(mNoopHookUser, c.w0, c.w1, this);
+                const uint32_t marker = (c.w0 >> 16) & 0xFFu; /* receipt split only */
+                DxScope dx(mStats, mDxOn, (marker == 0x5Au || marker == 0x5Bu) ? DX_TRK : DX_FX);
+                NrrNoopDispatch(c.w0, c.w1);
+            } else if (GDX_UNLIKELY(mNrrOpen) && ((c.w0 >> 16) & 0xFFu) != 0x5Eu) {
+                NrrHudHotClose();
+            }
+            if (GDX_UNLIKELY(mNiOn) && mSp == 1 && &f == &mStack[0]) {
+                NrrRaceHotDrive(f, c.w0); /* nirace [native] ni_race: the spans and markers after a root marker */
             }
             return 0;
         case OP_CULLDL: /* no-op today, as in the LUS path */
@@ -266,30 +422,35 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
             return 1;
 
         case OP_DL: {
+            DxScope dx(mStats, mDxOn, DX_DL);
+            if (mDeadSetLevel != 0) { /* [native] deadsetup (gdx_dlmemo.cpp) */
+                const int ds = DeadSetOnDl(c, f);
+                if (ds >= 0) {
+                    return ds;
+                }
+            }
             ListRef sub;
             /* [native] dspcensus>=2: split the G_DL handler into resolve / hook / push. The
              * reads are inside the opcode's own bracket, so they inflate 0xDE's self time by
              * ~6 clock reads; compare shares, not the absolute, at level 2. */
             const bool ph = mDspCensus >= 2;
             uint64_t t0 = ph ? static_cast<uint64_t>(gdx_ninterp_now()) : 0;
-            const bool resolved = mSrc.ResolveList(c, sub);
-            if (ph) {
-                const uint64_t t1 = static_cast<uint64_t>(gdx_ninterp_now());
-                mStats.phTicks[DSP_PH_DLRESOLVE] += t1 - t0;
-                mStats.phCalls[DSP_PH_DLRESOLVE]++;
-                t0 = t1;
+            /* [native] dlmemo (gdx_dlmemo.cpp): the cross-task resolve memo */
+            const bool resolved = (mDlMemoLevel != 0) ? ResolveListMemo(c, sub, false) : mSrc.ResolveList(c, sub);
+            if (GDX_UNLIKELY(ph)) {
+                t0 = DlPhaseLap(mStats, DSP_PH_DLRESOLVE, t0);
             }
             if (!resolved) {
                 mStats.noopLists++;
                 return 0;
             }
             if (mDlHook != nullptr) {
+                DxScope hx(mStats, mDxOn, DX_MCH);
+                mDlHookSub = sub; /* [native] machines_speck reads the list's shape (DlHookList) */
                 const int taken = mDlHook(mDlHookUser, sub.base, this);
-                if (ph) {
-                    const uint64_t t1 = static_cast<uint64_t>(gdx_ninterp_now());
-                    mStats.phTicks[DSP_PH_DLHOOK] += t1 - t0;
-                    mStats.phCalls[DSP_PH_DLHOOK]++;
-                    t0 = t1;
+                dx.Exclude(hx.Stop()); /* the hook is DX_MCH, not G_DL dispatch */
+                if (GDX_UNLIKELY(ph)) {
+                    t0 = DlPhaseLap(mStats, DSP_PH_DLHOOK, t0);
                 }
                 if (taken != 0) {
                     return 0;
@@ -304,9 +465,8 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
                 mStats.listsByClass[static_cast<int>(ClassOf(sub))]++;
                 if (sub.isF3d) mStats.listsF3d++;
             }
-            if (ph) {
-                mStats.phTicks[DSP_PH_DLPUSH] += static_cast<uint64_t>(gdx_ninterp_now()) - t0;
-                mStats.phCalls[DSP_PH_DLPUSH]++;
+            if (GDX_UNLIKELY(ph)) {
+                DlPhaseLap(mStats, DSP_PH_DLPUSH, t0);
             }
             return 2;
         }
@@ -393,13 +553,17 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
             mRsp.extra_geometry_mode &= ~(~C0(c.w0, 0, 24));
             mRsp.extra_geometry_mode |= c.w1;
             return 0;
-        case OP_MOVEMEM:
+        case OP_MOVEMEM: {
+            DxScope dx(mStats, mDxOn, DX_MV);
             SpMovemem(static_cast<uint8_t>(C0(c.w0, 0, 8)), static_cast<uint8_t>(C0(c.w0, 8, 8) * 8), c,
                       f3dXferSize, f.list);
             return 0;
-        case OP_MOVEWORD:
+        }
+        case OP_MOVEWORD: {
+            DxScope dx(mStats, mDxOn, DX_MV);
             SpMoveword(static_cast<uint8_t>(C0(c.w0, 16, 8)), static_cast<uint16_t>(C0(c.w0, 0, 16)), c);
             return 0;
+        }
         case OP_TEXTURE:
             SpTexture(static_cast<uint16_t>(C1(c.w1, 16, 16)), static_cast<uint16_t>(C1(c.w1, 0, 16)),
                       static_cast<uint8_t>(C0(c.w0, 11, 3)), static_cast<uint8_t>(C0(c.w0, 8, 3)),
@@ -412,9 +576,11 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
             SpSetOtherMode(63 - C0(c.w0, 8, 8) - C0(c.w0, 0, 8), C0(c.w0, 0, 8) + 1,
                            static_cast<uint64_t>(c.w1) << 32);
             return 0;
-        case OP_DMA_IO:
+        case OP_DMA_IO: {
+            DxScope dx(mStats, mDxOn, DX_MV);
             SpDmaIo(c);
             return 0;
+        }
 
         /* ---------------- RDP ---------------- */
         case OP_RDPSETOTHERMODE:
@@ -436,17 +602,31 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
                           static_cast<uint16_t>(C0(c.w0, 0, 12)), static_cast<uint16_t>(C1(c.w1, 12, 12)),
                           static_cast<uint16_t>(C1(c.w1, 0, 12)));
             return 0;
-        case OP_LOADTLUT:
+        case OP_LOADTLUT: {
+            DxScope dx(mStats, mDxOn, DX_LOAD);
             DpLoadTlut(static_cast<uint8_t>(C1(c.w1, 24, 3)), C1(c.w1, 14, 10));
             return 0;
-        case OP_LOADBLOCK:
+        }
+        case OP_LOADBLOCK: {
+            DxScope dx(mStats, mDxOn, DX_LOAD);
+            if (mDirectScope != 0 && !mDirectInLoad) {
+                /* C5 Stage 3b direct-load scope (gdx_hud_direct.cpp DirectScopeLoadBlock) */
+                DirectScopeLoadBlock(c, f, mDirectScope, mDirectLevels[mDirectScope]);
+                return 0;
+            }
+            if (mLoadMemo != 0 && SetListLoadBlock(c, f)) {
+                return 0; /* [native] machines_loadmemo: a machine texture-set list's load */
+            }
             DpLoadBlock(static_cast<uint8_t>(C1(c.w1, 24, 3)), C0(c.w0, 12, 12), C0(c.w0, 0, 12), C1(c.w1, 12, 12),
                         C1(c.w1, 0, 12));
             return 0;
-        case OP_LOADTILE:
+        }
+        case OP_LOADTILE: {
+            DxScope dx(mStats, mDxOn, DX_LOAD);
             DpLoadTile(static_cast<uint8_t>(C1(c.w1, 24, 3)), C0(c.w0, 12, 12), C0(c.w0, 0, 12), C1(c.w1, 12, 12),
                        C1(c.w1, 0, 12));
             return 0;
+        }
         case OP_SETCOMBINE:
             SetCombineWords(c.w0, c.w1);
             return 0;
@@ -489,6 +669,7 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
 
         case OP_TEXRECT:
         case OP_TEXRECTFLIP: {
+            DxScope dx(mStats, mDxOn, DX_RECT);
             /* The two trailing halves (RDPHALF_1: s,t; RDPHALF_2: dsdx,dtdy) belong to this
              * command; consume them here so RDPHALF_1 never latches a branch target. */
             if (f.idx + 2 > f.list.limit) {
@@ -514,10 +695,12 @@ int Interp::Exec(const Cmd& c, Frame& f, size_t f3dXferSize) {
             DpTextureRectangle(ulx, uly, lrx, lry, tile, uls, ult, dsdx, dtdy, op == OP_TEXRECTFLIP);
             return 0;
         }
-        case OP_FILLRECT:
+        case OP_FILLRECT: {
+            DxScope dx(mStats, mDxOn, DX_RECT);
             DpFillRectangle(static_cast<int32_t>(C1(c.w1, 12, 12)), static_cast<int32_t>(C1(c.w1, 0, 12)),
                             static_cast<int32_t>(C0(c.w0, 12, 12)), static_cast<int32_t>(C0(c.w0, 0, 12)));
             return 0;
+        }
         case OP_SETZIMG:
             DpSetZImage(c);
             return 0;

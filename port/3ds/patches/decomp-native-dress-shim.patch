@@ -1,0 +1,99 @@
+diff --git a/src/game/course_gadgets.c b/src/game/course_gadgets.c
+--- a/src/game/course_gadgets.c
++++ b/src/game/course_gadgets.c
+@@ -276,6 +276,22 @@
+ #else
+ #define GDX_C5SUB(sub)
+ #define GDX_C5SUB_EFFECT(t)
++#endif
++
++#if defined(PORT) && defined(GDX_NATIVE_DRESS)
++/* C5 STAGE 3b (port/3ds/gfx/gdx3ds_dress.h): [native] gadget_batch records the gadget pass
++   (landmines, jumps, course effects) through a GBI shim active only inside the bracket below and
++   replays it natively at a marker; [native] gadget_batch / dress_retained also open a direct-load
++   scope around their pass (G_NOOP p=0x6C) inside which the owned walker serves texture loads from
++   a resolved-once memo. Runtime-gated; inactive, every redefined macro emits the original GBI via
++   helpers compiled with this same gbi.h and no marker is written. The C bodies are unchanged. */
++#include "gdx3ds_dress.h"
++#include "gdx3ds_gad_shim.h"
++extern GfxPool D_8024DCE0[];
++extern GfxPool* gGfxPool;
++extern u32 gGameFrameCount;
++#else
++#define GDXDRESS_SCOPE(scope, open)
+ #endif
+ 
+ #if !defined(EXPANSION_KIT) || defined(NON_MATCHING)
+@@ -305,6 +321,11 @@
+     EffectDrawData* effectDrawDataEnd; // sp1A0
+     s32 temp_t0;
+ 
++    GDXDRESS_SCOPE(GDXDRESS_SCOPE_GADGET, 1);
++#if defined(PORT) && defined(GDX_NATIVE_DRESS)
++#include "gdx3ds_gad_shim_begin.h"
++    GDXGAD_BEGIN(!IN_COURSE_EDITOR);
++#endif
+     GDX_C5SUB(MINE);
+     gSPDisplayList(gfx++, aSetupLandmineTextureDL);
+ 
+@@ -570,6 +591,12 @@
+             }
+         }
+     }
++#if defined(PORT) && defined(GDX_NATIVE_DRESS)
++    GDXGAD_END();
++#include "gdx3ds_gad_shim_end.h"
++#endif
++    GDXDRESS_SCOPE(GDXDRESS_SCOPE_GADGET, 0);
++    GDXDRESS_SCOPE(GDXDRESS_SCOPE_DECO, 1);
+     GDX_C5SUB(DSIGN);
+     gSPSetGeometryMode(gfx++, G_CULL_BACK);
+     gSPTexture(gfx++, 0xFFFF, 0xFFFF, 0, G_TX_RENDERTILE, G_ON);
+@@ -765,6 +792,7 @@
+             decoration++;
+         }
+     }
++    GDXDRESS_SCOPE(GDXDRESS_SCOPE_DECO, 0);
+     return gfx;
+ }
+ #else
+diff --git a/src/game/racer.c b/src/game/racer.c
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -5599,6 +5599,9 @@
+  * pending native fx run is closed first (exactly what the next class's setup list would do), so
+  * the run's replay marker lands in the class it belongs to. Ids match GDX3DS_C5SUB_*. */
+ extern int gdx_c5sub_armed(void);
++#if defined(GDX_NATIVE_DRESS)
++extern int gdx_dress_scope_marker(void* slot, int scope, int open);
++#endif
+ #define GDX_C5SUB_BOOST 10
+ #define GDX_C5SUB_EXPL 11
+ #define GDX_C5SUB_DEBRIS 12
+@@ -6410,6 +6413,14 @@
+ 
+     GDX_C5CAT(FX);
+     GDX_C5SUB(BOOST);
++#if defined(PORT) && defined(GDX_NATIVE_DRESS)
++    /* C5 STAGE 3b [native] fxshd_direct (port/3ds/gfx/gdx3ds_dress.h): the effects section's
++       texture loads (boost flames, the class setup lists, the explosion frames) are served from a
++       resolved-once memo inside this scope. Marker written only while the lever is armed. */
++    if (gdx_dress_scope_marker(gfx, 3 /* GDXDRESS_SCOPE_FX */, 1)) {
++        gfx++;
++    }
++#endif
+     GDX_DLB(BOOST);
+     if (GDX_DL_SKIP(BOOST, playerIndex)) {
+         goto gdx_after_boost;
+@@ -7060,6 +7071,11 @@
+ #include "gdx3ds_fx_shim_end.h"
+ #endif
+ GDX_DL_SKIP_LABEL(gdx_after_efx);
++#if defined(PORT) && defined(GDX_NATIVE_DRESS)
++    if (gdx_dress_scope_marker(gfx, 3 /* GDXDRESS_SCOPE_FX */, 0)) {
++        gfx++;
++    }
++#endif
+ 
+     GDX_C5CAT(HUD);
+     GDX_DLB(RHUD);

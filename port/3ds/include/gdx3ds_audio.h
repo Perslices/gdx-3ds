@@ -51,6 +51,19 @@ int gdx3ds_audio_suspended(void);
 /* Percent granted by APT_SetAppCpuTimeLimit at init (0 = no core-1 rung taken), for the
  * ONRESTORE re-application NS's resume path otherwise discards. */
 int gdx3ds_audio_syscore_limit_percent(void);
+/* O3DSHOME: per-thread park state for the APT watch receipts (-1 = thread absent).
+ * Diagnostic; racy reads. Stub: -1. */
+void gdx3ds_audio_park_state(int* drainParked, int* producerParked, int* preloadRunning);
+/* O3DSHOMEFIX: 1 on an Old 3DS, else 0 (model gate for the Old 3DS audio defaults). Stub: 0. */
+int gdx3ds_is_old3ds(void);
+/* N60CORE1: partial-chunk underrun edges counted by the drain so far (diagnostic). Stub: 0. */
+unsigned long gdx3ds_audio_underruns(void);
+/* N60CORE1: the core libctru's ndsp service thread was created on under [debug] ndsp_core1,
+ * -1 when the lever is off or refused (the default core). Stub: -1. */
+int gdx3ds_audio_ndsp_core(void);
+/* N60SYSCORE60: this model's default [debug] syscore_pct, before any ini override or the
+ * syscore_pct_safe clamp (30 on New 3DS, 60 on Old 3DS). Diagnostic/log use. Stub: 30. */
+int gdx3ds_audio_syscore_default_pct(void);
 
 #ifdef __cplusplus
 }

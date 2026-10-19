@@ -10,6 +10,7 @@
 #ifndef GDX3DS_TEST_HOST_3DS_H
 #define GDX3DS_TEST_HOST_3DS_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef uint8_t u8;
@@ -39,5 +40,10 @@ static inline u64 svcGetSystemTick(void) {
 }
 
 Result svcOutputDebugString(const char* str, s32 length);
+
+/* gdx3ds_perf_preset.c's console-model probe (gdx3ds_perf_preset_host_tests.c owns the
+ * answer). R_FAILED is libctru's sign test, spelled for this stub's unsigned Result. */
+#define R_FAILED(res) (((Result)(res)) & 0x80000000u)
+Result APT_CheckNew3DS(bool* out);
 
 #endif /* GDX3DS_TEST_HOST_3DS_H */

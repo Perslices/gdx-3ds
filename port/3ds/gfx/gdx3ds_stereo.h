@@ -61,6 +61,23 @@ void gdx3ds_stereo_set_draw_class(int stereoClass);
  * the OS/config library. Must be called before the backend's Init(). */
 void gdx3ds_stereo_request_enable(void);
 
+/* B11q. Mark the OPEN frame as a TASKLESS HOLD PRESENT: a frame that puts no draws on
+ * the screen target and instead restores it from the frame mirror with a framebuffer
+ * COPY (n64_gfx_bridge.cpp, gdx_vi_present_fallback -> Interpreter::CopyFrameBuffer).
+ *
+ * A copy has no right-eye counterpart -- GfxRenderingAPIC3D::CopyFramebuffer writes
+ * mFramebuffers[dst] and nothing else -- while the clear that precedes it DOES mirror
+ * onto the right eye (ClearRight). The right target was therefore cleared to black and
+ * then never refilled, and was still transferred to GFX_RIGHT at C3D_FrameEnd: with the
+ * 3D slider up, every hold present blanked one eye.
+ *
+ * Marking the frame makes ClearRight a no-op for it, so the right target keeps the
+ * content it already holds -- which is this very game frame, drawn with its own eye
+ * matrix, since the mirror the left eye is restored from was captured from the same
+ * frame. Killswitch [debug] stereo_hold_keep (default 1). Cleared by the backend at
+ * EndFrame, so the mark never outlives one present. */
+void gdx3ds_stereo_mark_hold_frame(void);
+
 /* Verification readback of the RIGHT eye's color buffer (same output contract
  * as GfxRenderingAPIC3D::ReadFramebufferToCPU: packed RGBA5551, row 0 = scene
  * top, coverage bit forced). Call OUTSIDE an active C3D frame (after EndFrame).
@@ -93,6 +110,11 @@ bool Active();
 
 C3D_RenderTarget* RightTarget();
 
+/* B11q trace: true iff the right target is queued into the OPEN frame, i.e.
+ * C3D_FrameEnd will run its display transfer (citro3d sets C3D_RenderTarget::used
+ * in C3D_FrameDrawOn and clears it in C3D_FrameEnd). Read before C3D_FrameEnd. */
+bool RightQueued();
+
 /* Raw mid-frame target switch: C3D_SetFrameBuf without C3D_FrameDrawOn's
  * viewport/scissor reset (research: the sm64-3ds frame_draw_on precedent), so
  * the interpreter's current viewport/scissor state applies to both eyes. */
@@ -100,6 +122,11 @@ void BindTargetRaw(C3D_RenderTarget* target);
 
 /* Mirror a main-target clear onto the right eye (only when Active()). */
 void ClearRight(C3D_ClearBits flags, uint32_t color, uint32_t depth);
+
+/* B11q: end-of-present hook. Clears the taskless-hold mark (see
+ * gdx3ds_stereo_mark_hold_frame) and returns the cumulative number of hold presents
+ * whose right eye was preserved, for the [c3d] window receipt. */
+unsigned long EndFrameHold();
 
 /* THE eye-transform injection point. eye: -1 = left, +1 = right, 0 = center
  * (mono / zero parallax). Writes `base` patched for the eye into `out`.
@@ -127,6 +154,102 @@ int ClassifyDraw(bool orthoDraw);
    GDX3DS_STEREO_ANCHORED draw: the N64 prim depth of a marker rect, i.e. the machine it labels. */
 void SetAnchorDepth(float d);
 
+/* B11q: true while the open frame is a taskless hold present (no right-eye content to make). */
+bool HoldFrame();
+
+/* ---- n60stereo: the stereo FRAME REPLAY (gdx3ds_stereo_frame.cpp, STEREO.md "Frame replay") ----
+ *
+ * The per-draw loop above switches targets twice and uploads two projections per draw. The frame
+ * replay instead emits every draw ONCE, eye-independent, and makes the right eye by re-submitting
+ * the same command lists:
+ *   - the shader skews the incoming clip x by `steye * dot(stk, clip)` (shader.v.pica). `stk` is
+ *     a per-draw, eye-INDEPENDENT row (the draw's stereo class: ClassRow); `steye` is -1 / +1 /
+ *     0 and is written raw, only OUTSIDE the replayed body (never through citro3d);
+ *   - ReplayEnter (the first NRR hand-off of a stereo-active frame) closes the command list built
+ *     so far (those draws took the per-draw loop: both eyes are drawn already), writes steye = -1
+ *     and the main target's framebuffer words, and makes the rest of the frame self-contained
+ *     (every citro3d state group and uniform re-emitted at the first draw);
+ *   - ReplayFrameEnd (EndFrame, after the [overlap] drain, before C3D_FrameEnd) closes the body,
+ *     adds a prologue (the right target's framebuffer words, steye = +1), re-adds the body's GX
+ *     queue entries (command lists as they are; main-target clears retargeted to the right eye;
+ *     mid-frame captures / copies / uploads skipped: they are mono, as in the per-draw loop) and an
+ *     epilogue (steye = 0). C3D_FrameEnd then queues both display transfers after them.
+ * The CPU cost of the right eye is that prologue/epilogue and a few queue entries; the GPU runs
+ * the body twice. Killswitch [native] stereo_replay (default 1); 0 = the per-draw loop for every
+ * draw, and the NRR categories refuse under stereo (the pre-n60stereo behaviour). */
+
+/* Backend Init (after Init()): the shader's `stk` / `steye` registers, the main target. Latches
+ * the lever and prints `[stereo] replay ...`. stkLoc / eyeLoc < 0 = the shader has none: off. */
+void ReplayInit(int stkLoc, int eyeLoc, C3D_RenderTarget* mainTarget);
+/* StartFrame, every frame (also mono): the per-frame reset, and steye = 0 raw when the GPU may
+ * have lost it (boot, a HOME / sleep return). Inside the C3D frame. */
+void ReplayFrameBegin();
+/* The NRR's "may I draw" (gdx3ds_nrr_bk_frame_active): true when the frame is (now) in replay
+ * mode. False: stereo inactive / lever off / a hold frame / the GX queue cannot hold the replay. */
+bool ReplayEnter();
+/* True between ReplayEnter and ReplayFrameEnd. */
+bool ReplayActive();
+/* niview: read-only snapshot of the latest outcome ReplayEnter() decided (sticky across frame
+ * boundaries -- NOT reset at ReplayFrameBegin; see the sReplayOkThisFrame comment in
+ * gdx3ds_stereo_frame.cpp for why a strict per-frame clear broke the tick-ahead pipe). Never calls
+ * ReplayEnter() itself. A game-side reader (a category's admission check, ahead of the render thread
+ * in the pipe) may see the previous render frame's outcome, not this exact one -- acceptable, same
+ * staleness as this codebase's other cross-thread signals. See gdx3ds_stereo_nrr_ok() in
+ * gdx3ds_stereo_frame.cpp for why this indirection exists at all -- calling ReplayEnter() itself from
+ * the wrong thread crashed (GPUCMD_Add, svcBreak), a real gated finding. */
+bool ReplayOkThisFrame();
+/* StartDrawToFramebuffer(fbId) inside the body. A texture target: noted. The main target after a
+ * texture pass: the main framebuffer words go into their own command list, which the right eye's
+ * replay swaps for the right target's. The main target with no texture pass since the last bind:
+ * the GPU already holds this eye's target, so no framebuffer words at all. */
+void ReplayNoteBind(int fbId);
+/* EndFrame, after gdx3ds_overlap_before_frame_end, before C3D_FrameEnd. */
+void ReplayFrameEnd();
+/* [overlap] kick (after its split + queue run): with [native] stereo_interleave (default 1) the chunk
+ * the kick just submitted is replayed for the right eye right behind it, then the left eye resumes
+ * with a fresh self-contained start. The GPU draws both eyes of the early categories while the CPU
+ * builds the late ones; the frame end replays only the last chunk. */
+void ReplayKickChunk();
+/* n60tail [native] stereo_fold: the [overlap] kick, right before its split. When the kick chunk will
+ * replay, the right prologue is written at the end of the list the split closes (no prologue list). */
+void ReplayKickPreSplit();
+/* The stk row of a stereo class in replay mode (eye sign NOT applied: the shader multiplies by
+ * steye). UI_ZERO_PARALLAX / unknown: 0. ANCHORED uses SetAnchorDepth's depth. */
+void ClassRow(int stereoClass, float row[4]);
+/* The citro3d uniform location of stk (-1 none): DrawTriangles' upload. */
+int ReplayStkLoc();
+/* n60tail [native] sky_late: the next command list starts self-contained (citro3d's whole state and
+ * every uniform re-emitted before its first draw); the framebuffer binding is left as it is. */
+void MarkStateSelfContained();
+/* n60st3 ([debug] spike_ms): the right-eye CPU (enter + kick chunks + frame end) of the latest
+ * frame since its StartFrame; *chunks = its kick chunks. */
+uint64_t FrameCpuTicks(unsigned* chunks);
+
 } // namespace Gdx3dsStereo
 
+extern "C" {
 #endif /* __cplusplus */
+
+/* n60stereo, C side: 1 when an NRR category may consume / draw under the current [stereo] config
+ * (stereo off, or [native] stereo_replay on). The boot-time category refusals use it. */
+int gdx3ds_stereo_nrr_ok(void);
+/* 1 while the open frame is in frame-replay mode: NRR draws then upload their class's stk row. */
+extern int gdx3ds_stereo_replay_frame;
+/* The stk rows of this frame: [0] SCENE, [1] UI (zero). Valid while gdx3ds_stereo_replay_frame. */
+extern float gdx3ds_stereo_rows[2][4];
+/* Nonzero while an NRR hand-off owns citro3d (NrrBegin .. NrrEnd): no chunk boundary inside it. */
+extern int gdx3ds_nrr_handoff_open;
+/* C entry of Gdx3dsStereo::ReplayKickChunk (gdx3ds_overlap.c). */
+void gdx3ds_stereo_kick_chunk(void);
+/* C entry of Gdx3dsStereo::ReplayKickPreSplit (gdx3ds_overlap.c, n60tail). */
+void gdx3ds_stereo_kick_pre_split(void);
+/* n60tail: bit 0 = stereo_fold, bit 1 = stereo_xl_early in force for the frame being built. */
+int gdx3ds_stereo_tail_phase(void);
+/* 1 while the right-eye pass is active (Gdx3dsStereo::Active, latched at StartFrame): the pace rule. */
+int gdx3ds_stereo_active(void);
+/* C entry of Gdx3dsStereo::FrameCpuTicks (the spike receipt). */
+unsigned long long gdx3ds_stereo_frame_cpu_ticks(unsigned* chunks);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif

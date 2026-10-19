@@ -1,0 +1,40 @@
+--- a/src/overlays/records/records.c
++++ b/src/overlays/records/records.c
+@@ -11,6 +11,12 @@
+ #include ASSET_HEADER(common_assets_compressed.h)
+ #ifdef EXPANSION_KIT
+ #include ASSET_HEADER_EK(overlays/records/records_assets.h)
++#endif
++
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++/* niview: the records flyby's course + sky on the NRR (decomp-native-records-scene.patch) */
++#include "gdx3ds_dlb_shim.h"
++extern void gdx_dl_scene(int on);
+ #endif
+ 
+ #ifndef EXPANSION_KIT
+@@ -879,9 +885,24 @@
+     gCourseVtxPtr = gGfxPool->courseVtxBuffer;
+     gEffectsVtxPtr = gGfxPool->effectsVtxBuffer;
+     gEffectsVtxEndPtr = &gGfxPool->effectsVtxBuffer[0x7FF];
++#if defined(PORT) && defined(GDX_PLATFORM_3DS)
++    /* niview: a scene scope around the flyby's 3D: the NRR may take the sky and the dressing (their
++       c5tick consume stubs) and the track's lean walk; without [native] ni_view's records bit the
++       scope stays closed and GDX_DL_SKIP reads 0 (stock, as below). */
++    gdx_dl_scene(1);
++    if (!GDX_DL_SKIP(SKY, 0)) {
++        gfx = Background_Draw(gfx, 0, SCISSOR_BOX_FULL_SCREEN);
++    }
++    gfx = Course_Draw(gfx, 0);
++    if (!GDX_DL_SKIP(DRESS, 0)) {
++        gfx = Course_GadgetsDraw(gfx, 0);
++    }
++    gdx_dl_scene(0);
++#else
+     gfx = Background_Draw(gfx, 0, SCISSOR_BOX_FULL_SCREEN);
+     gfx = Course_Draw(gfx, 0);
+     gfx = Course_GadgetsDraw(gfx, 0);
++#endif
+     gfx = RecordsEntry_DrawRecords(gfx, sRecordsCourseIndex);
+     if (sGhostMarkerState != GHOST_MARKER_NONE) {
+         gfx = Records_DrawGhostMarker(gfx);

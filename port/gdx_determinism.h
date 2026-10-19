@@ -32,6 +32,10 @@ int gdx_det_audio_pin(void);
 // Any pin active (receipt / .gdxrec header helper).
 int gdx_det_active(void);
 
+// niview: tick-driven attract demo under the audio pin ([debug] det_title_demo, default 0 = off).
+void gdx_det_set_title_demo(int armTicks, int demoTicks);
+int gdx_det_title_demo_step(int gameModeIsTitle, int state);
+
 #ifdef __cplusplus
 }
 #endif

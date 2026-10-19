@@ -10,6 +10,9 @@
 #include <string.h>
 
 #include "gdx_log.h"
+#include "gdx3ds_xf_census.h" // [debug] xf_census: float24 shader-precision census (o3dsgpuxf)
+#include "gdx3ds_hotcold.h" // hotcold: GDX_COLD / GDX_UNLIKELY (per-function attributes only)
+#include "gdx3ds_replay.h"    // [native] replay (C6): the matrix-op log and the vertex tags
 
 namespace gdxn {
 
@@ -53,6 +56,37 @@ float Interp::AdjXForAspectRatio(float x) const {
         return x;
     }
     return x * (4.0f / 3.0f) / (static_cast<float>(mCfg.curW) / static_cast<float>(mCfg.curH));
+}
+
+/* [native] replay (C6): the x scale TransformVertices packs a vertex with (the pose patch undoes
+ * and redoes it around the correction), the same branch selection as the loop below. */
+float Interp::ReplayVtxXscale() const {
+    const float aspect = static_cast<float>(mCfg.curW) / static_cast<float>(mCfg.curH);
+    if ((mRsp.extra_geometry_mode & 0x00000004u) != 0) {
+        const bool widescreenFrameActive = aspect > (4.0f / 3.0f) && mCfg.widescreen && !mCfg.forceFixedAspect;
+        if (widescreenFrameActive) {
+            return 160.0f / (160.0f - 12.0f);
+        }
+    }
+    if (!mCfg.widescreen || mCfg.forceFixedAspect) {
+        return 1.0f;
+    }
+    return (4.0f / 3.0f) / aspect;
+}
+
+/* The x scale of a plain rectangle (DrawRectangle's default AdjXForAspectRatio branch). */
+float Interp::ReplayRectXscale() const {
+    if (!mCfg.widescreen || mCfg.forceFixedAspect) {
+        return 1.0f;
+    }
+    return (4.0f / 3.0f) / (static_cast<float>(mCfg.curW) / static_cast<float>(mCfg.curH));
+}
+
+/* nrrdiet: [native] replay (C6) is off on a steady race frame (recording, not playback); the
+ * matrix-op log call is a first-sight/record-only path, out of line and cold so SpMatrix's own
+ * body stays the transform math only. */
+GDX_COLD void Interp::SpMatrixReplayHook(uint8_t parameters, uintptr_t p, const int32_t* words) {
+    gdx3ds_replay_interp->opMtx(parameters, reinterpret_cast<const void*>(p), words);
 }
 
 void Interp::SpMatrix(uint8_t parameters, const Cmd& c, const ListRef& list) {
@@ -101,9 +135,15 @@ void Interp::SpMatrix(uint8_t parameters, const Cmd& c, const ListRef& list) {
         mRsp.lights_changed = true;
     }
     MatrixMul(mRsp.MP_matrix, mRsp.modelview_matrix_stack[mRsp.modelview_matrix_stack_size - 1], mRsp.P_matrix);
+    if (GDX_UNLIKELY(gdx3ds_replay_interp != nullptr)) {
+        SpMatrixReplayHook(parameters, p, words);
+    }
 }
 
 void Interp::SpPopMatrix(uint32_t count) {
+    if (gdx3ds_replay_interp != nullptr) {
+        gdx3ds_replay_interp->opPop(count);
+    }
     while (count--) {
         if (mRsp.modelview_matrix_stack_size > 0) {
             --mRsp.modelview_matrix_stack_size;
@@ -170,6 +210,15 @@ void Interp::SpVertex(size_t n_vertices, size_t dest_index, const Cmd& c, const 
     TransformVertices(reinterpret_cast<const uint8_t*>(p), n_vertices, dest_index, list.isBig);
 }
 
+/* [native] replay (C6): where the n slots at dest came from and the matrix state they carry. */
+void Interp::ReplayNoteVertexLoad(const uint8_t* src, size_t n, size_t dest, bool isBig) {
+    gdx3ds_replay_interp->vtxSrc(src, static_cast<unsigned>(n), static_cast<unsigned>(dest), isBig ? 1 : 0);
+    const uint16_t tag = gdx3ds_replay_interp->curTag(ReplayVtxXscale());
+    for (size_t i = 0; i < n; i++) {
+        gdx3ds_replay_vtx_tag[dest + i] = tag;
+    }
+}
+
 /* The transform/light/texgen/fog/clip-flag body of GfxSpVertex, from a resolved source. Also
  * the seam's SpVertex (marker replays, machine walks): host-endian Vtx, no resolution. */
 void Interp::TransformVertices(const uint8_t* src, size_t n_vertices, size_t dest_index, bool isBig) {
@@ -178,6 +227,9 @@ void Interp::TransformVertices(const uint8_t* src, size_t n_vertices, size_t des
     }
     float mp[4][4];
     memcpy(mp, mRsp.MP_matrix, sizeof(mp));
+    if (gdx3ds_replay_interp != nullptr) {
+        ReplayNoteVertexLoad(src, n_vertices, dest_index, isBig);
+    }
 
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         Vtx vv;
@@ -196,6 +248,7 @@ void Interp::TransformVertices(const uint8_t* src, size_t n_vertices, size_t des
         float y = v->ob[0] * mp[0][1] + v->ob[1] * mp[1][1] + v->ob[2] * mp[2][1] + mp[3][1];
         float z = v->ob[0] * mp[0][2] + v->ob[1] * mp[1][2] + v->ob[2] * mp[2][2] + mp[3][2];
         float w = v->ob[0] * mp[0][3] + v->ob[1] * mp[1][3] + v->ob[2] * mp[2][3] + mp[3][3];
+        const float xRaw = x; /* [debug] xf_census: the aspect scale below is part of the shader's row */
 
         float world_pos[3] = { 0.0f, 0.0f, 0.0f };
         if (mRsp.geometry_mode & GM_LIGHTING_POSITIONAL) {
@@ -346,6 +399,9 @@ void Interp::TransformVertices(const uint8_t* src, size_t n_vertices, size_t des
         d->y = y;
         d->z = z;
         d->w = w;
+        if (GDX_UNLIKELY(gdx3ds_xf_census_on)) {
+            gdx3ds_xf_census_note(v->ob, mp, xRaw != 0.0f ? x / xRaw : 1.0f, x, y, w);
+        }
 
         if (mRsp.geometry_mode & GM_FOG) {
             float fogRatio;

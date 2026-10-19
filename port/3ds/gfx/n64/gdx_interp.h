@@ -22,12 +22,18 @@
 #include "gdx_gbi.h"
 
 typedef struct GdxGfxJob GdxGfxJob;
+struct GdxHudWord; /* gdx3ds_hud_record.h: one word of a captured HUD run */
+struct GdxHudRun;  /* gdx3ds_hud_record.h: one captured run */
+struct NrrStateKey; /* ../nrr/gdx3ds_nrr.h: a core state-block key (the NRR HUD interns them) */
+struct NrrState;    /* ../nrr/gdx3ds_nrr.h: a core state block (n60hud3: the HUD builds its own when the table is full) */
 class GdxOwnedSeam; /* gdx_seam_owned.cpp: the native replay seam over this interpreter */
+struct Gdx3dsCourseModel; /* gdx3ds_interp_seam.h: a baked course preview model (nicourse) */
 
 namespace gdxn {
 
 constexpr int kMaxLights = 32;
 constexpr int kMaxVertices = 64;
+constexpr unsigned kNrrMemoKeyWords = 16; /* gdx_nrr_hud.cpp: a memoised HUD rectangle's inputs */
 constexpr int kMatrixStack = 11;
 constexpr int kCallStack = 32;
 constexpr int kMaxTriBuffer = 256;
@@ -233,6 +239,7 @@ struct TexEntry {
     bool used;
     int16_t lruPrev, lruNext;
     int16_t hashNext;
+    uint16_t gen; /* N60TEX [debug] tex_keep: the cache generation (mode) that last used it */
 };
 
 /* Backend-facing state the last batch was drawn with (the diff set, plan §3.9). */
@@ -273,6 +280,7 @@ enum FlushReason : uint8_t {
     FLUSH_COMBINER,
     FLUSH_SAMPLER,
     FLUSH_HOOK, /* a native replay hook (track/fx marker, machines G_DL) drained the batch */
+    FLUSH_POSE, /* [native] replay: the next triangle's matrix-state tag differs (C6) */
     FLUSH_COUNT
 };
 
@@ -319,6 +327,54 @@ enum DspPhase {
     DSP_PH_COUNT
 };
 
+/* [dspx] (o3dsinterp, NEXT.md C4m): the owned walker's `dsp` split by HANDLER GROUP, cheaply
+ * enough to leave on in every gputrace run. Unlike [native] dspcensus (three clock reads per
+ * command, ~5 ms/frame of its own on an Old 3DS) this times only the low-frequency groups
+ * below -- two reads per call, ~600 calls per task -- and each figure is SELF time: the [prof]
+ * sections the handler entered (vtx/tri/imp/drw/mtx) are subtracted, exactly as the census
+ * does, so the groups sum to part of `dsp` and `dsp - sum` is the per-command walk plus the
+ * untimed high-frequency state handlers (colors, othermode, syncs, TRI2 dispatch).
+ *   DX_LOAD  G_LOADBLOCK / G_LOADTILE / G_LOADTLUT (resolve, classify, mirror, span store)
+ *   DX_DL    G_DL minus its hook: the bridge list resolve + push
+ *   DX_MCH   the G_DL hook = [native] machines DrawMesh, SELF (its tnl/bind/emit live here)
+ *   DX_TRK   the G_NOOP hook on a track marker (p=0x5A/0x5B) = [native] track replay, SELF
+ *   DX_FX    the G_NOOP hook on any other marker (fx 0x5C/0x5D, bookkeeping) = [native] fx, SELF
+ *   DX_RECT  G_TEXRECT(FLIP) / G_FILLRECT (the SpTri they call is `tri`, subtracted)
+ *   DX_MV    G_MOVEWORD / G_MOVEMEM / G_DMA_IO (segment sets resolve through the bridge)
+ * Deliberately NOT timed: G_SETTILE (~500 calls/task) and G_SETTIMG (~250) -- the dispatch
+ * census put both at its own noise floor (~1.9 us/call = the clock reads), so a clock pair on
+ * each would cost more than the whole group it measures. They stay in `dsp - sum`. */
+enum DxGroup {
+    DX_LOAD = 0,
+    DX_DL,
+    DX_MCH,
+    DX_TRK,
+    DX_FX,
+    DX_RECT,
+    DX_MV,
+    DX_COUNT
+};
+
+/* [trix] SpTri's own time split into phases, SAMPLED (one top-level call in 32) so the
+ * receipt costs ~0.15 clock reads per triangle instead of five: a clock read is an SVC,
+ * 0.62 us on the Old 3DS and ~1.6 us of emulated time, and 1-in-8 measurably inflated `tri` on
+ * a 3.7k-triangle screen. Self time, [prof] children (the fan's nested SpTri, ImportTexture,
+ * the batch Flush) subtracted; the receipt also subtracts one calibrated clock read per closed
+ * phase interval (TriPhN), which is what the interval itself contains.
+ *   TRI_PH_SCREEN   entry -> the state block: reject variant, trivial reject, cull
+ *   TRI_PH_CLIP     the Sutherland-Hodgman clipper and the fan loop (nested SpTri subtracted)
+ *   TRI_PH_RESOLVE  ResolveDrawState (combiner, tile extents, sampler, shader, blend)
+ *   TRI_PH_BEGIN    VboPackBegin at a batch's first triangle
+ *   TRI_PH_EMIT     the packed emission: aux, UV prep, 3 x 12 floats, fog note */
+enum TriPhase {
+    TRI_PH_SCREEN = 0,
+    TRI_PH_CLIP,
+    TRI_PH_RESOLVE,
+    TRI_PH_BEGIN,
+    TRI_PH_EMIT,
+    TRI_PH_COUNT
+};
+
 /* GfxSpTri1's resolved draw state: what SpTri's state block leaves behind after binding the
  * backend (combiner, textures, sampler, shader, blend) and before the packed emission. Banked
  * as the tri memo the native replay seam reads (gdx_seam_owned.cpp PackState) and produced
@@ -332,6 +388,54 @@ struct DrawState {
     uint8_t numInputs;
     ClipParams clip;
     bool use_alpha, use_fog, use_blend_color;
+};
+
+/* [native] machines_mattab (C5 Stage 1b; gdx_tri.cpp MachMatOps): one machine material run's
+ * ResolveDrawState, recorded. KEY = every register the resolve reads to compute its targets
+ * (combiner key, depth/decal/blend bits, the texel0/1 tiles and their span views, plus the
+ * texture-source classification epoch). RESULT = those targets (depth, decal, per-unit sampler,
+ * shader, alpha, the DrawState) and, per texture unit, the texture-cache slot the unit's import
+ * hit with that entry's key. Opaque to the mesh code (gdx3ds_interp_seam.h GdxSeamMatRec);
+ * all-zero = empty. */
+struct MachMatRec {
+    uint64_t combineMode;
+    uint32_t otherModeL, otherModeH, geometryMode;
+    uint32_t impEpoch[2]; /* texture-source classification epoch each unit's import was recorded at */
+    uint32_t useSeq;      /* last served / banked (the victim choice between a run's ways) */
+    uint8_t valid, firstTile, grayscale;
+    uint8_t depthTM, decal, useAlpha;
+    uint8_t smpKnown[2], smpLinear[2], smpCms[2], smpCmt[2];
+    uint8_t importOk[2];
+    int16_t slot[2];
+    Tile tiles[2];
+    LoadedTexture lt[2];
+    TexKey texKey[2];
+    DrawState ds;
+};
+
+/* What one MachMatResolve call did (the mesh code's [mattab] receipt). */
+enum MachMatResult : uint8_t {
+    MM_HIT = 0,     /* served from the record */
+    MM_MISS_EMPTY,  /* no record yet */
+    MM_MISS_KEY,    /* a register / tile / span view differs */
+    MM_MISS_VP,     /* retired: a hit replays the viewport/scissor diff (kept for the receipt layout) */
+    MM_MISS_NOIMP,  /* a unit owes an import the record has no hit for */
+    MM_MISS_TEX,    /* the recorded cache slot no longer holds the recorded key */
+    MM_MISS_EPOCH,  /* the texture-source classification epoch moved */
+    MM_MISS_SMP,    /* a bound unit's sampler target was never recorded */
+    MM_FULL,        /* verify mode: the full resolve always runs */
+    MM_RESULT_COUNT
+};
+struct MachMatOutcome {
+    uint8_t result;   /* MachMatResult */
+    uint8_t binds;    /* backend state calls issued by a hit (depth/decal/select/sampler/shader/alpha) */
+    uint8_t banked;   /* the record was (re)written from a full resolve */
+    uint8_t checked;  /* verify: the record would have hit and was compared */
+    uint8_t mismatch; /* verify: ... and disagreed with the full resolve */
+    uint8_t wasValid; /* a miss on a record that had been valid (an invalidation) */
+    uint16_t keyBits; /* MM_MISS_KEY: 1 combine 2 omL 4 omH 8 geometry 10 first tile 20 grayscale,
+                         40/80 unit 0/1 tile, 100/200 unit 0/1 span view */
+    uint8_t live;     /* machines_mattab_live: units the hit (or verify's would-hit) imported live */
 };
 
 struct Counters {
@@ -416,6 +520,18 @@ struct Counters {
     uint64_t phTicks[DSP_PH_COUNT];     /* walk-phase ticks */
     uint32_t phCalls[DSP_PH_COUNT];
     uint64_t walkTicks;                 /* the whole Walk(), for the unattributed remainder */
+    /* --- [dspx] (gputrace; inert otherwise) --- */
+    uint64_t dxTicks[DX_COUNT];
+    uint32_t dxCalls[DX_COUNT];
+    /* Bytes the TMEM loads moved -- the memory traffic an L2-less ARM11 pays per load. Always
+       counted (three adds per load). `swap` is the native-RGBA16 subset that is byte-swapped. */
+    uint32_t tmemCopyBytes, tmemSwapBytes, spanWords;
+    /* --- [trix] SpTri exit paths (always counted) + sampled phase clocks (gputrace) --- */
+    uint32_t triCalls, triTopCalls, triRectCalls, triVariantRej, triClipIn, triClipFan, triClipAllOut;
+    uint32_t triTrivialRej, triCull, triResolveFull, triResolveMemo, triBegin, triEmitAll;
+    uint64_t triPhTicks[TRI_PH_COUNT];
+    uint32_t triPhN[TRI_PH_COUNT]; /* closed intervals per phase (clock-cost correction) */
+    uint32_t triPhSamples;
 };
 
 /* RAII [prof] section; one int test when tracing is off. */
@@ -462,6 +578,11 @@ class Interp {
         mNoopHook = fn;
         mNoopHookUser = user;
     }
+    /* nimenu W4 (review §4 hot trims): the G_NOOP/G_SPNOOP marker's two steps -- NrrHudHotClose
+     * (a marker hook may draw) then the registered NoopHook itself -- shared between Exec's own
+     * OP_NOOP case (gdx_dl.cpp) and NrrRaceHotDrive's marker loop (gdx_nirace.cpp), which used to
+     * each inline their own copy. Defined in gdx_dl.cpp. */
+    void NrrNoopDispatch(uint32_t w0, uint32_t w1);
 
     /* --- the native replay seam (gdx_seam_owned.cpp) --- */
     /* G_SETCOMBINE from its raw words (the OP_SETCOMBINE decode). */
@@ -472,6 +593,32 @@ class Interp {
     void SpTri(uint8_t v1, uint8_t v2, uint8_t v3, bool isRect);
     /* SpTri's state block alone: bind the backend for the current registers, no emission. */
     bool ResolveDrawState(bool isRect, DrawState& out);
+    /* [native] machines_mattab: ResolveDrawState (isRect = false) served from one of a run's
+     * `ways` records when its key matches and its texture slots are still valid, else the full
+     * resolve, banked into the matching way (or the least recently used one). mode 1 = use,
+     * 2 = verify (always the full resolve, compared with the record that would have served). */
+    bool MachMatResolve(MachMatRec* const* recs, int ways, int mode, DrawState& out, MachMatOutcome& o);
+    /* [native] track_mattab (C5 Stage 3d; gdx_tri.cpp TrackMatOps): the retained course's
+     * per-segment probe (SpTri on the segment's first surviving triangle, emission discarded)
+     * served from a course material table: the same MachMatRec proof as the machines, `table`
+     * holding nBuckets x ways records bucketed by the register key. `tri` = the probe triangle's
+     * three vertices exactly as SpTri would read them; `serve` = the caller proved the reject
+     * screen passed and nothing is pending. TrackMatBefore replays SpTri's geometry (clipper, fan,
+     * trivial reject, backface) to find whether and from which vertex 0 the state block runs;
+     * then, in mode 1: 4 = SpTri would bind and draw nothing (the probe must not run); with a
+     * record that validates, it applies the record, opens the packed batch and latches its aux
+     * exactly as SpTri would and returns 1 (served), 2 (applied, the batch refused: the probe's
+     * triangle is dropped) or 3 (applied, the pool nearly out: the caller runs the stock probe on
+     * top). Otherwise 0: the caller probes, then TrackMatAfter banks the record (and in mode 2
+     * compares the prediction -- the drop decision, the DrawState, mRs and the aux -- with what
+     * the probe did). mode 1 use, 2 verify; bit 0x10 imports a unit the record holds no hit for
+     * live (as machines_mattab_live). */
+    int TrackMatBefore(MachMatRec* table, int nBuckets, int ways, int mode, bool serve, const LoadedVertex* tri,
+                       MachMatOutcome& o);
+    /* probe: 0 = the state resolved, 1 = dropped before the state block, 2 = drawn by the interpreter. */
+    void TrackMatAfter(MachMatRec* table, int nBuckets, int ways, int mode, int probe, MachMatOutcome& o);
+    friend struct MachMatOps;
+    friend struct TrackMatOps;
     size_t PendingTris() const {
         return mBufNumTris;
     }
@@ -490,9 +637,60 @@ class Interp {
         return mVariant;
     }
 
+    /* --- [debug] nicensus (gdx_nicensus.cpp; docs/research/native/nicensus-progress.md) ---
+     * Measurement only: what the owned walker still interprets, per game mode and context. With
+     * the lever off mNc is null and the walker pays one pointer test per Walk() (the counting
+     * loop is a separate body, WalkNicensus, like WalkCensus). Counters and clocks only: it reads
+     * the command words and the RDP/RSP registers and never writes interpreter or game state. */
+    enum NcCtx {
+        NC_WALK = 0,   /* the walker itself (split per frame: between NRR markers / whole screen) */
+        NC_NRR = 1,    /* inside an NRR 0x63 marker (and the NRR learn / record markers) */
+        NC_NRRHUD = 2, /* a HUD capture run taken by the NRR HUD decoder (nrr_hud) */
+        NC_HUD = 3,    /* a HUD / shadow / fx capture run on the stock / direct / retained replay */
+        NC_SEAM = 4,   /* the track / fx / gadget / sky marker seams (C5 retained paths) */
+        NC_MESH = 5,   /* the G_DL hook: machine meshes, texskip, finish mesh, decorations */
+        NC_FRAME = 6,  /* the task outside Walk(): backend frame start / clear / final flush / task ends */
+        NC_COUNT = 7
+    };
+    static constexpr int kNcModes = 24; /* gGameMode 0..0x16, 0x17 = anything else */
+    static constexpr int kNcSubs = 6; /* 0 steady, 1 race intro, 2 racing, 3 post-finish, 4 mode change, 5 attract demo */
+    struct NcState; /* gdx_nicensus.cpp */
+    void NcSet(int on);
+    bool NcOn() const {
+        return mNc != nullptr;
+    }
+    /* Opens a rendered frame (one task) in bucket (mode * kNcSubs + sub). */
+    void NcFrameBegin(int bucket);
+    /* Closes it; the NRR core's per-category markers / draws / verts of the frame (nCats entries). */
+    void NcFrameEnd(const uint32_t* nrrMarkers, const uint32_t* nrrDraws, const uint32_t* nrrVerts, int nCats);
+    /* A task the owned walker refused (the LUS path drew it). */
+    void NcLusTask(int bucket);
+    /* Switches the attribution context; returns the previous one (pass it back to restore). */
+    int NcSwitch(int ctx);
+    /* One interpreted command (after the legacy-F3D remap). */
+    void NcNote(const Cmd& c, bool f3d);
+    /* Words consumed WITHOUT Exec in the current context (NRR HUD decoded / retained HUD runs). */
+    void NcNoteWords(uint32_t words, int retained);
+    /* The cumulative per-bucket tables ([nicensus] lines). */
+    void NcDump(const char* why, double msPerTick);
+    /* NcDump every `every` frames (0 = never). */
+    void NcDumpEvery(uint32_t every, double msPerTick);
+
     /* [nverify] both interpreters share one backend in verify mode; each pass must forget what it
      * believes the backend holds (shader, depth/decal/alpha, bound textures, samplers). */
     void ResetRenderStateCache();
+    /* [n60mach] Apply a pending viewport / scissor change to the backend, exactly as the next
+     * triangle's ResolveDrawState would (an NRR draw at a marker right after Camera_Draw: the
+     * split-screen view's rect must be in place before the NRR draws into it). */
+    void ApplyViewportScissor();
+    /* niview: a viewport or scissor change waits for the next triangle (ApplyViewportScissor's test). */
+    bool ViewportScissorDirty() const {
+        return mRdp.viewport_or_scissor_changed;
+    }
+    /* n60retry: the registers hold a viewport the backend does not have yet. */
+    bool ViewportPending() const {
+        return mRdp.viewport_or_scissor_changed && memcmp(&mRdp.viewport, &mRs.viewport, sizeof(Rect)) != 0;
+    }
     /* [nverify] re-apply this interpreter's cached backend state (the other pass changed it). */
     void ResyncBackend();
     /* [nverify] end-of-task state words, same layout as gdx_gfx_lus_state. */
@@ -504,6 +702,24 @@ class Interp {
      * invalidate) must reach it too. Render thread only, like every other cache mutation. */
     void TexCacheClear();
     void TexCacheDeleteAddress(const uint8_t* addr);
+
+    /* N60TEX [debug] tex_keep: a clear keeps the most recently used CONTENT-KEYED, uploaded
+     * entries (key.content_hash != 0: the key is a function of the bytes the decode reads, so a
+     * later hit is the same decode the clear would have redone) up to `budgetBytes` of backend
+     * texture memory, and keeps none while the linear heap is below `floorBytes`. Everything a
+     * retire signals (slot generations, the nrr epoch, live bindings) is still signalled for the
+     * kept slots. Under linear pressure a miss recycles the oldest kept entry's id first.
+     * budgetBytes 0 = the stock clear. */
+    void SetTexKeep(uint32_t budgetBytes, uint32_t floorBytes) {
+        mTexKeepBytes = budgetBytes;
+        mTexKeepFloorBytes = floorBytes;
+    }
+    struct TexKeepStats {
+        uint32_t clears, kept, keptKiB, retired, keptHits, pressureRetires, linFreeKiB;
+    };
+    const TexKeepStats& TexKeepReceipt() const {
+        return mTexKeep;
+    }
 
     /* [native] texhash_ci: fold the decoded source span (and, for CI, the live palette bytes)
      * into the key for the CI/RGBA32 classes. 0 restores the identity-only key. */
@@ -602,23 +818,803 @@ class Interp {
 
     /* Public for the emission helpers in gdx_tri.cpp. */
     void Flush(FlushReason why);
+    /* [native] replay (C6, gdx3ds_replay.h): the matrix-state tag of the open batch; a triangle
+     * with a different tag drains it first so every draw has exactly one pose. */
+    uint16_t mReplayBatchTag = 0;
+    uint16_t mReplayClipTag = 0; /* the tag of the triangle the CPU clipper is fanning */
+    void ReplayBatchTag(uint16_t tag);
+    uint16_t ReplayTriTag(uint8_t a, uint8_t b, uint8_t c, bool isRect) const;
+    float ReplayVtxXscale() const;
+    /* The vertex-load half of the hooks: source record + per-slot tag for n slots at dest (every
+     * path that fills loaded_vertices from a G_VTX, including the sky's memoised loads). */
+    void ReplayNoteVertexLoad(const uint8_t* src, size_t n, size_t dest, bool isBig);
+    float ReplayRectXscale() const;
     LoadedTexture LoadedTexAt(uint16_t word) const;
 
+    /* --- [native] machines_texskip (gdx_texskip.cpp; C5 Stage 1, c5s1-progress.md) ---
+     * Racer_Draw emits, per drawn machine, `G_DL D_800CDD38[slot]` (the machine's texture-set
+     * list: 8 x SETTIMG/SETTILE/LOADBLOCK/SETTILESIZE) + SETENVCOLOR + `G_DL` body. The body
+     * is drawn natively (gdx3ds_mesh.cpp); the texture-set list is still walked. With the
+     * lever on, a texture-set list is SKIPPED when (a) its slot has a record of what the list
+     * leaves behind (tile descriptor fields, TMEM span views), (b) the body that follows is a
+     * native machine mesh whose tiles are immutable (o2r asset) sources, and (c) the lists that
+     * really RUN later in the same command group rewrite every TMEM word and tile field it
+     * writes, and no later body samples one of its tiles as a tile its own list leaves alone --
+     * so the state after the group is byte-for-byte what the stock stream leaves. Between the
+     * skip and the next list (the "window") the recorded state is served through LoadedTexAt
+     * and the swapped tile descriptors; immutable sources are keyed and decoded from their
+     * SOURCE bytes, never TMEM, so the imports inside a window are the stock imports. The
+     * tripwire counts any texture-state writer, non-immutable import or unexpected G_DL inside
+     * a window. gdx_texskip.cpp carries the full argument.
+     * Levels: 0 off (default), 1 skip, 2 verify (never skips; compares the record with the
+     * live state wherever a skip would have happened). OwnedDlHook (gdx_rt_glue.cpp) calls
+     * TexSkipOnDl before the machines hook and TexSkipAfterDl after it. */
+    /* The machine-registry queries the skip needs, injected by the glue (gdx3ds_mesh.cpp via
+     * gdx_rt_glue.cpp) so this file stays host-compilable. */
+    struct TexSkipHooks {
+        int (*setSlot)(const void* list);   /* slot whose texture-set list this is, else -1 */
+        int (*isSpeck)(const void* list);   /* 1 = the shared LOD-6 far speck */
+        int (*isBody)(const void* list);    /* 1 = a registered machine body list (no bake) */
+        /* 1 = `body` is a machine list the G_DL hook will draw natively; its slot and the
+         * tiles its runs sample, given the tile / combiner texel use it inherits (inhUse bit0 =
+         * cycle-1 TEXEL0, bit1 = cycle-1 TEXEL1, bit2 = any texel in cycle 2). */
+        int (*bodyProbe)(void* user, const void* body, uint8_t inhTile, uint8_t inhUse, int* slot, uint8_t* tiles);
+        uint32_t (*generation)(void);       /* machine-list generation */
+        void* user;
+    };
+    void SetTexSkip(int level, const TexSkipHooks& hooks);
+    int TexSkipOnDl(const void* listPtr); /* 1 = consumed (a skipped set) */
+    void TexSkipAfterDl(const void* listPtr);
+    void TexSkipTaskEnd();
+    struct TexSkipCounters {
+        uint32_t lists, skips, real, recs, noRec, noBody, noTiles, noNext, noCover, unsup;
+        uint32_t vfyChecks, vfyTileMis, vfyLtMis, vfyWould;
+        uint32_t trips, tripWriter, tripImport, tripDl, tripTaskEnd;
+        uint32_t ovImports, plans;
+    };
+    const TexSkipCounters& TexSkipStats() const {
+        return mTexSkipStats;
+    }
+    void TexSkipResetStats() {
+        memset(&mTexSkipStats, 0, sizeof(mTexSkipStats));
+    }
+    int TexSkipLevel() const {
+        return mTexSkip;
+    }
+
+    /* --- [debug] machsplit (gdx_machsplit.cpp; c5mach2-progress.md) ---
+     * Diagnostic split of the [c5cat] MACH category: inside the machine section of Racer_Draw
+     * every command at the section's own list depth opens a class (matrix, texture-set list
+     * walked / skipped, body, highlight body, far speck, other list, state) and its gross time,
+     * including the lists it pushes, is charged to that class; the native mesh draw's own time
+     * (meshTicks) is subtracted, so the classes add up to `mach`. One clock read per section
+     * command, a separate walk loop (the shipping loop carries no branch). Off by default. */
+    void MachSplitSet(int on, uint64_t (*meshTicks)(void));
+    /* [native] machines_loadmemo (gdx_setload.cpp; c5mach2): 0 off, 1 the machine texture-set
+     * lists' LOADBLOCKs served from their memoised resolved form, 2 verify. */
+    void SetLoadMemo(int level);
+    void LoadMemoTaskEnd();
+    /* [native] dlmemo (gdx_dlmemo.cpp; c5dlmemo-progress.md §1): 0 off, 1 the G_DL resolve
+     * served from a cross-task memo, 2 verify (the resolve always runs and is compared). */
+    void SetDlMemo(int level);
+    /* [native] deadsetup (gdx_dlmemo.cpp; c5dlmemo-progress.md §2): 0 off, 1 the state
+     * commands of back-to-back setup lists whose output no later command can observe are not
+     * executed (a list with none left is not entered), 2 verify. Needs dlmemo. */
+    void SetDeadSetup(int level);
+    /* One receipt line each per `tasks` tasks ([dlmemo], [deadset]); 0 when there is nothing. */
+    int DlMemoFormat(char* buf, size_t cap, uint32_t tasks);
+    int DeadSetFormat(char* buf, size_t cap, uint32_t tasks, double msPerTick);
+    /* Session totals (host tests): plans, lists skipped, dead commands, verify ok, verify bad,
+     * trips, plans reused from the cache; and the memo's hits. */
+    void DeadSetSession(uint32_t out[7]) const;
+    uint32_t DlMemoSessionHits() const;
+    /* [native] machines_speck (c5mach2): the G_DL being dispatched names the shared LOD-6 far
+     * speck (its placeholder operand; the walker resolves it to the loaded asset image). */
+    bool DlOperandIsSpeck(const void* listPtr) {
+        return mTexHooks.isSpeck != nullptr && TexSkipDlIsSpeck(listPtr);
+    }
+    /* The resolved list the G_DL hook is being offered (valid inside the hook call only). */
+    const ListRef& DlHookList() const {
+        return mDlHookSub;
+    }
+    /* nicourse [native] ni_course (gdx_nicourse.cpp): the course preview's G_NOOP p=0x6B marker. The
+     * model's G_VTX / G_TRI2 run right after the marker pair is drawn from a GPU-resident copy and the
+     * walker moves past it, or the run is left to the walk. `seam` = the owned GdxInterpSeam. */
+    void NrrCourseHotMarker(uint32_t w0, uint32_t w1, void* seam);
+    void MachSplitTaskEnd();
+
+    /* --- [native] hud_batch (gdx_hud_replay.cpp; C5 Stage 2, c5s2-progress.md) ---
+     * The game-side capture (gdx3ds_hud_capture.c) moved runs of RDP-state / texture-load /
+     * rectangle commands out of the HUD's display list into a record and left one G_NOOP
+     * p=0x5E marker per run; the glue's noop hook calls HudReplayRun at that marker, which
+     * executes the run's commands through Exec -- the walker's own handlers, same order, same
+     * position. Two memos ride on it, both only while a run replays (mHud != nullptr) and both
+     * only for `immutable` (o2r asset) sources: the SETTIMG source resolution
+     * (HudResolveTextureSource) and the immutable content hash of ImportTexture's key
+     * (HudHashLookup/Store). Level 2 (verify) computes the stock answer every time and
+     * compares it with the memo instead of using it. HudMemoClear follows the texture cache's
+     * clear (gdx_rdram_mode_reset). */
+    void HudReplayRun(const void* record, uint32_t runIndex);
+    void HudReplayRunOne(void* record, uint32_t runIndex); /* n60results: one run of a marker group (a GdxHudRecord) */
+    void HudMemoClear();
+    /* [hudop] per-opcode self time of the replayed runs (gputrace only); resets the window. */
+    int HudCensusFormat(char* buf, size_t cap, uint32_t tasks, double msPerTick);
+    /* [native] hudcensus=1 (with gputrace): arm the [hudop] clock (two tick reads per command). */
+    void HudSetCensus(bool on) {
+        mHudCensus = on;
+    }
+
+    /* --- [native] hud_direct (gdx_hud_direct.cpp; C5 Stage 2b, c5s2b-progress.md) ---
+     * 0 off, 1 on, 2 verify. Inside a replayed HUD run: LOADBLOCKs leave their TMEM bytes as a
+     * DEBT (source + generation stamp) instead of copying them, the texture key's TMEM hash comes
+     * from a per-source memo, and TEXRECTs are emitted straight into the packed batch. Every
+     * reader of TMEM bytes pays the debt first (MirrorToTmem trims it, ImportTexture hashes or
+     * pays it, the task end pays the rest). Level 2 runs the stock path and cross-checks. */
+    void HudSetDirect(int level) {
+        mHudDirect = level;
+    }
+    /* [native] hudclock: 1 = a clock pair around every direct run, 2 = also around every
+     * direct rectangle and load ([hudd] runms/rectms/loadms; diagnostic, inflates by its reads). */
+    void HudSetClock(int level) {
+        mHudClock = level;
+    }
+    void HudDirectTaskEnd();
+    void HudDirectClear();
+    int HudDirectFormat(char* buf, size_t cap, uint32_t tasks);
+
+    /* --- [native] hudelem / hud_retain (gdx_hud_retain.cpp; c5hud3-progress.md) ---
+     * hudelem=1: the per-run HUD census ([hudelem] lines once every 512 tasks, [hudelem] sum on
+     * the receipt cadence). Diagnostic; changes nothing drawn. */
+    void HudSetElem(int level) {
+        mHudElem = level;
+    }
+    /* [native] hud_retain: 0 off, 1 on, 2 verify (gdx_hud_retain.cpp). Inside a direct HUD run
+     * (hud_batch + hud_direct=1): a run whose words, the entry registers it reads, its texture
+     * sources and cache slots and the backend facts it depends on all match the recorded run
+     * re-submits the recorded backend calls and vertex floats and applies the recorded state
+     * effects instead of executing. Level 2 executes every would-be hit and compares. */
+    void HudSetRetain(int level, int clock) {
+        mHudRetain = level;
+        mHudRetClock = clock; /* [native] hudretclock: retention's own time split (diagnostic) */
+    }
+    void HudRetainTaskEnd();
+    void HudRetainClear();
+    int HudRetainFormat(char* buf, size_t cap, uint32_t tasks);
+    /* [native] hudsky_emit: 0 off, 1 on, 2 verify (gdx_hudsky_emit.inc, hudsky-progress.md). With
+     * hud_retain=1, a retained HUD run's hit is decided by a compiled fingerprint and replayed as
+     * ONE backend program (Backend::HsxRun) with a compiled register write-back; the batches a
+     * sky run drains take the backend's lean packed-draw tail (Backend::DrawPackedLean). */
+    void HsxSetLevel(int level) {
+        mHudSkyEmit = level;
+    }
+    int HsxFormat(char* buf, size_t cap, uint32_t tasks);
+    /* --- [native] nrr_hud (gdx_nrr_hud.cpp; n60hud-progress.md, n60-design.md §4.1) ---
+     * The NRR HUD: a HUD-kind 0x5E run is decoded by one small loop (register ops written to the
+     * live registers, loads kept virtual, rectangles emitted from memoised state blocks) instead
+     * of the replay. 0 off, 1 on, 2 verify (the run executes stock; the decoder's state blocks,
+     * floats and register write-back are compared with it). census: [nrrhud] inventory lines. */
+    void NrrHudSet(int level, int census, int clock, int wide) {
+        mNrrHud = level;
+        mNrrCensus = census;
+        mNrrClock = clock;
+        mNrrWide = wide;
+    }
+    /* [native] nrr_hud_memo (n60gp): a program's rectangle whose every input (its words, block,
+     * corner colours, the corner mapping) is the one it had last time copies the six vertices it
+     * produced then instead of computing them again (bit-identical by construction). 0 off. */
+    void NrrHudMemoSet(int level) {
+        mNrrHudMemo = level;
+    }
+    void NrrHudDepDiagSet(int n) {
+        mNrrDepDiag = n;
+    }
+    void NrrHudLateSet(int bits) {
+        mNrrLate = bits;
+    }
+    /* [native] nrr_hud_kept (n60hudx, default 0): the HUD capture records the G_DLs to the HUD's
+     * static setup lists inside the runs (gdx3ds_hud_capture.c); the NRR HUD compiles each into its
+     * run's program (an SL op: the list's register words as masked stores, re-checked against the
+     * resolved list every time); any other path walks it nested at its place (HudNestedDl). */
+    void NrrHudKeptSet(int level) {
+        mNrrKept = level;
+    }
+    /* [debug] nrr_hud_runclock=1 (n60hudx, diagnostic): a clock pair around every NRR HUD run, kept per
+     * run position in the task ([nrrrun] line beside [nrrhud]). */
+    void NrrHudRunClockSet(int on) {
+        mNrrRunClock = on;
+    }
+    /* [native] nrr_hud_rr (n60hudx, default 0): an unchanged run replays its last output -- the
+     * program's register and load ops run (merged), every rectangle's six vertices come from the
+     * record of the run's last execution (gdx_nrr_hud.cpp "run replay"). Bits: 1 runs of >= 8
+     * rectangles (the race-position portrait column), 2 every run, 4 verify (the run executes, and
+     * its output is compared with the record). */
+    void NrrHudRrSet(int bits);
+    /* nimenu [native] ni_menu (gdx_nrr_menu.inc): 0 off, 1 the MENU-kind runs (non-race modes' draw,
+     * gdxmenu_capture in gdx3ds_hud_capture.c) through the NRR program runner, 2 verify. Needs the
+     * NRR HUD (nrr_hud=1). */
+    void NiMenuSet(int level) {
+        mNiMenu = level;
+    }
+    int NiMenuLevel() const {
+        return mNiMenu;
+    }
+    int NiMenuFormat(char* buf, size_t cap, uint32_t tasks, int gameMode);
+    void NrrRunClockNote(uint32_t runInTask, const void* runWords, uint32_t n, uint64_t ticks);
+    int NrrHudFormat(char* buf, size_t cap, uint32_t tasks);
+    void NrrHudTaskEnd();
+    void NrrHudClear();
+    int HudElemFormat(char* buf, size_t cap, uint32_t tasks);
+    struct HudRegs;   /* gdx_hud_retain.cpp: the register view a HUD run reads and writes */
+    struct HudRetRec; /* gdx_hud_retain.cpp: one retained run */
+    /* --- C5 Stage 3b direct-load scopes (gdx_hud_direct.cpp; port/3ds/gfx/gdx3ds_dress.h) ---
+     * Inside a scope opened by a decomp p=0x6C marker (the gadget pass, the decoration passes,
+     * the effects section) every walker G_LOADBLOCK runs hud_direct's load: the resolved form
+     * from the memo, the TMEM bytes left as debt (settled by the next reader or the task end).
+     * [native] fxshd_direct also routes the LOADBLOCKs of the shadow / boost-flame replay runs
+     * here. `level` per scope kind: 0 off, 1 on, 2 verify (the stock load runs and is compared). */
+    void DirectSetLevels(const int levels[4]) {
+        for (int k = 0; k < 4; k++) {
+            mDirectLevels[k] = levels[k];
+        }
+    }
+    void DirectScope(int kind) {
+        mDirectScope = (kind > 0 && kind < 4 && mDirectLevels[kind] != 0) ? kind : 0;
+    }
+    int DirectScopeKind() const {
+        return mDirectScope;
+    }
+    int DirectLevel(int kind) const {
+        return (kind >= 0 && kind < 4) ? mDirectLevels[kind] : 0;
+    }
+    int DirectFormat(char* buf, size_t cap, uint32_t tasks);
+    /* --- [native] sky_retain / skyclock (gdx_sky_retain.cpp; c5sky-progress.md) ---
+     * The p=0x65 markers Background_Draw writes (gdx3ds_sky_capture.c). SkyMarker takes each
+     * one where the walker meets it; SkyFormat writes the receipts line by line (index 0..),
+     * returning 0 past the last; SkyClear follows the texture cache's clear. */
+    void SkyMarker(uint32_t w0, uint32_t w1);
+    /* The census reads the [prof] section ticks/calls (GDX3DS_PROF_*) through this; null = none. */
+    static constexpr int kSkyProfSections = 7;
+    typedef void (*SkyProfFn)(uint64_t ticks[kSkyProfSections], uint32_t calls[kSkyProfSections]);
+    void SkySetLevels(int retain, int clock, SkyProfFn prof);
+    int SkyFormat(char* buf, size_t cap, int line);
+    void SkyTaskEnd();
+    void SkyClear();
+    /* --- [native] nrr_sky (gdx_nrr_sky.cpp; n60sky-progress.md): the NRR sky category. The game
+     * side's p=0x64 LEARN markers bank the stock state blocks here (cold); the core's 0x63 marker
+     * draws (NrrSkyHotDraw, a free function) read the walker through the NrrSkyHot* members. */
+    void NrrSkyMarker(uint32_t w0, uint32_t w1);
+    int NrrSkyFormat(char* buf, size_t cap, uint32_t tasks);
+    bool NrrSkyHotTex(int16_t slot, uint32_t id, const uint8_t* addr, uint32_t contentHash);
+    void NrrSkyHotHead(float mp[4][4], float* xs, int16_t scissor[4]) const;
+    void NrrSkyHotProj(float out[4][4]) const;
+    /* --- [native] nrr_shd / nrr_fx (gdx_nrr_fx.cpp; n60fx-progress.md): shadows, boost flames and
+     * effects on the NRR. The game side's p=0x66 LEARN markers bank stock state blocks here (cold);
+     * the core's 0x63 markers draw (free functions) and read the walker through NrrFxHot*. */
+    void NrrFxMarker(uint32_t w0, uint32_t w1);
+    int NrrFxFormat(char* buf, size_t cap, uint32_t tasks);
+    bool NrrFxHotTex(int16_t slot, uint32_t id, const uint8_t* addr);
+    void NrrFxHotHead(float mp[4][4], float xs[2], int16_t scissor[4]) const;
+    const void* NrrFxResolveVtx(const void* src, uint32_t n); /* cold: the walker's own G_VTX resolution */
+    void NrrFxHotFog(int16_t* mul, int16_t* off, float rgb[3]) const;
+    /* --- nimach (nointerp S5b; nimach-progress.md): a menu machine's gSPViewport. Computes the
+     * pending viewport/scissor only (CalcAndSetViewport); the caller (gdx3ds_nrr_mach.cpp
+     * NrrMachMenuHotEnt) applies it through the same NrrEnd/ApplyViewportScissor/NrrBegin cycle
+     * as niview's NrrFxColdMultiView (gdx_nrr_fx.cpp) -- one idiom for an in-hand-off viewport
+     * change instead of two (native-review-2026-10-15.md Sec.2 "in-hand-off viewport change"). */
+    void NrrMachViewport(const int16_t* vp) {
+        CalcAndSetViewport(vp);
+    }
+    /* nimach: the fog colour's alpha (a blend-colour run's fog factor, XfFillRun's fogFactorConst). */
+    void NrrMachFogAlpha(uint8_t* fogA) const {
+        *fogA = mRdp.fog_color.a;
+    }
+    void NrrMachViewportDirty() {
+        memset(&mRs.viewport, 0, sizeof(mRs.viewport));
+        memset(&mRs.scissor, 0, sizeof(mRs.scissor));
+        mRdp.viewport_or_scissor_changed = true;
+    }
+
   private:
+    void NrrFxLearnBegin(uint32_t cat, uint32_t kind);
+    void NrrFxLearnEnd(uint32_t cat, uint32_t kind);
+    bool NrrFxProbe(void* block);
+    void NrrSkyLearnBegin(uint32_t kind);
+    void NrrSkyLearnEnd(uint32_t kind, uint32_t gen);
+    bool NrrSkyProbe(void* block);
+    bool NrrSkyLearnStars();
+    struct SkyState; /* gdx_sky_retain.cpp */
+    struct SkyGroup;
+    SkyState* mSky = nullptr;
+    int mSkyRetain = 0;
+    int mSkyClock = 0;
+    SkyProfFn mSkyProf = nullptr;
+    bool mSkyPending = false; /* deferred texture-state groups are queued (SpTri materializes) */
+    bool mSkyActive = false;  /* a sky run is replaying (ImportTexture's hash memo hooks) */
+    bool mSkyRectFast = false; /* this draw follows a draw of its kind with only colour writes between */
+    bool mSkyNoClip = false;   /* sky_retain=3 (NOT exact): the sky's triangles skip the CPU clipper */
+    bool SkyRectState(bool isRect, DrawState& out);
+    bool SkyEnsure();
+    void SkyCensusSwitch(int section);
+    int SkyFormatCensus(char* buf, size_t cap, int line);
+    int SkyFormatReceipt(char* buf, size_t cap);
+    int SkyFormatOps(char* buf, size_t cap);
+    bool SkyRunValid(const void* record, uint32_t runIndex) const;
+    void SkyReplayRun(const void* record, uint32_t runIndex);
+    void SkyReplayWords(uint16_t start, uint16_t end, const ListRef& hint);
+    bool SkyGroupEliminable(uint16_t start, uint16_t end) const;
+    bool SkyGroupsMatch(const SkyGroup& a, uint16_t start, uint16_t end) const;
+    void SkyGroupOpen(int wordIndex);
+    void SkyGroupClose();
+    void SkyExecWords(uint16_t start, uint16_t end);
+    bool SkyGroupCovered(const SkyGroup& g, uint32_t unresolvedBefore) const;
+    void SkyExecGroup(const SkyGroup& g);
+    void SkyMaterialize();
+    bool SkyVerifyEnsure();
+    void SkyVerifySnapshotS0();
+    void SkyVerifyMaterialize();
+    bool SkySrcHashLookup(const uint8_t* addr, uint32_t n, bool immutable, uint32_t* out);
+    void SkySrcHashStore(const uint8_t* addr, uint32_t n, bool immutable, uint32_t h);
+    bool SkyPalHashLookup(const uint8_t* bytes, uint32_t n, uint32_t* out);
+    void SkyPalHashStore(const uint8_t* bytes, uint32_t n, uint32_t h);
+    bool SkyTmemSpanMirrorsSource(uint16_t base, uint32_t span) const;
+    bool SkyTmemHashLookup(uint16_t base, uint32_t span, uint32_t* out);
+    void SkyTmemHashStore(uint16_t base, uint32_t span, uint32_t h);
+    void SkyVertex(const Cmd& c, const ListRef& hint);
+    struct HudDirect; /* gdx_hud_direct.cpp */
+    HudDirect* mHudD = nullptr;
+    int mHudDirect = 0;
+    int mHudClock = 0;
+    void HudDirectTicks(int what, uint64_t ticks);
+    bool mHudVirtualLoad = false; /* the LOADBLOCK being executed leaves its bytes as TMEM debt */
+    uint32_t mHudDebtN = 0;       /* live debt entries (or shadow entries under verify) */
+    bool HudDirectEnsure();
+    bool HudDirectBegin(); /* a direct run starts: the receipt, and whether it is a verify run */
+    bool HudDebtMirror(uint8_t* dst, const uint8_t* src, uint32_t n, bool nativeRgba16);
+    bool HudDebtHash(uint32_t off, uint32_t span, uint32_t* out);
+    void HudDebtPayAll();
     struct Frame {
         ListRef list;
         size_t idx;
     };
+    void SkyExecTextureOp(const Cmd& c, Frame& f); /* [native] sky_retain (gdx_sky_retain.cpp) */
+    void SkyReplayWord(const Cmd& c, Frame& f, Frame& hintFrame, uint8_t op, int at);
+    /* [native] hud_direct: a TEXRECT (+ its two RDPHALF trailers) of a direct HUD run, and the
+     * pieces it shares with its verify mode (gdx_hud_direct.cpp). */
+    void HudDirectTexRect(const Cmd& c, Frame& f);
+    void HudVerifyTexRect(const Cmd& c, Frame& f);
+    void HudDirectLoadBlock(const Cmd& c, Frame& f);
+    /* C5 Stage 3b: a LOADBLOCK served by the direct path for scope `kind` (0 = the shadow / flame
+     * replay runs under fxshd_direct; 1..3 = GDXDRESS_SCOPE_*). */
+    void DirectScopeLoadBlock(const Cmd& c, Frame& f, int kind, int level);
+    int mDirectScope = 0;
+    int mDirectLevels[4] = { 0, 0, 0, 0 };
+    bool mDirectInLoad = false;
+    struct DirectWin {
+        uint32_t hit[4], miss[4], stock[4], vfyOk, vfyBad;
+    } mDirectWin = {};
+    bool HudRectGeometry(const Cmd& c, const Cmd& h1, const Cmd& h2, LoadedVertex v[4], float* lrs, float* lrt) const;
+    void HudRectPositions(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, LoadedVertex v[4]) const;
+    bool HudTrectEligible(uint8_t tile, int16_t uls, int16_t ult, float lrs, float lrt) const;
+    bool HudRetainVariant(HudRetRec& rec, const void* runWords, uint32_t n);
+    void HudRetainPackRect(const void* rectCtx, const LoadedVertex quad[4], float* corners, Gdx3dsVboPackAux* aux);
+    bool HudDirectTri(const int idx[3], DrawState& ds, bool haveState, float* corners, bool* packed);
+    void HudPackVerts(const DrawState& ds, const LoadedVertex* const* v, int n, const LoadedVertex* v1,
+                      float* out, bool halfTexel = false) const;
+    void HudPackAux(const DrawState& ds, const LoadedVertex* v0, Gdx3dsVboPackAux* aux) const;
+
+    struct HudRetain; /* gdx_hud_retain.cpp */
+    class HudRecBackend; /* gdx_hud_retain.cpp: the recording decorator over mBackend */
+    HudRetain* mHudR = nullptr;
+    int mHudElem = 0;
+    int mHudRetain = 0;
+    int mHudRetClock = 0;
+    int mHudSkyEmit = 0; /* [native] hudsky_emit */
+    bool mHsxLean = false; /* a HUD or sky run replays under hudsky_emit=1: its drains take DrawPackedLean */
+    /* [native] hudsky_emit, the sky half (gdx_hudsky_tri.inc): a sky run's triangles through the
+     * compact SpTri (level 1), or SpTri with every emitted triangle's floats checked against the
+     * compact packing (level 2). */
+    bool mHsxSky = false;
+    bool mHsxSkyVfy = false;
+    uint32_t mHsxSkyTris = 0, mHsxSkyCalls = 0, mHsxSkyStock = 0;
+    uint32_t mHsxSkyVfyOk = 0, mHsxSkyVfyBad = 0, mHsxSkyVfyBadSes = 0;
+    bool HsxSkyOk() const;
+    void HsxSkyTri(uint8_t a, uint8_t b, uint8_t c);
+    void HsxSkyTail(LoadedVertex* v1, LoadedVertex* v2, LoadedVertex* v3, uint16_t replayTag);
+    void HsxSkyVerifyEmit(const DrawState& ds, const LoadedVertex* const* v, const float* out, bool halfTexel);
+    struct HsxStats;
+    HsxStats* mHsx = nullptr;
+    bool HsxEnsure();
+    int HsxGroupFields(int group, void* out) const;
+    bool HsxCompile(HudRetRec& rec);
+    bool HsxPlanReady(HudRetRec& rec);
+    bool HsxFingerprint(HudRetRec& rec, int* why);
+    int HsxExactFingerprint(HudRetRec& rec, const void* runWords, uint32_t n, int* why, bool* hit);
+    void HsxApply(const HudRetRec& rec);
+    void HsxRunGeneric(Gdx3dsHsxProgram* prog);
+    void HsxReplay(HudRetRec& rec);
+    void HsxVerifyPlan(HudRetRec& rec, bool stockHit, bool hsxHit);
+    void HsxVerifyApply(const HudRetRec& rec);
+    void HsxNoteRun(bool retained, uint64_t ticks);
+    void HsxMark(int phase) {
+        if (mHudClock >= 2) {
+            HsxMarkSlow(phase); /* hudclock=2 only: the emitter's hit phase clock */
+        }
+    }
+    void HsxMarkSlow(int phase);
+    void HsxPhaseEnd(bool retained);
+    bool mHudRec = false; /* a retained run is being recorded (the hooks below note into it) */
+    bool mHudLastTrectOk = false; /* the last direct TEXRECT's [trectbatch] eligibility */
+    bool HudRetainEnsure();
+    bool HudElemCensusTask() const;
+    void HudElemBegin();
+    void HudElemEnd(const void* runWords, uint32_t n);
+    /* The run's entry: 1 = handled (a hit was replayed), 0 = execute it (maybe recording). */
+    int HudRetainBegin(const void* runWords, uint32_t n);
+    void HudRetainEnd();
+    void HudRecOpPre(uint32_t wordIndex, uint8_t op);
+    void HudRecOpPost(uint32_t wordIndex, uint8_t op);
+    void HudRecNoteLoad();
+    void HudRecNoteRect(uint32_t wordIndex, uint8_t op);
+    void HudRecNoteImportBegin(uint16_t tmemIdx, uint32_t hashOff, uint32_t hashSpan, bool tmemHashed, bool covered,
+                               bool supported);
+    void HudRecNoteImportHit(int unit, int16_t slot, bool uploaded);
+    void HudRegCapture(HudRegs& r) const;
+    void HudRegCaptureGroup(HudRegs& r, int group) const;
+    bool HudRegSame(const HudRegs& a, const HudRegs& b, int group) const;
+    bool HudRegSameLive(const HudRegs& b, int group) const;
+    bool HudColourSame(uint8_t op, uint32_t w0, uint32_t w1) const;
+    void HudRegApply(const HudRegs& r, int group);
+    bool HudRetainFingerprint(const HudRetRec& rec, const void* runWords, uint32_t n, bool checkWords, int* why);
+    void HudRetainReplay(HudRetRec& rec);
+    bool HudRetainSameContentPlan(const HudRetRec& rec) const;
+    void HudRetainVerifyPrepare(HudRetRec& rec);
+    void HudRetainVerifyCompare(const HudRetRec& rec);
+    void HudRetainRunDone();
+    void TexCacheTouch(int16_t slot);
+    /* gdx_hud_direct.cpp: a direct load's resolved form, applied without resolving (the hit
+     * path's tail), and the debt ledger as an opaque snapshot (retention verify). */
+    struct HudLoadForm {
+        LoadedTexture loaded;
+        const uint8_t* tlAddr;
+        uint32_t copyBytes;
+        uint16_t tmemIndex;
+        uint8_t cls, native, imm, valid;
+        uint8_t skipped; /* an immutable load the same-content test skipped (nothing stored) */
+    };
+    const HudLoadForm* HudDirectLastLoad() const;
+    void HudDirectApplyLoad(const HudLoadForm& form, bool countLoad);
+    void HudDirectApplySpan(const HudLoadForm& form, const uint64_t srcStamp[2], unsigned srcCls);
+    bool HudDirectLastHashCovered() const;
+    void HudDirectLastHashSource(const uint8_t** src, uint8_t* native, uint8_t* cls) const;
+    bool HudDebtCoverSame(uint32_t off, uint32_t span, const uint8_t* src, uint8_t native, uint8_t cls) const;
+    size_t HudDebtStateBytes() const;
+    void HudDebtStateSave(void* out) const;
+    void HudDebtStateLoad(const void* in);
+    void HudDebtMaterialize(uint8_t* out4096) const;
+
+    /* [native] nrr_hud (gdx_nrr_hud.cpp; n60hud-progress.md). The decoder keeps the run's
+     * register writes LIVE (the interpreter's own setters) and its LOADBLOCKs VIRTUAL: a load
+     * records which source now sits at which TMEM words (the texture identity a rectangle's
+     * state block is keyed on) and is queued as PENDING; its TMEM words are STALE in the
+     * interpreter until an interpreter reader needs them (NrrTmemRead materialises the pending
+     * loads, cold) or an interpreter writer overwrites them (NrrTmemWrite drops what it covers
+     * and materialises what it only partly covers first, so the write order stays the stock one).
+     * mNrrTmemLive gates both hooks: false = the NRR holds no TMEM state, the hooks cost a test. */
+    struct NrrHud;
+    struct NrrBlock;
+    struct NrrKey;
+    struct NrrRegFx;
+    struct NrrProg;
+  public:
+    /* HudPackVerts' unit-0 texture coordinate constants, per axis (u, v) (gdx_nrr_hud.cpp) */
+    struct NrrBlockUv {
+        float pre[2], off[2], normMul[2], normDiv[2], scale[2], clamp[2], viewOff[2];
+        uint8_t mul[2];
+        uint8_t hasOff;
+    };
+
+  private:
+    NrrHud* mNrr = nullptr;
+    int mNrrHud = 0;
+    int mNrrCensus = 0;
+    int mNrrClock = 0;
+    int mNrrLate = 0;    /* [native] nrr_hud_late (n60intro): 1 late-bound scissor, 2 wide-load pitch checked at run */
+    int mNrrDepDiag = 0; /* [debug] nrr_hud_depdiag (n60intro): log which entry words a program missed on */
+    int mNrrWide = 7; /* [native] nrr_hud_wide: 1 virtual SETTIMG width > 1 loads, 2 page-keyed atlas states,
+                       * 4 virtual segmented-operand loads */
+    int mNrrHudMemo = 0;
+    int mNrrKept = 0; /* [native] nrr_hud_kept (n60hudx) */
+    int mNrrRunClock = 0; /* [debug] nrr_hud_runclock (n60hudx) */
+    int mNrrRr = 0;       /* [native] nrr_hud_rr (n60hudx) */
+    int mNiMenu = 0;      /* nimenu [native] ni_menu */
+    struct NiMenuWin {
+        uint32_t runs, words, prog, dec, stockRuns, stockWords, tileIds, vol;
+    } mNiMenuWin = {};
+    static constexpr uint32_t kNiVolSlots = 256; /* run ordinals per task tracked (power of two) */
+    static constexpr uint32_t kNiVolTrip = 4;    /* decoded this many times in a row: volatile */
+    static constexpr uint32_t kNiVolRetry = 16;  /* a volatile run is offered to the decoder again after this */
+    uint8_t mNiMenuVol[kNiVolSlots] = {};
+    uint32_t mNiMenuOrd = 0;
+    bool mNiMenuRun = false; /* inside a MENU run (the decoder's MENU-only arms: NrrNoteLoadTile) */
+    uint32_t mNrrRunInTask = 0;
+    bool mNrrTmemLive = false;
+    bool mNrrOpen = false;     /* the NRR core holds citro3d (between HUD runs too): anything else closes it */
+    /* A Flush a register setter makes with no batch open (prim depth, fog / blend colour, the fog
+     * line, prim / env) drains nothing and touches no backend state: it leaves the hand-off open.
+     * Every other reason is a state block, a draw, a hook or the task end. */
+    static bool NrrFlushTouchesBackend(FlushReason why) {
+        return why != FLUSH_PRIMDEPTH && why != FLUSH_FOGCOLOR && why != FLUSH_BLENDA && why != FLUSH_FOG &&
+               why != FLUSH_PRIM && why != FLUSH_ENV;
+    }
+    uint32_t mNrrTexEpoch = 0; /* every texture-cache retire (a clear's are counted here too) */
+    uint32_t mNrrSlotGen[kTexCacheSize] = {}; /* per cache slot: bumped when the slot is retired */
+    void NrrCensusRun(const void* runWords, uint32_t n, uint32_t runIndex, uint32_t frame);
+    bool NrrEnsure();
+    /* hot (tools/native/nrr_size.sh counts NrrHudHot*) */
+    bool NrrHudHotRun(const void* runWords, uint32_t n, uint32_t mode);
+    /* nimenu: the menu phase's runner (gdx_nrr_menu.inc; nrr_size.sh counts NrrMenuHot*) */
+    bool NrrMenuHotRun(const void* runWords, uint32_t n);
+    bool NrrMenuHotBody(const GdxHudWord* w, uint32_t n);
+    void NrrMenuDec(const GdxHudWord* w, uint32_t n);
+    bool NrrMenuRunCold(const GdxHudWord* w, uint32_t n);
+    void NrrNoteLoadTile(const Cmd& c);
+    void NrrHudHotBody(const GdxHudWord* w, uint32_t n);
+    const NrrProg* NrrHudHotProg(const GdxHudWord* w, uint32_t n);
+    void NrrHudHotExec(const NrrProg& p, const GdxHudWord* w, uint32_t n, const uint32_t* op, uint32_t pos);
+    /* n60hudx [native] nrr_hud_rr */
+    const uint32_t* NrrHudHotRrTry(const NrrProg& p, const GdxHudWord* w, uint32_t n, uint32_t* pos);
+    bool NrrHudHotRectFrom(const uint32_t* q, const GdxHudWord* w, const float* f);
+    void NrrHudHotGroups(const uint32_t* g, const uint32_t* end);
+    void NrrRrArm(const NrrProg& p);
+    void NrrRrGateOut(const NrrProg& p);
+    void NrrRrCapBegin(const NrrProg& p, bool verify);
+    void NrrRrCapture(const uint32_t* op, const NrrBlock* b, const float* p);
+    void NrrRrCapEnd(const NrrProg& p, const GdxHudWord* w, uint32_t n);
+    bool NrrRrBuild(const NrrProg& p, const GdxHudWord* w, uint32_t n);
+    void NrrRrVerify(const NrrProg& p, uint32_t n);
+    void NrrHudHotRrSnap(uint32_t* out) const;
+    void NrrRrReset();
+    const uint32_t* NrrHudHotStores(uint32_t hdr, const uint32_t* st);
+    void NrrHudHotLoad(const uint32_t* r, const Cmd& c);
+    void NrrHudHotSlot(uint32_t lo, uint32_t hi, const uint32_t* r);
+    bool NrrHudHotIdent(const uint32_t* src, uint32_t lo) const;
+    void NrrHudHotDraw();
+    bool NrrHudHotSplits(const NrrBlock& b, uint32_t cls);
+    void NrrHudHotBatch(NrrBlock& b, bool noSc, uint32_t cls);
+    float* NrrHudHotReserve(NrrBlock& b);
+    void NrrHudHotClose();
+    void NrrHudHotCorners(const NrrBlock& b, const int32_t e[4], const float st[4], bool flip, float* out) const;
+    void NrrHudHotCornersAt(const NrrBlock& b, const int32_t e[4], const float st[4], bool flip, const Rgba* colSrc,
+                            const Rgba* alphaSrc, float* out) const;
+    bool NrrHudHotGeom(const NrrBlock& b, const Cmd& c, const GdxHudWord* t, int32_t e[4], float st[4],
+                       bool* flipOut) const;
+    void NrrHudHotRect(NrrBlock* b, const Cmd& c, const GdxHudWord* t, const uint32_t* op);
+    NrrBlock* NrrScVariant(NrrBlock* base, const Cmd& c, const GdxHudWord* t, bool fill);
+    void* NrrScStateMem(uint32_t owner);
+    void NrrLateFlush();
+    NrrBlock* NrrScVariantOf(NrrBlock* base, const NrrKey& k, uint32_t h);
+    NrrBlock* NrrScSibling(const NrrKey& k);
+    NrrBlock* NrrScPromote(uint32_t var, uint32_t h);
+    NrrBlock* NrrScBaseOf(NrrBlock* b);
+    bool NrrLdPitchOk(const uint32_t* r, const Cmd& c);
+    struct NrrRectMemo;
+    NrrRectMemo* NrrHudHotMemoFind(const NrrBlock& b, const Cmd& c, const GdxHudWord* t, const uint32_t* op);
+    void NrrHudHotMemoKey(const NrrBlock& b, const Cmd& c, const GdxHudWord* t, const uint32_t* op,
+                          uint32_t key[kNrrMemoKeyWords]) const;
+    /* cold: the per-word decoder (compiles programs, finishes what a program cannot) */
+    void NrrDecRun(const GdxHudWord* w, uint32_t n);
+    void NrrDecFrom(const GdxHudWord* w, uint32_t n, uint32_t i);
+    uint32_t NrrProgEx(const NrrProg& p, const GdxHudWord* w, uint32_t n, uint32_t i);
+    void NrrProgMiss(const NrrProg& p, const GdxHudWord* w, uint32_t n, uint32_t i);
+    void NrrRec(uint32_t hdr, const Cmd& c, const uint32_t* payload, uint32_t words);
+    void NrrRecEx(uint32_t i);
+    void NrrRecOpaque(uint32_t i);
+    void NrrRecBegin(bool ok);
+    uint32_t NrrSnapIndex(const void* p) const;
+    void NrrRecRead(const void* p, uint32_t len);
+    void NrrRecWrote(const void* p, uint32_t mask);
+    void NrrRecSt(uint32_t i, const Cmd& c, uint32_t hdr, const uint32_t* st);
+    void NrrRecLd(uint32_t i, const uint32_t* r, const Cmd& c);
+    void NrrRecWideReads(uint8_t loadTile);
+    void NrrVerifyLoadedAs(const Cmd& c, const uint32_t* r);
+    uint32_t NrrStateTex(const NrrBlock& b) const;
+    const NrrState* NrrHudState(const NrrStateKey& k);
+    const NrrState* NrrOwnState(const NrrStateKey& k);
+    bool NrrCoreTableFlush();
+    bool NrrVerifyBindsSame(const NrrBlock& b) const;
+    void NrrRecTl(uint32_t i, const Cmd& c);
+    void NrrRecRect(uint32_t i, const Cmd& c, const NrrBlock* b, uint8_t tile, bool fill);
+    void NrrRecRegWord(const Cmd& c, uint32_t i, const NrrRegFx* fx, bool plain);
+    bool NrrColourOp(const Cmd& c, uint32_t col[3]) const;
+    bool NrrRegFirstSight(const Cmd& c) const;
+    bool NrrNoteNoProg(const GdxHudWord* w, uint32_t n);
+    void NrrDepDiag(const NrrProg& g, const GdxHudWord* w, uint32_t n);
+    void NrrDepDiagTask();
+    void NrrHudHotColour(uint32_t hdr, const uint32_t* op, const Cmd& c);
+    /* n60hudx [native] nrr_hud_kept: an SL op (a recorded G_DL to a static setup list) */
+    bool NrrHudHotSl(const uint32_t* op, const Cmd& c, const NrrProg& p, const GdxHudWord* w, uint32_t n, uint32_t i);
+    void NrrSlMiss(const NrrProg& p, const GdxHudWord* w, uint32_t n, uint32_t i, const ListRef& sub, int why);
+    uint32_t NrrDecDl(const GdxHudWord* w, uint32_t n, uint32_t i, bool rec, const ListRef* pre);
+    int NrrSlCompile(const ListRef& sub, uint32_t i, uint32_t* pay, uint32_t* words);
+    uint32_t NrrVerifyDl(const GdxHudWord* w, uint32_t n, uint32_t i, const uint32_t* opPay, bool rec);
+    bool ResolveDlAsExec(const Cmd& c, ListRef& sub, bool* hookTaken);
+    void WalkNestedList(const ListRef& sub);
+    void HudNestedDl(const Cmd& c);
+    void HudReplayRunPlain(const GdxHudWord* w, uint32_t n);
+    void HudReplayMenuRun(void* record, const GdxHudRun& run); /* nimenu */
+    void HudReplayMenuStock(const GdxHudWord* w, uint32_t n);
+    uint32_t NrrDecWord(const GdxHudWord* w, uint32_t n, uint32_t i, bool rec);
+    uint32_t NrrDecReg(const Cmd& c, uint32_t i, bool rec);
+    void NrrDecLoad(const Cmd& c, uint32_t i, bool rec);
+    bool NrrLoadRecord(const Cmd& c, uint32_t r[5]);
+    bool NrrSegResolve(const Cmd& c, uint32_t line, uint32_t bytes, uint32_t r[5]);
+    void NrrRecLoad(uint32_t i, const uint32_t* r, const Cmd& c);
+    void NrrDecRect(const Cmd& c, const GdxHudWord* t, uint32_t i, bool rec);
+    bool NrrDecKey(NrrKey& k, uint8_t tile, bool fill) const;
+    NrrBlock* NrrDecFind(const NrrKey& k, uint32_t* hashOut);
+    NrrBlock* NrrDecBlockFor(uint8_t tile, bool fill, const Cmd& c, const GdxHudWord* t);
+    bool NrrRegApply(const NrrRegFx& fx);
+    static uint32_t NrrKeyHash(const NrrKey& k);
+    void NrrProgClear();
+    void NrrProgStore(const GdxHudWord* w, uint32_t n);
+    void NrrSnapInit();
+    void NrrSnapAdd(const void* p, uint32_t len);
+    void NrrSnapTake(uint32_t* dst) const;
+    /* cold */
+    bool NrrHudOpen();
+    void NrrHudClose();
+    void NrrSimDefaultViewport();
+    void NrrStockViewportScissor();
+    bool NrrResolveNoScissor(NrrBlock& b);
+    void NrrRunCold(const GdxHudWord* w, uint32_t n);
+    void NrrRunEpochs();
+    uint32_t NrrExecWord(const Cmd& c, uint32_t i);
+    uint32_t NrrColdWord(const Cmd& c, uint32_t i);
+    void NrrRegEnv(uint32_t env[8]) const;
+    void NrrRegClear();
+    int NrrRegRegions(uint8_t* base[3], uint32_t len[3]);
+    uint32_t NrrRegKeepMask(const uint8_t* word) const;
+    uint32_t NrrRegCold(const Cmd& c, uint32_t i, uint32_t h, const NrrRegFx** fxOut);
+    void NrrRegCompile(NrrRegFx& fx, const Cmd& c, uint32_t i);
+    uint32_t NrrFxHeader(const NrrRegFx& fx, uint32_t* st) const;
+    NrrBlock* NrrBlockMiss(const NrrKey* key, uint32_t h, NrrBlock* b, const Cmd& c, const GdxHudWord* t, bool fill);
+    bool NrrBlockFresh(NrrBlock& b);
+    void NrrAuxCold(const NrrBlock& b, float out[7][4]);
+    void NrrAuxSelect(NrrBlock& b, bool* exotic);
+    void NrrHudHotAux(const NrrBlock& b, uint32_t prim, uint32_t env, uint32_t shade, float out[7][4]) const;
+    uint32_t NrrInternClass(const NrrStateKey& k);
+    void NrrNoRing(const Cmd& c, const GdxHudWord* t, bool fill);
+    void NrrLoadCold(const Cmd& c);
+    void NrrNoteTlut(const Cmd& c);
+    bool NrrBlockRecheck(NrrBlock& b);
+    void NrrRectXFull(int32_t ulx, int32_t lrx, float* x0, float* x1) const;
+    void NrrXMode();
+    void NrrFillFullScreen(int32_t e[4]) const;
+    void NrrCornersCold(const NrrBlock& b, const int32_t e[4], const float st[4], bool flip, float* out) const;
+    void NrrStockRect(const Cmd& c, const GdxHudWord* t, bool fill, const NrrKey* k, uint32_t hash);
+    void NrrCaptureAfter(const NrrKey& key, uint32_t hash, uint8_t tile, bool fill, uint32_t emit0, const Cmd& c,
+                         const GdxHudWord* t);
+    bool NrrBlockCapture(NrrBlock& b, uint8_t tile, bool fill);
+    bool NrrResolveState(NrrBlock& b);
+    void NrrSelectInputs(NrrBlock& b);
+    bool NrrBlockSelfCheck(const NrrBlock& b, const Cmd& c, const GdxHudWord* t, bool fill);
+    void NrrMaterializeAll();
+    void NrrMaterializeAt(uint32_t i);
+    void NrrPendMakeRoom();
+    void NrrDropPendingAt(uint32_t i);
+    void NrrTmemWrite(uint32_t off, uint32_t n);
+    void NrrTmemRead(int tile);
+    void NrrUpdateLive();
+    void NrrMemoClear();
+    void NrrDebugBatch(const NrrBlock& b, const Gdx3dsVboPackAux& aux);
+    void NrrDebugStock(const void* runWords, uint32_t at);
+    void NrrDebugRect(const NrrBlock& b, const float* v);
+    /* [native] nrr_hud=2 */
+    void NrrVerifyRun(const GdxHudWord* w, uint32_t n);
+    uint32_t NrrVerifyWord(const GdxHudWord* w, uint32_t n, uint32_t i, bool rec);
+    void NrrVerifyProg(const NrrProg& p, const GdxHudWord* w, uint32_t n);
+    void NrrVerifyBad(const char* what, const Cmd& c, uint32_t a, uint32_t b);
+    uint32_t NrrVerifyLoad(const Cmd& c, uint32_t i, const uint32_t* opRec, bool rec);
+    uint32_t NrrVerifyReg(const Cmd& c, uint32_t i, const uint32_t* opSt, uint32_t opHdr, bool rec);
+    void NrrVerifyRecReg(const Cmd& c, uint32_t i, uint32_t h);
+    uint32_t NrrVerifyRect(const Cmd& c, const GdxHudWord* t, uint32_t i, NrrBlock* opBlock, bool rec);
+    void NrrVerifyRectOut(const NrrBlock& b, const Cmd& c, const float* mine, uint32_t emit0);
+    void NrrVerifyAux(const NrrBlock& b);
+
+    struct HudMemo; /* gdx_hud_replay.cpp */
+    HudMemo* mHudMemo = nullptr; /* allocated on first replay */
+    HudMemo* mHud = nullptr;     /* == mHudMemo while a run replays, else nullptr */
+    int mHudLevel = 0;           /* the replaying record's mode: 1 use the memos, 2 verify them */
+    bool mHudCensus = false;
+    /* The replayed run has executed only rectangles and colour-register writes since the last
+     * rectangle: every input of ResolveDrawState is what it was then (gdx_hud_replay.cpp). */
+    bool mHudRectFast = false;
+    bool HudRectState(bool isRect, DrawState& out);
+    bool ResolveTextureSourceStock(size_t requiredBytes);
+    bool HudResolveTextureSource(size_t requiredBytes);
+    bool HudHashLookup(const uint8_t* addr, uint32_t n, uint32_t* out);
+    void HudHashStore(const uint8_t* addr, uint32_t n, uint32_t h);
+    bool HudTmemHashLookup(uint16_t base, uint32_t span, uint32_t* out);
+    void HudTmemHashStore(uint16_t base, uint32_t span, uint32_t h);
 
     void SpReset();
     void Walk(const ListRef& root);
     void WalkCensus(); /* [native] dspcensus: Walk with the per-opcode/per-phase clocks */
+    void WalkNicensus(); /* [debug] nicensus: Walk with NcNote per command (gdx_nicensus.cpp) */
+    NcState* mNc = nullptr; /* [debug] nicensus: null = off */
+  public:
+    /* nirace [native] ni_race (gdx_nirace.cpp): the words between the root list's markers of a race
+     * frame, compiled into span programs. 0 off, 1 on, 2 verify (every compiled register group checked
+     * against its stock handlers). Set once (allocates); armed per task by the glue (race scope). */
+    void NrrRaceSet(int level, int log);
+    /* nirace [native] ni_race_mesh: a geometry segment of a span program (its G_VTX words + one run of
+     * triangles, a narrow 8-byte-packet list ending in G_ENDDL) drawn by the mesh path (the glue: the
+     * dress registry); hint = the list the words came from. Returns 1 when drawn. */
+    typedef int (*NiSegHook)(void* user, const void* seg, size_t cmds, const void* hint);
+    void NrrRaceSetSegHook(NiSegHook fn, void* user) {
+        mNiSeg = fn;
+        mNiSegUser = user;
+    }
+    void NrrRaceArm(bool on) {
+        mNiOn = on && mNi != nullptr;
+    }
+    bool NrrRaceArmed() const {
+        return mNiOn;
+    }
+    /* The window's receipt fields (programs, ops, bails, verify) appended to buf; resets the window. */
+    int NrrRaceReceipt(char* buf, int cap);
+    /* [debug] nirace_rcpt (nimenu W4, review §4 hot trims): whether the periodic receipt window is
+     * even going to print ([native] gdx_rt_glue.cpp's sNiRcpt > 0, the window-length lever, default
+     * 256 whenever ni_race is armed at all). When false, the kNiEnd span-end tally
+     * (NrrRaceEndReceipt) is skipped outright instead of accumulating into counters nothing will
+     * ever read. Mirrored here (not read from gdx_rt_glue.cpp directly) so the hot dispatch only
+     * pays one bool test, not a cross-TU call. */
+    void NrrRaceRcptSet(bool on) {
+        mNiRcpt = on;
+    }
+
+  private:
+    struct NrrRace;
+    struct NrrRaceSlot;
+    NrrRace* mNi = nullptr;
+    bool mNiOn = false;
+    bool mNiRcpt = false;
+    NiSegHook mNiSeg = nullptr;
+    void* mNiSegUser = nullptr;
+    void NrrRacePlanGeo(const ListRef& L, size_t a, size_t b, size_t base);
+    bool NrrRaceSegFallback(const uint32_t* seg, uint32_t cmds);
+    void NrrRaceNoteEx(const Cmd& c); /* [debug] nicensus (nimenu W2): cold trampoline for kNiEx's NcNote */
+    void NrrRaceEndReceipt(size_t start, size_t r, uint32_t c0, uint32_t c1); /* nimenu W4: kNiEnd's cold tally */
+    void NrrRaceSegRun(const uint32_t* seg, uint32_t cmds, const void* hint, NrrRaceSlot* slot);
+    void NrrRaceTaskBegin(); /* the root's walk starts: the environment the compiled scissors rest on */
+    void NrrRaceHotDrive(Frame& f, uint32_t marker);
+    bool NrrRaceHotSpan(Frame& f, uint32_t marker);
+    bool NrrRaceMissRecover();
+    bool NrrRaceHotRun(const uint32_t* op, Frame& f, NrrRaceSlot* slot);
+    const uint32_t* NrrRaceGeoOp(const uint32_t* op, Frame& f, const ListRef& L, NrrRaceSlot* slot, size_t start);
+    void NrrRaceHotCall(const Cmd& c, Frame& t);
+    bool NrrRaceMiss(Frame& f, uint32_t marker, const Cmd& c, uint32_t h);
+    bool NrrRaceCompile(Frame& f, NrrRaceSlot* slot);
+    int NrrRaceCompileWord(const Cmd& c, const ListRef& list, uint32_t idx, uint32_t* st, uint32_t* ns);
+    bool NrrRaceCompileList(const ListRef& sub);
+    void NrrRaceBail(NrrRaceSlot* slot, size_t start, size_t resume, int why, size_t var, uint32_t expW0);
+    void NrrRaceStOther(const uint32_t* op, const ListRef& list, size_t idx, bool root);
+    void NrrRaceVerifySt(const uint32_t* op, const ListRef& list, size_t idx, bool root);
+    /* nicourse [native] ni_course (gdx_nicourse.cpp) */
+    bool NrrCourseHotNextIsModel(const Frame& f) const;
+    bool NrrCourseHotOffscreen() const;
+    void NrrCourseHotKey(void* key) const;
+    int NrrCourseHotDraw(const Gdx3dsCourseModel& m, const void* memo, void* seam);
+    int NrrCourseCold(const Gdx3dsCourseModel& m, const void* key, void* seam);
+    void NrrCourseLeave(Frame& f, size_t first, const uint32_t tail[2]);
+    void NrrCourseVerify(uint32_t nCmds, uint32_t w1, const Cmd& second, const Frame& f, void* seam);
     bool RemapF3d(Cmd& c, const ListRef& list, size_t* f3dXferSize);
     int Exec(const Cmd& c, Frame& f, size_t f3dXferSize);
     bool PushList(const ListRef& list);
 
     /* --- gdx_rsp.cpp --- */
     void SpMatrix(uint8_t params, const Cmd& c, const ListRef& list);
+    void SpMatrixReplayHook(uint8_t params, uintptr_t p, const int32_t* words); /* nrrdiet: cold, [native] replay only */
     void SpPopMatrix(uint32_t count);
     void SpVertex(size_t n, size_t dest, const Cmd& c, const ListRef& list);
     void SpModifyVertex(uint16_t idx, uint8_t where, uint32_t val);
@@ -651,6 +1647,14 @@ class Interp {
     void DpSetTileSize(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt);
     void DpLoadTlut(uint8_t tile, uint32_t highIndex);
     void DpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt);
+    uint32_t LoadBlockLineBytes(uint8_t tile, uint16_t tmemIndex, uint32_t size_bytes, uint32_t dxt) const;
+    /* [native] nrr_hud: DpLoadBlock's line pitch while a virtual load is materialised (0 = its own
+     * decision, LoadBlockLineBytes) -- the pitch the load had when it was recorded */
+    uint32_t mLoadLineForce = 0;
+    /* [native] nrr_hud: the source a materialised virtual load of a segmented operand resolved to
+     * when it was recorded (ResolveTextureSource serves it; flags bit 0 immutable, bit 1 native) */
+    const uint8_t* mLoadSrcForce = nullptr;
+    uint8_t mLoadSrcFlags = 0;
     void DpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt);
     bool ResolveTextureSource(size_t requiredBytes);
     void StoreLoadedTexture(uint16_t start, const LoadedTexture& t);
@@ -693,8 +1697,17 @@ class Interp {
     void UploadNeutralFallback(int unit);
     void Upload(uint32_t w, uint32_t h);
     void TexCacheRetireSlot(int16_t slot);
+    void TexCacheSignalRetire(int16_t slot);
+    bool TexKeepEligible(const TexEntry& e) const;
+    void TexCacheClearKeeping();
+    void TexKeepRelieve();
+    void TexKeepLog() const;
 
     /* --- gdx_tri.cpp --- */
+    /* [native] trimemo: is every input ResolveDrawState reads identical to the last full
+       resolve's? See mTmKey. Bank records the key after a full resolve. */
+    bool TriMemoHit(bool isRect) const;
+    void TriMemoBank(bool isRect, const DrawState& ds);
     void* LookupOrCreateShader(uint64_t id0, uint64_t id1);
     /* True when a VALUE change of prim (env) colour can ride per vertex in the OPEN packed
      * batch, i.e. no TexEnv stage constant of its shader reads that register. Mirrors the LUS
@@ -706,6 +1719,11 @@ class Interp {
     void DpSetScissor(uint32_t mode, uint32_t ulx, uint32_t uly, uint32_t lrx, uint32_t lry);
     void CalcAndSetViewport(const int16_t* vp /* vscale[4], vtrans[4] */);
     void AdjustViewportOrScissor(Rect* area);
+#ifdef EXPANSION_KIT
+    /* B11o: widen a scissor's x span to the union of the linear (viewport) mapping and the
+     * 2D pillarbox mapping DrawRectangle uses. gdx_rect.cpp carries the derivation. */
+    void ScissorPillarSafeX(float n64X, float n64W);
+#endif
     void DrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry);
     void DpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls,
                             int16_t ult, int16_t dsdx, int16_t dtdy, bool flip);
@@ -785,6 +1803,11 @@ class Interp {
     uint32_t mVtxSoftCap = static_cast<uint32_t>(kMaxVertices); /* [debug] vtxmax */
     bool mVtxClamp = true;                                      /* [native] vtxclamp */
     bool mTexStaleFix = true;                                   /* [native] texstalefix */
+    uint32_t mTexKeepBytes = 0;      /* N60TEX [debug] tex_keep budget; 0 = the stock clear */
+    uint32_t mTexKeepFloorBytes = 0; /* N60TEX: no keeping below this much linear heap */
+    uint16_t mTexGen = 0;            /* N60TEX: bumped by every clear */
+    bool mTexKeptNone = true;        /* N60TEX: no entry of an older generation is left */
+    TexKeepStats mTexKeep = {};
     uint32_t mClipPolyMax = 16;                                 /* [debug] clippolymax */
     unsigned mTexCountHw = 0;                                   /* B23: LRU occupancy high-water */
     SessionDrops mSesDrops = {};                                /* never reset by ResetStats */
@@ -805,6 +1828,39 @@ class Interp {
     int mTmemFault = 0;
     uint32_t mTmemFaultTick = 0;
     uint32_t mBatchesAtTaskStart = 0;
+
+    /* [dspx]/[trix] clocks: latched per task in RunFrame from the backend's [prof] gate (and
+       off under [native] dspcensus, which runs its own heavier clocks). */
+    bool mDxOn = false;
+    uint32_t mTriSampleSeq = 0;
+    /* [native] o3dsfast (default 1): the EXACT rewrites -- same stores, same floats, fewer
+       instructions (halfword swap by word, span-store range fills, a clipper without `%`,
+       which ARMv6 has no divider for). 0 restores the historic loops for an A/B. */
+    int mO3dsFast = 1;
+    /* [native] trimemo (default 0): skip ResolveDrawState when nothing it reads has changed. */
+    int mTriMemoOn = 0;
+    /* Bumped by every span-store mutation (StoreLoadedTexture): LoadedTexAt is a function of
+       the store, so the tri memo keys on this instead of trusting textures_changed alone. */
+    uint32_t mSpanEpoch = 0;
+    /* The tri memo's key: a SNAPSHOT of every input ResolveDrawState reads, taken right after
+       a full resolve. A hit requires every field equal (memcmp where a struct is compared, so
+       padding can only cause a spurious MISS, never a hit). The native replay hooks write the
+       RDP/RSP registers through GdxSeamRegs pointers without passing through a handler, which
+       is why this is a snapshot compare and not a dirty flag: a hook's direct write shows up
+       as an unequal field. */
+    struct TriMemoKey {
+        bool valid;
+        bool isRect;
+        uint8_t firstTile;
+        bool grayscale;
+        uint32_t otherModeL, otherModeH, geometryMode;
+        uint64_t combineMode;
+        uint32_t spanEpoch;
+        Tile tiles[2];     /* the texel0/texel1 tiles, whole */
+        RenderState rs;    /* what the backend was left holding */
+    };
+    TriMemoKey mTmKey = {};
+    DrawState mTmState = {};
 
     /* [native] timgmemo -- the cross-frame SETTIMG classification memo.
      *
@@ -848,8 +1904,150 @@ class Interp {
     static constexpr unsigned kTimgMemoSlots = 256; /* power of two: the index is a mask */
     TimgClassEntry mTimgClassMemo[kTimgMemoSlots];
 
+    /* [native] machines_texskip state (see TexSkipOnDl). One record per machine slot. */
+    static constexpr int kTexSkipSlots = 30;
+    struct TexSetRec {
+        uint32_t gen;         /* machine-list generation the record belongs to (0 = none) */
+        uint8_t shapeOk;      /* the list is only SETTIMG(w=1, non-CI)/SETTILE/LOADBLOCK/SETTILESIZE/syncs */
+        uint8_t setTileMask;  /* tiles the list SETTILEs */
+        uint8_t sizeTileMask; /* tiles the list SETTILESIZEs */
+        uint8_t captured;     /* tile/lt/span state captured after a real run at `gen` */
+        uint8_t nSpans;       /* TMEM spans the list's LOADBLOCKs leave (base, words) */
+        uint16_t spanBase[8];
+        uint16_t spanWords[8];
+        uint64_t wordMask[8]; /* the TMEM words those spans cover (512 bits) */
+        Tile tile[8];         /* texture_tile[] as the list leaves it (fields per set/sizeTileMask) */
+        LoadedTexture lt[8];  /* LoadedTexAt(tile.tmem_index) as the list leaves it */
+    };
+    TexSetRec* mTexRecs = nullptr;
+    int mTexSkip = 0;
+    TexSkipHooks mTexHooks = {};
+    bool mTexVfyArm = false;           /* the armed body is a verify (would-skip) site, not a capture */
+    uint32_t mTexSkipTasks = 0;        /* receipt cadence */
+    const TexSetRec* mTexOv = nullptr; /* open skip window: the record served in place of the list */
+    uint8_t mTexOvMask = 0;            /* tiles swapped in for the window */
+    Tile mTexOvSaved[8];               /* the live descriptors they replaced */
+    const void* mTexOvBody = nullptr;  /* the body the window was opened for */
+    TexSetRec* mTexRecArm = nullptr;   /* a real set just ran: capture its state at this body */
+    const void* mTexRecArmBody = nullptr;
+    TexSkipCounters mTexSkipStats = {};
+    uint32_t mTexSkipTripLogs = 0;
+    /* gdx_texcache.cpp: an import inside a window (tripwire on a non-immutable source). */
+    void TexSkipCheckImport(int tile);
+    /* gdx_tmem.cpp / gdx_interp.cpp: a texture-state writer inside an open window. */
+    void TexSkipNoteWriter(uint8_t op) {
+        if (mTexOv != nullptr) {
+            TexSkipTrip(1, op);
+        }
+    }
+    void TexSkipTrip(int kind, uint32_t detail);
+    /* gdx_texskip.cpp */
+    bool TexSkipScanList(const ListRef& list, TexSetRec& rec);
+    bool TexSkipPeekBody(const Frame& f, const void** body);
+    int TexSkipChain(const Frame& f, int* chain, uint8_t* chainTiles, int cap);
+    void TexSkipBuildPlan(const Frame& f);
+    void TexSkipBuildPlanBody(const Frame& f);
+    int TexSkipOnDlBody(const void* listPtr);
+    uint8_t TexSkipPlanBodyTiles(const ListRef& list, size_t setIdx);
+    static constexpr int kChainMaxSets = 32;
+    struct TexSkipPlan {
+        uint32_t task;          /* mTexSkipTaskSeq it was built in */
+        const uint8_t* base;    /* the list it indexes */
+        int n;
+        uint32_t idx[kChainMaxSets]; /* each set's G_DL index, in stream order */
+        int slot[kChainMaxSets];
+        uint8_t bodyTiles[kChainMaxSets]; /* tiles the set's body can sample (0xFF unknown) */
+    };
+    TexSkipPlan mTexPlan = {};
+    uint32_t mTexSkipTaskSeq = 1;
+    bool TexSkipDlIsSpeck(const void* listPtr);
+    bool TexSkipCovered(const TexSetRec& rec, const int* chain, const uint8_t* chainTiles, int n, uint32_t gen);
+    bool TexSkipCanSkip(const TexSetRec& rec, const int* chain, const uint8_t* chainTiles, int n, uint8_t bodyTiles,
+                        uint32_t gen);
+    uint8_t TexSkipInheritedUse() const;
+    bool TexSkipLiveTilesClear(const TexSetRec& rec, uint8_t live);
+    void TexSkipOpen(const TexSetRec& rec, const void* body);
+    void TexSkipClose();
+    void TexSkipCapture(TexSetRec& rec);
+    void TexSkipVerifyAt(const TexSetRec& rec);
+    void TexSkipReceipt();
+
+    /* [native] machines_loadmemo (gdx_setload.cpp) */
+    struct LdMemo;
+    LdMemo* mLdMemo = nullptr;
+    int mLoadMemo = 0;
+    bool SetListLoadBlock(const Cmd& c, const Frame& f);
+    void SetListLoadServe(const uint8_t* tlAddr, uint8_t imm, uint8_t native, const LoadedTexture& memo,
+                          uint32_t readable, uint16_t tmemIndex);
+
+    /* [debug] machsplit (gdx_machsplit.cpp) */
+    static constexpr int kMsClasses = 10;
+    struct MachSplitWin {
+        uint64_t ticks[kMsClasses];
+        uint64_t meshTicks[kMsClasses];
+        uint32_t calls[kMsClasses];
+        uint32_t cmds[kMsClasses];
+        uint32_t loads[kMsClasses];
+        uint32_t batches[kMsClasses];
+        uint64_t resolveTicks[kMsClasses]; /* G_DL / G_MTX operand resolution, side-timed */
+        uint64_t texskipTicks, planTicks; /* TexSkipOnDl (incl. its plan) / the plan alone */
+        uint32_t texskipCalls, plans;
+        uint64_t subTicks[3]; /* inside the speck lists: vtx / tri / other */
+        uint32_t subCalls[3];
+        uint32_t tasks;
+    };
+    int mMsOn = 0;
+    uint64_t (*mMsMeshTicks)(void) = nullptr;
+    uint8_t mMsCat = 0;         /* the [c5cat] category the walk is in (0x61 markers) */
+    int mMsDepth = 0;           /* stack depth of the MACH section's commands */
+    int mMsClass = -1;          /* the class open, -1 none */
+    bool mMsAfterBlend = false; /* the previous section command was SETBLENDCOLOR (highlight) */
+    uint64_t mMsT0 = 0, mMsMesh0 = 0;
+    uint32_t mMsCmds0 = 0, mMsLoads0 = 0, mMsBatches0 = 0, mMsSkips0 = 0;
+    MachSplitWin mMsWin = {};
+    void WalkMachSplit();
+    void MachSplitMarker(uint8_t cat);
+    void MachSplitOpen(const Cmd& c);
+    void MachSplitClose();
+    void MachSplitReceipt();
+
+    /* [native] dlmemo / deadsetup (gdx_dlmemo.cpp) */
+    struct DlMemo;
+    DlMemo* mDlMemo = nullptr;
+    int mDlMemoLevel = 0;
+    struct DeadSet;
+    DeadSet* mDs = nullptr;
+    int mDeadSetLevel = 0;
+    bool ResolveListMemo(const Cmd& c, ListRef& out, bool hitOnly);
+    /* entryOut: the memo entry that answered (a hit), else nullptr -- deadsetup's plan cache
+     * names the entries its lists came from. */
+    bool ResolveListMemoKeyed(const Cmd& c, ListRef& out, bool hitOnly, const GdxDlMemoKey* keyIn,
+                              const void** entryOut);
+    int DeadSetOnDl(const Cmd& c, Frame& f);
+    bool DeadSetBuild(const Cmd& c, Frame& f, const GdxDlMemoKey& key);
+    bool DeadSetReuse(Frame& f, const GdxDlMemoKey& key);
+    void DeadSetStore(const Frame& f, size_t start, bool pending);
+    void DeadSetActivate(Frame& f);
+    bool DeadSetMachineList(const void* p) const;
+    void DeadSetDecline(const Frame& f, size_t start, bool pending);
+    bool DeadSetDeclined(const Frame& f);
+    int DeadSetFind(const Cmd& first, bool pending);
+    bool DeadSetSameWords(const void* planList, const void* entry) const;
+    int DeadSetSlot(const Cmd& first, bool pending);
+    bool DeadSetNextIsDl(const Frame& f) const;
+    int DeadSetRunList(Frame& f);
+    void DeadSetVerify(Frame& f);
+    bool DeadSetEligible(const Cmd& c, const Frame& f) const;
+    void DeadSetTaskEnd();
+    void DeadSetCheckCover(const Cmd& c);
+    void DeadSetFree();
+    /* gdx_hud_direct.cpp: the TMEM debt ledger, saved and restored around deadsetup's verify. */
+    size_t DebtStateSave(void* dst, size_t cap) const;
+    void DebtStateLoad(const void* src, size_t n);
+
     DlHook mDlHook = nullptr;
     void* mDlHookUser = nullptr;
+    ListRef mDlHookSub; /* the list offered to mDlHook (Exec OP_DL) */
     NoopHook mNoopHook = nullptr;
     void* mNoopHookUser = nullptr;
     uint32_t mUnknownLogged[8];

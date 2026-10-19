@@ -37,6 +37,9 @@
 
 #include "gdx3ds_gfx.h" // the frozen factory contract this class fulfils
 #include "gdx3ds_vbopack.h" // [triloop] direct PICA-layout emission contract
+#include "gdx3ds_hsx.h"     // [native] hudsky_emit: the compact emitter's backend program
+#include "gdx3ds_mesh.h"    // [native] gpuxf: Gdx3dsXfDraw
+#include "nrr/gdx3ds_nrr_internal.h" // [native] nrr: the NRR core's backend bridge (gfx_citro3d_nrr.inc)
 
 namespace Fast {
 
@@ -105,7 +108,11 @@ struct ShaderProgramC3D {
  * Registers). Fog blend out = fogColor*f + fragColor*(1-f) maps to
  * src0=fogColor(const), src1=fragColor(previous), src2=primaryColor.alpha=f. */
 
+struct NrrBackend; /* n60 NRR machines (gfx_citro3d_nrrmach.inc): the compact draw's backend half */
+
 class GfxRenderingAPIC3D final : public GfxRenderingAPI {
+    friend struct NrrBackend;
+
   public:
     GfxRenderingAPIC3D() = default;
     ~GfxRenderingAPIC3D() override = default;
@@ -188,6 +195,17 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
      * legacy path to fall back to, so it splits the batch at the cap instead of dropping it. */
     float* VboPackBegin(Gdx3dsVboPackParams* params, uint32_t* capTris = nullptr);
     void DrawPackedBatch(size_t numTris, const Gdx3dsVboPackAux* aux);
+    /* [native] hudsky_emit (gfx_citro3d_hsx.inc, gdx3ds_hsx.h): a retained HUD run's whole backend
+     * program in one call (false = refused, nothing done), and the packed draw's lean tail (the
+     * statements DrawTriangles runs for a steady-state packed draw; anything else routes to
+     * DrawPackedBatch). HsxLeanOk: no diagnostic / gpuxf / indexed / stereo draw in the way. */
+    bool HsxLeanOk() const;
+    bool HsxRun(Gdx3dsHsxProgram* prog);
+    float* HsxBegin();
+    /* [native] nrr_hud (n60hud): HsxBegin with the GEOMLOSS cap -- a packed batch's write cursor
+     * without VboPackBegin's parameter derivation (the NRR HUD refreshes the texture fields itself). */
+    float* NrrPackCursor(uint32_t* capTris);
+    void DrawPackedLean(size_t numTris, const Gdx3dsVboPackAux* aux);
     /* [native] machines (gdx3ds_mesh.h): reserve packed vertices + u16 indices in the
      * linear pool for the CURRENT shader/texture state, then submit ONE indexed draw
      * through DrawTriangles' shared tail (C3D_DrawElements in place of DrawArrays). */
@@ -200,6 +218,24 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
                      size_t numVerts, size_t numTris);
     void CovNoteTexture(int unit, uint32_t texId);
     void NativeMeshDraw(uint32_t nVerts, const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux);
+    /* [native] gpuxf (gdx3ds_mesh.h Gdx3dsXfDraw): raw-Vtx vertex reservation, pack parameters
+     * without a reservation, and one indexed GPU-transform draw through DrawTriangles. */
+    void* NativeXfVertices(uint32_t nVerts);
+    bool NativeXfParams(Gdx3dsVboPackParams* params);
+    void NativeXfDraw(const uint16_t* idx, uint32_t nIdx, const Gdx3dsVboPackAux* aux, const Gdx3dsXfDraw* xf);
+    bool XfReady() const {
+        return mXfUnifLoc >= 0;
+    }
+    /* [native] nrr (gfx_citro3d_nrr.inc, nrr/gdx3ds_nrr.h): the decal depth map with the backend's
+     * bias; the combiner translation of a shader id pair without making it current; a texture id's
+     * bind. (The hand-back is a citro3d context restore in gdx3ds_nrr.cpp, not a backend call.) */
+    void NrrDepthMap(bool decal);
+    bool NrrTranslate(uint64_t id0, uint64_t id1, NrrBkShader* out);
+    bool NrrTex(uint32_t texId, NrrBkTex* out) const;
+    bool NrrTexPage(uint32_t page, NrrBkTex* out) const;
+    bool NrrCurrentKey(NrrStateKey* k) const; /* n60 nrr_trk: the bound draw state as a key */
+    void NrrScissorKey(int16_t out[4]) const; /* n60retry: its scissor field, alone */
+    uint32_t mTexSerial = 0;
 
   private:
     struct TextureC3D {
@@ -222,6 +258,9 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
         uint16_t ay = 0;
         float uOff = 0.0f;
         float vOff = 0.0f;
+        /* n60 nrr_trk: bumped whenever this id's content is (re)defined or deleted, so a cached
+         * NRR state block can tell its texture id still names the texture it was built from. */
+        uint32_t serial = 0;
     };
     static bool TexReady(const TextureC3D& t) {
         return t.inited || t.page >= 0;
@@ -270,8 +309,26 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     int TexPage(uint32_t id) const {
         return id < mTextures.size() ? mTextures[id].page : -1;
     }
+    /* N60TEX [debug] tex_keep: the memory an id holds -- its own C3D_Tex, or its atlas cell. */
+    uint32_t TexBytes(uint32_t id) const {
+        if (id >= mTextures.size()) {
+            return 0;
+        }
+        const TextureC3D& t = mTextures[id];
+        if (t.page >= 0) {
+            return (t.width + 2u) * (t.height + 2u) * 4u;
+        }
+        return t.inited ? (uint32_t)t.tex.size : 0u;
+    }
     void VboPackRefreshTextures(Gdx3dsVboPackParams* params);
     void AtlasStats(unsigned long out[5]) const;
+    /* [native] hud_retain: the placement epoch alone (AtlasStats also walks the linear heap). */
+    unsigned long AtlasResetCount() const {
+        return mAtlasResets;
+    }
+    const unsigned long* AtlasResetCountPtr() const {
+        return &mAtlasResets;
+    }
     void ComputeVertexLayout(ShaderProgramC3D& prg);
     void ApplyShaderState(const ShaderProgramC3D& prg);
     void ApplyAlphaTest();
@@ -397,6 +454,9 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
      * Init(); the per-eye draw loop additionally gates on the slider per frame. */
     bool mStereoEnabled = false;
     uint32_t mFrameDrawsRightEye = 0; // right-eye re-emissions this frame
+    /* B11q: cumulative taskless-hold presents whose right-eye clear was suppressed
+     * ([debug] stereo_hold_keep); the `hold=` field of the [c3d] stereo suffix. */
+    unsigned long mStereoHoldFrames = 0;
 
     /* Present-path telemetry (m1-boot-debug): per-frame draw/tri counters,
      * emitted on the svc debug channel every 64th EndFrame (~1 line/sec). */
@@ -417,6 +477,51 @@ class GfxRenderingAPIC3D final : public GfxRenderingAPI {
     /* [triloop] batch aux record of the packed draw currently threading through
      * DrawTriangles (non-null exactly inside DrawPackedBatch). */
     const Gdx3dsVboPackAux* mPackedAux = nullptr;
+
+    /* [native] gpuxf: the draw currently threading through DrawTriangles (non-null exactly
+     * inside NativeXfDraw), the first gpuxf uniform register (xmvp; -1 = shader lacks the
+     * layout, gpuxf refused), the xfon bool register, the two attribute layouts and the PICA
+     * cull mode currently set (legacy draws always run GPU_CULL_NONE). */
+    const Gdx3dsXfDraw* mXf = nullptr;
+    int mXfUnifLoc = -1;
+    int mXfBoolLoc = -1;
+    C3D_AttrInfo mAttrLegacy = {};
+    C3D_AttrInfo mAttrXf = {};
+    C3D_AttrInfo mAttrXfF = {}; /* [native] track_retained: float position + UV (near-plane polygons) */
+    bool mXfPosFloat = false;   /* the next gpuxf draw's vertices use mAttrXfF (24-byte stride) */
+    bool mXfAttrF = false;      /* mAttrXfF is the bound gpuxf layout */
+    /* gpuxf GPU state is switched lazily: on at the first gpuxf draw, off at the next legacy
+     * draw (every submit goes through DrawTriangles), so consecutive runs of a mesh pay one
+     * attribute/bool switch; uniforms upload only the vec4s that changed (shadow). */
+    bool mXfStateOn = false;
+    int mXfCull = -1;
+    bool mXfShadowValid = false;
+    float mXfShadow[28 * 4] = {}; /* kXfUniformVec4s (c5s1: + xflx, c5s3c: + xoff) */
+    /* [native] machines_mattab (Gdx3dsXfDraw::stateElide): citro3d marks a state block dirty on
+     * every set call and the next draw re-emits it, identical or not. What this backend last
+     * issued, so a stateElide draw can skip an identical re-issue: the vertex buffer (null =
+     * unknown / a legacy draw's), each unit's C3D_TexBind (pointer + the struct as bound), the
+     * alpha test. Every C3D_TexBind / BufInfo / C3D_AlphaTest in this file goes through them. */
+    const void* mBufLastVerts = nullptr;
+    int mBufLastStride = 0;
+    const C3D_Tex* mTexLastBound[2] = { nullptr, nullptr };
+    C3D_Tex mTexLastSnap[2] = {};
+    bool mAtValid = false;
+    bool mAtOn = false;
+    int mAtFunc = 0;
+    int mAtRef = 0;
+    unsigned mElideVbo = 0, mElideTex = 0, mElideAt = 0;
+    void ElideReset();
+    bool ElideOn(bool* countOnly) const;
+    void BindTexUnit(int unit, C3D_Tex* tex);
+    void XfBindVertexBuffer(const void* verts, int stride);
+    void XfInitLayout();
+    void XfUploadUniforms(const Gdx3dsXfDraw& xf);
+    void ReplayDirtyXfPose();   /* C6 [replay]: force the pose vec4s out at the next draw */
+    void* ReplayMainColorBuf(); /* C6 [replay]: the main target's colour buffer (verify lane) */
+    void XfSetCull(int cullMode);
+    void XfRestore();
+    void StereoReplayRow(bool texBacked, float clsW, bool anchoredDraw); /* n60stereo frame replay */
 };
 
 } // namespace Fast

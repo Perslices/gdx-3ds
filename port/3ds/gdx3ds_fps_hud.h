@@ -6,7 +6,8 @@
  * loop). Integration-level TU like gdx3ds_filelog.c, not a stream dir.
  *
  * Rows:
- *   1  host fps (frame-loop presents/sec) + game fps (decomp gGameFrameCount rate)
+ *   1  drawn fps (frames actually presented/sec: host iterations minus FRAMESKIP
+ *      skips) + game fps (decomp gGameFrameCount rate) + the frameskip mode
  *   2  when [debug] gputrace = 1: window-avg CPU build ms + the top [profop]
  *      opcode (read from gdx3ds_gpu_prof's live window accumulators)
  *   3  static build id (branch@hash, baked at configure time) so on-device

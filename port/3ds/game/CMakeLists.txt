@@ -135,7 +135,19 @@ add_library(gdx3ds_game OBJECT ${GAME_SOURCES} ${GDX_GAME_CORE_SOURCES}
     ${GDX3DS_EK_SOURCES}    # EK=ON: n64_leo.c, gen/EkAssetBindings.c, gen/EkLinkStubs.c, gdx_ek_disk_overrides.c
     gdx3ds_livery_diag.c    # SHIP-LIVERY-2 [livery] game-state receipts (weak-called by gfx)
     gdx3ds_track_gbi.c      # [native] track: real GBI emitters behind gdx3ds_track_shim.h
+    gdx3ds_track_bake_game.c # [native] track_resident: game-data side of the course bake (C5 Stage 3c)
+    gdx3ds_nrr_trk_game.c   # n60 NRR track: the lean course walk (decomp-native-nrr-trk.patch)
     gdx3ds_fx_gbi.c         # [native] fx: real GBI emitters behind gdx3ds_fx_shim_begin.h
+    gdx3ds_replay_game.c    # C6 [replay]: read-only game signals + GfxPool geometry for the pose replay
+    gdx3ds_gad_gbi.c        # [native] gadget_batch: real GBI emitters behind gdx3ds_gad_shim_begin.h
+    gdx3ds_c5tick_game.c    # C5TICK: dlwrite scratch ranges + the gstate_ext digest (decomp types)
+    gdx3ds_frameskip_game.c # n60fs [debug] frameskip = race0: the race scope from the game's mode globals
+    gdx3ds_nrr_sky_game.c   # [native] nrr_sky: the consumed SKY section's stub + snapshot (n60sky)
+    gdx3ds_nrr_shd_game.c   # [native] nrr_shd: the consumed SHD section's stub + snapshot (n60fx)
+    gdx3ds_nrr_fx_game.c    # [native] nrr_fx: the consumed BOOST section's stub + the effects' snapshot (n60fx)
+    gdx3ds_nrr_dress_game.c # [native] nrr_dress: the consumed DRESS section's stub: gadget pass native, decorations stock (n60fx)
+    gdx3ds_prewarm_game.c   # [native] prewarm: first-use work in the race's opaque appear frame (n60prewarm)
+    gdx3ds_course_game.c    # [native] ni_course: the course preview's marker pair + generation (nicourse)
 )
 
 target_include_directories(gdx3ds_game PRIVATE
@@ -155,6 +167,9 @@ target_compile_definitions(gdx3ds_game PRIVATE
     GDX_PLATFORM_3DS=1
     GDX_NATIVE_TRACK=1     # course.c includes gdx3ds_track_shim.h (runtime-gated: [native] track)
     GDX_NATIVE_FX=1        # racer.c includes gdx3ds_fx_shim.h (runtime-gated: [native] fx_sink)
+    GDX_NATIVE_HUD=1       # race.c/racer.c compact the HUD's display list (runtime-gated: [native] hud_batch)
+    GDX_NATIVE_DRESS=1     # course_gadgets.c/racer.c: gadget shim + direct-load scopes (runtime-gated, gdx3ds_dress.h)
+    GDX_NATIVE_SKY=1       # background.c marks/captures Background_Draw (runtime-gated: [native] sky_retain/skyclock)
 )
 
 if(GDX_3DS_EXPANSION_KIT)
@@ -187,6 +202,8 @@ target_compile_options(gdx3ds_game PRIVATE -w -Werror=return-type -fcommon
 add_library(gdx3ds_glue OBJECT
     "${GDX_PORT_DIR}/enhancements/events/GameEvents.cpp"   # decomp racer.c references GameEvents_FireOnBoostStart
     "${GDX_PORT_DIR}/input_bridge.c"
+    "${GDX_PORT_DIR}/gdx_hud_placement.c"  # nihudtop Phase 3: split out of input_bridge.c so the
+                                            # predicate is host-testable standalone
     "${GDX_PORT_DIR}/gdx_input_script.c"
     "${GDX_PORT_DIR}/gdx_input_rec.c"     # ORACLE: .gdxrec record/replay
     "${GDX_PORT_DIR}/gdx_determinism.c"   # ORACLE: determinism pins
@@ -195,6 +212,10 @@ add_library(gdx3ds_glue OBJECT
     "${GDX_PORT_DIR}/n64_gfx_convert.cpp"
     "${GDX_PORT_DIR}/gdx_vi_convert.c"
     "${GDX_PORT_DIR}/n64_audio_hle.c"
+    "${GDX_PORT_DIR}/n64_audio_hle_fast.c" # [debug] audio_simd: bit-exact fast HLE kernels (C4k)
+    "${GDX_PORT_DIR}/gdx_audio_hle_cost.c" # [synx]: HLE synth CPU-vs-wall ledger (C4k)
+    "${GDX_PORT_DIR}/gdx_ndsp_hash.c"   # [debug] ndsphash: the content-addressed render digest
+    "${GDX_PORT_DIR}/gdx_audio_mix_census.c" # [debug] audiomix: the mix-bus headroom census
     "${GDX_PORT_DIR}/gdx_audio_lle.c"
     "${GDX_PORT_DIR}/gdx_audio_thread.cpp"
     "${GDX_PORT_DIR}/gdx_audio_capture.c"
@@ -204,6 +225,7 @@ add_library(gdx3ds_glue OBJECT
     "${GDX_PORT_DIR}/resource/ResourceFactories.cpp"
     "${GDX_PORT_DIR}/rom_buffer.cpp"
     "${GDX_PORT_DIR}/sram_buffer.cpp"
+    "${GDX_PORT_DIR}/gdx_save_replace.c" # n60save: crash-safe replace (the SD archive never renames over a file)
     "${GDX_PORT_DIR}/disk_savefile.cpp"
     "${GDX_PORT_DIR}/gdx_ghost_io.c"
     "${GDX_PORT_DIR}/gdx_perf.cpp"
@@ -229,6 +251,7 @@ if(GDX_3DS_EXPANSION_KIT)
         "${GDX_PORT_DIR}/disk_buffer.cpp"
         "${GDX_PORT_DIR}/gdx_disk_stream.cpp"   # B11c: SD-backed block reader ([debug] disk_stream)
         "${GDX_PORT_DIR}/gdx_disk_dcrc.cpp"      # B11m: the .dcrc cached identity fingerprint
+        "${GDX_PORT_DIR}/gdx_save_ek_layout.c"   # ekship: the EK title's own save, proven-EK seed
         "${GDX_PORT_DIR}/gen/EkTranslatedOverrides.c"
         "${GDX_PORT_DIR}/gdx_ek_strings.c"
         "${GDX_PORT_DIR}/gen/EkTranslatedStrings.c"
@@ -260,7 +283,7 @@ target_compile_definitions(gdx3ds_glue PRIVATE
     # CRC-64 gate both still refused, and the Japanese .ndd FILENAMES were not even searched
     # -- which presents as "[leo] no disk image found" with no mention of the gate. Both of
     # those TUs are in THIS object library, so the definitions belong here. The option
-    # defaults OFF and tools/ci-3ds.sh never passes it, so the shipped build is unaffected.
+    # defaults ON for 3DS builds (port/cmake/GdxGameSources.cmake) and OFF on desktop.
     ${GDX_JP_INPUT_DEFS}
     GDX_PLATFORM_3DS=1
     F3DEX_GBI_2=1

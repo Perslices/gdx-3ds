@@ -3,6 +3,7 @@
  * their own TUs (gdx_rsp / gdx_tmem / gdx_texcache / gdx_cc / gdx_tri) as the milestones land;
  * until then the handlers below that only count are marked [M1]/[M2]. */
 #include "gdx_interp.h"
+#include "gdx3ds_replay.h" // [native] replay (C6)
 
 #include <math.h>
 #include <string.h>
@@ -20,6 +21,8 @@ extern "C" int gdx_ninterp_timgmemo(void);
 extern "C" int gdx_ninterp_tmemskip(void);
 extern "C" int gdx_ninterp_tmemfault(void);
 extern "C" int gdx_ninterp_tmemcls(void);
+extern "C" int gdx_ninterp_o3dsfast(void);
+extern "C" int gdx_ninterp_trimemo(void);
 
 Interp::Interp(Backend* backend) : mBackend(backend) {
     memset(&mRsp, 0, sizeof(mRsp));
@@ -57,10 +60,18 @@ Interp::Interp(Backend* backend) : mBackend(backend) {
        ever reached from an admitted skip), and 0 in every shipped configuration. */
     mTmemFault = gdx_ninterp_tmemfault();
     memset(mTimgClassMemo, 0, sizeof(mTimgClassMemo));
+    /* o3dsinterp (NEXT.md C4m): the exact rewrites and the tri state memo. */
+    mO3dsFast = gdx_ninterp_o3dsfast();
+    mTriMemoOn = gdx_ninterp_trimemo();
+    memset(&mTmKey, 0, sizeof(mTmKey));
+    memset(&mTmState, 0, sizeof(mTmState));
 }
 
 Interp::~Interp() {
+    delete[] mTexRecs; /* [native] machines_texskip */
+    DeadSetFree(); /* [native] dlmemo + deadsetup (gdx_dlmemo.cpp) */
     delete[] mTexUpload;
+    NcSet(0); /* [debug] nicensus (gdx_nicensus.cpp) */
 }
 
 void Interp::ResetStats() {
@@ -88,6 +99,23 @@ void Interp::ResetRenderStateCache() {
         mRs.sampler_valid[i] = false;
     }
     ArmTexturesChanged();
+}
+
+void Interp::ApplyViewportScissor() {
+    if (!mRdp.viewport_or_scissor_changed) {
+        return;
+    }
+    if (memcmp(&mRdp.viewport, &mRs.viewport, sizeof(Rect)) != 0) {
+        Flush(FLUSH_VIEWPORT);
+        mBackend->SetViewport(mRdp.viewport.x, mRdp.viewport.y, mRdp.viewport.width, mRdp.viewport.height);
+        mRs.viewport = mRdp.viewport;
+    }
+    if (memcmp(&mRdp.scissor, &mRs.scissor, sizeof(Rect)) != 0) {
+        Flush(FLUSH_SCISSOR);
+        mBackend->SetScissor(mRdp.scissor.x, mRdp.scissor.y, mRdp.scissor.width, mRdp.scissor.height);
+        mRs.scissor = mRdp.scissor;
+    }
+    mRdp.viewport_or_scissor_changed = false;
 }
 
 void Interp::ResyncBackend() {
@@ -197,6 +225,11 @@ void Interp::RunFrame(GdxGfxJob* job, const GdxFrameConfig& cfg, int variant) {
      * immediately before RunFrame and gdx3ds_verify_begin(0) immediately after, so this is
      * exact, and it keeps the hot sites free of a cross-TU / virtual call. */
     mVerifyActive = mBackend->VerifyActive();
+    /* [dspx]/[trix] ride the [prof] gate; dspcensus runs its own (heavier) clocks instead. */
+    mDxOn = mBackend->ProfActive() && mDspCensus == 0;
+    /* [native] trimemo: a new task starts from a freshly started backend frame and a reset
+       mRs.viewport/scissor, so nothing banked by the previous task may be reused. */
+    mTmKey.valid = false;
     mStats.tasks++;
     mBatchesAtTaskStart = mStats.batches;
     SpReset();
@@ -209,6 +242,12 @@ void Interp::RunFrame(GdxGfxJob* job, const GdxFrameConfig& cfg, int variant) {
     mCfg.rendersToFb = rendersToFb ? 1 : 0;
     mBackend->UpdateFramebufferParameters(0, cfg.windowW, cfg.windowH, 1, false, true, true, !rendersToFb);
     mBackend->StartFrame();
+    if (gdx3ds_replay_interp != nullptr) {
+        /* [native] replay (C6): the walk's starting matrix state, and the verified replay (the
+         * backend frame is open, nothing of this task is drawn yet) */
+        gdx3ds_replay_interp->taskBegin(&mRsp.P_matrix[0][0], &mRsp.modelview_matrix_stack[0][0][0],
+                                        mRsp.modelview_matrix_stack_size, &mRsp.MP_matrix[0][0]);
+    }
     mBackend->StartDrawToFramebuffer(rendersToFb ? cfg.gameFb : 0,
                                      static_cast<float>(cfg.curH) / static_cast<float>(cfg.nativeH));
     mBackend->ClearFramebuffer(true, true);
@@ -219,11 +258,21 @@ void Interp::RunFrame(GdxGfxJob* job, const GdxFrameConfig& cfg, int variant) {
 
     ListRef root;
     if (mSrc.Root(root)) {
+        const int ncPrev = (mNc != nullptr) ? NcSwitch(NC_WALK) : -1; /* [debug] nicensus */
         Walk(root);
+        if (ncPrev >= 0) {
+            NcSwitch(ncPrev);
+        }
     } else {
         mStats.rootRejects++;
     }
     Flush(FLUSH_TASK_END);
+    TexSkipTaskEnd(); /* [native] machines_texskip: no window may outlive the task */
+    if (mDs != nullptr) {
+        DeadSetTaskEnd(); /* [native] deadsetup: no window may outlive the task */
+    }
+    MachSplitTaskEnd(); /* [debug] machsplit receipt cadence */
+    LoadMemoTaskEnd();  /* [native] machines_loadmemo receipt cadence */
     if (mCensus) {
         const uint32_t n = mStats.batches - mBatchesAtTaskStart;
         if (n > mStats.maxBatchesPerTask) {
@@ -358,6 +407,7 @@ void Interp::DpSetPrimDepth(uint16_t z) {
 }
 
 void Interp::DpSetTextureImage(uint32_t fmt, uint32_t siz, uint32_t width, const Cmd& c) {
+    TexSkipNoteWriter(0xFD); /* [native] machines_texskip tripwire */
     /* Resolution is lazy: the load extent is only known at LOADBLOCK/LOADTILE/LOADTLUT time
      * (plan §3.2, replaces the bridge's forward scan + persistent copy). */
     mRdp.texture_to_load.fmt = static_cast<uint8_t>(fmt);

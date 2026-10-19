@@ -1,0 +1,134 @@
+diff --git a/src/overlays/ovl_i3/background.c b/src/overlays/ovl_i3/background.c
+--- a/src/overlays/ovl_i3/background.c
++++ b/src/overlays/ovl_i3/background.c
+@@ -1078,12 +1078,79 @@
+ 
+ extern GfxPool D_1000000;
+ extern Mtx D_2000000[];
++
++#if defined(PORT) && defined(GDX_NATIVE_SKY)
++/* [native] sky_retain / skyclock (port/3ds/gfx/gdx3ds_sky_capture.c, c5sky-progress.md).
++ * GDX_SKYSEC writes ONE G_NOOP p=0x65 section marker (gradient, stars, sprites, floor, fireworks,
++ * clouds) that the owned walker's census and replay read; GDX_SKY_CAPTURE then compacts what
++ * Background_Draw wrote, in place, into a per-GfxPool record behind p=0x65 run markers. The
++ * draw code and its logic run unchanged. Off (the default) gdxsky_armed() is 0: nothing is
++ * written and the display list is byte-identical. */
++#include "gdx3ds_sky_record.h"
++extern int gdxsky_armed(void);
++extern void* gdxsky_section(void* gfx, int section);
++extern void* gdxsky_capture(void* regionStart, void* regionEnd, int cameraIndex, const GdxSkyIdentity* identity);
+ 
++/* What this frame's sky draws with: a change bumps the capture's generation, which every
++ * retained answer on the render side is keyed on. */
++static void gdxSkyIdentityFill(GdxSkyIdentity* id) {
++    s32 i;
++
++    id->skybox = sSkyboxTexture;
++    id->floor = sVenueFloorTexture;
++    id->cloud = sCloudTexture;
++    id->star = sStarTexture;
++    for (i = 0; i < 6; i++) {
++        if (i < sBackgroundSpriteCount) {
++            id->spriteTex[i] = sBackgroundSprites[i].texture;
++            id->spritePal[i] = sBackgroundSprites[i].palette;
++        } else {
++            id->spriteTex[i] = NULL;
++            id->spritePal[i] = NULL;
++        }
++    }
++    id->spriteCount = sBackgroundSpriteCount;
++    id->paletteReplacements = sSpritePaletteReplacementCount;
++    id->courseIndex = gCourseIndex;
++    id->gameMode = gGameMode;
++    id->skyboxFlags = sSkyboxFlags;
++}
++#define GDX_SKYSEC_HEAD 1
++#define GDX_SKYSEC_GRAD 2
++#define GDX_SKYSEC_STARS 3
++#define GDX_SKYSEC_SPRITES 4
++#define GDX_SKYSEC_FLOOR 5
++#define GDX_SKYSEC_FIREWORKS 6
++#define GDX_SKYSEC_CLOUDS 7
++#define GDX_SKYSEC_END 8
++#define GDX_SKYSEC(sec)                                                  \
++    do {                                                                 \
++        if (gdxsky_armed()) {                                            \
++            gfx = (Gfx*) gdxsky_section((void*) gfx, GDX_SKYSEC_##sec); \
++        }                                                                \
++    } while (0)
++#define GDX_SKY_REGION_BEGIN(var) Gfx* var = gfx
++#define GDX_SKY_CAPTURE(var)                                                                   \
++    do {                                                                                       \
++        if (gdxsky_armed()) {                                                                  \
++            GdxSkyIdentity gdxSkyId;                                                           \
++            gdxSkyIdentityFill(&gdxSkyId);                                                     \
++            gfx = (Gfx*) gdxsky_capture((void*) (var), (void*) gfx, cameraIndex, &gdxSkyId);   \
++        }                                                                                      \
++    } while (0)
++#else
++#define GDX_SKYSEC(sec)
++#define GDX_SKY_REGION_BEGIN(var)
++#define GDX_SKY_CAPTURE(var)
++#endif
++
+ Gfx* Background_Draw(Gfx* gfx, s32 cameraIndex, s32 scissorBoxType) {
+     CourseSkyboxes* skybox;
+     Camera* camera = &gCameras[cameraIndex];
++    GDX_SKY_REGION_BEGIN(gdxSkyStart);
+ 
+     skybox = sBackgroundCtx.skybox;
++    GDX_SKYSEC(HEAD);
+ 
+     gSPPerspNormalize(gfx++, camera->perspectiveScale);
+ 
+@@ -1100,21 +1167,25 @@
+     gSPMatrix(gfx++, D_2000000, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+     gSPVertex(gfx++, &D_1000000.unk_29B48[cameraIndex * 28], 28, 0);
+ 
++    GDX_SKYSEC(GRAD);
+     gDPLoadTextureBlock(gfx++, sSkyboxTexture, G_IM_FMT_RGBA, G_IM_SIZ_16b, 64, 1, 0, G_TX_NOMIRROR | G_TX_CLAMP,
+                         G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMASK, G_TX_NOMASK, G_TX_NOLOD, G_TX_NOLOD);
+ 
+     gSP2Triangles(gfx++, 8, 11, 9, 0, 8, 10, 11, 0);
+ 
+     if (sSkyboxFlags & SKYBOX_STARRY) {
++        GDX_SKYSEC(STARS);
+         gSPDisplayList(gfx++, D_303AA18);
+         gfx = Background_DrawStars(gfx, cameraIndex);
+     }
+     if (cameraIndex == 0 && (sBackgroundSpriteCount != 0)) {
++        GDX_SKYSEC(SPRITES);
+         gfx = Background_DrawBackgroundSprites(gfx);
+         gSPMatrix(gfx++, D_2000000, G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+         gSPVertex(gfx++, &D_1000000.unk_29B48[cameraIndex * 28], 28, 0);
+     }
+ 
++    GDX_SKYSEC(FLOOR);
+ #ifdef EXPANSION_KIT
+     if (sBackgrounds[cameraIndex].pos.y < camera->eye.y) {
+ #endif
+@@ -1131,6 +1202,7 @@
+ #endif
+ 
+     if (gGameMode == GAMEMODE_GP_END_CS) {
++        GDX_SKYSEC(FIREWORKS);
+         gfx = EndingCutsceneEffects_DrawFireworks(gfx);
+         gSPClearGeometryMode(gfx++, 0xFFFFFFFF);
+         gSPSetGeometryMode(gfx++, G_SHADE | G_SHADING_SMOOTH | G_CLIPPING);
+@@ -1138,6 +1210,7 @@
+     }
+ 
+     if (sCloudCount > 0) {
++        GDX_SKYSEC(CLOUDS);
+         gDPPipeSync(gfx++);
+         gDPSetRenderMode(gfx++, G_RM_XLU_SURF, G_RM_XLU_SURF2);
+         gDPSetCombineLERP(gfx++, PRIMITIVE, 0, TEXEL0, 0, 0, TEXEL0, SHADE, TEXEL0, PRIMITIVE, 0, TEXEL0, 0, 0, TEXEL0,
+@@ -1151,6 +1224,8 @@
+         gSP2Triangles(gfx++, 16, 19, 17, 0, 16, 18, 19, 0);
+     }
+ 
++    GDX_SKYSEC(END);
++    GDX_SKY_CAPTURE(gdxSkyStart);
+     return gfx;
+ }
+ 

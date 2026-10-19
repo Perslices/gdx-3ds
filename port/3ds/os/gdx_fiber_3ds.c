@@ -131,8 +131,13 @@ GdxFiber* gdx_fiber_create(GdxFiberEntry entry, void* arg, size_t stackSize) {
     return f;
 }
 
+/* C5TICK: fiber switches so far (read by the [c5tick] window: switches per logic tick, the
+ * kernel thread handoffs the `vi`/`disp` buckets are made of). One increment per switch. */
+unsigned long gdx_fiber_switch_count = 0;
+
 void gdx_fiber_switch(GdxFiber* to) {
     GdxFiber* from = sSelf;
+    gdx_fiber_switch_count++;
     /* Order matters for the no-lost-wakeup argument, not for races: signal the target
      * first (ONESHOT latches if it has not parked yet), then block ourselves. Between the
      * two calls both threads are briefly runnable; the kernel may even run `to` before we

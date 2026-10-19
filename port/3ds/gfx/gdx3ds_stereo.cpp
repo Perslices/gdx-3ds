@@ -59,6 +59,12 @@ C3D_RenderTarget* sRightTarget = nullptr; // 240x400 RGBA8+D24S8, GFX_RIGHT
 int sDrawClassOverride = -1;              // bridge tag channel; -1 = heuristic
 bool sForceEnable = false;                // harness hook (no config lib linked)
 bool sActivationLogged = false;
+/* B11q taskless-hold state. sHoldFrame is set by the bridge for the frame it is
+ * re-presenting from the frame mirror and cleared by the backend at EndFrame. */
+bool sHoldFrame = false;
+int sHoldKeep = -1; // [debug] stereo_hold_keep, read once; -1 = unread
+unsigned long sHoldFrames = 0;
+bool sHoldLogged = false;
 
 void StereoLog(const char* msg) {
     /* Console echo only from the main thread and only while the touch menu does not own the
@@ -120,6 +126,10 @@ extern "C" void gdx3ds_stereo_set_draw_class(int stereoClass) {
 
 extern "C" void gdx3ds_stereo_request_enable(void) {
     sForceEnable = true;
+}
+
+extern "C" void gdx3ds_stereo_mark_hold_frame(void) {
+    sHoldFrame = true;
 }
 
 /* ---- MENU live tuning (3D tab) --------------------------------------------------
@@ -229,6 +239,10 @@ C3D_RenderTarget* RightTarget() {
     return sRightTarget;
 }
 
+bool RightQueued() {
+    return sRightTarget != nullptr && sRightTarget->used;
+}
+
 void BindTargetRaw(C3D_RenderTarget* target) {
     /* sm64-3ds precedent: C3D_SetFrameBuf alone — no viewport/scissor reset, so
      * the interpreter's current rects stay bound for the second eye. */
@@ -236,9 +250,41 @@ void BindTargetRaw(C3D_RenderTarget* target) {
 }
 
 void ClearRight(C3D_ClearBits flags, uint32_t color, uint32_t depth) {
-    if (sActive && sRightTarget != nullptr) {
-        C3D_RenderTargetClear(sRightTarget, flags, color, depth);
+    if (!sActive || sRightTarget == nullptr) {
+        return;
     }
+    if (ReplayActive()) {
+        return; /* n60stereo: the body's clear is replayed onto the right target in its place */
+    }
+    if (sHoldFrame) {
+        /* B11q: a taskless hold present. The left eye is about to be restored from the
+         * frame mirror by a framebuffer copy that has no right-eye counterpart, so
+         * clearing the right target here is what blanked it. Keep what it holds. */
+        if (sHoldKeep < 0) {
+            sHoldKeep = 1;
+            if (gdx3ds_config_get_bool != nullptr) {
+                sHoldKeep = gdx3ds_config_get_bool("debug", "stereo_hold_keep", 1) ? 1 : 0;
+            }
+        }
+        if (!sHoldLogged) {
+            sHoldLogged = true;
+            char msg[112];
+            std::snprintf(msg, sizeof(msg),
+                          "[stereo] taskless hold present: right-eye clear %s (stereo_hold_keep=%d)",
+                          sHoldKeep ? "SUPPRESSED" : "kept (pre-fix behaviour)", sHoldKeep);
+            StereoLog(msg);
+        }
+        if (sHoldKeep) {
+            sHoldFrames++;
+            return;
+        }
+    }
+    C3D_RenderTargetClear(sRightTarget, flags, color, depth);
+}
+
+unsigned long EndFrameHold() {
+    sHoldFrame = false;
+    return sHoldFrames;
 }
 
 void ComputeEyeMatrix(const C3D_Mtx* base, int eye, C3D_Mtx* out, int stereoClass) {
@@ -312,6 +358,33 @@ void ComputeEyeMatrix(const C3D_Mtx* base, int eye, C3D_Mtx* out, int stereoClas
 
 void SetAnchorDepth(float d) {
     sAnchorDepth = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
+}
+
+bool HoldFrame() {
+    return sHoldFrame;
+}
+
+/* n60stereo: the frame replay's per-draw row. The SAME coefficients ComputeEyeMatrix folds into
+ * the matrix for the right eye (eye = +1); the shader applies the sign (steye), so the row is
+ * eye-independent: x' = x + steye * dot(row, clip). */
+void ClassRow(int stereoClass, float row[4]) {
+    row[0] = 0.0f;
+    row[1] = 0.0f;
+    row[2] = 0.0f;
+    row[3] = 0.0f;
+    if (!sActive) {
+        return;
+    }
+    const float sep = sSepNdc * sSlider;
+    const float k = sep / (1.0f - sConvergence);
+    if (stereoClass == GDX3DS_STEREO_SCENE) {
+        row[2] = k;
+        row[3] = -k * sConvergence;
+    } else if (stereoClass == GDX3DS_STEREO_SKY_DEEP) {
+        row[3] = sep;
+    } else if (stereoClass == GDX3DS_STEREO_ANCHORED) {
+        row[3] = k * (sAnchorDepth - sConvergence);
+    }
 }
 
 int ClassifyDraw(bool orthoDraw) {

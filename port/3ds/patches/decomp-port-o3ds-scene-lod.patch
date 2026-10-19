@@ -1,0 +1,135 @@
+--- a/src/game/racer.c
++++ b/src/game/racer.c
+@@ -33,6 +33,11 @@
+    exempts the nearest GDX_RIVAL_PROTECT_COUNT rivals so the machines the player actually
+    fights keep full detail. */
+ #define GDX_RIVAL_PROTECT_COUNT 5
++#define GDX_RIVAL_PROTECT_COUNT_LOW 3 /* O3DS-SCENE-LOD: tier 3 (LOW) protects fewer */
++/* O3DS-SCENE-LOD: sGdxRivalBiased value for a LOW-protected rival: REDUCED's curve. */
++#define GDX_RIVAL_BIAS_MILD 2
++#define GDX_RIVAL_MILD_NEAR 250.0f
++#define GDX_RIVAL_MILD_BIAS 2.5f
+ static u8 sGdxRivalBiased[TOTAL_RACER_COUNT];
+ #endif
+ Vtx* gEffectsVtxPtr;
+@@ -5624,6 +5629,7 @@
+     s32 gdxRivalDetail;
+     f32 gdxRivalNear;
+     f32 gdxRivalBias;
++    s32 gdxLod6Skip; /* O3DS-SCENE-LOD: port hook gdx_rival_lod6_skip, read once per Racer_Draw */
+ #endif
+ 
+     camera = &gCameras[playerIndex];
+@@ -5673,11 +5679,21 @@
+            the near band), so every stock threshold below — LOD tiers 230/290/380/470/
+            1500, shadow 800, effects 400/900 — engages earlier by the same factor. */
+         gdxRivalDetail = gdx_rival_detail_level();
++        {
++            extern int gdx_rival_lod6_skip(void); // port hook (3DS: gdx3ds_perf_preset.c)
++            gdxLod6Skip = gdx_rival_lod6_skip();
++        }
+         gdxRivalNear = 250.0f;
+         gdxRivalBias = 2.5f;
+         if (gdxRivalDetail == 2) {
+             gdxRivalNear = 120.0f;
+             gdxRivalBias = 6.0f;
++        } else if (gdxRivalDetail >= 3) {
++            /* O3DS-SCENE-LOD: LOW, the Old 3DS tier ([perf] rival_tier_max=3, on by default
++               only under [perf] preset=o3ds). An unprotected rival reaches LOD 5
++               past ~119 and LOD 6 (the far speck) past ~222; shadows go past ~152. */
++            gdxRivalNear = 80.0f;
++            gdxRivalBias = 10.0f;
+         }
+     }
+ 
+@@ -5711,10 +5727,12 @@
+                     gdxDepth[gdxI] = (gdxD < 0.0f) ? -gdxD : gdxD;
+                 }
+             }
+-            if (gdxRivalDetail == 2) {
++            if (gdxRivalDetail >= 2) {
+                 /* MINIMAL: the nearest GDX_RIVAL_PROTECT_COUNT rivals keep full treatment
+-                   (O(n^2) over <=30 racers, ~450 compares — noise next to the draw walk). */
++                   (O(n^2) over <=30 racers, ~450 compares — noise next to the draw walk).
++                   O3DS-SCENE-LOD: LOW protects the nearest GDX_RIVAL_PROTECT_COUNT_LOW. */
+                 s32 gdxJ;
++                s32 gdxProtect = (gdxRivalDetail >= 3) ? GDX_RIVAL_PROTECT_COUNT_LOW : GDX_RIVAL_PROTECT_COUNT;
+ 
+                 for (gdxI = gNumPlayers; gdxI < gdxCount; gdxI++) {
+                     s32 gdxNearer = 0;
+@@ -5727,8 +5745,11 @@
+                             gdxNearer++;
+                         }
+                     }
+-                    if (gdxNearer < GDX_RIVAL_PROTECT_COUNT) {
+-                        sGdxRivalBiased[gdxI] = 0;
++                    if (gdxNearer < gdxProtect) {
++                        /* O3DS-SCENE-LOD: under LOW a protected rival is not exempt, it is
++                           demoted to REDUCED (GDX_RIVAL_BIAS_MILD): its mesh stays near-native,
++                           but its shadow and effects follow REDUCED's earlier thresholds. */
++                        sGdxRivalBiased[gdxI] = (gdxRivalDetail >= 3) ? GDX_RIVAL_BIAS_MILD : 0;
+                     }
+                 }
+             }
+@@ -5785,7 +5806,12 @@
+                 /* RIVAL-DETAIL: stretch this rival's depth beyond the near band so the
+                    LOD/shadow/effect thresholds below all engage earlier. temp_fa0 is not
+                    read again after the tier assignments, so overwriting it is safe. */
+-                if ((gdxRivalDetail != 0) && sGdxRivalBiased[racer - gRacers] && (temp_fa0 > gdxRivalNear)) {
++                if ((gdxRivalDetail != 0) && (sGdxRivalBiased[racer - gRacers] == GDX_RIVAL_BIAS_MILD)) {
++                    /* O3DS-SCENE-LOD: a protected rival under LOW gets REDUCED's curve. */
++                    if (temp_fa0 > GDX_RIVAL_MILD_NEAR) {
++                        temp_fa0 = GDX_RIVAL_MILD_NEAR + ((temp_fa0 - GDX_RIVAL_MILD_NEAR) * GDX_RIVAL_MILD_BIAS);
++                    }
++                } else if ((gdxRivalDetail != 0) && sGdxRivalBiased[racer - gRacers] && (temp_fa0 > gdxRivalNear)) {
+                     temp_fa0 = gdxRivalNear + ((temp_fa0 - gdxRivalNear) * gdxRivalBias);
+                 }
+                 if (gdxForceMaxMachineLod) {
+@@ -6142,10 +6168,26 @@
+             racer->modelMatrixInit = true;
+         }
+         if (racer->stateFlags & RACER_STATE_CRASHED) {
++            continue;
++        }
++#ifdef PORT
++        /* O3DS-SCENE-LOD: LOD 6 is the far speck (D_7045098, a 12-vertex, few-pixel stand-in),
++           yet the stock code emits the machine's whole texture-load list (D_800CDD38[i]: every
++           LOADBLOCK of that machine's textures) in front of it, walked by the interpreter once
++           per such machine per frame. gdx_rival_lod6_skip() (3DS: [perf] lod6_skip, default 0):
++           1 = drop only that texture-load list and keep the speck; 2 = drop the speck as well.
++           The model matrix above is initialised either way: only display-list emission changes. */
++        if ((racer->machineLod == 6) && (gdxLod6Skip >= 2)) {
+             continue;
+         }
++#endif
+         gSPMatrix(gfx++, &D_1000000.unk_20308[racer->id], G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+-        gSPDisplayList(gfx++, D_800CDD38[racer->machineIndex]);
++#ifdef PORT
++        if (!((racer->machineLod == 6) && (gdxLod6Skip >= 1)))
++#endif
++        {
++            gSPDisplayList(gfx++, D_800CDD38[racer->machineIndex]);
++        }
+         gDPSetEnvColor(gfx++, racer->bodyR, racer->bodyG, racer->bodyB, 255);
+         gSPDisplayList(gfx++, D_800CDDB0[racer->machineIndex * 6 + racer->machineLod - 1]);
+     }
+--- a/src/game/course.c
++++ b/src/game/course.c
+@@ -4639,6 +4639,17 @@
+             drawDistancePercent = 200;
+         }
+         gdxFarRenderDistanceScale = (f32) drawDistancePercent / 100.0f;
++        /* O3DS-SCENE-LOD: the port may SHORTEN the far cull below stock (3DS: [perf]
++           draw_distance, 40..100, default 100; the o3ds preset lowers it). At 100 the scale
++           above is not touched at all, so stock output stays bit-identical. Visual only: the
++           far cull feeds chunk->drawState, which only Course_Draw and Course_GadgetsDraw read. */
++        {
++            extern int gdx_track_draw_distance_pct(void); // port hook (3DS: gdx3ds_perf_preset.c)
++            s32 gdxPortDrawPct = gdx_track_draw_distance_pct();
++            if ((gdxPortDrawPct > 0) && (gdxPortDrawPct < 100)) {
++                gdxFarRenderDistanceScale = gdxFarRenderDistanceScale * ((f32) gdxPortDrawPct / 100.0f);
++            }
++        }
+     }
+     /* The NDC-x cull below tests the 4:3 frustum's +-1.0, but under hor+ the visible band is
+        +-(aspect/(4/3)), so chunks that occupy real screen get culled (side pop-in).

@@ -91,6 +91,35 @@ typedef void (*GdxSegWindowAuditFn)(uint32_t relOffset, uint32_t size, const voi
 void GdxSegmentSourceSetWindow(uint32_t romBase, uint32_t span, GdxSegWindowReadFn readFn,
                                GdxSegWindowAuditFn auditFn);
 
+/* A12b BOOT-WINDOW IN-FLIGHT BYPASS (docs/research/native/bootstall-progress.md).
+ *
+ * seg_ensure_loaded's in-flight wait is all-or-nothing: a reader arriving while another
+ * thread holds the family mid-load sleeps until the WHOLE payload is published. For
+ * audio_blob/audio_table that is a 10.7 MB archive read, and the waiter is the audio producer
+ * asking for six small DMAs -- which also holds sAudioCtxMutex, so the GAME fiber stalls
+ * behind it in AudioThread_QueueCmd. This declares an ALTERNATIVE BYTE SOURCE for
+ * [romBase, romBase+span) to be offered any read that arrives before the payload is
+ * published, so such a read is served in milliseconds instead of waiting out the load.
+ *
+ * `readFn` takes a family-relative offset and returns 1 when it served `dst` in full, or 0 to
+ * decline -- on which the ordinary in-flight wait runs exactly as before. ON REFUSAL IT MUST
+ * LEAVE `dst` UNTOUCHED (gdx_block_cache.h's contract). It MUST serve bytes identical to the
+ * resident payload; it is consulted on a race, so "correct only while in flight" is not a
+ * property this seam can offer.
+ *
+ * SELF-DISARMING: the hook sits after the lock-free published-payload fast path, so once the
+ * loader publishes, no read reaches it again. The always-on cost when unarmed is one NULL
+ * compare. Pass readFn = NULL to retract, then GdxSegmentSourceDrainBypass() to wait out any
+ * reader already inside it before closing the underlying source. */
+typedef int (*GdxSegBypassReadFn)(uint32_t relOffset, uint32_t size, void* dst);
+void GdxSegmentSourceSetBypass(uint32_t romBase, uint32_t span, GdxSegBypassReadFn readFn);
+void GdxSegmentSourceDrainBypass(void);
+
+/* Receipt counters: reads served by the bypass instead of waiting, their bytes, and reads the
+ * bypass declined (which fell through to the ordinary wait). Any pointer may be NULL. */
+void GdxSegmentSourceBypassStats(unsigned int* outServed, unsigned int* outBytes,
+                                 unsigned int* outDeclined);
+
 /* Millisecond monotonic clock backing the [seg-src]/[audio-load] load receipts; exported
  * so decomp-side diag code can time loads without platform headers. */
 double gdx_host_ms_now(void);

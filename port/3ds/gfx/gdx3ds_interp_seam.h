@@ -126,6 +126,48 @@ struct GdxSeamMaterial {
     bool use_alpha, use_fog, use_blend_color;
 };
 
+/* --- [native] machines_mattab: one material run's recorded resolve (C5 Stage 1b) --------- */
+
+/* Opaque per-run record storage the mesh code owns (all-zero = empty). The owned interpreter
+ * keeps a gdxn::MachMatRec in it (gdx_seam_owned.cpp asserts it fits). */
+#if defined(__LP64__) || defined(_WIN64)
+#define GDXSEAM_MATREC_BYTES 384 /* host builds (64-bit pointers) */
+#else
+#define GDXSEAM_MATREC_BYTES 328 /* the 3DS: sizeof(gdxn::MachMatRec) on ARM32, exactly */
+#endif
+struct GdxSeamMatRec {
+    alignas(8) unsigned char bytes[GDXSEAM_MATREC_BYTES];
+};
+/* Records per run: the same (slot, LOD) list is drawn in more than one render mode per frame
+ * (the body pass and the highlight pass), so each run keeps one record per mode. */
+#define GDXSEAM_MATREC_WAYS 2
+/* [native] machines_speck (c5mach2): the shared far speck inherits the state of whichever
+ * machine was drawn before it (a different combiner/tile per slot), so its one run keeps more
+ * ways. The upper bound a BindMaterialRec call may pass. */
+#define GDXSEAM_MATREC_WAYS_MAX 8
+
+/* == gdxn::MachMatResult / MachMatOutcome (asserted at the owned adapter). */
+enum {
+    GDXSEAM_MM_HIT = 0,
+    GDXSEAM_MM_MISS_EMPTY,
+    GDXSEAM_MM_MISS_KEY,
+    GDXSEAM_MM_MISS_VP,
+    GDXSEAM_MM_MISS_NOIMP,
+    GDXSEAM_MM_MISS_TEX,
+    GDXSEAM_MM_MISS_EPOCH,
+    GDXSEAM_MM_MISS_SMP,
+    GDXSEAM_MM_FULL,
+    GDXSEAM_MM_RESULT_COUNT
+};
+struct GdxSeamMatOutcome {
+    uint8_t result, binds, banked, checked, mismatch, wasValid;
+    uint16_t keyBits; /* MM_MISS_KEY: which key parts differed (gdxn::MachMatOutcome) */
+    uint8_t live;     /* [native] machines_mattab_live: units imported live by this hit (bit per unit) */
+};
+/* BindMaterialRec mode flag: a unit whose record holds no import hit (a non-immutable source:
+ * the race setup's tile 0) imports live instead of missing. */
+#define GDXSEAM_MATREC_LIVE 0x10
+
 /* --- the seam --------------------------------------------------------------------------- */
 
 struct GdxTrackPackState; /* gdx3ds_track_interp.h */
@@ -172,11 +214,93 @@ class GdxInterpSeam {
      * (depth/decal/viewport, combiner, texture import + sampler, shader, blend), binding the
      * backend exactly as a triangle would. false = a state shape this path does not handle. */
     virtual bool BindMaterial(GdxSeamMaterial& out) = 0;
+    /* [native] machines_mattab: BindMaterial through a run's `ways` records (mode 1 use, 2 verify).
+     * 1 = bound, 0 = a state shape this path does not handle (as BindMaterial's false),
+     * -1 = this interpreter keeps no records (the caller uses BindMaterial). */
+    virtual int BindMaterialRec(GdxSeamMatRec* recs, int ways, int mode, GdxSeamMaterial& out,
+                                GdxSeamMatOutcome& o) {
+        (void)recs;
+        (void)ways;
+        (void)mode;
+        (void)out;
+        (void)o;
+        return -1;
+    }
+    /* [native] track_mattab (C5 Stage 3d): the retained course's segment probe served from a
+     * course material table of nBuckets x ways records (gdxn::Interp::TrackMatBefore/After).
+     * `tri` = the probe triangle's three vertices as the interpreter's cache would hold them.
+     * Before: 1 = served (state bound, packed batch open, aux latched: the probe must not run),
+     * 2 = applied but the batch did not open (the probe's triangle is dropped), 3 = applied but
+     * the stock probe must still run (pool nearly out), 4 = the triangle binds and draws nothing
+     * (dropped), 0 = not served (probe, then After), -1 = this interpreter keeps no records.
+     * After (probe: 0 resolved, 1 dropped, 2 drawn): bank, and in mode 2 compare. */
+    virtual int TrackMatBefore(GdxSeamMatRec* table, int nBuckets, int ways, int mode, bool serve,
+                               const GdxSeamVertex* tri, GdxSeamMatOutcome& o) {
+        (void)table;
+        (void)nBuckets;
+        (void)ways;
+        (void)mode;
+        (void)serve;
+        (void)tri;
+        (void)o;
+        return -1;
+    }
+    virtual void TrackMatAfter(GdxSeamMatRec* table, int nBuckets, int ways, int mode, int probe,
+                               GdxSeamMatOutcome& o) {
+        (void)table;
+        (void)nBuckets;
+        (void)ways;
+        (void)mode;
+        (void)probe;
+        (void)o;
+    }
     /* [native] machines: everything GfxSpVertex reads from the RSP, latched once per draw. */
     virtual bool LatchVtxState(Gdx3dsVtxMathState& out) = 0;
     /* The per-draw constants Flush() applies before every submit (prim depth, alpha-compare
      * threshold) from the current registers. */
     virtual void ApplyDrawConstants() = 0;
+    /* n60retry: the registers hold a viewport the backend does not have yet (the next triangle's
+     * state resolve would set it, with the scissor), and putting both there now. */
+    virtual bool ViewportPending() const {
+        return false;
+    }
+    virtual void ApplyViewportScissor() {}
+    /* The scissor the registers hold (x, y, w, h as the backend's SetScissor takes them): what a
+     * triangle drawn now is clipped to. false = not known (the caller takes the backend's). */
+    virtual bool RegisterScissor(int32_t out[4]) const {
+        (void)out;
+        return false;
+    }
+    /* n60finish [native] finish_mesh: execute commands [begin, end) of the list the G_DL hook is
+     * being offered (valid inside the hook call only) through the walker's own handlers, in order,
+     * as if the walker had reached them. The caller passes no G_DL / G_ENDDL / branch.
+     * 0 = this interpreter cannot (the caller keeps the list on the walker). */
+    virtual int ExecHookCmds(size_t begin, size_t end) {
+        (void)begin;
+        (void)end;
+        return 0;
+    }
+    /* The same for the n listed command indices, in the order given. */
+    virtual int ExecHookCmdList(const uint16_t* idx, size_t n) {
+        (void)idx;
+        (void)n;
+        return 0;
+    }
+    /* n60finish: the backend binding the LAST BindMaterial left behind (depth, decal, alpha, shader,
+     * each used unit's texture-cache slot + sampler), saved in slot 0..1, and re-applied later in
+     * the same list without the texture loads that produced it -- exactly the binds a stock
+     * ResolveDrawState would issue for that state (diffed against what the backend holds). Apply
+     * returns 0 (nothing touched) when the slot is empty or a saved unit's cache entry no longer
+     * holds the key it was saved with. Reset empties both slots. */
+    virtual int BindingSave(int slot) {
+        (void)slot;
+        return 0;
+    }
+    virtual int BindingApply(int slot) {
+        (void)slot;
+        return 0;
+    }
+    virtual void BindingReset() {}
 
   protected:
     GdxSeamRegs mR = {};
@@ -194,5 +318,93 @@ void gdx3ds_fx_marker_seam(GdxInterpSeam& I, uint32_t w0, uintptr_t w1);
  * lazy bake (NULL = the bridge did the redirecting: only stub targets draw). Returns 1 when the
  * mesh was drawn natively (the caller skips the list). */
 int gdx3ds_mesh_dl_hook_seam(GdxInterpSeam& I, const void* listPtr, Gdx3dsMeshResolveFn resolve, void* user);
+/* [native] gadget_batch (C5 Stage 3b): the gadget run marker (p=0x6D end / 0x6E verify start). */
+void gdx3ds_gad_marker_seam(GdxInterpSeam& I, uint32_t w0, uintptr_t w1);
+/* [native] dress_retained (C5 Stage 3b): G_DL hook inside the decoration scope. `listPtr` is the
+ * resolved narrow (8-byte packet) decoration list; the machine registry bakes it into a dress
+ * entry on first sight and draws it like a machine mesh. Returns 1 when drawn natively (the
+ * caller skips the list), 0 to walk it (not bakeable: a texture setup list, a load inside). */
+int gdx3ds_mesh_dress_hook_seam(GdxInterpSeam& I, const void* listPtr, size_t listCmds, int stride, int isBig,
+                                Gdx3dsMeshResolveFn resolve, void* user);
+/* [native] machines_speck (c5mach2): draw the resolved LOD-6 far speck natively; 1 = taken.
+ * `packets` = the same list re-packed as host-built 16-byte packets (the bake walker's input). */
+int gdx3ds_mesh_speck_hook_seam(GdxInterpSeam& I, const void* listPtr, const void* packets,
+                                Gdx3dsMeshResolveFn resolve, void* user);
+/* nimach: 1 when a settings reflection model may draw from the dress registry: it is registered
+ * already, or fewer than half the entries are taken (the models never crowd out a race's decorations:
+ * entries are never freed). */
+int gdx3ds_mesh_dress_model_ok(const void* listPtr);
+/* nimach: the interpreter state a machine body entry's stock draw leaves behind (every run's texture /
+ * combine / prim / env words, in order, as DrawMesh applies them) -- applied without drawing, after an
+ * NRR menu entry, so the walk after the marker sees the stock registers (a body list sets its own env
+ * colour in its last runs). No-op when the entry has no live mesh. Drawing thread. */
+void gdx3ds_mesh_apply_tail(GdxInterpSeam& I, int entryIdx, const uint8_t* envRgb /* the stock gDPSetEnvColor before the list (alpha 255), or NULL */);
+/* n60finish [native] finish_mesh: the G_DL the p=0x6A marker armed (Menus_DrawFinish's aFinishDL,
+ * the spinning 3D FINISH banner). The narrow list is baked once into a GPU-resident mesh split at
+ * its texture loads and drawn with the GPU transform; only the first load of each of its two
+ * textures runs per frame. Returns 1 when drawn (the caller skips the list), 0 to walk it. */
+int gdx3ds_mesh_finish_hook_seam(GdxInterpSeam& I, const void* listPtr, size_t listCmds, int stride, int isBig,
+                                 Gdx3dsMeshResolveFn resolve, void* user);
+/* 1 when [native] finish_mesh is on and the GPU transform can take it (latches the mesh ini keys). */
+int gdx3ds_mesh_finish_enabled(void);
+
+/* nicourse [native] ni_course: one course model of the 3D course preview -- Course_DrawModel's G_VTX /
+ * G_TRI2 run after its G_NOOP p=0x6B marker pair (gdx_nicourse.cpp, gdx3ds_course_game.c). */
+struct Gdx3dsCourseRun {
+    const uint8_t* words; /* the run's first command in the walker's list */
+    uint32_t stride;      /* the list's packet stride (16: host-built) */
+    uint32_t nCmds;       /* the run's commands */
+    uint32_t vtxW1;       /* the model's vertex buffer (the marker's w1: the G_VTX operand's low word) */
+    uint32_t vtxCount;    /* its vertex count */
+    uint32_t gen;         /* the buffer's content generation (game side) */
+    int offscreen;        /* the viewport misses the scissor / window: no pixel can be drawn */
+};
+/* A baked model as the walker's hot path draws it: the resident raw Vtx + u16 indices (stock triangle
+ * order), the object box, the run-relative G_VTX the leaving state re-runs. */
+struct Gdx3dsCourseModel {
+    const void* verts;
+    const uint16_t* idx;
+    uint32_t nIdx;
+    float lo[3], hi[3];
+    uint32_t tail[2]; /* the second-to-last and the last G_VTX (run-relative, ~0u none) */
+};
+/* What the cold draw bound, for the walker's material memo (round 2): the gpuxf uniform block (28 vec4,
+ * Gdx3dsXfDraw from mvp to off), the combiner inputs, and the facts the memo is valid under. */
+struct Gdx3dsCourseCold {
+    int drawn;          /* 1 = a native draw went out (the rest is filled) */
+    float xf[28][4];
+    float in[7][4];
+    int numInputs;
+    int cullMode;       /* GDX3DS_CULL_* after G_EX_INVERT_CULLING */
+    int xMode;          /* the vertex math x mode (classification) */
+    float aspect;
+    int memoOk;         /* no texture, fog, lighting or texgen: the block is a function of the key */
+};
+/* The window counters (the mesh module prints them; the walker's hot path adds to them). */
+struct Gdx3dsCourseWin {
+    unsigned frames, models, drawn, nrr, cold, memos, memoFails, offscreen, outside, straddle, hits, bakes, fails;
+    unsigned fbWords, fbVs, fbClip, fbErr, fbBind, fbOpen;
+    unsigned long tris, verts;
+    unsigned maxErrMpx;
+    unsigned vfyModels, vfyBad, vfyWords, vfyMiss;
+    unsigned long long ticks;
+};
+extern Gdx3dsCourseWin gdx3ds_course_win;
+extern int gdx3ds_course_frame_models; /* models seen since the last frame boundary */
+/* 0 off, 1 on, 2 verify (render-side latch; needs gpuxf and the mesh module). */
+int gdx3ds_mesh_course_level(void);
+/* gpuxf_maxerr (the float24 bound, mpx; < 0 = off), latched with the level. ni_course_clip (always
+ * on: a model straddling its clip volume draws through the PICA clipper; no documented use of the
+ * off path -- removed, W6 Fable review) used to be read through a sibling getter here. */
+int gdx3ds_mesh_course_maxerr(void);
+/* Hot: the model of the run's key (baked on first sight), its words checked against the baked copy.
+ * NULL = walk the run (not bakeable, a word differs). */
+const Gdx3dsCourseModel* gdx3ds_mesh_course_model(GdxInterpSeam& I, const Gdx3dsCourseRun& run,
+                                                  Gdx3dsMeshResolveFn resolve, void* user);
+/* Cold: the round-1 draw of a model (gpuxf gates, ResolveDrawState bind, the backend's xf draw).
+ * 1 = taken (drawn, or nothing to draw); 0 = nothing touched. `out` says what was bound. */
+int gdx3ds_mesh_course_cold(GdxInterpSeam& I, const Gdx3dsCourseModel* m, Gdx3dsCourseCold* out);
+/* ni_course=2: compare the baked copy (words + vertex bytes) of the run's key with the live ones. */
+void gdx3ds_mesh_course_verify(const Gdx3dsCourseRun& run, Gdx3dsMeshResolveFn resolve, void* user);
 
 #endif /* GDX3DS_INTERP_SEAM_H */

@@ -15,6 +15,7 @@
 #include "gdx3ds_interp_seam.h"
 #include "gdx3ds_track_interp.h"
 #include "gdx3ds_vtx_math.h"
+#include "gdx3ds_xf_census.h"
 #include "gdx_interp.h"
 
 using namespace gdxn;
@@ -24,6 +25,14 @@ static_assert(offsetof(LoadedVertex, color) == offsetof(GdxSeamVertex, color), "
 static_assert(offsetof(LoadedVertex, clip_out) == offsetof(GdxSeamVertex, clip_out), "LoadedVertex.clip_out offset");
 static_assert(sizeof(Rgba) == sizeof(GdxSeamRgba), "Rgba layout");
 static_assert(kMaxVertices == GDXSEAM_MAX_VERTICES, "vertex cache size");
+static_assert(sizeof(MachMatRec) <= GDXSEAM_MATREC_BYTES && alignof(MachMatRec) <= 8,
+              "gdxn::MachMatRec must fit the seam's opaque record");
+static_assert((int)MM_HIT == GDXSEAM_MM_HIT && (int)MM_MISS_EMPTY == GDXSEAM_MM_MISS_EMPTY && (int)MM_MISS_KEY == GDXSEAM_MM_MISS_KEY &&
+                  (int)MM_MISS_VP == GDXSEAM_MM_MISS_VP && (int)MM_MISS_NOIMP == GDXSEAM_MM_MISS_NOIMP &&
+                  (int)MM_MISS_TEX == GDXSEAM_MM_MISS_TEX && (int)MM_MISS_EPOCH == GDXSEAM_MM_MISS_EPOCH &&
+                  (int)MM_MISS_SMP == GDXSEAM_MM_MISS_SMP && (int)MM_FULL == GDXSEAM_MM_FULL &&
+                  (int)MM_RESULT_COUNT == GDXSEAM_MM_RESULT_COUNT,
+              "MachMatResult drifted from the seam's GDXSEAM_MM_*");
 
 class GdxOwnedSeam final : public GdxInterpSeam {
   public:
@@ -57,7 +66,9 @@ class GdxOwnedSeam final : public GdxInterpSeam {
     void SpVertex(size_t n, size_t dest, const void* vtx) override {
         ProfScope prof(mI->mBackend, 2);
         mI->mStats.vtx += static_cast<uint32_t>(n);
+        gdx3ds_xf_census_path = GDX3DS_XFC_SEAM; /* [debug] xf_census bucket: native replays */
         mI->TransformVertices(static_cast<const uint8_t*>(vtx), n, dest, false);
+        gdx3ds_xf_census_path = GDX3DS_XFC_DL;
     }
     void SpModifyVertex(uint16_t idx, uint8_t where, uint32_t val) override {
         mI->SpModifyVertex(idx, where, val);
@@ -130,6 +141,59 @@ class GdxOwnedSeam final : public GdxInterpSeam {
         if (!mI->ResolveDrawState(false, ds)) {
             return false;
         }
+        FillMaterial(ds, mat);
+        return true;
+    }
+    int BindMaterialRec(GdxSeamMatRec* recs, int ways, int mode, GdxSeamMaterial& mat,
+                        GdxSeamMatOutcome& o) override {
+        MachMatRec* r[GDXSEAM_MATREC_WAYS_MAX];
+        const int n = ways < GDXSEAM_MATREC_WAYS_MAX ? ways : GDXSEAM_MATREC_WAYS_MAX;
+        for (int w = 0; w < n; w++) {
+            r[w] = reinterpret_cast<MachMatRec*>(recs[w].bytes);
+        }
+        MachMatOutcome mo;
+        DrawState ds;
+        const bool ok = mI->MachMatResolve(r, n, mode, ds, mo);
+        o.result = mo.result;
+        o.binds = mo.binds;
+        o.banked = mo.banked;
+        o.checked = mo.checked;
+        o.mismatch = mo.mismatch;
+        o.wasValid = mo.wasValid;
+        o.keyBits = mo.keyBits;
+        o.live = mo.live;
+        if (!ok) {
+            return 0;
+        }
+        FillMaterial(ds, mat);
+        return 1;
+    }
+    int TrackMatBefore(GdxSeamMatRec* table, int nBuckets, int ways, int mode, bool serve, const GdxSeamVertex* tri,
+                       GdxSeamMatOutcome& o) override {
+        MachMatOutcome mo;
+        const int rc = mI->TrackMatBefore(reinterpret_cast<MachMatRec*>(table), nBuckets, ways, mode, serve,
+                                          reinterpret_cast<const LoadedVertex*>(tri), mo);
+        CopyOutcome(mo, o);
+        return rc;
+    }
+    void TrackMatAfter(GdxSeamMatRec* table, int nBuckets, int ways, int mode, int probe,
+                       GdxSeamMatOutcome& o) override {
+        MachMatOutcome mo;
+        memset(&mo, 0, sizeof(mo));
+        mI->TrackMatAfter(reinterpret_cast<MachMatRec*>(table), nBuckets, ways, mode, probe, mo);
+        CopyOutcome(mo, o);
+    }
+    static void CopyOutcome(const MachMatOutcome& mo, GdxSeamMatOutcome& o) {
+        o.result = mo.result;
+        o.binds = mo.binds;
+        o.banked = mo.banked;
+        o.checked = mo.checked;
+        o.mismatch = mo.mismatch;
+        o.wasValid = mo.wasValid;
+        o.keyBits = mo.keyBits;
+        o.live = mo.live;
+    }
+    static void FillMaterial(const DrawState& ds, GdxSeamMaterial& mat) {
         mat.inputMap = ds.comb->shader_input_mapping;
         mat.combUsedTextures[0] = ds.comb->usedTextures[0];
         mat.combUsedTextures[1] = ds.comb->usedTextures[1];
@@ -149,12 +213,32 @@ class GdxOwnedSeam final : public GdxInterpSeam {
         mat.use_alpha = ds.use_alpha;
         mat.use_fog = ds.use_fog;
         mat.use_blend_color = ds.use_blend_color;
-        return true;
     }
     bool LatchVtxState(Gdx3dsVtxMathState& s) override;
     void ApplyDrawConstants() override {
         mI->mBackend->SetCurrentPrimDepth(static_cast<float>(mI->mRdp.prim_depth) / 32767.0f);
         mI->mBackend->SetCurrentAlphaCompareThreshold(static_cast<float>(mI->mRdp.blend_color.a) / 255.0f);
+    }
+    bool ViewportPending() const override {
+        return mI->ViewportPending();
+    }
+    void ApplyViewportScissor() override {
+        mI->ApplyViewportScissor();
+    }
+    bool RegisterScissor(int32_t out[4]) const override {
+        out[0] = mI->mRdp.scissor.x;
+        out[1] = mI->mRdp.scissor.y;
+        out[2] = static_cast<int32_t>(mI->mRdp.scissor.width);
+        out[3] = static_cast<int32_t>(mI->mRdp.scissor.height);
+        return true;
+    }
+    int ExecHookCmds(size_t begin, size_t end) override;
+    int ExecHookCmdList(const uint16_t* idx, size_t n) override;
+    int BindingSave(int slot) override;
+    int BindingApply(int slot) override;
+    void BindingReset() override {
+        mBind[0].valid = false;
+        mBind[1].valid = false;
     }
 
     const void* ResolveVtx(uint64_t w1word, size_t bytes) const {
@@ -173,9 +257,157 @@ class GdxOwnedSeam final : public GdxInterpSeam {
     }
 
   private:
+    /* n60finish: one saved binding (BindingSave / BindingApply). */
+    struct SavedBinding {
+        bool valid;
+        bool used[2];
+        RenderState rs;
+        TexKey key[2];
+    };
+    void ApplyUnit(const SavedBinding& b, int unit);
+
     Interp* mI;
     const void* mListHint = nullptr;
+    SavedBinding mBind[2] = {};
 };
+
+/* n60finish [native] finish_mesh: the hook list's commands [begin, end) through Exec, each with the
+ * frame position the walker would have given it (a G_VTX resolves with the list as its hint). */
+int GdxOwnedSeam::ExecHookCmds(size_t begin, size_t end) {
+    Interp::Frame f;
+    f.list = mI->mDlHookSub;
+    if (f.list.base == nullptr || end > f.list.limit || f.list.isF3d) {
+        return 0;
+    }
+    for (size_t i = begin; i < end; i++) {
+        const Cmd c = ReadCmd(f.list, i);
+        f.idx = i + 1;
+        if (mI->NcOn()) {
+            mI->NcNote(c, false); /* [debug] nicensus */
+        }
+        (void)mI->Exec(c, f, 0);
+    }
+    return 1;
+}
+
+int GdxOwnedSeam::ExecHookCmdList(const uint16_t* idx, size_t n) {
+    Interp::Frame f;
+    f.list = mI->mDlHookSub;
+    if (f.list.base == nullptr || f.list.isF3d) {
+        return 0;
+    }
+    for (size_t k = 0; k < n; k++) {
+        if (idx[k] >= f.list.limit) {
+            return 0;
+        }
+        const Cmd c = ReadCmd(f.list, idx[k]);
+        f.idx = static_cast<size_t>(idx[k]) + 1u;
+        if (mI->NcOn()) {
+            mI->NcNote(c, false); /* [debug] nicensus */
+        }
+        (void)mI->Exec(c, f, 0);
+    }
+    return 1;
+}
+
+/* What the last ResolveDrawState left in mRs (each used unit's slot, sampler, the shader, depth,
+ * decal, alpha) and the cache key of each used unit's slot. */
+int GdxOwnedSeam::BindingSave(int slot) {
+    if (slot < 0 || slot > 1 || !mI->mTriMemoValid || mI->mTriMemo.comb == nullptr) {
+        return 0;
+    }
+    SavedBinding& b = mBind[slot];
+    b.valid = false;
+    b.rs = mI->mRs;
+    for (int i = 0; i < 2; i++) {
+        b.used[i] = mI->mTriMemo.comb->usedTextures[i];
+        if (!b.used[i]) {
+            continue;
+        }
+        const int16_t s = b.rs.textures[i];
+        if (s < 0 || !mI->mTex[s].uploaded) {
+            return 0;
+        }
+        memcpy(&b.key[i], &mI->mTex[s].key, sizeof(TexKey));
+    }
+    b.valid = true;
+    return 1;
+}
+
+/* One used unit, in ResolveDrawState's order: the texture (a cache hit's select + LRU refresh), then
+ * the sampler when it differs from what the backend holds. */
+void GdxOwnedSeam::ApplyUnit(const SavedBinding& b, int unit) {
+    RenderState& rs = mI->mRs;
+    const int16_t s = b.rs.textures[unit];
+    if (rs.textures[unit] != s) {
+        mI->Flush(FLUSH_TEXTURE);
+        mI->mBackend->SelectTexture(unit, mI->mTex[s].texture_id);
+        rs.textures[unit] = s;
+        mI->TexCacheTouch(s);
+    }
+    if (!rs.sampler_valid[unit] || rs.sampler_linear[unit] != b.rs.sampler_linear[unit] ||
+        rs.sampler_cms[unit] != b.rs.sampler_cms[unit] || rs.sampler_cmt[unit] != b.rs.sampler_cmt[unit]) {
+        mI->Flush(FLUSH_SAMPLER);
+        mI->mBackend->SetSamplerParameters(unit, b.rs.sampler_linear[unit], b.rs.sampler_cms[unit],
+                                           b.rs.sampler_cmt[unit]);
+        rs.sampler_valid[unit] = true;
+        rs.sampler_linear[unit] = b.rs.sampler_linear[unit];
+        rs.sampler_cms[unit] = b.rs.sampler_cms[unit];
+        rs.sampler_cmt[unit] = b.rs.sampler_cmt[unit];
+    }
+}
+
+/* The saved binding back on the backend, diffed against mRs like ResolveDrawState's apply half. The
+ * registers still hold the OTHER texture's tiles, so neither tri memo may describe this state: the
+ * banked key is dropped (the next resolve runs in full) and the last-resolve view is cleared. */
+int GdxOwnedSeam::BindingApply(int slot) {
+    if (slot < 0 || slot > 1 || !mBind[slot].valid) {
+        return 0;
+    }
+    const SavedBinding& b = mBind[slot];
+    for (int i = 0; i < 2; i++) {
+        if (!b.used[i]) {
+            continue;
+        }
+        const int16_t s = b.rs.textures[i];
+        if (s < 0 || !mI->mTex[s].uploaded || memcmp(&mI->mTex[s].key, &b.key[i], sizeof(TexKey)) != 0) {
+            return 0;
+        }
+    }
+    if (mI->mNrrOpen) {
+        mI->NrrHudHotClose(); /* [native] nrr_hud: binding the backend closes the core */
+    }
+    RenderState& rs = mI->mRs;
+    if (b.rs.depth_test_and_mask != rs.depth_test_and_mask) {
+        mI->Flush(FLUSH_DEPTH);
+        mI->mBackend->SetDepthTestAndMask((b.rs.depth_test_and_mask & 1u) != 0, (b.rs.depth_test_and_mask & 2u) != 0);
+        rs.depth_test_and_mask = b.rs.depth_test_and_mask;
+    }
+    if (b.rs.decal_mode != rs.decal_mode) {
+        mI->Flush(FLUSH_DECAL);
+        mI->mBackend->SetZmodeDecal(b.rs.decal_mode != 0);
+        rs.decal_mode = b.rs.decal_mode;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (b.used[i]) {
+            ApplyUnit(b, i);
+        }
+    }
+    if (b.rs.shader_program != rs.shader_program) {
+        mI->Flush(FLUSH_SHADER);
+        mI->mBackend->UnloadShader(rs.shader_program);
+        mI->mBackend->LoadShader(b.rs.shader_program);
+        rs.shader_program = b.rs.shader_program;
+    }
+    if (b.rs.alpha_blend != rs.alpha_blend) {
+        mI->Flush(FLUSH_ALPHA);
+        mI->mBackend->SetUseAlpha(b.rs.alpha_blend != 0);
+        rs.alpha_blend = b.rs.alpha_blend;
+    }
+    mI->mTmKey.valid = false;
+    mI->mTriMemoValid = false;
+    return 1;
+}
 
 /* Latch SpVertex's RSP inputs (gdx_rsp.cpp), the shapes gdx3ds_vtx_math.h models. */
 bool GdxOwnedSeam::LatchVtxState(Gdx3dsVtxMathState& s) {

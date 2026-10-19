@@ -1,0 +1,419 @@
+{
+  "kind": "gdx-bottom-screen-design",
+  "version": 1,
+  "exportedAt": "2026-10-17T17:31:37.120Z",
+  "seedSource": "native/nibottom@c20beedb",
+  "screen": {
+    "w": 320,
+    "h": 240,
+    "cell": 8
+  },
+  "openNotes": 7,
+  "changes": [
+    {
+      "screen": "menu-STA",
+      "element": "tab-sta",
+      "change": "edited",
+      "fields": {
+        "y": {
+          "was": 8,
+          "now": 0
+        },
+        "bg": {
+          "was": "#FFFFFF",
+          "now": "#ffffff"
+        },
+        "action": {
+          "was": "switch MENU to the STA tab",
+          "now": "show STA tab"
+        },
+        "notes": {
+          "was": "Reverse-video (white bg, black text) while this is the open tab.",
+          "now": null
+        }
+      }
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-off",
+      "change": "added",
+      "now": {
+        "id": "tab-off",
+        "type": "button",
+        "x": 296,
+        "y": 0,
+        "w": 24,
+        "h": 8,
+        "text": "OFF",
+        "fg": "#000000",
+        "bg": "#ffffff",
+        "touch": true,
+        "action": "turn bottom screen off"
+      }
+    },
+    {
+      "screen": "menu-STA",
+      "element": "fps-row",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-dsp",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-3d",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-aud",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-in",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-lg",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-dbg",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "tab-ab",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "off-button-label",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "off-button-hitbox",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-heap-row",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-linear-row",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-cpu-build-row",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-build-row",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-audio-3d-row",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-hint-row1",
+      "change": "removed"
+    },
+    {
+      "screen": "menu-STA",
+      "element": "sta-hint-row2",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-background",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-header-panel",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-course-name",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-racer-count",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-mode-chip",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-menu-button",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-portrait-box",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-our-position",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-box",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-rank-0",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-swatch-0",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-rank-1",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-swatch-1",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-rank-2",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-swatch-2",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-rank-3",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-swatch-3",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-rank-4",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-swatch-4",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-standings-hilite",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-lap-label",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-lap-value",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-time-label",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-time-value",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-best-label",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-best-value",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-gap-label",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-gap-value",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-boost-box",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-boost-ready-badge",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-speed-box",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-map-box",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-energy-bar-panel",
+      "change": "removed"
+    },
+    {
+      "screen": "dash",
+      "element": "dash-energy-bar-fill",
+      "change": "removed"
+    }
+  ],
+  "screens": [
+    {
+      "id": "menu-STA",
+      "name": "MENU · STA tab",
+      "notes": "",
+      "elements": [
+        {
+          "id": "tab-sta",
+          "type": "tab",
+          "x": 0,
+          "y": 0,
+          "w": 24,
+          "h": 8,
+          "text": "STA",
+          "fg": "#000000",
+          "bg": "#ffffff",
+          "touch": true,
+          "action": "show STA tab"
+        },
+        {
+          "id": "tab-off",
+          "type": "button",
+          "x": 296,
+          "y": 0,
+          "w": 24,
+          "h": 8,
+          "text": "OFF",
+          "fg": "#000000",
+          "bg": "#ffffff",
+          "touch": true,
+          "action": "turn bottom screen off"
+        }
+      ],
+      "pins": [],
+      "hasBackgroundImage": false
+    },
+    {
+      "id": "dash",
+      "name": "DASH (race HUD)",
+      "notes": "",
+      "elements": [],
+      "pins": [
+        {
+          "number": 1,
+          "id": "note-2",
+          "x": 159,
+          "y": 10,
+          "text": "Energy bar isn't flat in the real UI assets. maybe because its borrowing from the real assets, it has 'overflow' that is cut off ontop. Should either resize/adjust or just have a diff bar or get rid of the background. Explore correct option.",
+          "status": "change",
+          "elementId": null
+        },
+        {
+          "number": 2,
+          "id": "note-1",
+          "x": 12,
+          "y": 92,
+          "text": "These portrait elements don't update based on the racers/position. They're static and essentially useless as is. Also they don't follow the sizing of the original HUD, where the top 2 racers have bigger portraits.",
+          "status": "change",
+          "elementId": null
+        },
+        {
+          "number": 3,
+          "id": "note-3",
+          "x": 22,
+          "y": 39,
+          "text": "This position element has a black background that overflows onto the mini map",
+          "status": "change",
+          "elementId": null
+        },
+        {
+          "number": 4,
+          "id": "note-4",
+          "x": 161,
+          "y": 95,
+          "text": "Mini map could probably afford to be a bit smaller, uses a lot of prime real estate. would give everything else some more room.",
+          "status": "change",
+          "elementId": null
+        },
+        {
+          "number": 5,
+          "id": "note-5",
+          "x": 272,
+          "y": 230,
+          "text": "Useful info ",
+          "status": "change",
+          "elementId": null
+        },
+        {
+          "number": 6,
+          "id": "note-6",
+          "x": 286,
+          "y": 179,
+          "text": "Basically useless. Bar turns green when boost power. More useful would be the 'knockout' stars which are not visible anywhere on the second screen HUD. i'd put the stars at the top of this right side column.",
+          "status": "change",
+          "elementId": null
+        },
+        {
+          "number": 7,
+          "id": "note-7",
+          "x": 276,
+          "y": 45,
+          "text": "When the race ends, this goes up to 4/3. Should be clamped. ",
+          "status": "change",
+          "elementId": null
+        }
+      ],
+      "hasBackgroundImage": false
+    }
+  ]
+}

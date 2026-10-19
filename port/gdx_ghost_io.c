@@ -37,6 +37,44 @@
 #include <sys/stat.h>
 #endif
 
+#ifndef _WIN32
+#include "gdx_save_replace.h"
+
+/* N60SAVE: rename() never replaces an existing file on the 3DS SD archive (libctru's fallback
+ * keys on a result code the SD archive does not return), so re-saving a ghost or the selection
+ * table failed there. Same crash-safe replace as fzerox.sav (port/gdx_save_replace.h). */
+static int gdx_ghost_fs_rename(void* ctx, const char* from, const char* to) {
+    (void) ctx;
+    return rename(from, to);
+}
+
+static int gdx_ghost_fs_remove(void* ctx, const char* path) {
+    (void) ctx;
+    return remove(path);
+}
+
+static int gdx_ghost_fs_exists(void* ctx, const char* path) {
+    struct stat st;
+    (void) ctx;
+    return stat(path, &st) == 0 ? 1 : 0;
+}
+
+static int gdx_ghost_replace_file(const char* tempPath, const char* path) {
+    GdxSaveFsOps ops;
+    char bakPath[2100];
+    int n = snprintf(bakPath, sizeof(bakPath), "%s.bak", path);
+    if (n < 0 || (size_t) n >= sizeof(bakPath)) {
+        return 0;
+    }
+    ops.rename_file = gdx_ghost_fs_rename;
+    ops.remove_file = gdx_ghost_fs_remove;
+    ops.file_exists = gdx_ghost_fs_exists;
+    ops.file_valid = NULL;
+    ops.ctx = NULL;
+    return gdx_save_replace(&ops, tempPath, path, bakPath, 1, 0, NULL) == GDX_SAVE_REPLACE_OK;
+}
+#endif
+
 /* ---------------------------------------------------------------------------------
  * Mirrored decomp ghost structs.
  *
@@ -414,7 +452,7 @@ static int gdx_ghost_write_container(const char* path, GdxGhostSave* save) {
         return GDX_GHOST_ERR_IO;
     }
 #else
-    if (rename(tempPath, path) != 0) {
+    if (!gdx_ghost_replace_file(tempPath, path)) {
         remove(tempPath);
         return GDX_GHOST_ERR_IO;
     }
@@ -654,7 +692,7 @@ static int gdx_ghost_selection_write(const GdxGhostSelection* selections, int co
         return GDX_GHOST_ERR_IO;
     }
 #else
-    if (rename(tempPath, path) != 0) {
+    if (!gdx_ghost_replace_file(tempPath, path)) {
         remove(tempPath);
         return GDX_GHOST_ERR_IO;
     }

@@ -3,6 +3,8 @@
 // which would double-wrap StartFrame/EndFrame.
 // Must build into the G-Diffuser executable target only, never the gdiffuser_game OBJECT library.
 
+#include <cstdarg> // HAZARD CRUMBS (native/n3dsfix): va_list for GdxHazardCrumb's printf-style format
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -664,6 +666,25 @@ static inline bool IsLikelyBigEndianDisplayList(const N64Gfx* source, size_t rea
         }
     }
     return false;
+}
+
+/* [dlmemo] The commands IsLikelyBigEndianDisplayList above reads (their w0 words), given the
+   same readable limit: the answer is a function of those words only. Kept beside it so the two
+   read patterns cannot drift apart. */
+static inline size_t BigEndianSniffExtent(const N64Gfx* source, size_t readableLimit) {
+    if (readableLimit == 0) return 0;
+    uint32_t w0 = source[0].w0;
+    uint8_t opL = w0 >> 24;
+    uint8_t opB = w0 & 0xFF;
+    if (opL == 0 && opB != 0) return 1;
+    if ((opB >= 0xB0 || opB == 0x01 || opB == 0x04) && opL < 0x20) return 1;
+    const size_t scan = (readableLimit < 64) ? readableLimit : 64;
+    for (size_t i = 0; i < scan; i++) {
+        const uint8_t op = static_cast<uint8_t>(source[i].w0 & 0xFFu);
+        if (!IsLikelyDisplayListOpcode(op)) return i + 1;
+        if (op == 0xDF || op == 0xB8) return i + 1;
+    }
+    return scan;
 }
 
 constexpr uint8_t kGfxSegmentCount = 16;
@@ -1656,6 +1677,7 @@ bool LookupAssetSegment(uint32_t raw, AssetSegmentLookup& out) {
  * verbatim. ProcessList uses this so a wide packet carrying a placeholder is not mistaken for a
  * real host pointer just because its high32 is set. */
 static bool GdxBrFastOn(); // defined below (per-list micro-opt killswitch)
+static bool GdxBrFastRelatch(); // adapter constructor only: the once-per-task live read
 
 /* [brfast] IsAssetPlaceholderPointer runs for EVERY host-pointer command of every host-built
    list (VTX/MTX/DL/SETTIMG/MOVEMEM: the placeholder-redirect exception in ProcessList), and a
@@ -4291,12 +4313,50 @@ static bool GdxDlFactsOn() {
    (3DS ini) or GDX_BRFAST=0 (desktop env) restores the byte-identical legacy path: every
    fast helper below is an exact re-implementation that memoizes results of pure functions
    (per-frame per-list facts, append-only range lookups) instead of recomputing them. */
+#ifdef __3DS__
+/* [o3dsinterp] The LATCH the hot sites read. The comment below always said "one config lookup
+   per gfx task, from the adapter constructor" -- but three free-function sites
+   (IsAssetPlaceholderPointer, the raw-texture-copy index, the N64-range memo) called this same
+   function per CALL, i.e. an ini table walk + strcmp per host-pointer command. o3dsflags' PC
+   profile of the Old 3DS lane race window put that at ~12.6% of render/interp-thread samples.
+   Now the adapter constructor re-reads the ini once per task (GdxBrFastRelatch) and everything
+   else reads this word, so the DBG-tab toggle still applies from the next task. brfast=0 and 1
+   are byte-identical by construction (every fast helper memoises a pure function), so WHEN a
+   toggle lands cannot change a pixel. -1 = not yet read (first call reads live). */
+static std::atomic<int> gGdxBrFastLatch{ -1 };
+static bool GdxBrFastReadLive() {
+    return gdx3ds_config_get_bool("debug", "brfast", 1) != 0;
+}
+static bool GdxBrFastRelatch() {
+    const bool on = GdxBrFastReadLive();
+    gGdxBrFastLatch.store(on ? 1 : 0, std::memory_order_relaxed);
+    return on;
+}
+#endif
+
+static int gGdxBrFastLive = -1; /* [debug] brfast_live, latched at the first GdxBrFastOn() */
+static bool GdxBrFastLiveOn() {
+    return gGdxBrFastLive == 1;
+}
+
 static bool GdxBrFastOn() {
 #ifdef __3DS__
-    // Read LIVE (one config lookup per gfx task, from the adapter constructor) so the DBG-tab
-    // BRFAST toggle applies to the next frame without a reboot -- the A/B on hardware is a
-    // touch, not an ini swap. Each adapter latches its own copy for the task's lifetime.
-    return gdx3ds_config_get_bool("debug", "brfast", 1) != 0;
+    /* [debug] brfast_live=1 restores the historic per-call ini read (the A/B arm for the latch);
+       the lever itself is read once. Default 0 = the latch. */
+    int& sLive = gGdxBrFastLive;
+    if (sLive < 0) {
+        sLive = gdx3ds_config_get_bool("debug", "brfast_live", 0) ? 1 : 0;
+        gdx_port_logf("[brfast] latch live=%d (0 = [debug] brfast read once per task by the adapter; "
+                      "1 = the historic per-call read)\n", sLive);
+    }
+    if (sLive == 1) {
+        return GdxBrFastReadLive();
+    }
+    int v = gGdxBrFastLatch.load(std::memory_order_relaxed);
+    if (v < 0) {
+        v = GdxBrFastRelatch() ? 1 : 0;
+    }
+    return v == 1;
 #else
     static int sOn = -1;
     if (sOn < 0) {
@@ -4306,6 +4366,12 @@ static bool GdxBrFastOn() {
     return sOn == 1;
 #endif
 }
+
+#ifndef __3DS__
+static bool GdxBrFastRelatch() {
+    return GdxBrFastOn(); /* desktop: the env is read once; nothing to re-latch */
+}
+#endif
 
 /* [stubmemo] Killswitch for the NARROWED gWideStubMemo key. [debug] stubgen=0 (3DS ini) or
    GDX_STUBGEN=0 (desktop env) restores the byte-identical old key -- the all-sixteen mSegGen --
@@ -4413,7 +4479,7 @@ class N64DisplayListAdapter {
           mRootByteEnd(reinterpret_cast<uintptr_t>(root) + rootSizeBytes),
           mIsBig(isBig),
           mStats(stats),
-          mBrFast(GdxBrFastOn()),
+          mBrFast(GdxBrFastRelatch()), /* the once-per-task live read (see gGdxBrFastLatch) */
           mStubGenNarrow(GdxStubGenNarrowOn()) {
         GetMainModuleRange(mModuleBegin, mModuleEnd);
         if (mBrFast) {
@@ -7248,9 +7314,20 @@ class N64DisplayListAdapter {
         *outBig = isBig;
         *outF3d = isF3d;
     }
-    /* == TranslateDisplayListPointer minus the conversion enqueue and the diag budgets. */
+    /* == TranslateDisplayListPointer minus the conversion enqueue and the diag budgets.
+       [dlmemo] outMemoOk (optional): set to 1 only when the answer is a function of the
+       memo key the owned walker holds (docs/research/native/c5dlmemo-progress.md §1) plus the
+       opcode bytes up to the terminator: no alignment fallback (whose answer also depends on
+       the FIRST candidate's bytes failing validation), not the raw big-endian class (whose
+       endianness sniff reads past the terminator), and not inside the task's root range
+       (RootCommandLimit's term). */
     bool NativeResolveList(uint32_t raw, bool hostPtr, uintptr_t hostFull, const N64Gfx** outPtr,
-                           size_t* outLimit, size_t* outStride, bool* outBig, bool* outF3d) {
+                           size_t* outLimit, size_t* outStride, bool* outBig, bool* outF3d,
+                           int* outMemoOk = nullptr, uint32_t* outSniffCmds = nullptr) {
+        if (outMemoOk != nullptr) {
+            *outMemoOk = 0;
+        }
+        bool alignedFallback = false;
         if (!hostPtr) {
             const uint32_t epoch = GdxSegmentEpochSnapshot();
             if (!GdxSegmentEpochStable(epoch)) {
@@ -7273,6 +7350,7 @@ class N64DisplayListAdapter {
             const uint32_t alignedRaw = raw & ~static_cast<uint32_t>(7u);
             if (alignedRaw != raw) {
                 const N64Gfx* alignedTarget = ResolveDisplayListSource(alignedRaw);
+                alignedFallback = true;
                 if (isValidTarget(alignedTarget)) {
                     raw = alignedRaw;
                     target = alignedTarget;
@@ -7289,7 +7367,38 @@ class N64DisplayListAdapter {
             return false;
         }
         NativeListFacts(target, limit, outPtr, outLimit, outStride, outBig, outF3d);
+        if (outMemoOk != nullptr) {
+            *outMemoOk = NativeListMemoAdmissible(target, *outStride, limit, alignedFallback);
+            if (*outMemoOk == 2 && outSniffCmds != nullptr) {
+                *outSniffCmds = static_cast<uint32_t>(
+                    BigEndianSniffExtent(target, ReadableCommandLimit(target, kN64GfxStride)));
+            }
+        }
         return true;
+    }
+    /* [dlmemo] see NativeResolveList. 0 = not admissible; 1 = the answer reads the list's
+       opcode bytes up to its terminator only; 2 = the raw class: CommandSourceIsBigEndian's own
+       guard (a narrow list in a raw N64 range that is not a command range) runs
+       IsLikelyBigEndianDisplayList, which also reads the w0 words of the first
+       BigEndianSniffExtent commands (at most 64). Admitted only when the limit (<= the readable
+       command limit) is at least 64, so that extent does not depend on the memory map. */
+    int NativeListMemoAdmissible(const N64Gfx* target, size_t stride, size_t limit, bool alignedFallback) const {
+        if (alignedFallback || target == nullptr) {
+            return 0;
+        }
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(target);
+        if (mRootBegin != nullptr && ptr >= reinterpret_cast<uintptr_t>(mRootBegin) && ptr < mRootByteEnd) {
+            return 0;
+        }
+        if (stride == kN64GfxStride && IsRawN64HostPointer(ptr) && !IsHostN64CommandPointer(ptr)) {
+            return (limit >= 64u) ? 2 : 0;
+        }
+        return 1;
+    }
+    /* [dlmemo] the root range, for the memo's per-entry exclusion test. */
+    void NativeRootRange(uintptr_t* begin, uintptr_t* end) const {
+        *begin = reinterpret_cast<uintptr_t>(mRootBegin);
+        *end = mRootByteEnd;
     }
     /* == ResolveGuarded + NormalizeLusDirectPointer (the shared tail of the data cases). */
     uintptr_t NativeResolveData(uint32_t raw, bool hostPtr, uintptr_t hostFull, size_t requiredBytes,
@@ -9528,6 +9637,9 @@ extern "C" void gdx_register_n64_framebuffer(void* cpuAddr, unsigned int width, 
  * do not compile the 3DS oracle TU and never paid this cost anyway. See the comment on
  * sFastWrite there for the 2-seconds-per-image measurement this exists to kill. */
 extern "C" int gdx3ds_shot_fastwrite(void) __attribute__((weak));
+/* B11q: 3DS stereo layer (port/3ds/gfx/gdx3ds_stereo.cpp). Weak -- the desktop link has
+ * no 3DS backend, and a taskless hold present is a no-op for a mono renderer. */
+extern "C" void gdx3ds_stereo_mark_hold_frame(void) __attribute__((weak));
 
 /* Give a BMP stream one 64 KB stdio buffer instead of newlib's ~1 KB default, so a row-at-a-
  * time dump goes to the SD card in a handful of FS transactions rather than one per row. The
@@ -9909,6 +10021,26 @@ extern "C" void gdx3ds_gpuprof_note_shot(const char* label) __attribute__((weak)
 extern "C" void gdx_oracle_capture_request(const char* tag) __attribute__((weak));
 extern "C" int gdx3ds_oracle_owns_shot(void) __attribute__((weak));
 
+/* BOTTOMHUD (port/3ds/gdx3ds_racemap.c): the ORACLE captures the citro3d MAIN TARGET, which
+   is the TOP screen and nothing else -- the bottom screen is a libctru console framebuffer,
+   not a citro3d target, so no oracle capture can ever contain it. This arms the matching
+   bottom capture (autotest/<tag>_B.bmp), written by the next main-thread map paint. Weak for
+   the same reason as above, and a no-op unless [debug] bottom_map is on. */
+extern "C" void gdx3ds_racemap_note_shot(const char* label) __attribute__((weak));
+
+/* nibottom Phase 2 (port/3ds/gdx3ds_bottomhud.c): same reasoning as gdx3ds_racemap_note_shot
+   above, for the DASH's own bottom-screen box (autotest/<tag>_R.bmp). A no-op unless
+   [debug] bottom_race is on. */
+extern "C" void gdx3ds_bottomhud_note_shot(const char* label) __attribute__((weak));
+
+/* nidle verification gap (port/3ds/gdx3ds_menu.c): the plain tab-bar console UI -- the bottom
+   screen's own default owner whenever neither the race DASH nor the idle view's takeover above
+   applies -- had no SHOT hook at all until now, so a SHOT requested while it owns the screen
+   (e.g. the DEBUG button's own console, outside a race) silently produced no bottom-screen BMP.
+   Same reasoning/shape as gdx3ds_racemap_note_shot/gdx3ds_bottomhud_note_shot above (autotest/
+   <tag>_R.bmp, written by the next main-thread console tick); a no-op unless [menu] enabled. */
+extern "C" void gdx3ds_menu_note_shot(const char* label) __attribute__((weak));
+
 extern "C" void gdx_request_frame_dump(const char* label) {
     if (label == nullptr || label[0] == '\0') {
         return;
@@ -9933,6 +10065,15 @@ extern "C" void gdx_request_frame_dump(const char* label) {
     }
     if (gdx3ds_gpuprof_note_shot != nullptr) {
         gdx3ds_gpuprof_note_shot(label);
+    }
+    if (gdx3ds_racemap_note_shot != nullptr) {
+        gdx3ds_racemap_note_shot(label);
+    }
+    if (gdx3ds_bottomhud_note_shot != nullptr) {
+        gdx3ds_bottomhud_note_shot(label);
+    }
+    if (gdx3ds_menu_note_shot != nullptr) {
+        gdx3ds_menu_note_shot(label);
     }
     if (gdx_oracle_capture_request != nullptr && gdx3ds_oracle_owns_shot != nullptr && gdx3ds_oracle_owns_shot()) {
         gdx_oracle_capture_request(label);
@@ -10017,12 +10158,121 @@ extern "C" void gdx_gfx_post_run_capture(void) {
 static unsigned long gFrameMirrorSeq = 0;
 static int gFrameMirrorLastMode = -1;
 
+/* C5 Stage 4 frame tail, `[debug] mirror_lazy` (3DS only, default 0 = stock eager copy).
+ * The mirror copy (a VBO flush, a split and a 384 KB PPF copy, ~0.3 ms per task on the Old 3DS,
+ * hw-rel2 mir=) is read only by a hold present, a transition snapshot, a SHOT/named dump or the
+ * env capture. Lazy: when none of those is armed at the task's epilogue, the frame's pixels stay
+ * in fb0 (nothing draws into fb0 between the epilogue and the next frame's clear), and the copy
+ * runs only when a consumer needs it (GdxMaterializeFrameMirror): the hold present copies fb0
+ * into the mirror right before its clear, gdx_read_current_framebuffer before its read. */
+static bool gFrameMirrorPending = false;
+
+#if defined(GDX_PLATFORM_3DS)
+extern "C" int gdx3ds_config_get_int(const char* section, const char* key, int fallback);
+extern "C" int gdx3ds_config_loaded(void);
+extern "C" int gdx3ds_rt_mode(void) __attribute__((weak));
+
+/* HAZARD CRUMBS (native/n3dsfix, docs/research/native/hw-n60-3d7-analysis.md): the New3DS
+ * attract-demo freeze near frame ~6900-7100 always follows a "[transition] capture" line (the
+ * demo-to-demo fade reading the LCD scanout) that overlaps the next course's [trkres] bake/
+ * adopt. These crumbs bracket GdxRtFence() and the scanout read inside
+ * gdx_read_current_framebuffer so a hardware capture can tell a GdxRtFence() stall (render-
+ * thread join; expected to be a no-op at renderthread=0, but a crumb beats an assumption) apart
+ * from a GdxReadTopScanoutRgba16() stall. Durable: each crumb is flushed synchronously so it
+ * survives a freeze one line later. [debug] hazard_crumbs (default 0): zero cost unless armed. */
+extern "C" void gdx3ds_filelog_write(const char* msg, size_t len) __attribute__((weak));
+extern "C" void gdx3ds_filelog_flush(void) __attribute__((weak));
+static bool GdxHazardCrumbsOn() {
+    static int on = -1;
+    if (on < 0) {
+        on = gdx3ds_config_get_int("debug", "hazard_crumbs", 0) != 0 ? 1 : 0;
+    }
+    return on > 0;
+}
+static void GdxHazardCrumb(const char* fmt, ...) {
+    if (!GdxHazardCrumbsOn() || &gdx3ds_filelog_write == nullptr) {
+        return;
+    }
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        gdx3ds_filelog_write(buf, (size_t)n);
+        if (&gdx3ds_filelog_flush != nullptr) {
+            gdx3ds_filelog_flush();
+        }
+    }
+}
+#endif
+
+static bool GdxMirrorLazy() {
+#if defined(GDX_PLATFORM_3DS)
+    static int sLazy = -1;
+    if (sLazy < 0 && gdx3ds_config_loaded()) {
+        const char* capEnv = std::getenv("GDX_CAPTURE_FRAMES");
+        const bool capture = capEnv != nullptr && *capEnv != '\0';
+        /* renderthread=0 only: the transition read materializes from the game thread, which
+         * owns the C3D frame only when there is no render thread. */
+        const bool want = gdx3ds_config_get_int("debug", "mirror_lazy", 0) != 0;
+        const int rtMode = (&gdx3ds_rt_mode != nullptr) ? gdx3ds_rt_mode() : 0;
+        sLazy = (want && !capture && rtMode == 0) ? 1 : 0;
+        gdx_port_logf("[overlap] mirror_lazy=%d (asked %d, rt=%d)\n", sLazy, want ? 1 : 0, rtMode);
+    }
+    return sLazy > 0;
+#else
+    return false;
+#endif
+}
+
+static bool GdxMirrorConsumerArmed() {
+    extern int gGameModeChangeState; /* an s16 in game.c: declared int like the rest of this file, read as 16 bits */
+    const short changeState = *reinterpret_cast<const short*>(&gGameModeChangeState);
+    return gPendingNamedDumpArmed || changeState != 0 || GdxTransitionCapturePendingThisTick();
+}
+
+/* mirror_lazy receipt: per 1024 mirror refreshes, how many were deferred, copied eagerly (a
+ * consumer was armed) and materialized later by a hold present / a transition read. */
+enum GdxMirrorStat { GDX_MIRROR_DEFERRED, GDX_MIRROR_EAGER, GDX_MIRROR_MAT_HOLD, GDX_MIRROR_MAT_READ, GDX_MIRROR_STATS };
+static unsigned long gFrameMirrorStats[GDX_MIRROR_STATS];
+
+static void GdxMirrorStatEmitMaybe() {
+    const unsigned long refreshes = gFrameMirrorStats[GDX_MIRROR_DEFERRED] + gFrameMirrorStats[GDX_MIRROR_EAGER];
+    if (refreshes == 0 || (refreshes & 1023ul) != 0) {
+        return;
+    }
+    gdx_port_logf("[overlap] mirror refreshes=%lu deferred=%lu eager=%lu mat_hold=%lu mat_read=%lu\n", refreshes,
+                  gFrameMirrorStats[GDX_MIRROR_DEFERRED], gFrameMirrorStats[GDX_MIRROR_EAGER],
+                  gFrameMirrorStats[GDX_MIRROR_MAT_HOLD], gFrameMirrorStats[GDX_MIRROR_MAT_READ]);
+}
+
+static void GdxMaterializeFrameMirror(Fast::Interpreter* interp, GdxMirrorStat why) {
+    if (!gFrameMirrorPending || gFrameMirrorFb < 0) {
+        return;
+    }
+    interp->CopyFrameBuffer(gFrameMirrorFb, 0, false, nullptr);
+    gFrameMirrorPending = false;
+    gFrameMirrorStats[why]++;
+}
+
 static void GdxUpdateFrameMirror(const std::shared_ptr<Fast::Interpreter>& interp) {
     if (gFrameMirrorFb < 0) {
         gFrameMirrorFb = interp->CreateFrameBuffer(320, 240, 320, 240, 1, false);
     }
     if (gFrameMirrorFb >= 0) {
-        interp->CopyFrameBuffer(gFrameMirrorFb, 0, false, nullptr);
+        const bool lazy = GdxMirrorLazy();
+        if (lazy && !GdxMirrorConsumerArmed()) {
+            gFrameMirrorPending = true; /* mirror_lazy: the pixels stay in fb0 for now */
+            gFrameMirrorStats[GDX_MIRROR_DEFERRED]++;
+        } else {
+            interp->CopyFrameBuffer(gFrameMirrorFb, 0, false, nullptr);
+            gFrameMirrorPending = false;
+            gFrameMirrorStats[GDX_MIRROR_EAGER] += lazy ? 1ul : 0ul;
+        }
+        if (lazy) {
+            GdxMirrorStatEmitMaybe();
+        }
         gFrameMirrorValid = true;
         ++gFrameMirrorSeq;
         gFrameMirrorLastMode = (gGameMode & 0x1F);
@@ -10369,6 +10619,18 @@ extern "C" void gdx_vi_present_fallback(void) {
                                  interp->mNativeDimensions.height != 0
                                      ? static_cast<float>(interp->mCurDimensions.height) / interp->mNativeDimensions.height
                                      : 1.0f);
+    /* Hoisted above the clear for B11q: the clear's right-eye mirror has to know whether
+     * this present will refill the target with DRAWS (the VI-scanout branch below, which
+     * goes through the normal per-eye draw loop) or with a framebuffer COPY (the hold
+     * branch, which has no right eye at all). Same three inputs, read one statement
+     * earlier; nothing between here and its old site touches them. */
+    const bool holdGpuFrame = sGpuContentLive && gFrameMirrorValid && gFrameMirrorFb >= 0;
+    if (holdGpuFrame && &gdx3ds_stereo_mark_hold_frame != nullptr) {
+        gdx3ds_stereo_mark_hold_frame(); /* B11q: keep the right eye, nothing will redraw it */
+    }
+    if (holdGpuFrame) {
+        GdxMaterializeFrameMirror(interp.get(), GDX_MIRROR_MAT_HOLD); /* mirror_lazy: fb0 still holds the last task's frame */
+    }
     rapi->ClearFramebuffer(true, true);
 
     // Source selection. Once GPU content is live, a taskless present re-presents
@@ -10410,7 +10672,6 @@ extern "C" void gdx_vi_present_fallback(void) {
     // 3 presents flashed black" fix above is untouched) and the vifb-scanout
     // (non-GPU-content-live) path below is byte-for-byte unchanged. Branch A
     // (the mRendersToFb re-composite above) is untouched.
-    const bool holdGpuFrame = sGpuContentLive && gFrameMirrorValid && gFrameMirrorFb >= 0;
     GdxPresentPathTrace(holdGpuFrame ? "vifb-held-gpu-mirror" : "vifb-vi-scanout");
     if (holdGpuFrame) {
         // Diag only: true iff a real task refreshed the mirror since the previous
@@ -11451,11 +11712,11 @@ static void GdxEmitWalkReceipts() {
             /* [brfast] memo receipt: tables version (bumps at every asset/range append and
                segment write), resolve/stub memo hit/miss, range-class misses, snapshots. */
             gdx_port_logf("[brfast] on=%d ver=%u resolve=%u/%u stub=%u/%u class_miss=%u gen=%u"
-                          " stubgen=%d chg=%u\n",
+                          " stubgen=%d chg=%u live=%d\n",
                           GdxBrFastOn() ? 1 : 0, GdxResolveTablesVersion(), gGdxBrFastStat[0],
                           gGdxBrFastStat[1], gGdxBrFastStat[2], gGdxBrFastStat[3],
                           gGdxBrFastStat[4], gGdxBrFastStat[5],
-                          GdxStubGenNarrowOn() ? 1 : 0, gGdxStubGenChg);
+                          GdxStubGenNarrowOn() ? 1 : 0, gGdxStubGenChg, GdxBrFastLiveOn() ? 1 : 0);
             memset(gGdxBrFastStat, 0, sizeof(gGdxBrFastStat));
             /* [resolverace] thread-reach census: which THREADS touched each process-wide
                bridge structure this window. mask bit0 = submitter/game thread, bit1 = render
@@ -13581,7 +13842,13 @@ static void GdxDiagCaptureContentProbe(const uint16_t* px, unsigned int width, u
 }
 
 extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int width, unsigned int height) {
+#if defined(GDX_PLATFORM_3DS)
+    GdxHazardCrumb("[hzc] read_fb enter w=%u h=%u\n", width, height);
+#endif
     GdxRtFence(); /* RENDER THREAD: game-thread mutator (audit §4) */
+#if defined(GDX_PLATFORM_3DS)
+    GdxHazardCrumb("[hzc] read_fb post-RtFence\n");
+#endif
     if (rgba16Buffer == nullptr || width == 0 || height == 0) {
         return 0;
     }
@@ -13597,6 +13864,7 @@ extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int wid
         return 0;
     }
 
+    GdxMaterializeFrameMirror(interp.get(), GDX_MIRROR_MAT_READ); /* mirror_lazy: the last task's frame is still in fb0 */
     const uintptr_t requestedAddress = reinterpret_cast<uintptr_t>(rgba16Buffer);
     auto requested = std::find_if(gN64Framebuffers.begin(), gN64Framebuffers.end(),
                                   [requestedAddress](const N64FramebufferInfo& info) {
@@ -13616,7 +13884,13 @@ extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int wid
         return 1;
     }
 
+#if defined(GDX_PLATFORM_3DS)
+    GdxHazardCrumb("[hzc] read_fb pre-interp-Flush\n");
+#endif
     interp->Flush();
+#if defined(GDX_PLATFORM_3DS)
+    GdxHazardCrumb("[hzc] read_fb post-interp-Flush\n");
+#endif
     const auto hasContent = [](const uint16_t* px, unsigned int w, unsigned int h) {
         const size_t count = static_cast<size_t>(w) * h;
         for (size_t k = 0; k < count; k++) {
@@ -13643,10 +13917,12 @@ extern "C" int gdx_read_current_framebuffer(void* rgba16Buffer, unsigned int wid
        linear memory holding exactly what the LCD shows, which is also the N64-exact capture
        semantics (Transition_SetBackgroundBuffer copies the VI's displayed framebuffer). The
        GPU readbacks remain as fallbacks for the pre-first-present window. */
+    GdxHazardCrumb("[hzc] read_fb pre-scanout\n");
     if (GdxReadTopScanoutRgba16(out, width, height)) {
         sourcePath = "lcd-scanout";
         gotContent = hasContent(out, width, height);
     }
+    GdxHazardCrumb("[hzc] read_fb post-scanout gotContent=%d\n", gotContent ? 1 : 0);
     if (!gotContent) {
         const int direct = interp->mRendersToFb ? interp->mGameFb : 0;
         interp->GetCurrentRenderingAPI()->ReadFramebufferToCPU(direct, width, height, out);
@@ -13755,6 +14031,43 @@ extern "C" int gdx_gfx_job_resolve_list(GdxGfxJob* job, uint32_t raw, int hostTa
     }
     GdxNativeFillList(out, ptr, limit, stride, isBig, isF3d);
     return 1;
+}
+
+/* [dlmemo] c5dlmemo-progress.md §1: the resolve with its memo admissibility. */
+extern "C" int gdx_gfx_job_resolve_list_memo(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull,
+                                             GdxDlSrcList* out, int* memoOk, uint32_t* sniffCmds) {
+    *memoOk = 0;
+    *sniffCmds = 0;
+    if (job == nullptr || job->adapter == nullptr || out == nullptr) return 0;
+    const N64Gfx* ptr = nullptr;
+    size_t limit = 0, stride = 0;
+    bool isBig = false, isF3d = false;
+    if (!job->adapter->NativeResolveList(raw, hostTagged != 0, hostFull, &ptr, &limit, &stride, &isBig, &isF3d,
+                                         memoOk, sniffCmds)) {
+        return 0;
+    }
+    GdxNativeFillList(out, ptr, limit, stride, isBig, isF3d);
+    return 1;
+}
+
+/* [dlmemo] Every mutable input of NativeResolveList's answer that is not the operand or the
+   list's own opcode bytes (c5dlmemo-progress.md §1): the running thread's segment view (all
+   16 slots; the job-private one on the render thread), the resolve-tables version, the
+   segment-reload epoch (odd = a reload in flight: the caller must not use the memo) and the
+   mode segment-9 state; plus the task's root range for the per-entry exclusion. */
+extern "C" void gdx_gfx_job_list_memo_key(GdxGfxJob* job, GdxDlMemoKey* out) {
+    const uintptr_t* view = gSegments; /* one TLS read (GdxSegTable), not sixteen */
+    for (int i = 0; i < 16; i++) {
+        out->seg[i] = view[i];
+    }
+    out->tablesVersion = GdxResolveTablesVersion();
+    out->epoch = GdxSegmentEpochSnapshot();
+    out->seg9State = gdx_mode_segment9_state();
+    out->rootBegin = 0;
+    out->rootEnd = 0;
+    if (job != nullptr && job->adapter != nullptr) {
+        job->adapter->NativeRootRange(&out->rootBegin, &out->rootEnd);
+    }
 }
 
 extern "C" uintptr_t gdx_gfx_job_resolve_data(GdxGfxJob* job, uint32_t raw, int hostTagged, uintptr_t hostFull,

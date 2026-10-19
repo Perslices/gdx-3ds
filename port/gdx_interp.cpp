@@ -57,6 +57,11 @@ extern "C" void gdx_interp_mark_cut(void) {
 extern "C" void gdx_interp_mark_cut_src(const char* tag) {
     GdxInterpMarkCutImpl(tag);
 }
+// C6 pose-replay (port/3ds/gfx/gdx3ds_replay.cpp) reads the epoch: a replayed 3DS frame must
+// never bridge a cut, so these hooks outlive the M5 interpolation deletion (NEXT.md C6).
+extern "C" std::uint32_t gdx_interp_cut_epoch(void) {
+    return g_cutEpoch.load(std::memory_order_relaxed);
+}
 
 namespace gdx_interp {
 

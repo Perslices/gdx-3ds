@@ -418,6 +418,21 @@ int main(int argc, char** argv) {
         check(gdx_block_cache_read(&c, base, 256u, buf) == 1, "case 9: read after invalidate");
         gdx_block_cache_get_stats(&c, &st);
         check(st.blockMisses > missesBefore, "case 9: invalidate forced a refetch");
+        /* QUICKFIX: would_fill is the "this read may touch the card" predicate that drops the
+         * audio producer's mutex; it must be 1 exactly when a block is missing, and a pure lookup. */
+        gdx_block_cache_get_stats(&c, &st);
+        const GdxBlockCacheStats wfBefore = st;
+        check(gdx_block_cache_would_fill(&c, base, 256u) == 0, "case 9: would_fill=0 for a resident span");
+        check(gdx_block_cache_would_fill(&c, base + 4050u, 40u) == 1, "case 9: would_fill=1 for a missing block");
+        check(gdx_block_cache_would_fill(&c, base - 1u, 4u) == 0, "case 9: would_fill=0 for a refused read");
+        gdx_block_cache_set_readahead(&c, 1u);
+        check(gdx_block_cache_would_fill(&c, base, 256u) == 1,
+              "case 9: would_fill=1 when read-ahead could fetch the next block");
+        gdx_block_cache_set_readahead(&c, 0u);
+        gdx_block_cache_get_stats(&c, &st);
+        check(st.blockHits == wfBefore.blockHits && st.blockMisses == wfBefore.blockMisses &&
+                  st.hostReads == wfBefore.hostReads,
+              "case 9: would_fill touches no statistics and no card");
         unsigned char raw[16];
         check(gdx_block_cache_read_uncached(&c, 0u, 4u, raw) == 1, "case 9: uncached read serves");
         check(raw[0] == 0x50 && raw[1] == 0x4B, "case 9: and it read the zip's local signature");
@@ -444,6 +459,129 @@ int main(int argc, char** argv) {
         gdx_block_cache_close(&c);
         check(gdx_block_cache_open(&c, good.c_str(), 0u, 0u, 12345678u, 14u, 8u) == 0,
               "case 10: a wrong expected file size is refused");
+    }
+
+    /* -- case 11: READ-AHEAD ------------------------------------------------------------
+     *
+     * What has to be true for this to be safe to turn on, in order:
+     *   (a) with it OFF nothing changes at all -- `fills == misses`, `pf == 0`, and the
+     *       `refetch` the receipt prints is the same number every earlier receipt printed;
+     *   (b) it never changes a byte. A cache that serves different bytes when it guesses is
+     *       the one failure this whole track exists to prevent, and no frame hash can see it;
+     *   (c) it actually reduces the number of times the CARD is asked for a block on the
+     *       sequential walk that audio does -- which is the only quantity an emulator lane
+     *       can measure honestly, because a miss there is a host-directory read;
+     *   (d) it does NOT speculate on a scattered pattern, i.e. a first touch never prefetches.
+     */
+    {
+        const char* paths[1] = { good.c_str() };
+        /* A sequential walk in ~760-byte reads, which is the size AudioLoad_DmaSampleData
+         * actually asks for (3,138 reads / 2,337 KB measured on the guest). */
+        const unsigned int kStep = 760u;
+        const unsigned int kSpan = 64u * 4096u;
+
+        unsigned long long fillsOff = 0, missOff = 0;
+        std::vector<unsigned char> refBytes(kSpan);
+        {
+            check(gdx_o2r_stream_open(paths, 1, kKey, kEntryBytes, 0x44u, 12u, 16u) == 1,
+                  "case 11: opens with read-ahead off");
+            check(gdx_o2r_stream_readahead() == 0u, "case 11: read-ahead defaults to 0");
+            unsigned char buf[760];
+            int bad = 0;
+            for (unsigned int off = 0; off + kStep <= kSpan; off += kStep) {
+                if (gdx_o2r_stream_read(off, kStep, buf) != 1) {
+                    bad++;
+                    break;
+                }
+                for (unsigned int i = 0; i < kStep; i++) {
+                    refBytes[off + i] = buf[i];
+                    if (buf[i] != bodyByte(off + i)) {
+                        bad++;
+                    }
+                }
+            }
+            check(bad == 0, "case 11: the baseline walk is byte-exact");
+            char line[320];
+            gdx_o2r_stream_format_stats(line, sizeof(line));
+            check(std::strstr(line, "pf=0") != nullptr, "case 11: no prefetch happens when off");
+            check(std::strstr(line, "ra=0") != nullptr, "case 11: the receipt reports ra=0");
+            /* (a): fills == misses with read-ahead off, so `refetch` is the historical one. */
+            const char* f = std::strstr(line, "fills=");
+            const char* m = std::strstr(line, "miss=");
+            check(f != nullptr && m != nullptr, "case 11: the receipt carries fills= and miss=");
+            if (f != nullptr && m != nullptr) {
+                fillsOff = std::strtoull(f + 6, nullptr, 10);
+                missOff = std::strtoull(m + 5, nullptr, 10);
+                check(fillsOff == missOff,
+                      "case 11: with read-ahead off every fill is a demand miss");
+            }
+        }
+
+        unsigned long long fillsOn = 0, pfOn = 0;
+        {
+            check(gdx_o2r_stream_open(paths, 1, kKey, kEntryBytes, 0x44u, 12u, 16u) == 1,
+                  "case 11: reopened for the read-ahead walk");
+            gdx_o2r_stream_set_readahead(2u);
+            check(gdx_o2r_stream_readahead() == 2u, "case 11: read-ahead armed at 2 blocks");
+            unsigned char buf[760];
+            int bad = 0;
+            for (unsigned int off = 0; off + kStep <= kSpan; off += kStep) {
+                if (gdx_o2r_stream_read(off, kStep, buf) != 1) {
+                    bad++;
+                    break;
+                }
+                /* (b): compared against the bytes the SAME walk produced with read-ahead off,
+                 * not merely against the generator -- so a prefetch that landed a block in the
+                 * wrong slot shows up as a difference from the proven-good path. */
+                if (std::memcmp(buf, &refBytes[off], kStep) != 0) {
+                    bad++;
+                }
+            }
+            check(bad == 0, "case 11: the read-ahead walk serves identical bytes");
+            char line[320];
+            gdx_o2r_stream_format_stats(line, sizeof(line));
+            check(std::strstr(line, "ra=2") != nullptr, "case 11: the receipt reports ra=2");
+            const char* f = std::strstr(line, "fills=");
+            const char* pp = std::strstr(line, "pf=");
+            if (f != nullptr && pp != nullptr) {
+                fillsOn = std::strtoull(f + 6, nullptr, 10);
+                pfOn = std::strtoull(pp + 3, nullptr, 10);
+            }
+            check(pfOn > 0ull, "case 11: read-ahead actually prefetched");
+            /* (c): the card is asked for the SAME blocks, no more. A sequential walk over a
+             * span that fits nothing extra must not fetch a block twice, and must not fetch a
+             * block it never needed beyond the two past the end of the walk. */
+            check(fillsOn <= fillsOff + 2ull,
+                  "case 11: read-ahead does not increase the number of card fetches");
+            check(gdx_o2r_stream_read(0u, 16u, buf) == 1, "case 11: a re-read still serves");
+        }
+        check(fillsOff > 0ull, "case 11: the baseline walk did fetch blocks");
+
+        /* (d): a SCATTERED pattern must not speculate. Each read lands in a fresh, distant
+         * block, so no slot ever matches and prefetch must stay at zero -- otherwise a
+         * random-access consumer pays double the card traffic for nothing.
+         *
+         * The stride is 29 blocks modulo 70, chosen because 29, 58, 87 and 116 are none of
+         * them 0 or +/-1 modulo 70: no read lands on or one past ANY of the four slots' tails,
+         * which is the condition the detector tests. The first attempt at this check used a
+         * plain additive stride and FAILED -- modulo the payload it degenerated into two
+         * slowly-advancing sequential streams, which is precisely what the detector is
+         * supposed to find. The bug was in the test, and the check is stated this way so the
+         * next person does not re-make it. */
+        {
+            check(gdx_o2r_stream_open(paths, 1, kKey, kEntryBytes, 0x44u, 12u, 16u) == 1,
+                  "case 11: reopened for the scattered walk");
+            gdx_o2r_stream_set_readahead(4u);
+            unsigned char buf[64];
+            for (unsigned int i = 0; i < 24u; i++) {
+                const unsigned int off = (((i * 29u) + 3u) % 70u) * 4096u + 100u;
+                check(gdx_o2r_stream_read(off, 64u, buf) == 1, "case 11: scattered read serves");
+            }
+            char line[320];
+            gdx_o2r_stream_format_stats(line, sizeof(line));
+            check(std::strstr(line, "pf=0") != nullptr,
+                  "case 11: a first touch never prefetches (no speculation on scatter)");
+        }
     }
 
     gdx_o2r_stream_close();

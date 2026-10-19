@@ -1,0 +1,43 @@
+# race-timeattack-mc: TIME ATTACK on JACK 1 MUTE CITY (one machine, no ghost on a fresh save), for
+# the n60ships GP-vs-TT receipts ([ships] census md=14, [lsplit] one-racer logic) and the NRR
+# categories' one-machine path. Menu walk: SELECT MODE grid (TIME ATTACK = top row, second
+# column), then A through the course / machine / settings screens as the practice replay does.
+# A ghost needs a finished 3-lap run in the same session (racer.c: D_800F5DEA writes gGhosts on
+# a finished time attack; Race_Init loads gGhostRacers from them on the retry), which an
+# open-loop script cannot drive; see docs/research/native/n60ships-progress.md.
+# SHOT PLACEMENT IS NOT AUTHORED HERE (NEXT.md B15/B43): derive it with tools/dev/covsched.py.
+build native/n60ships
+seed1 0x1234abcd
+seed2 0x0fedcba9
+pins renderthread=0 rival_detail_auto=0 stereo=0 fh_every=0
+at 400
+press START 15 0
+at 700
+press RIGHT 12 0
+at 1000
+press A 15 0
+at 1300
+press A 15 0
+at 1600
+press A 15 0
+at 1900
+press A 15 0
+at 2200
+press A 15 0
+at 2500
+press A 15 0
+at 2800
+press A 15 0
+at 3100
+press A 15 0
+at 3400
+press A 15 0
+at 3700
+press A 15 0
+# --- race: full throttle down the start straight, then coast (an open-loop steer leaves the
+# course within ~15 s and retires the machine; coasting keeps the one machine on track and
+# active for the rest of the recording) ---
+at 3900
+hold A 420
+hold B 60
+len 6000

@@ -124,6 +124,8 @@ add_executable(G-Diffuser
     enhancements/tuning/BoostDuration.cpp   # self-registers from a static initializer; nothing
                                 # references it, so it looks like dead code and is not.
     input_bridge.c
+    gdx_hud_placement.c        # nihudtop Phase 3: split out of input_bridge.c so the predicate
+                                # is host-testable standalone (port/tests/)
     gdx_input_script.c
     gdx_input_rec.c            # ORACLE: .gdxrec record/replay stage of the unified injector
     gdx_determinism.c          # ORACLE: Math_Rand seed / boot-hold pins the decomp reads
@@ -132,6 +134,10 @@ add_executable(G-Diffuser
     n64_gfx_convert.cpp
     gdx_vi_convert.c
     n64_audio_hle.c            # standalone C, deliberately not part of gdiffuser_game
+    n64_audio_hle_fast.c       # [debug] audio_simd: the bit-exact fast kernels (C4k)
+    gdx_audio_hle_cost.c       # [synx]: HLE synth CPU-vs-wall ledger (C4k)
+    gdx_ndsp_hash.c            # [debug] ndsphash; its taps live inside n64_audio_hle.c
+    gdx_audio_mix_census.c     # [debug] audiomix; its taps live inside n64_audio_hle.c too
     gdx_audio_lle.c
     gdx_audio_thread.cpp
     gdx_audio_capture.c
@@ -145,6 +151,7 @@ add_executable(G-Diffuser
     gdx_firstboot_gui.cpp
     rom_buffer.cpp
     sram_buffer.cpp
+    gdx_save_replace.c
     disk_savefile.cpp
     gdx_ghost_io.c
     gdx_ghost_window.cpp
@@ -382,12 +389,29 @@ endif()
 add_executable(gdx_dsp_tests
     tests/dsp_tests.c
     n64_audio_hle.c
+    n64_audio_hle_fast.c # C4k fast kernels (lever default off; the parity test flips it)
+    gdx_audio_hle_cost.c # C4k [synx] ledger (never armed here)
+    gdx_ndsp_hash.c   # n64_audio_hle.c's [ndsphash] taps; inert here (never configured on)
+    gdx_audio_mix_census.c # [audiomix]: armed BY these tests, see TEST 21
     gdx_dev_gates.c)
 if(MSVC)
     target_compile_options(gdx_dsp_tests PRIVATE /W3)
 elseif(GDX_PORT_WARN_FLAGS)
     target_compile_options(gdx_dsp_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
     target_link_libraries(gdx_dsp_tests PRIVATE m) # sin/floor: libm is separate on UNIX
+endif()
+
+# [ndsphash] unit test: compiles gdx_ndsp_hash.c UNMODIFIED and drives its public API through
+# the test-only configure/reset seams. No game objects, no decomp headers, no DSP -- the point
+# is the MAP (content-addressed key -> rendered value) and its two failure modes, which are
+# assertable without an emulator. Mirrored into tools/ci-3ds.sh as gdx3ds_ndsphash_host_tests.
+add_executable(gdx3ds_ndsphash_tests
+    tests/ndsphash_tests.c
+    gdx_ndsp_hash.c)
+if(MSVC)
+    target_compile_options(gdx3ds_ndsphash_tests PRIVATE /W3)
+elseif(GDX_PORT_WARN_FLAGS)
+    target_compile_options(gdx3ds_ndsphash_tests PRIVATE ${GDX_PORT_WARN_FLAGS})
 endif()
 
 # PCM capture unit test: compiles gdx_audio_capture.c UNMODIFIED and drives its public API plus
@@ -595,6 +619,7 @@ if(GDX_BUILD_JP)
         enhancements/tuning/BoostDuration.cpp
         gdx_discord.cpp
         input_bridge.c
+        gdx_hud_placement.c
         gdx_input_script.c
         gdx_input_rec.c
         gdx_determinism.c
@@ -603,6 +628,10 @@ if(GDX_BUILD_JP)
         n64_gfx_convert.cpp
         gdx_vi_convert.c
         n64_audio_hle.c
+        n64_audio_hle_fast.c
+        gdx_audio_hle_cost.c
+        gdx_ndsp_hash.c
+        gdx_audio_mix_census.c
         gdx_audio_lle.c
         gdx_audio_thread.cpp
         gdx_audio_capture.c
@@ -616,6 +645,7 @@ if(GDX_BUILD_JP)
         gdx_firstboot_gui.cpp
         rom_buffer.cpp
         sram_buffer.cpp
+        gdx_save_replace.c
         disk_savefile.cpp
         gdx_ghost_io.c
         gdx_ghost_window.cpp

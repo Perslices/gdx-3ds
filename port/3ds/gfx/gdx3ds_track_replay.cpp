@@ -30,6 +30,7 @@
 #include "gdx3ds_native_tri.h"
 #include "gdx3ds_nativebatch.h"
 #include "gdx3ds_track_record.h"
+#include "gdx3ds_track_retained.h"
 #include "gdx3ds_track_templates.h"
 
 extern "C" void gdx_dbg_logf(const char* fmt, ...) __attribute__((weak));
@@ -97,6 +98,10 @@ void gdx3ds_track_marker_seam(GdxInterpSeam& I, uint32_t w0, uintptr_t w1) {
             memcpy(sSnapshot, cache, sizeof(sSnapshot));
             sSnapValid = true;
         }
+        return;
+    }
+    if (p == GDXTRK_MARKER_P_RETAINED && run < rec->nRuns) {
+        gdx3ds_track_retained_run(I, rec, run); /* [native] track_retained (C5 Stage 3) */
         return;
     }
     if (p != GDXTRK_MARKER_P_END || run >= rec->nRuns) {

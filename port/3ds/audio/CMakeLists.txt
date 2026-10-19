@@ -5,6 +5,8 @@ if(NINTENDO_3DS)
     # Real backend: ndsp channel 0, LightLock ring, drain thread on the spare-core ladder.
     add_library(gdx3ds_audio STATIC
         gdx3ds_audio_ndsp.c
+        gdx3ds_audio_crk.c
+        gdx3ds_audio_pcmdump.c
     )
 else()
     # Host build keeps the Phase 0 swallow-everything stub (no libctru on host).
