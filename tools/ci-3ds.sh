@@ -158,6 +158,15 @@ if [ ! -e "${ROOT}/port/3ds/vendor/lus/cmake/cvars.cmake" ]; then
     echo "MISSING: port/3ds/vendor/lus/ — the vendored LUS carve is part of this repo" >&2
     PREFLIGHT_OK=0
 fi
+# fzerox-expansion-kit is NOT needed for this gate (it only builds the shipped, non-EK
+# .3dsx) -- but it's a hard configure-time requirement for -DGDX_3DS_EXPANSION_KIT=ON
+# (tools/gen_ek_assets.py reads its yaml/patch.py), so say so rather than leaving the
+# first EK configure to a cryptic FileNotFoundError.
+if [ ! -e "${ROOT}/fzerox-expansion-kit/tools/patch.py" ]; then
+    echo "NOTE: fzerox-expansion-kit submodule not initialized -- fine for this gate, but" >&2
+    echo "      required to configure an Expansion Kit target. Run:" >&2
+    echo "      git submodule update --init fzerox-expansion-kit" >&2
+fi
 if [ "$PREFLIGHT_OK" -ne 1 ]; then
     record "preflight" FAIL "toolchain/submodules missing (see above)"
     summary; exit 1

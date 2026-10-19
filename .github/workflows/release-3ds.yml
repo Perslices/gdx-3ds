@@ -11,15 +11,16 @@ name: Release (3DS, native renderer)
 # existing release tag (builds AND attaches/updates the release). `workflow_dispatch` also takes
 # an optional `targets` input to build only some of the four, for a quick one-off.
 #
-# This is the `native` branch's workflow. What differs from the `main` one:
-#   * tags are `native-v*`, so a native beta never collides with a stable `v*` release;
-#   * submodules are initialised BY NAME. The 3DS lane needs `decomp` and `torch` (for
+# This is the `native` branch's workflow.
+#   * submodules are initialised BY NAME. The O3DS/N3DS targets need `decomp` and `torch` (for
 #     libmio0) -- the slice of libultraship the console compiles is vendored in-tree at
 #     port/3ds/vendor/lus/ (see its PROVENANCE.md), so the `libultraship` submodule is
-#     desktop-only and is never fetched here. `torch` is the extractor's source and is
-#     fetched only by the extractor job. The one-liner for a human clone that wants both
-#     lanes is:
-#         git submodule update --init decomp torch
+#     desktop-only and is never fetched here. The O3DS-EK/N3DS-EK targets additionally need
+#     `fzerox-expansion-kit`: its asset generator (tools/gen_ek_assets.py) reads that
+#     submodule's yaml/patch.py at CMake configure time, with no prebaked fallback. `torch` is
+#     also the extractor's source and is fetched separately by that job. The one-liners:
+#         git submodule update --init decomp torch                      # O3DS / N3DS
+#         git submodule update --init decomp torch fzerox-expansion-kit # O3DS-EK / N3DS-EK
 #   * Ninja + ccache are installed in the container, so tools/ci-3ds.sh picks them up and
 #     the incremental rebuild it times is meaningful; the ccache directory is cached
 #     between runs, one cache per console target;
@@ -233,6 +234,12 @@ jobs:
           git submodule update --init --depth 1 decomp torch
           test -f decomp/Makefile
           test -f port/3ds/vendor/lus/cmake/cvars.cmake
+          # The two -EK targets additionally need fzerox-expansion-kit: its asset generator
+          # reads this submodule's yaml/patch.py at configure time, no prebaked fallback.
+          case "${{ matrix.target.name }}" in
+            *-ek) git submodule update --init --depth 1 fzerox-expansion-kit
+                  test -f fzerox-expansion-kit/tools/patch.py ;;
+          esac
           echo "libultraship submodule intentionally NOT initialised:"
           git submodule status | sed 's/^/  /'
 

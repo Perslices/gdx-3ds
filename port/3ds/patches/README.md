@@ -11,7 +11,8 @@ neither the submodule nor the patch step. Those 38 patch files moved to
 per-patch write-ups moved with them into `port/3ds/vendor/lus/patches/README.md`. Start at
 `port/3ds/vendor/lus/PROVENANCE.md`.
 
-Apply after `git submodule update --init decomp torch`:
+Apply after `git submodule update --init decomp torch` (add `fzerox-expansion-kit` too if
+you're configuring an Expansion Kit target -- see `.gitmodules`):
 
 ```sh
 git -C decomp apply ../port/3ds/patches/decomp-ilp32.patch

@@ -1,24 +1,23 @@
 # Which submodules you actually need depends on the lane.
 #
-#   3DS (this branch's build):  decomp torch   (torch supplies lib/libmio0)
-#   PC-side asset extractor:    torch
-#   Desktop G-Diffuser build:   all four, libultraship included
+#   3DS, shipped config (O3DS/N3DS):      decomp torch   (torch supplies lib/libmio0)
+#   3DS, Expansion Kit config (*-EK):     decomp torch fzerox-expansion-kit
+#   PC-side asset extractor:              torch
+#   Desktop G-Diffuser build:             all four, libultraship included
 #
 # The 3DS lane does NOT need libultraship: the 36 sources + 83 headers the console
 # compiles are vendored in-tree at port/3ds/vendor/lus/ with every 3DS patch already
 # folded in (port/3ds/vendor/lus/PROVENANCE.md). Initialise by name rather than with
 # --recursive so a 3DS checkout stays small.
 #
-# fzerox-expansion-kit is NOT a submodule here. It is needed only to REGENERATE the
-# desktop build's Expansion Kit asset recipes (port/CMakeLists.txt's G-Diffuser target,
-# --ek-yaml-dir); the 3DS target never evaluates that file. Clone it yourself if you
-# need it:
+# fzerox-expansion-kit IS needed for an Expansion Kit build (-DGDX_3DS_EXPANSION_KIT=ON):
+# tools/gen_ek_assets.py reads this submodule's assets/yaml/jp/**/*.yaml and tools/patch.py
+# at CMake configure time to generate the (gitignored, disk-derived) EK asset sources —
+# there is no prebaked fallback, so an EK configure fails outright without it. The shipped
+# O3DS/N3DS targets never evaluate any of that and do not need it.
 #
-#   git clone https://github.com/Zorkats/fzerox-expansion-kit.git
-#
-# Regenerating those assets needs your own dump in any case.
-#
-#   git submodule update --init decomp torch
+#   git submodule update --init decomp torch                          # O3DS / N3DS
+#   git submodule update --init decomp torch fzerox-expansion-kit     # O3DS-EK / N3DS-EK
 #
 [submodule "libultraship"]
 	path = libultraship
@@ -29,3 +28,6 @@
 [submodule "decomp"]
 	path = decomp
 	url = https://github.com/Zorkats/fzerox.git
+[submodule "fzerox-expansion-kit"]
+	path = fzerox-expansion-kit
+	url = https://github.com/Zorkats/fzerox-expansion-kit.git

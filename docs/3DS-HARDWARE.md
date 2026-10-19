@@ -261,7 +261,13 @@ Tested on macOS and Linux with devkitPro. Windows works through the devkitPro MS
    cd gdx-3ds
    git submodule update --init decomp torch
    ```
-   (`git clone --recurse-submodules` still works and just fetches more than the 3DS lane uses.)
+   Building an Expansion Kit target (`-DGDX_3DS_EXPANSION_KIT=ON`, i.e. `O3DS-EK`/`N3DS-EK`)
+   additionally needs `fzerox-expansion-kit`: its asset generator reads that submodule's
+   `assets/yaml/jp/` and `tools/patch.py` at configure time, with no prebaked fallback.
+   ```sh
+   git submodule update --init decomp torch fzerox-expansion-kit
+   ```
+   (`git clone --recurse-submodules` still works and just fetches more than any one lane uses.)
 3. **Apply the patch stack.** The submodules are never modified in place; the remaining 3DS
    deltas are the 52 `decomp-*.patch` in `port/3ds/patches/`, applied to `decomp/`'s working
    tree in the order listed in `port/3ds/patches/README.md`. `tools/ci-3ds.sh` does that
