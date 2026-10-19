@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # tools/ci-3ds.sh — one-command local CI for the Nintendo 3DS port.
 #
+# For an O3DS/N3DS x vanilla/Expansion-Kit release build (not this gate),
+# use tools/build-3ds.sh instead — it maps a target name to the right
+# CMake flags and renames/checksums the output into dist/3ds/.
+#
 # From a clean checkout (submodules initialized) this script:
 #   1. verifies the devkitPro toolchain is present;
 #   2. verifies/applies the port/3ds/patches/ decomp patches (idempotent —
@@ -93,7 +97,7 @@ while [ $# -gt 0 ]; do
         --no-ccache)      USE_CCACHE=0 ;;
         --no-incremental) RUN_INCREMENTAL=0 ;;
         -h|--help)
-            sed -n '2,32p' "$0"; exit 0 ;;
+            sed -n '2p;7,36p' "$0"; exit 0 ;;
         *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
