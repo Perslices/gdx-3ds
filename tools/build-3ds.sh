@@ -275,7 +275,7 @@ make_zip() { # target suffix has_cia
     local ek_line=""
     case "$suffix" in
         *-EK)
-            ek_line=$'\nThis is the Expansion Kit title: it installs alongside the normal game and needs the\n64DD disk image too. Put your own .ndd dump at:\n  3ds/gdiffuser/media/\n'
+            ek_line=$'\\nThis is the Expansion Kit title: it installs alongside the normal game. For the\\nExpansion Kit modes (course editor, machine creator) put your own 64DD disk dump at:\\n  3ds/gdiffuser/media/baserom.jp.ek.ndd          (Japanese retail disk), or\\n  3ds/gdiffuser/media/baserom.translated.ek.ndd  (English fan translation)\\nThe first boot checks the whole image once (about a minute). Without a disk it plays\\nthe normal game.\\n'
             ;;
     esac
 
