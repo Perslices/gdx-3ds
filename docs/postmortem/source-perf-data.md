@@ -237,8 +237,9 @@ Round 2 fps by brfast toggle (`hw-art-1788357755/log.txt`): before-any-toggle(de
 The raw per-session fps samples and the token census that sections 1-6 above were computed from no
 longer exist in this worktree (see the post-mortem build script's own note on this); this addendum's
 numbers instead come from `docs/postmortem/gen/o3ds-data.json` (built from hardware logs and
-`docs/research/native/` in the native-fork worktree) and `docs/research/native/n3ds-cmdbuf-freeze.md`,
-cited per row.
+internal research in the native-fork worktree), cited per row, and the native-fork's own hardware
+testing for the GPU command-buffer figures in 7.2 — see `native.html`'s own account of the freeze fix
+those figures support.
 
 ### 7.1 Old 3DS race frame rate, per card (`gen/o3ds-data.json`)
 
@@ -260,18 +261,18 @@ Method per `old-3ds.html`: 1000 / median frame time where a log gives one; the s
 rate where the game runs an even frame-skip cadence; the hold-1 vblank share for the two 3D cards.
 09-03's/10-03's and 10-07's 3D values are documented-range estimates, flagged as such on the page.
 
-### 7.2 GPU command-buffer high-water marks, by model (`n3ds-cmdbuf-freeze.md` §5)
+### 7.2 GPU command-buffer high-water marks, by model
 
-Same scripted replay (`race-gp-finish`), full `[DEBUG]`/`[NATIVE]`/`[STEREO]` ini, Azahar emulator
-(hardware margin is almost certainly tighter — see the doc's own caveat, repeated here: this table is
-a lower bound, not a ceiling; the New 3DS freeze this fix resolved never reproduced on the emulator at
-all, only on real hardware):
+Same scripted replay (`race-gp-finish`), full `[DEBUG]`/`[NATIVE]`/`[STEREO]` ini, Azahar emulator.
+Hardware margin is almost certainly tighter than these emulator figures: this table is a lower bound,
+not a ceiling; the New 3DS freeze this fix resolved never reproduced on the emulator at all, only on
+real hardware (see `native.html`'s own account of the freeze fix for what hardware testing showed):
 
 | Model | Buffer | Peak words | Buffer size (words) | % of buffer |
 |---|---|---|---|---|
 | Old 3DS | ×2 (prior) | 91,938 | 131,072 | 70.1% |
 | Old 3DS | ×4 (shipped) | 91,938 | 262,144 | 35.1% |
-| New 3DS | ×4 (shipped) | 21,946 | 262,144 | 8.4% (not comparable — run did not land on the 30-machine burst; see doc §5) |
+| New 3DS | ×4 (shipped) | 21,946 | 262,144 | 8.4% (not comparable — run did not land on the 30-machine burst; see `native.html`'s account of the freeze fix) |
 
 ### 7.3 Could not find / caveats, this addendum
 

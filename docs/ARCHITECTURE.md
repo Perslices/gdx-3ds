@@ -21,9 +21,10 @@ something is on fire.
 |---|---|---|
 | `decomp/` | submodule | The matching F-Zero X decompilation: `src/`, `include/`, its own build and expected ROM checksums. **The game logic.** Shared with the PC port; nothing here is 3DS-specific. |
 | `port/` | in-tree | The **shared host layer**: `decomp_port.c`, `n64_sched.c`, `n64_gfx_bridge.cpp`, `disk_buffer.cpp`, `rom_buffer.cpp`, the fiber scheduler contract, generated asset bindings. The 3DS build does not use `port/CMakeLists.txt` (that wires the desktop executable); `port/3ds/game/CMakeLists.txt` pulls the specific `port/*` translation units the console needs and compiles them into the console game library instead. |
-| `port/3ds/` | in-tree | Everything 3DS-specific. See [§4](#4-the-3ds-platform-layer) below for what is in each subdirectory. |
+| `port/3ds/` | in-tree | Everything 3DS-specific. See [§4](#4-the-3ds-platform-layer-port3ds) below for what is in each subdirectory. |
 | `libultraship/` | submodule | The desktop runtime (SDL window/input/audio, ImGui, ship resource loader). **Not linked into the 3DS build at all** — see §4.2. |
 | `torch/` | submodule | PC-side asset extraction, built into the standalone `gdx-extract` tool. Used by `tools/prebake` before anything reaches the console; see §3. |
+| `fzerox-expansion-kit/` | submodule | The 64DD Expansion Kit's own asset source (`assets/yaml/jp/`, `tools/patch.py`). Only needed to configure an EK target (`-DGDX_3DS_EXPANSION_KIT=ON`) — `tools/gen_ek_assets.py` reads it at CMake configure time, with no prebaked fallback. The shipped O3DS/N3DS targets never evaluate it. |
 | `tools/` | in-tree | Python build/asset/dev-loop tooling: `tools/build-3ds.sh` (the one-command 3DS build, §4.6), `tools/prebake/` (PC-side ROM→archive conversion), `tools/dev/` (the WiFi and emulator dev loops — see `docs/HW-DEV-LOOP.md`), the asset-binding and link-stub generators. |
 | `docs/` | in-tree, tracked | Ships with the release. |
 
@@ -203,7 +204,9 @@ Which performance preset actually runs is decided **at runtime**, by asking the
 hardware (`APT_CheckNew3DS`) — not by which build you installed. An `o3ds` build on a
 New 3DS still selects New-3DS settings; the reverse does not work, because the New-3DS
 build's RDRAM arena and memory layout do not fit an Old 3DS's real grant. Use the
-build that matches your own console.
+build that matches your own console. The same model probe also picks this release's
+`[perf] preset = auto` default — see `NATIVE-RENDERER.md` §4 — so a stock ini already
+runs the native renderer tuned for whichever console it boots on.
 
 ---
 

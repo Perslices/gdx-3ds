@@ -15,11 +15,12 @@ The first release to support the **Old 3DS / 2DS** family, and the first to incl
 - **A new bottom-screen dashboard ("DASH")** during races, with three HUD layouts and an
   idle screen between races.
 - **A native 3DS renderer** that redraws part of each frame itself instead of going
-  through the general-purpose interpreter the first release used for everything. It is
-  optional (see [Performance](#performance) below).
+  through the general-purpose interpreter the first release used for everything. It runs
+  by default on both consoles, tuned per console, with no ini editing needed (see
+  [Performance](#performance) below).
 - **A New 3DS attract-demo freeze fixed.** See [What changed](#what-changed-since-v090)
-  below for the technical detail; this never affected default, out-of-the-box play, which
-  has no native renderer at all.
+  below for the technical detail; this matters for default, out-of-the-box play now that
+  the native renderer runs there too.
 - **Old 3DS audio crackle greatly reduced** by a resampler fix. Some faint crackle can
   still occur in a minority of sessions; see [Known issues](#known-issues).
 
@@ -27,6 +28,7 @@ The first release to support the **Old 3DS / 2DS** family, and the first to incl
 
 Download the file for your console from the [latest release](https://github.com/cruxxxxxx/gdx-3ds/releases/latest).
 Each release includes a `SHA256SUMS` file so you can check your download.
+Each build also comes as a ready-to-unzip `G-Diffuser-3DS-<BUILD>-v1.0.0.zip`, laid out like an SD card.
 
 | File | Console | Content | Who it's for |
 |---|---|---|---|
@@ -49,10 +51,11 @@ First time installing? See `docs/3DS-HARDWARE.md` for the full setup walkthrough
 image, placed at `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` (or
 `baserom.translated.ek.ndd` for the fan translation) — see `docs/3DS-HARDWARE.md` §6 for
 the full layout. Not sure which disk-image layout your dump is in? Check the file size:
-about 67 MB (70,627,520 bytes) is MAME's layout — convert it first with
+about 71 MB (70,627,520 bytes) is MAME's layout — convert it first with
 `tools/dev/mame2ndd.py tondd yourfile.mame baserom.jp.ek.ndd` (needs Python 3 on your PC;
 no 3DS build toolchain needed — see Tooling below). About 65 MB (64,931,840 bytes) is
-already this port's layout — just rename and copy it as-is.
+already this port's layout — just rename and copy it as-is. These are the only two sizes
+to expect; anything else is a bad or truncated dump, not a third valid layout.
 
 Already running v0.9.0? Here's what's different for you:
 
@@ -73,23 +76,28 @@ Already running v0.9.0? Here's what's different for you:
 
 ### Performance
 
-The native renderer is **not turned on by default** in this release on either console.
+The native renderer is **on by default** on both consoles in this release. You don't need
+to write any ini lines for performance — with no `gdiffuser.ini`, or no `[perf] preset` key
+in one, `preset` resolves to `auto`, which picks the tuned configuration for your console at
+startup:
 
-**New 3DS:** add this to `sdmc:/3ds/gdiffuser/gdiffuser.ini` (create the file yourself if it
-doesn't exist — it's plain text; the game only writes this file when you change a setting in
-its own in-game menus, never just from being launched):
+- **New 3DS:** the `n60` lever set — native renderer, native race renderer, and frame-pacing
+  tuning, with the render thread off.
+- **Old 3DS:** `o3ds-auto` — the same tuning, minus a texture-cache headroom setting the New
+  3DS has the RAM for, plus three Old-3DS memory/CPU safety levers, plus the existing
+  automatic detail scaling in crowded races.
+
+An explicit `[perf] preset` key in `gdiffuser.ini` always wins over the automatic choice.
+On a New 3DS, you can set `preset = n60` by hand to force that same lever set explicitly.
+**Don't do this on an Old 3DS:** `n60` applies the New 3DS's texture-cache headroom without
+the Old 3DS memory/CPU safety levers that `auto` gives an Old 3DS for free, and it isn't a
+supported or tested configuration there. `preset = off` is an escape hatch back to the
+pre-native-renderer defaults, on either console:
 
 ```ini
 [perf]
-preset = n60    # New 3DS, the n60 ("New-3DS, 60 fps") lever set
+preset = off    # bare stock defaults; no native renderer
 ```
-
-Without that line, a New 3DS runs exactly as the first release did. With it, a New 3DS
-uses the faster native draw paths.
-
-**Old 3DS** has no equivalent switch yet. The numbers below are from an internal
-development build, not something you can turn on — detail scaling in crowded races is
-still on by default either way.
 
 ### What changed since v0.9.0
 
@@ -98,8 +106,8 @@ still on by default either way.
 - A native F3DEX2 (the N64's graphics-command format) interpreter and native draw paths
   for the track, the racer models, the bottom-screen dashboard, and the particle effects
   (sparks, smoke, explosions, force field), replacing libultraship's general-purpose
-  interpreter for those parts of the frame. Enabled on New 3DS with
-  `[perf] preset = n60`; see [Performance](#performance) for the Old 3DS situation.
+  interpreter for those parts of the frame. On by default on both consoles; see
+  [Performance](#performance) for the per-console lever sets and how to turn it off.
 - A long list of frame-pacing fixes that came out of chasing stutter on real hardware:
   the GPU command queue, display-list batching, and the stereoscopic 3D draw order were
   all reworked.
@@ -118,15 +126,18 @@ still on by default either way.
 
 **New 3DS**
 
-- Fixed a reproducible freeze in the title screen's attract-mode demo loop (native
-  renderer on, `[perf] preset = n60`), caused by a GPU command buffer that was too small
-  for the demo's full 30-racer field.
+- Fixed a reproducible freeze in the title screen's attract-mode demo loop (surfaces with
+  the native renderer on, which is the default now), caused by a GPU command buffer that
+  was too small for the demo's full 30-racer field.
 - The same save-write fix as Old 3DS, above.
 
 **Expansion Kit**
 
-- Runs on console for the first time, on both Old 3DS and New 3DS. The course editor and
-  machine creator open and are usable; the Expansion Kit's own cups race.
+- Runs on console for the first time, on both Old 3DS and New 3DS: the build boots and the
+  Expansion-Kit-only menu signs draw, confirmed on real hardware. The course editor, machine
+  creator, and the Expansion Kit's own cups have been verified with a mounted disk image in
+  the emulator; a hardware pass with an actual disk image mounted hasn't been done yet for
+  this release (see `docs/STATUS.md`).
 - The ~65 MB disk image is streamed from the SD card rather than held in memory — neither
   console has room to hold it whole.
 - Source builds can now bake in an optional English text pack for the Expansion Kit's
@@ -181,9 +192,10 @@ still on by default either way.
 
 ### Measured performance
 
-Hardware figures below are from Old 3DS consoles running the native renderer's current
-development configuration (see [Performance](#performance) above), in races against the
-game's own AI field (not WiFi-connected multiplayer).
+Hardware figures below are from Old 3DS consoles running the native renderer's `o3ds-auto`
+lever set — the same one this release now applies by default (see
+[Performance](#performance) above) — in races against the game's own AI field (not
+WiFi-connected multiplayer).
 
 | Mode | Scene | Excluding log-flush stalls | Whole run, including them |
 |---|---|---|---|
@@ -196,9 +208,9 @@ card; the hardware run this table is sourced from ran extra diagnostic logging o
 normal play to get these numbers, so the "excluding them" column is the more representative
 figure for ordinary play.)
 
-New 3DS hardware frame-rate figures for the native renderer specifically have not been
-captured separately yet — see `docs/STATUS.md`. The New 3DS has comfortably more CPU
-headroom than the Old 3DS at every setting tested so far.
+New 3DS hardware frame-rate figures for the native renderer (also on by default there, via
+the `n60` lever set) have not been captured separately yet — see `docs/STATUS.md`. The New
+3DS has comfortably more CPU headroom than the Old 3DS at every setting tested so far.
 
 ### Thanks
 

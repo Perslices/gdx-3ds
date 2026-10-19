@@ -287,18 +287,19 @@ a quoted session.
 - **Phase 0 (09-07 → 09-23):** dev-loop upgrade (network control/log link to the console, replacing the SD
   sneakernet; a Linux/arm64 reference-render container; input-recorder determinism) and the first renderer
   tier (an owned F3DEX2 interpreter replacing libultraship's, 10,466 lines) plus the native race-frame paths
-  for track, machines, sky, HUD and effects. Source: `docs/research/native/00-master-plan.md` through
-  `09-fx-integration-plan.md` (all dated 2026-09-07), `hwlink-progress.md`.
+  for track, machines, sky, HUD and effects. Source: the post-mortem's own `native.html` ("Why fork the
+  renderer" and the Tier 1 / Tier 2 table).
 - **Phase 1, the Old 3DS campaign (09-24 → 10-08):** see `source-perf-data.md` §3 and the post-mortem's
   `old-3ds.html` for the full per-card numbers; this addendum does not repeat them.
 - **Phase 2, shipping it (10-08 → 10-19):** Expansion Kit save/title separation (own CIA title
-  `000400000FF3D600`, own save `saves/fzerox-ek.sav`); the bottom-screen dashboard (`docs/research/native/
-  nibottom-plan.md`, `nibottom-progress.md` — three placement modes shipped, a fourth fully-custom layout
-  editor designed and shelved 10-18); a measured Old 3DS memory ceiling (`o3ds-memory-ceiling.md`, 10-16); an
-  audio-crackle hypothesis tested and refuted (`audiofix-progress.md`, 10-16); a New 3DS title-screen freeze
-  root-caused and fixed on real hardware, not the emulator (`n3ds-cmdbuf-freeze.md`, commits `14eccfe2`
-  through `403c241a`, 10-18); disk streaming and Japanese-input defaults for every 3DS build (commit
-  `c99682f3`, 10-19).
+  `000400000FF3D600`, own save `saves/fzerox-ek.sav`); the bottom-screen dashboard (see the post-mortem's
+  `native.html`, "The bottom screen: DASH" — three placement modes shipped, a fourth fully-custom layout
+  editor designed and shelved 10-18); a measured Old 3DS memory ceiling (see `native.html`'s known-issues
+  table and `old-3ds.html`, 10-16); an audio-crackle hypothesis tested and refuted (see `native.html`'s
+  known-issues table, 10-16); a New 3DS title-screen freeze root-caused and fixed on real hardware, not the
+  emulator (see `native.html`, "The New 3DS freeze", commits `14eccfe2` through `403c241a`, 10-18); disk
+  streaming and Japanese-input defaults for every 3DS build (commit `c99682f3`, 10-19).
 - **Research docs:** 199 `.md` files under `docs/research/native/` as of this compile (`ls docs/research/
-  native/*.md | wc -l`), plus evidence subfolders for several of them. Not individually catalogued here;
-  the ones this addendum and the post-mortem's new chapters draw from are named inline above.
+  native/*.md | wc -l`), plus evidence subfolders for several of them. These internal notes are not part of
+  the public repo and are not cited individually here or elsewhere in this file; the facts above are drawn
+  from them but sourced to the post-mortem's own published pages instead.

@@ -24,7 +24,7 @@ def build(D):
     b.append('<h2>What v1.0.0 added</h2>')
     b.append(tiles([
         ("4", "console builds from one source tree: Old 3DS, New 3DS, and each with the Expansion Kit", True),
-        ("199", "internal progress notes written during the second phase (docs/research/native/*.md)", False),
+        ("199", "internal progress notes written during the second phase", False),
         ("43<small>days</small>", "calendar span of the second phase, 2026-09-07 to 10-19 inclusive", False),
     ]))
     b.append('<div class="note">The tiles above are dated. The first phase\'s hardware numbers and token/cost '
@@ -54,7 +54,9 @@ def build(D):
              'with music and effects on the real DSP, stereoscopic 3D on the slider, a bottom-screen dashboard with three '
              'HUD layouts and an idle view outside races, and clean HOME suspend, resume, close, lid sleep and power-off. '
              'The New 3DS build keeps the native-60 frame pacing the first phase reached; the Old 3DS build gets to a '
-             'comparable result by a different route — see <a href="frontier.html">Frontier</a> and <a href="boundaries.html">'
+             'comparable result by a different route. At v1.0.0, with no ini, both builds default to that same route: '
+             'the native renderer (<code>[perf] preset = auto</code>). The New 3DS\'s first-phase render-thread/per-draw-stereo '
+             'path is still built in and reachable with an explicit ini, but is no longer the default — see <a href="frontier.html">Frontier</a> and <a href="boundaries.html">'
              'Pushing the boundaries</a> for the two builds compared side by side.</p>')
     b.append('<div class="cols2">')
     b.append('<div><h3>The stack</h3><ul>'
@@ -62,7 +64,7 @@ def build(D):
              '<li><b>libultraship</b>: the N64 runtime (Kenix3), untouched upstream, including a 13-line newlib fix that lets it build on devkitARM; it still draws every menu and non-race screen.</li>'
              '<li><b>port/3ds</b>: ' + esc(D["loc_port3ds"]) + ' lines as of the first phase, since grown: a citro3d rendering backend, stereo, audio, input, menu, lifecycle, render thread, profilers, packaging.</li>'
              '<li><b>the native renderer</b> (added in the second phase): an owned interpreter that skips the per-frame '
-             'display-list walk for race geometry — see <a href="frontier.html">Frontier</a> for how, and why it is '
+             'display-list walk for race geometry, and is the v1.0.0 default on both consoles — see <a href="frontier.html">Frontier</a> for how, and why it is '
              'what lets the Old 3DS keep up.</li>'
              '</ul></div>')
     b.append('<div><h3>The headline numbers on hardware, first phase (New 3DS)</h3>' + table(["When", "Median", "p10", "At cap"], D["headline_rows"], num_cols=(1, 2, 3)) + '</div>')

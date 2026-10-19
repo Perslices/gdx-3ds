@@ -21,21 +21,25 @@ the 3DS fork's internal notes is published here.
    - *Miscellaneous options* → **Enable input redirection** — needed for `hw.py input`.
    - *Debugger options* → **Enable debugger** — needed for `hw.py gdb`. Leave it off if you
      are not debugging, and turn it off before powering down.
-6. On the SD card, `sdmc:/3ds/gdiffuser/gdiffuser.ini` needs:
+6. On a fresh SD card, you don't need to touch `gdiffuser.ini` at all for this: `[net] enabled`
+   defaults ON for exactly this launch path, and that covers the whole loop, not just the first
+   push — hbmenu's netloader (`hw.py push`) and the `hw.py reload` that follows it both count,
+   because the netloader's address trailer is re-synthesised across the `hb:ldr` relaunch, so the
+   console still sees itself as netloader-launched after a reload. Only if the card's ini has an
+   EXPLICIT
 
    ```ini
    [net]
-   enabled = 1
+   enabled = 0
    ```
+
+   do you need to remove or flip that line (`hw.py put` a replacement ini, or edit the card
+   directly) — an explicit key always overrides the launch-method default. Launching from the
+   SD/CIA menu with no netloader involved still defaults OFF, same as before.
 
    Everything else has a working default (see the header of `port/3ds/net/gdx3ds_net.h`).
    `[debug] filelog = 1` is also worth having: it keeps a copy of everything on the card,
    so a crash that kills the link still leaves evidence.
-
-   **Set this explicitly — don't rely on the default.** `[net] enabled` only defaults on
-   when launched through hbmenu's netloader (the first `hw.py push`); `hw.py reload`
-   relaunches through Luma's `hb:ldr` instead, so without this key the link silently dies
-   on the very next reload even though the first push worked.
 
 ## 2. Mac setup (once)
 

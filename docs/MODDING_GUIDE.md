@@ -9,9 +9,17 @@ PC build, not a separate project — and then explains why the 3DS build doesn't
 The PC port supports drop-in texture packs through its Workshop tab (open the enhancement menu
 with **F1**):
 
-1. In-game, open the Workshop tab and run **Dump textures while playing**. This writes a dump
-   folder containing one PNG per texture plus `manifest.tsv` — a line per texture key with its
-   native width, height, and N64 texel format.
+1. In-game, open the Workshop tab's **Asset Dump** section, leave (or tick) the **Textures**
+   class checkbox, and click **Dump selected** (or **Dump everything** for every class). This
+   runs the bundled `gdx-extract` tool against the already-extracted archive — no gameplay
+   needed — and writes a `dump/` folder containing one PNG per texture plus `manifest.tsv`, a
+   line per texture key with its native width, height, and N64 texel format, in the same format
+   `gen_texture_pack.py` (step 3 below) expects. Click **Open dump folder** when it's done.
+
+   (The older **Dump textures while playing** live-capture control described in earlier releases
+   is retired: the code now force-sets it off on every boot with no surviving checkbox to turn it
+   back on. Asset Dump replaces it and writes the identical `manifest.tsv` layout, so the rest of
+   this pipeline is unaffected.)
 2. Edit or replace the PNGs you want to override. A replacement must be an integer multiple of
    its native size (1x, 2x, 4x, …); `manifest.tsv` records that native size for every key.
    Paletted formats (CI4/CI8) can be dumped but not replaced yet — see the PC-port README's

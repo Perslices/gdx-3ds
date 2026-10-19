@@ -235,15 +235,16 @@ everyday play — see `DIAGNOSTICS.md` if you're asked to use it.)
   Full-bleed and hybrid can show a sliver of empty sky at the very edges in some scenes, since
   the original backdrops were painted for the narrower 4:3 view — authentic mode doesn't have
   this, at the cost of the black bars it was always drawn with.
-- **Rival detail (DSP tab):** NATIVE / REDUCED / MINIMAL / LOW (NATIVE by default) — simplifies
-  distant rival machines for more fps in big fields. An AUTO toggle on the same tab raises the
-  cut automatically in a crowded race and relaxes it when the field thins out; whatever you pick
-  by hand is treated as the floor it won't go below.
-- **Stereoscopic 3D (3D tab):** off by default. There's no console-UI toggle to turn it on —
-  set `[stereo] enabled = 1` in `gdiffuser.ini` (§10) and relaunch. (The experimental `n60`
-  performance preset, §10, turns this on as a side effect — check it if 3D shows up
-  unexpectedly.) Once enabled, on New 3DS, depth (IOD) and convergence become live steppers on
-  the 3D tab while the 3D slider is up. Slider down (or `enabled = 0`) renders identically to 2D.
+- **Rival detail (DSP tab):** NATIVE / REDUCED / MINIMAL / LOW — simplifies distant rival
+  machines for more fps in big fields. Default is REDUCED on Old 3DS, NATIVE on New 3DS (part of
+  the `[perf] preset = auto` bundle, §10). An AUTO toggle on the same tab raises the cut
+  automatically in a crowded race and relaxes it when the field thins out; whatever you pick by
+  hand is treated as the floor it won't go below.
+- **Stereoscopic 3D (3D tab):** on by default on both consoles, as part of the `[perf] preset =
+  auto` bundle (§10) — there's no console-UI toggle for it, only the ini key (`[stereo] enabled`,
+  §10). Set `enabled = 0` in `gdiffuser.ini` and relaunch if you'd rather play in 2D. On New 3DS,
+  depth (IOD) and convergence are live steppers on the 3D tab while the 3D slider is up. Slider
+  down (or `enabled = 0`) renders identically to 2D.
 - **Steering feel (IN tab):** circle-pad deadzone, range, and response curve, plus whether the
   D-Pad can steer (off / full / ramps up while held) — all four are live steppers with a pad
   readout so you can see the effect immediately.
@@ -276,12 +277,13 @@ border_mode = 1     ; 0 authentic, 1 full-bleed (default), 2 zoom, 3 hybrid
 master_volume = 100 ; 0-100
 
 [stereo]
-enabled = 0          ; OFF by default; set to 1 and reboot to turn on 3D — not a console-UI toggle
-iod = 12             ; depth, 0-40 px; default 12; live on the 3D tab once enabled above
-convergence = 0.25   ; 0.00-0.90; default 0.25; live on the 3D tab once enabled above
+enabled = 1          ; ON by default on both consoles (bundled with [perf] preset = auto below);
+                     ; set to 0 and reboot to force 2D — not a console-UI toggle
+iod = 12             ; depth, 0-40 px; default 12; live on the 3D tab while enabled
+convergence = 0.25   ; 0.00-0.90; default 0.25; live on the 3D tab while enabled
 
 [perf]
-preset = auto        ; auto | o3ds | n60 — see note below
+preset = auto        ; auto (default, tuned per console model) | off | o3ds | n60 — see note below
 draw_distance = 100  ; percent, 40-100
 rival_detail = 0     ; 0 native, 1 reduced, 2 minimal, 3 low (floor for the AUTO toggle)
 rival_detail_auto = 1 ; 1 = auto-raise the cut in crowded races (default); 0 = always use rival_detail as a fixed level
@@ -294,13 +296,17 @@ crashdump = 0        ; 1 = write a crash dump (crash.txt / crash-EK.txt) if the 
                      ; default off — see §13 for bug reports
 ```
 
-**A note on `[perf] preset`.** `auto` (the default) quietly applies a reduced-detail profile
-*only on Old 3DS* — the New 3DS default is the stock, full-detail settings either way. There's
-also an experimental `n60` profile for a 60 fps New 3DS race. It hasn't crashed in testing, but a
-steady 60 fps isn't confirmed on hardware yet — try it, don't rely on it. `n60` also turns on
-stereo 3D (`[stereo] enabled = 1`) as part of its bundled defaults — set `enabled = 0` explicitly
-afterward if you don't want that. An explicit `[perf]` key you set yourself always wins over
-whatever the preset would have picked.
+**A note on `[perf] preset`.** `auto` (the default) needs no ini at all: at boot it detects your
+console model and applies the matching tuned bundle. New 3DS gets the `n60` set — the native
+renderer (G-Diffuser's own F3DEX2 interpreter, replacing libultraship's) plus its matching native
+track/machine/sky/HUD/fx paths. Old 3DS gets the equivalent `o3ds-auto` set, sized for its
+smaller memory budget, plus the existing Old-3DS LOD scaling (rival detail drops to REDUCED;
+draw distance stays stock). Both bundles also turn on stereo 3D (`[stereo] enabled = 1`) — set
+`enabled = 0` explicitly if you don't want that. `preset = off` goes back to the bare stock
+settings (no native renderer, no LOD scaling, stereo off) as an escape hatch; `preset = o3ds` or
+`preset = n60` pin one bundle regardless of which console you're on. Any key you set explicitly
+yourself — in `[perf]`, `[stereo]`, or elsewhere — always wins over whatever the preset would
+have picked.
 
 A few Expansion-Kit-only and diagnostic-only ini keys aren't reproduced here, since normal play
 never needs them — see `NATIVE-RENDERER.md` §2 / `DIAGNOSTICS.md` if a bug report ever asks you

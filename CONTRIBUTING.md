@@ -10,9 +10,12 @@ Two things here are unusual, and will cost you time if you don't know them going
 
 - **`decomp/` is a matching decompilation.** Your change has to work on PC *and* leave the retail
   build byte-identical. The PC build cannot tell you when you have broken the second one.
-- **There is no CI that checks pull requests.** Your local build is the only check that runs on a
-  change. (Tagged releases do build through CI — see [Releases](#releases). `decomp/` has its own
-  CI too, and it checks something different.)
+- **A PR gets a 3DS build check, but nothing checks the PC/decomp side.**
+  [`release-3ds.yml`](.github/workflows/release-3ds.yml) builds and host-tests all four 3DS
+  console targets on every push and pull request to `main` — it shows green/red per target, but
+  it's a status check, not a merge gate, and attaches nothing. For a PC or `decomp/` change, your
+  local build is the only check that runs. See [Releases](#releases) for what the same workflow
+  does on a tagged release; `decomp/` has its own CI too, and it checks something different.
 
 Read [Things that will bite you](#things-that-will-bite-you) before you touch `decomp/`.
 
@@ -259,8 +262,8 @@ shared OS struct, change both trees.**
 
 ## Code style
 
-There is no repository-wide formatter for port code. `decomp/`, `libultraship/` and `torch/` each
-carry their own `.clang-format`; `port/` does not.
+There is no repository-wide formatter for port code. `decomp/`, `libultraship/`, `torch/` and
+`fzerox-expansion-kit/` each carry their own `.clang-format`; `port/` does not.
 
 - **Match the file you are editing.** Every file in `port/` is internally consistent; follow it.
 - **In `decomp/`, follow the decomp's conventions**, not the port's — it is a submodule with its own
@@ -285,7 +288,7 @@ carry their own `.clang-format`; `port/` does not.
 `docs/` is tracked and maintained — read it as current. Where a document records a measurement, it
 carries the date and the numbers, so stale claims are checkable rather than quietly trusted.
 
-## The repository is four repos
+## The repository is five repos
 
 Changes usually span more than one, and they publish in a fixed order:
 
@@ -295,6 +298,7 @@ Changes usually span more than one, and they publish in a fixed order:
 | `decomp/` (submodule) | `g-diffuser` | the matching decompilation + `#ifdef PORT` changes |
 | `libultraship/` (submodule) | `g-diffuser` | the Fast3D/engine fork |
 | `torch/` (submodule) | `g-diffuser` | the asset extraction tool |
+| `fzerox-expansion-kit/` (submodule) | `g-diffuser` | the Expansion Kit's matching decompilation; only needed for the `-ek` 3DS targets |
 
 The submodules' `main`/upstream branches track their upstreams — **never** target those with port
 work. A PR that changes a submodule needs a PR against that submodule's `g-diffuser` branch, and
@@ -327,6 +331,14 @@ bump lands last.
 **Discussion venue:** GitHub Issues, for now. There is no Discord or forum yet.
 
 ## Releases
+
+**3DS releases are built by CI too** — the same [`release-3ds.yml`](.github/workflows/release-3ds.yml)
+workflow mentioned above. On every push or PR to `main` it builds all four console targets as a
+build-only check (nothing attached, doesn't gate merging). On a `v*` tag, or a manual dispatch
+naming an existing release tag, it does the full job: builds all four targets, zips each one, and
+attaches the zips, the loose `.3dsx`/`.cia`/`.elf` files, and one `SHA256SUMS` to the GitHub
+release, plus a "Which file do I need?" table in the release notes. Manual dispatch also takes a
+`targets` input to build only some of the four, for a quick one-off.
 
 **Linux releases are built by CI, not by hand.** Push a `v*` tag, or run the
 *Release (Linux)* workflow manually, then download the tarball from the workflow artifacts and

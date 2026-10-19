@@ -12,25 +12,29 @@ def build(D):
     b.append('<p class="lede">On 08-11 the first feasibility study said this port was New 3DS only: the Old 3DS memory '
              'region could not hold it. Six weeks later the same game boots on an Old 3DS (268 MHz, no L2 cache), races at about '
              '10 fps, and eleven days after that an internal development card holds 59–60 fps (245–256 of 256 frames on the '
-             'first vblank) in Grand Prix races with the 3D slider up — on an experimental build, not the shipped v1.0.0 Old 3DS '
-             'configuration; see the caveat below. This page is that road, card by card, with the number each hardware run '
-             'actually logged.</p>')
+             'first vblank) in Grand Prix races with the 3D slider up — on an internal development card, not the shipped v1.0.0 build. '
+             'v1.0.0 now ships that same lever set as its default, but a separate real-hardware confirmation pass for the shipped '
+             'binary\'s own 3D frame rate has not been done; see the note below and RELEASE-NOTES.md / STATUS.md for the current, '
+             'authoritative status. This page is that road, card by card, with the number each hardware run actually logged.</p>')
     b.append(tiles([
         ('~10<small>fps</small>', "first Old 3DS race, 09-29 (wall p50 96 ms; the user said \"like 9fps\")", False),
         ('16.5<small>ms</small>', "race median frame time on card 3, 10-02, 2D, 0 race hitches", True),
-        ('59–60<small>fps</small>', "3D Grand Prix race windows on card 4, 10-08, internal dev build — not the shipped v1.0.0 Old 3DS setup (245–256 of 256 frames on the first vblank)", True),
+        ('59–60<small>fps</small>', "3D Grand Prix race windows on card 4, 10-08, an internal development card (245–256 of 256 frames on the first vblank); v1.0.0 ships that same renderer family on by default — see the note below", True),
         ('0', "bad draws in the hardware verify mode: 199,472 checked on card 2, and again (count not logged) on card 4", True),
         (esc(str(len(cards))), "hardware cards and runs logged between 09-28 and 10-08", False),
         (esc(str(A["hw_logsets"])), "physical SD-card round trips logged for the Old 3DS campaign — no network loader on this console, so every test was a hands-on trip", False),
     ]))
     b.append('<div class="note">The 59–60 fps 3D figure above is from card 4 (10-08), an internal development build with the '
-             'native race renderer\'s stereo path turned on by hand — not the shipped v1.0.0 Old 3DS configuration, which has no '
-             'single preset for it yet (see <a href="native.html">The native fork</a>). For what v1.0.0 actually ships and measures, '
-             'see <a href="../RELEASE-NOTES.md#known-issues">RELEASE-NOTES.md, Known issues</a> ("Stereoscopic 3D plays but isn\'t '
-             'yet a locked 60 fps on either console") and <a href="../STATUS.md">STATUS.md</a>\'s Old 3DS stereoscopic-3D row '
-             '("plays; not yet a locked 60 fps, exact hardware figure not confirmed for this release"). The two accounts agree: '
-             'this page is the internal hardware campaign that produced the capability; the release docs are what\'s actually '
-             'turned on by default today.</div>')
+             'native race renderer\'s stereo path turned on by hand — it is <b>not</b> a hardware-confirmed figure for the shipped '
+             'v1.0.0 binary. What <i>is</i> true for v1.0.0: a no-ini <code>[perf] preset = auto</code> resolves to the Old 3DS\'s own '
+             'tuned table (native renderer, NRR and stereo all on, plus the memory-fit levers card 4 still set by hand), so the same '
+             'lever family card 4 ran by hand is now the default — see <a href="native.html">The native fork</a> for how the '
+             'per-console default resolves. What is <b>not</b> yet true: a separate real-hardware pass confirming the shipped '
+             'v1.0.0 build\'s own 3D frame rate has not been run. The current, authoritative status is in '
+             '<a href="../RELEASE-NOTES.md#known-issues">RELEASE-NOTES.md, Known issues</a> ("Stereoscopic 3D plays but isn\'t yet a '
+             'locked 60 fps on either console") and <a href="../STATUS.md">STATUS.md</a>\'s stereoscopic-3D row ("plays, not yet a '
+             'locked 60 fps, exact hardware figure not confirmed for this release"). An explicit <code>[perf] preset = off</code> '
+             'reverts to the legacy interpreter.</div>')
 
     b.append('<h2>The machine</h2>')
     b.append(table(["", "Old 3DS", "New 3DS", "Source"], [

@@ -105,7 +105,7 @@ def build(D):
              'built a different renderer, a second console tier and a second game mode on top of a build that already '
              'worked, which changed the shape of the work more than its length: many more parallel workstreams, each '
              'still in its own worktree with its own brief and progress file, left behind 199 internal progress notes '
-             '(docs/research/native/*.md) by the end, far more than the first phase\'s smaller written record. The rules in the table above (patch '
+             'by the end, far more than the first phase\'s smaller written record. The rules in the table above (patch '
              'as pure delta, killswitch for everything, receipt for everything, commit early) held and were leaned on '
              'harder, because more of the work now ran unattended for longer between human checks.</p>')
     b.append('<p>Three things were added to the loop that the first phase did not have:</p>')

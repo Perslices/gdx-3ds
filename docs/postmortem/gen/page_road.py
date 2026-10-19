@@ -158,7 +158,8 @@ def continuation_note():
             '<p>None of the above levers reached the Old 3DS, which has no second render core, no L2 cache, and a third of the clock. '
             'Starting 09-24, a second performance campaign rebuilt the race-frame renderer around that console\'s instruction cache instead '
             'of its instruction count, and an internal development card reached 59–60 fps (245–256 of 256 frames on the first vblank) in '
-            '3D Grand Prix races by 10-08 — not the shipped v1.0.0 Old 3DS configuration, which has no single preset for 3D yet. '
+            '3D Grand Prix races by 10-08. v1.0.0 ships that same renderer lever family on by default on both consoles via '
+            '<code>[perf] preset = auto</code> — no ini editing needed. '
             'That campaign, card by card, is on '
             '<a href="old-3ds.html">Old 3DS: the road to a real 60</a>; the renderer work that enabled it is on '
             '<a href="native.html">The Native Fork</a>.</p>')

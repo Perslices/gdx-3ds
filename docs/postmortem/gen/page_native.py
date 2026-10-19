@@ -17,7 +17,7 @@ def build(D):
         ("187", "feature branches cut for this chapter, almost all merged back", False),
         ("199", "internal progress and plan documents dated 09-07 → 10-19, this chapter's window", False),
         ("2", "consoles supported from one codebase: Old 3DS and New 3DS", True),
-        ("0<small> / 10,466</small>", "lines of the libultraship F3DEX2 interpreter (09-07 snapshot) that run during a race with the native race renderer turned on, versus the full 10,466 that still run on a default build of either console (see the table below)", True),
+        ("0<small> / 10,466</small>", "lines of the libultraship F3DEX2 interpreter (09-07 snapshot) that still run during a race with the native race renderer on — the default on both consoles at release (see the table below)", True),
         ("43 <small>days</small>", "09-07 to 10-19, across five rate-limit or session pauses", False),
     ]))
 
@@ -37,12 +37,16 @@ def build(D):
              'The fork is therefore a <b>hybrid renderer</b>: an owned interpreter for everything, plus three race-only paths that bypass '
              'it for the things a race frame actually spends its time on.</p>')
     b.append(table(["Tier", "What it does", "Status at release"], [
-        ["Tier 1 — own the interpreter", "A purpose-built F3DEX2 → citro3d walker reads the game's display list directly, replacing libultraship's interpreter and its bridge. Same pixels, no 32→64-bit conversion pass.", "Shipped; every lever defaults to the exact prior path and can be switched back"],
-        ["Tier 2 — bypass it for races", "<code>track</code> replays the course tessellator's vertex stream straight into a GPU buffer; <code>machines</code> draws the racers from baked, retained lists; the HUD, effects and shadows batch into sprite passes. Together this is the native race renderer (NRR).", "Built and verified on Old 3DS hardware — holds 59–60 fps in Grand Prix races (see <a href=\"old-3ds.html\">Old 3DS</a>) — but off by default there like every native lever; turning it on means setting the native-renderer ini keys by hand, since Old 3DS has no single preset for it yet. On New 3DS it is built, verified in the emulator, and reachable with one ini key (<code>[perf] preset = n60</code>), but also off by default: the NRR's sequential host-loop architecture and the New 3DS's own core-2 render thread are mutually exclusive (see <a href=\"boundaries.html\">Pushing the Boundaries</a>), and it still awaits its own New 3DS hardware verification pass."],
+        ["Tier 1 — own the interpreter", "A purpose-built F3DEX2 → citro3d walker reads the game's display list directly, replacing libultraship's interpreter and its bridge. Same pixels, no 32→64-bit conversion pass.", "Shipped and on by default on both consoles (see the preset note below); an explicit <code>[perf] preset = off</code> switches back to the exact prior libultraship path."],
+        ["Tier 2 — bypass it for races", "<code>track</code> replays the course tessellator's vertex stream straight into a GPU buffer; <code>machines</code> draws the racers from baked, retained lists; the HUD, effects and shadows batch into sprite passes. Together this is the native race renderer (NRR).", "Built and on by default on both consoles. On Old 3DS hardware an internal development card held 59–60 fps in Grand Prix races with the 3D slider up (see <a href=\"old-3ds.html\">Old 3DS</a>) — that card, not the shipped v1.0.0 binary, so it isn't a hardware-confirmed figure for this release's own 3D mode (see the release note below). On New 3DS the same default also turns the core-2 render thread off in favour of the NRR's sequential host loop — the two are mutually exclusive by design (see <a href=\"boundaries.html\">Pushing the Boundaries</a>) — and that stack is verified in the emulator and exercised on real hardware during the title-screen freeze fix below, but still awaits its own dedicated New 3DS hardware verification pass for full races."],
     ]))
-    b.append('<p>Every lever is an ini killswitch, defaulting to the old path, with a verify mode that draws both paths and compares the '
-             'packed vertex bytes bit for bit before trusting the new one. That discipline is also why a two-console fork stayed tractable: '
-             'a regression on one model shows up as a byte mismatch, not a maybe.</p>')
+    b.append('<p>Every individual lever is still an ini killswitch that compiles to off, with a verify mode that draws both paths and '
+             'compares the packed vertex bytes bit for bit before trusting the new one — that discipline is why a two-console fork stayed '
+             'tractable, since a regression on one model shows up as a byte mismatch, not a maybe. What changed for release: a no-ini player '
+             'no longer sees that off default. <code>[perf] preset</code> defaults to <code>auto</code>, which resolves per console at '
+             'startup — <code>n60</code> on New 3DS, the matching <code>o3ds-auto</code> table on Old 3DS — and switches the whole race-frame '
+             'lever set on out of the box. An explicit ini key always wins, so <code>preset = off</code> is the one-line escape hatch back to '
+             'every lever\'s compiled-off default.</p>')
 
     b.append('<h2>Fixing the dev loop before forking</h2>')
     b.append('<p>The 09-07 plan explicitly delayed the renderer work by about two weeks to fix the development loop first: every iteration '
@@ -124,11 +128,17 @@ def build(D):
     b.append('<p>The native fork\'s work ships as four console builds from one source tree: a plain build and an Expansion Kit build, each '
              'for Old 3DS and New 3DS. Which performance profile runs is decided at startup by asking the console what it is, not by which '
              'binary was installed — an Old 3DS build on a New 3DS still gets the New 3DS settings, but the reverse does not fit the memory '
-             'budget and is not supported. All four share one SD-card folder for settings, save data and media. The native race renderer\'s '
-             'status differs by console at release: it ships off by default on both, built and verified on Old 3DS hardware (an ini setting '
-             'away from the 59–60 fps described above), and built, verified in the emulator and available but still off by default pending '
-             'its own New 3DS hardware verification pass (see the Tier 2 status above).</p>')
+             'budget and is not supported. All four share one SD-card folder for settings, save data and media. The native race renderer '
+             'ships on by default on both consoles — a no-ini <code>[perf] preset = auto</code> resolves to each console\'s own tuned lever '
+             'table, so a player does not need to write any ini lines for performance. Verification depth still differs by console and by '
+             'feature: the native draw paths themselves are extensively hardware-tested on Old 3DS; on New 3DS they are verified in the '
+             'emulator and exercised on real hardware during the freeze fix below, but still await a dedicated New 3DS hardware frame-rate '
+             'pass for full races (see the Tier 2 status above). Stereoscopic 3D is a separate, narrower claim: it is on by default on both '
+             'consoles, but the 59–60 fps figure above is from an internal development card, not the shipped binary, so it isn\'t yet a '
+             'hardware-confirmed locked 60 on either console (see <a href="../RELEASE-NOTES.md#known-issues">RELEASE-NOTES.md</a> and '
+             '<a href="../STATUS.md">STATUS.md</a>).</p>')
     b.append(table(["Known at release", "What it means"], [
+        ["Stereoscopic 3D not yet a locked 60 fps on either console", "3D plays on by default on both consoles, but the 59–60 fps figure in the Tier 2 row above is from an internal development card, not the shipped binary — no hardware-confirmed 3D frame rate for v1.0.0 yet (see RELEASE-NOTES.md / STATUS.md)"],
         ["A rare speed-readout spike (as high as ~826 KPH) at the finish line", "Cosmetic; the bottom-screen DASH only, noted above"],
         ["Brief audio gaps during loads", "Short, occasional; not the crackle hypothesis this chapter investigated and refuted"],
         ["The Old 3DS has a memory ceiling", "Reproduced on the Azahar emulator under the real 64 MB budget simulation, not yet on real Old 3DS hardware: a single large asset load during a race can exhaust the budget under worst-case conditions. A separate real-hardware capture (heapUsed≈24.2 MB peak) suggests the margin is thin on real hardware too"],

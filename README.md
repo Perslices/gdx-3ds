@@ -20,6 +20,10 @@ Pick the file that matches your console from the
 | `O3DS-EK` | Old 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-O3DS-EK.3dsx` / `.cia` |
 | `N3DS-EK` | New 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-N3DS-EK.3dsx` / `.cia` |
 
+Easiest: grab the zip for your build, e.g. `G-Diffuser-3DS-O3DS-v1.0.0.zip`. It is laid out like
+an SD card (`3ds/…3dsx`, the `.cia` at the top, a short README.txt), so you unzip it onto the SD
+card's root.
+
 Use the build for your console — an `N3DS` build does not fit an Old 3DS's memory budget. The two
 `-EK` builds additionally need your own 64DD disk dump — see [Expansion Kit](#expansion-kit)
 below for what happens without one. `.3dsx` runs from the Homebrew Launcher, `.cia` installs to
@@ -28,7 +32,7 @@ settings and logs.
 
 ## Quick install
 
-1. Download the `.3dsx` or `.cia` for your console (table above).
+1. Download the zip (or the `.3dsx` / `.cia`) for your console (table above).
 2. Clone this repository with **git** to get `tools/prebake/prebake.py` — it's not in the release
    download. Do **not** use GitHub's "Download ZIP" button: that leaves the `decomp` submodule
    empty and the next step will fail.
@@ -45,17 +49,17 @@ settings and logs.
    ```
    This produces `fzerox.o2r` and `gdiffuser.o2r`. The console never sees your ROM — this step
    runs entirely on your computer.
-4. Copy both `.o2r` files to `sdmc:/3ds/gdiffuser/`, and the `.3dsx` to `sdmc:/3ds/` (or install
+4. Copy both `.o2r` files to `sdmc:/3ds/gdiffuser/`, and unzip the release zip onto the SD root so the
+   `.3dsx` lands in `sdmc:/3ds/` (or install
    the `.cia` with [FBI](https://github.com/Steveice10/FBI/releases)). `-EK` builds: also copy
    your 64DD disk image — see [Expansion Kit](#expansion-kit) below.
 5. **Dump your console's DSP firmware once, if you haven't already:** install the **DSP1**
    homebrew app and press B to write `sdmc:/3ds/dspfirm.cdc`. Without this the game runs but is
    completely silent — see [`docs/3DS-HARDWARE.md`](docs/3DS-HARDWARE.md#7-audio-dumping-dspfirmcdc-one-time-every-console).
 6. Launch from the Homebrew Launcher or the HOME menu.
-7. **Optional:** create (or edit) `sdmc:/3ds/gdiffuser/gdiffuser.ini` — a plain text file; it
-   doesn't need to exist yet — to turn on the native renderer. There's a documented key for New
-   3DS (it also turns on stereoscopic 3D as a side effect); Old 3DS doesn't have an equivalent
-   yet. See [Performance](#performance).
+7. That's it — the native renderer and stereoscopic 3D are on by default on both consoles; you
+   don't need to write any `gdiffuser.ini` lines for performance. The file is optional, for
+   hand-tuning or reverting to the bare defaults. See [Performance](#performance).
 
 Full steps, the complete SD card layout, the DSP firmware dump audio needs, and troubleshooting:
 **[`docs/3DS-HARDWARE.md`](docs/3DS-HARDWARE.md)**.
@@ -141,9 +145,9 @@ by lever: **[`docs/NATIVE-RENDERER.md`](docs/NATIVE-RENDERER.md)**.
   plus a DEBUG button for the settings/log console; an idle view outside races. In 2–4 player, the
   HUD is forced to the top screen.
 - **Stereoscopic 3D** — real depth via the 3D slider, with adjustable strength and convergence.
-  Off by default on both consoles; set `[stereo] enabled = 1` in `gdiffuser.ini` to turn it on
-  (already set for you on New 3DS once you've added `preset = n60` — see
-  [Performance](#performance)). Details: [`docs/3DS-HARDWARE.md`](docs/3DS-HARDWARE.md#10-gdiffuserini--the-keys-worth-setting-by-hand)
+  On by default on both consoles, as part of the tuned performance preset below; set
+  `[stereo] enabled = 0` in `gdiffuser.ini` if you'd rather it stayed off. Details:
+  [`docs/3DS-HARDWARE.md`](docs/3DS-HARDWARE.md#10-gdiffuserini--the-keys-worth-setting-by-hand)
 - **Full audio** through the 3DS DSP
 - **Touch-screen settings menu** — display mode (full-bleed or authentic borders), 3D tuning,
   circle pad deadzone/range/curve, optional D-pad steering, volume, a log viewer, debug toggles
@@ -154,23 +158,20 @@ Settings are written back to `gdiffuser.ini` from the in-game menus as you chang
 
 ## Performance
 
-Out of the box, both consoles use automatic rival-detail scaling to hold up in crowded races.
-The native renderer itself is **off by default on both consoles**:
+**The native renderer is on by default on both consoles — you don't need to write any ini lines
+for performance.** With no `gdiffuser.ini`, or none with a `[perf] preset` key, the game detects
+the console it's running on at startup and picks the tuned configuration for it: New 3DS gets the
+`n60` preset, Old 3DS gets `o3ds-auto` (the same stack, sized for Old 3DS's smaller memory
+budget). Both also get automatic rival-detail scaling in crowded races and stereoscopic 3D (see
+[Features](#features)). This is the configuration this release's measured numbers were taken on.
 
-- **New 3DS:** create (or edit) `sdmc:/3ds/gdiffuser/gdiffuser.ini` — a plain text file; the
-  game only writes one once you've changed a setting in its menus, so it may not exist yet — and
-  add this to turn the renderer on. This is the configuration this release's New 3DS numbers were
-  measured on, and it also turns on stereoscopic 3D (see [Features](#features)):
+Any key you set by hand in `gdiffuser.ini` overrides the preset's value for that key. To go back
+to the bare, untuned defaults instead — for comparison, or if something regresses for you — set:
 
-  ```ini
-  [perf]
-  preset = n60
-  ```
-
-- **Old 3DS:** the key above is New 3DS's switch, not Old 3DS's — it's sized for the New 3DS's
-  larger memory budget and isn't confirmed safe or effective on an Old 3DS. There's no documented,
-  player-facing way to turn the native renderer on for Old 3DS in this release; it still gets the
-  automatic rival-detail scaling above either way.
+```ini
+[perf]
+preset = off
+```
 
 See [`docs/RELEASE-NOTES.md`](docs/RELEASE-NOTES.md#performance) for the measured figures, and
 [`docs/NATIVE-RENDERER.md`](docs/NATIVE-RENDERER.md) for what each lever does.
@@ -227,7 +228,9 @@ toolchain), if you'd rather configure by hand:
 
 Requires devkitPro (`devkitARM` + `libctru` + `citro3d`), CMake, and the `decomp` / `torch`
 submodules (`git submodule update --init decomp torch`); the `libultraship` submodule is not
-needed for the 3DS build. The `o3ds-ek` / `n3ds-ek` targets also need Python's PyYAML package.
+needed for the 3DS build. The `o3ds-ek` / `n3ds-ek` targets also need the
+`fzerox-expansion-kit` submodule (`git submodule update --init fzerox-expansion-kit`) and
+Python's PyYAML package.
 This list isn't exhaustive — step-by-step instructions, including building in a container and on
 Windows: **[`docs/BUILDING.md`](docs/BUILDING.md)**.
 

@@ -13,18 +13,21 @@ def build(D):
              'press, each claim linked. Where we could not check something, the page says so.</p>')
 
     b.append('<h2>Against our own New 3DS build</h2>')
-    b.append('<p>The New 3DS build keeps the render-thread approach the first phase (2026-08-11 to 09-03) shipped: '
+    b.append('<p>The first phase (2026-08-11 to 09-03) shipped the New 3DS build on a render-thread approach: '
              'libultraship\'s display-list interpreter, moved to its own CPU core so it runs a frame ahead of the game. '
-             'The Old 3DS has no second core to give that interpreter, so the second phase (09-07 to 10-19) took a '
+             'The Old 3DS has no second core to give that interpreter, so the second phase (09-07 to 10-19) built a '
              'different route: a native renderer that skips the per-frame display-list walk for the geometry a race '
-             'spends its time on. Both reach a comparable result; the table is how they get there.</p>')
+             'spends its time on. At v1.0.0, with no <code>gdiffuser.ini</code>, that native renderer is the default on '
+             'both consoles: <code>[perf] preset = auto</code> resolves the New 3DS to the same n60 lever set as the Old '
+             '3DS, render thread off. The render-thread path is still built in and reachable with an explicit ini. The '
+             'table below compares the two approaches on their own terms.</p>')
     b.append(table(["", "New 3DS build", "Old 3DS build"], [
-        ["Race renderer", "libultraship's display-list interpreter (Fast3D) on its own CPU core, one frame ahead of the game", "The native renderer: one small loop per race category over a game-state snapshot, writing PICA200 command words directly; the interpreter remains for menus and the long tail of other screens"],
+        ["Race renderer", "libultraship's display-list interpreter (Fast3D) on its own CPU core, one frame ahead of the game — the first-phase architecture, still built in and reachable with an explicit ini, but not the v1.0.0 default (see note above)", "The native renderer: one small loop per race category over a game-state snapshot, writing PICA200 command words directly; the interpreter remains for menus and the long tail of other screens"],
         ["What limits the frame", "CPU instruction count in the interpreter and the bridge that feeds it (the GPU itself was not the bottleneck: about 0.4 ms per frame in the emulator)", "Instruction-cache misses, not instruction count: at 268 MHz with no L2 cache, the render path ran at 4.34 cycles per instruction with 43.6% of cycles stalled on instruction fetch, so the interpreter's own code did not reliably fit the 16 KB L1 instruction cache"],
-        ["Cores", "A render thread on the second core, one frame ahead of the game", "No second core. One core does everything but audio, which gets a fixed 30% share of the other"],
+        ["Cores", "A render thread on the second core, one frame ahead of the game, when that path is selected; core 2 backs the audio threads under the v1.0.0 default (native renderer, render thread off)", "No second core. One core does everything but audio, which gets a 60% share of the other (raised from an initial 30% default after a hardware A/B showed 30% caused heavy audio padding)"],
         ["Memory", "124 MB app-mode budget, 16 MiB RDRAM arena", "64 MB app-mode budget (half the console's 128 MB FCRAM is reserved for the system); RDRAM arena halved to 8 MiB plus a 16 MiB linear-heap pin, 38.9 MB of heap left for the game"],
-        ["Audio", "Headroom to spare in the synthesis budget", "Synthesis needed about 36% of its CPU share against a 30% grant: narrowing the audio lock (−20 ms of race-wall waiting per frame) and hand-tuned ARMv6 SIMD decode kernels (2.2× cheaper) closed the gap"],
-        ["Stereo 3D", "Per draw: the packed vertex buffers replayed with a second matrix for the right eye", "Per frame: the recorded command stream resubmitted for the right eye with a per-eye uniform, interleaved in chunks, with its own swap-pacing mode"],
+        ["Audio", "Headroom to spare in the synthesis budget", "Synthesis' CPU share was tight enough against that grant that it was raised from an initial 30% to 60% during the port: narrowing the audio lock (−20 ms of race-wall waiting per frame) and hand-tuned ARMv6 SIMD decode kernels (2.2× cheaper) closed the gap"],
+        ["Stereo 3D", "Per draw: the packed vertex buffers replayed with a second matrix for the right eye — the first-phase mechanism, used when the render-thread path is selected; the v1.0.0 default uses the Old 3DS's per-frame mechanism instead (next column)", "Per frame: the recorded command stream resubmitted for the right eye with a per-eye uniform, interleaved in chunks, with its own swap-pacing mode"],
         ["Hardware result", "Full Grand Prix, end of the first phase: median " + esc(D["final_median"]) + " fps, p10 " + esc(D["final_p10"]) + ", " + esc(D["final_cap"]) + " of frames at the 60 cap", "16.5 ms median frame time on a full 2D Grand Prix race, 0 hitches; 59–60 fps in 3D on most Grand Prix courses, with the heaviest courses (Silence, Sand Ocean) able to trip the frame-skip safety net to a steady 30 fps mid-race — see <a href=\"old-3ds.html\">Old 3DS</a> for the full campaign. Measured with a different harness (frame time and a vblank-hold share, not the fps/p10/cap-% stats above), so not directly stacked against the New 3DS row"],
         ["Correctness gate", "Exact parity with the interpreter checked for every performance lever, on and off", "The game's own per-tick state hash must match exactly; pixels are checked within a tolerance; an on-console verify mode re-checks every GPU command word the native path writes"],
     ]))
@@ -51,8 +54,8 @@ def build(D):
         ["A fix for a freeze when backlight/HOME handling toggled the screen off", "Applies to both models. The New 3DS build never showed the freeze in practice, because no New 3DS HOME test happened to run with the bottom screen off"],
         ["A save-persistence fix for a rare corrupted save on power loss", "The underlying cause is in how the SD card's filesystem handles a file rename, not anything model-specific, so the New 3DS build is believed to carry the same fix; not separately confirmed on a New 3DS log"],
         ["A never-blocking file log and hitch-detection receipts", "Model-independent; applies to both"],
-        ["The native renderer, the per-eye stereo resubmit, and the Old 3DS's end-of-frame pacing mode", "Not yet enabled on the New 3DS: the native renderer currently steps aside when the New 3DS's own render thread is active, pending its own New 3DS verification pass"],
-        ["The two audio tuning levers added for the Old 3DS's tighter CPU-share budget", "Default on for Old 3DS only; the New 3DS default is unchanged, since it was never short on audio headroom"],
+        ["The native renderer, NRR, the per-eye stereo resubmit, and the end-of-frame pacing/frame-skip stack built for the Old 3DS", "Carried back as the v1.0.0 default: with no ini, <code>preset = auto</code> resolves the New 3DS to the same n60 lever set, render thread off. An explicit ini can still select the old render-thread/per-draw-stereo path instead"],
+        ["The two audio tuning levers added for the Old 3DS's tighter CPU-share budget (<code>audio_ctx_narrow</code>, <code>audio_simd</code>)", "Also on by default for the New 3DS now, bundled into the same n60 preset, even though the New 3DS was never short on audio headroom"],
         ["The Old 3DS's reduced-memory build profile", "Off for the New 3DS build, which is otherwise unchanged by the Old 3DS work"],
     ]))
 

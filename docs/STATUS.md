@@ -24,20 +24,20 @@ per console. "Verified" means run and checked on a physical console, not just an
 | 60 Hz game logic | ✅ | ✅ |
 | Save files (race records, ghosts) | ✅ — the write-corruption bug below is fixed and hardware-confirmed | ✅ — same fix applies |
 | Local multiplayer (2–4 player split-screen) | 🟡 — plays; not soak-tested on hardware | 🟡 — plays; not soak-tested on hardware |
-| Stereoscopic 3D (3D slider) | 🟡 — plays; not yet a locked 60 fps, exact hardware figure not confirmed for this release | ⚪ — supported in code; not separately hardware-measured yet |
+| Stereoscopic 3D (3D slider) | 🟡 — on by default (part of `o3ds-auto`); plays, not yet a locked 60 fps, exact hardware figure not confirmed for this release | ⚪ — on by default (part of `n60`); supported in code, not separately hardware-measured yet |
 | HOME menu / sleep / power-off | ✅ | ✅ |
 
-## Native renderer (opt-in on New 3DS — no supported way to turn it on for Old 3DS yet)
+## Native renderer (on by default on both consoles)
 
-Turned on with `[perf] preset = n60` on New 3DS; see RELEASE-NOTES.md "Performance." That
-same key is not the Old 3DS's enablement path, and no equivalent one ships yet — the Old
-3DS row below is hardware-tested and real, but only reachable through an internal
-development configuration, not anything a player can turn on. See `docs/NATIVE-RENDERER.md`
-§4 for the technical detail.
+On by default on both consoles via `[perf] preset = auto` (the default with no ini, or no
+`[perf] preset` key) — see RELEASE-NOTES.md "Performance" for the New 3DS (`n60`) and Old
+3DS (`o3ds-auto`) lever sets it resolves to. An explicit `preset` key in `gdiffuser.ini`
+always wins over the automatic choice; `preset = off` is the escape hatch back to the
+pre-native-renderer defaults. See `docs/NATIVE-RENDERER.md` §4 for the technical detail.
 
 | Feature | Old 3DS / 2DS | New 3DS / New 2DS XL |
 |---|---|---|
-| Native draw paths (track, racers, HUD, effects) | 🔧 — extensively hardware-tested across many sessions, in a development configuration only; no documented way for a player to enable it | ⚪ — hardware-correct in principle (same code path); dedicated New-3DS hardware frame-rate run not done yet |
+| Native draw paths (track, racers, HUD, effects) | ✅ — extensively hardware-tested across many sessions; ships on by default (`o3ds-auto`) | ⚪ — hardware-correct in principle (same code path), on by default (`n60`); dedicated New-3DS hardware frame-rate run not done yet |
 | Automatic Old-3DS detail scaling in crowded races | ✅ — on by default, no ini needed | — |
 
 ### Measured frame rate
@@ -55,9 +55,9 @@ vs. "how fast"). Full detail and sourcing: RELEASE-NOTES.md "Measured performanc
 | Feature | Old 3DS / 2DS | New 3DS / New 2DS XL |
 |---|---|---|
 | Boots, reaches the main menu | ✅ | ✅ |
-| Course editor (loads, playable) | ✅ | ✅ |
-| Machine creator (loads, playable) | ✅ | ✅ |
-| DD cups race | ✅ | ✅ |
+| Course editor (loads, playable) | ⚪ verified in the emulator with a mounted disk image; the one real-hardware Expansion Kit session ran with no disk mounted | ⚪ same — emulator-verified with a disk image, not yet exercised on hardware with one |
+| Machine creator (loads, playable) | ⚪ verified in the emulator with a mounted disk image; not yet exercised on hardware with one | ⚪ same — emulator-verified only |
+| DD cups race | ⚪ verified in the emulator with a mounted disk image; not yet exercised on hardware with one | ⚪ same — emulator-verified only |
 | Disk streamed from SD (no full in-memory copy) | ✅ | ✅ |
 | Audio crackle | 🟡 greatly reduced, not eliminated | 🟡 greatly reduced, not eliminated |
 
@@ -93,6 +93,7 @@ no row in this table. See RELEASE-NOTES.md's Expansion Kit section.
 | Rare ~826 KPH speed-readout spike | Both consoles | Cosmetic; appears briefly at the finish line. |
 | Stereoscopic 3D not locked to 60 fps | Both consoles | Plays; a confirmed hardware frame-rate figure for this release isn't available yet. |
 | Not every mode tested on every console | Both | Coverage is broad (see tables above) but not exhaustive — multiplayer and 3D soak testing in particular. |
+| Expansion Kit gameplay content (course editor, machine creator, DD cups) is primarily emulator-verified | Both | The one real-hardware Expansion Kit session ran with no disk image mounted. A hardware pass with an actual disk image mounted hasn't been done yet for this release. |
 
 ## Where the documentation lives
 

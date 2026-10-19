@@ -28,15 +28,15 @@ ships pre-generated in the repo.
 
 ## 2. Clone with submodules
 
-The 3DS build needs only the `decomp` and `torch` submodules — the same two
-for every target, vanilla or Expansion Kit (an EK target's extra requirement
-is Python3 + PyYAML, not a submodule; see `GDX_3DS_EXPANSION_KIT` in §6). It
-does **not** need the `libultraship` submodule — the slice of it the console
+The `o3ds`/`n3ds` targets need only the `decomp` and `torch` submodules. An
+Expansion Kit target (`o3ds-ek` / `n3ds-ek`) additionally needs the
+`fzerox-expansion-kit` submodule: `tools/gen_ek_assets.py` reads its
+`assets/yaml/jp/**/*.yaml` and `tools/patch.py` at CMake configure time to
+generate the EK asset sources, and there's no prebaked fallback — an EK
+configure fails outright without it. It does **not** need the
+`libultraship` submodule for any target — the slice of it the console
 compiles is vendored in-tree at `port/3ds/vendor/lus/` with every
-3DS-specific patch already folded in. It also does **not** need the
-`fzerox-expansion-kit` submodule — that repository isn't a submodule of this
-one at all; it's only used to regenerate the *desktop* build's Expansion Kit
-asset recipes, and the 3DS target never reads it.
+3DS-specific patch already folded in.
 
 Get the repository with `git`, not GitHub's "Download ZIP" button — a zip
 download omits submodule content, so `decomp/` lands empty and the build
@@ -46,12 +46,13 @@ fails later with no indication the clone was the cause.
 git clone --recurse-submodules https://github.com/cruxxxxxx/gdx-3ds.git
 cd gdx-3ds
 # or, if you already cloned without --recurse-submodules:
-git submodule update --init decomp torch        # all four targets: o3ds, n3ds, o3ds-ek, n3ds-ek
+git submodule update --init decomp torch                      # o3ds / n3ds
+git submodule update --init decomp torch fzerox-expansion-kit # o3ds-ek / n3ds-ek
 ```
 
 `--recurse-submodules` also pulls in `libultraship`, which you don't need for
 this build — to skip it, clone plain (no `--recurse-submodules`) and use the
-targeted `git submodule update --init decomp torch` line above instead.
+targeted `git submodule update --init` line above instead.
 
 (`torch` supplies a small source module — `libmio0`, MIO0 decompression —
 that the port compiles directly into its asset-loading code; it is not built
@@ -153,7 +154,7 @@ want for turning a crash address in a log into a source line.
 | Option | Default | Effect |
 |---|---|---|
 | `GDX_3DS_O3DS` | `OFF` | Builds the Old 3DS memory profile: a smaller RDRAM arena and a pinned linear heap, sized to fit an Old 3DS's actual memory grant. This is a *compile-time* choice about how much memory the build asks for; which performance settings run is decided separately, at runtime, by detecting the console model. |
-| `GDX_3DS_EXPANSION_KIT` | `OFF` | Compiles in the 64DD Expansion Kit content (course editor, machine creator, DD cups). This is a different compile of the game, not an add-on: it swaps out several subsystems and installs as its own HOME-menu title alongside the regular game, with its own save file. Needs Python3 + PyYAML at configure time (§1) — no extra submodule. |
+| `GDX_3DS_EXPANSION_KIT` | `OFF` | Compiles in the 64DD Expansion Kit content (course editor, machine creator, DD cups). This is a different compile of the game, not an add-on: it swaps out several subsystems and installs as its own HOME-menu title alongside the regular game, with its own save file. Needs Python3 + PyYAML at configure time (§1) and the `fzerox-expansion-kit` submodule (§2). |
 | `GDX_ALLOW_JP_INPUTS` | **`ON`** on 3DS builds (`OFF` on desktop) | Accepts Japanese-region game data (JP ROM / the retail JP Expansion Kit disk). On by default for 3DS builds; off by default on desktop. |
 
 3DS defaults this on because the console never reads a ROM directly (the
@@ -177,7 +178,7 @@ this project's CI uses. With Docker installed:
 docker run --rm -v "$PWD":/src -w /src devkitpro/devkitarm:latest bash -lc '
   apt-get update -qq && apt-get install -y -qq python3 python3-yaml cmake ninja-build
   export DEVKITPRO=/opt/devkitpro
-  git submodule update --init --depth 1 decomp torch
+  git submodule update --init --depth 1 decomp torch                      # add fzerox-expansion-kit too for an -ek target
   tools/ci-3ds.sh --jobs 4
   tools/build-3ds.sh <target>     # o3ds | n3ds | o3ds-ek | n3ds-ek | all
 '

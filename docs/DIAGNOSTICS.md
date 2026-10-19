@@ -35,8 +35,9 @@ crashdump = 1
 
 With it set, a fatal error writes `sdmc:/3ds/gdiffuser/crash*.txt`, including the tail of the
 retained log ring. Attach that file whenever the game crashed. If you didn't have `crashdump` set
-when it happened, there is nothing to attach beyond `log.txt` (if `filelog` was on) — turn
-`crashdump` on and try to reproduce it again.
+when it happened, `log.txt` (if `filelog` was on) is the next log-level evidence — and if the
+crash happened early in boot, the boot trail below may already have caught it with no ini change
+at all. Otherwise, turn `crashdump` on and try to reproduce it again.
 
 **On Old 3DS with older Luma builds, the exception handler is not guaranteed to fire for every
 real crash** — closing an armed title from HOME has, on real hardware, reported "the system will
@@ -45,7 +46,28 @@ it actually works on your own console: set `[debug] crashdump_selftest = 1` alon
 `crashdump = 1` and reboot. `crashdump_selftest` deliberately faults on boot so you can check that
 `crash*.txt` gets written at all. If the selftest produces nothing either, the handler is not
 dispatching on that console/Luma combination, and `log.txt` (with `filelog = 1`) is the only
-evidence you'll get.
+evidence you'll get — unless the crash was early enough in boot for the boot trail below to have
+already recorded it.
+
+### Early-boot crashes: the boot trail (`boot.txt` / `boot-prev.txt`)
+
+Separate from `crashdump` above, and **on by default with no ini key needed**: a crash-proof boot
+trail runs on every boot. From `main()` entry — before config loads, before `gfxInit`, before the
+file log even starts — through the first couple of game frames, every boot milestone is appended
+with a raw, immediately-flushed write to `sdmc:/3ds/gdiffuser/boot.txt`, and the main thread gets
+its own early CPU-exception handler armed for that same window. The previous boot's trail survives
+one more boot as `boot-prev.txt`. It exists because a real Old-3DS/Luma-6.6 boot crash once left no
+log and no crash dump at all (`port/3ds/gdx3ds_boot_trail.c`).
+
+```ini
+[debug]
+boot_trail = 0         ; default 1 (on); set to 0 to turn it off entirely
+boot_trail_frames = 2  ; how many host frames it records before closing itself (default 2)
+```
+
+You do not need to set anything to get a boot trail — `boot.txt` / `boot-prev.txt` are already on
+the SD card by default. Pull them with `hw.py get` (`docs/HW-DEV-LOOP.md`) or straight off the
+card, the same way you would `log.txt`.
 
 ### The desktop trace family does not reach this platform
 
@@ -69,6 +91,8 @@ switch you forgot.
 | `crashdump` | `0` | Writes `crash*.txt` on a fatal error. See above — opt in *before* reproducing. |
 | `crashdump_selftest` | `0` | Deliberately faults right after boot so you can confirm `crashdump` actually writes a file on your console. See above. |
 | `boot_breadcrumbs` | `0` | Logs the decomp's own boot checkpoints for the given number of host frames. Useful for a hang or crash during the earliest part of boot, before the normal log path is even running. |
+| `boot_trail` | `1` | Crash-proof boot-milestone trail to `boot.txt`/`boot-prev.txt`, on by default; see "Early-boot crashes" above. Set to `0` to disable. |
+| `boot_trail_frames` | `2` | How many host frames the boot trail records before it closes itself. |
 | `gputrace` | `0` | Arms the per-phase CPU/GPU profiler (`[prof]`/`[gpu]`/`[fill]` tables) and the DBG tab's live frame-time rows. **Costs real frame time** — confirm a bug still reproduces with it off before filing. |
 | `mainprof` | `0` | The same per-phase clock as `gputrace`, without the GPU-side instrumentation — a lighter option when you only need CPU-phase timing. |
 | `det` | `0` | Pins game nondeterminism for a reproducible run (frame-hash / replay tooling). See `NATIVE-RENDERER.md` §5. |
@@ -113,6 +137,9 @@ arm one of these; if you need it, it needs a new ini bridge first.
 - [ ] **`crash*.txt`** if the game crashed and `[debug] crashdump = 1` was set. If it wasn't, say
       so and try to reproduce with it set. If `crashdump` was set but no file appeared, try
       `crashdump_selftest` (see above) before assuming the crash itself produced nothing.
+- [ ] **`boot.txt` / `boot-prev.txt`**, especially for a hang or crash very early in boot (before
+      the title even gets far enough for `log.txt` or `crash*.txt` to help) — these are written
+      by default with no ini change needed; see "Early-boot crashes" above.
 - [ ] **Repro steps**, including which modes/menus you passed through before the symptom —
       several defects in this port only show up after a particular sequence of mode changes
       (`ARCHITECTURE.md` §5).
