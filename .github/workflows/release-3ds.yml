@@ -6,12 +6,11 @@ name: Release (3DS, native renderer)
 #     .3dsx/.cia/.elf from a clean checkout via tools/ci-3ds.sh plus the matching cmake flags,
 #     each also packaged as a ready-to-drop-on-an-SD-card zip.
 #
-# Runs on every push and pull request against `native` (artifacts only, nothing attached, so a
-# PR shows green/red per console target) and on a `native-v*` tag or a manual dispatch naming an
-# existing release tag (builds AND attaches/updates the release). `workflow_dispatch` also takes
-# an optional `targets` input to build only some of the four, for a quick one-off.
+# Runs on every push and pull request against `main` (artifacts only, nothing attached, so a PR
+# shows green/red per console target) and on a `v*` tag or a manual dispatch naming an existing
+# release tag (builds AND attaches/updates the release). `workflow_dispatch` also takes an
+# optional `targets` input to build only some of the four, for a quick one-off.
 #
-# This is the `native` branch's workflow.
 #   * submodules are initialised BY NAME. The O3DS/N3DS targets need `decomp` and `torch` (for
 #     libmio0) -- the slice of libultraship the console compiles is vendored in-tree at
 #     port/3ds/vendor/lus/ (see its PROVENANCE.md), so the `libultraship` submodule is
@@ -37,10 +36,10 @@ name: Release (3DS, native renderer)
 
 on:
   push:
-    branches: ['native']
-    tags: ['native-v*']
+    branches: ['main']
+    tags: ['v*']
   pull_request:
-    branches: ['native']
+    branches: ['main']
   workflow_dispatch:
     inputs:
       tag:
@@ -147,11 +146,11 @@ jobs:
           dispatch_tag = os.environ.get("INPUT_TAG", "").strip()
           sha_short = os.environ.get("GITHUB_SHA", "")[:7]
 
-          if ref_type == "tag" and ref_name.startswith("native-v"):
-              version = ref_name[len("native-v"):]
+          if ref_type == "tag" and ref_name.startswith("v"):
+              version = ref_name[len("v"):]
               tag = ref_name
           elif dispatch_tag:
-              version = dispatch_tag[len("native-v"):] if dispatch_tag.startswith("native-v") else dispatch_tag
+              version = dispatch_tag[len("v"):] if dispatch_tag.startswith("v") else dispatch_tag
               tag = dispatch_tag
           else:
               version = f"dev-{sha_short}"
