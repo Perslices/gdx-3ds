@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* n60lead: 128 silently dropped keys of real cards (launch variant blocks pushed them past it). 256
  * (~30 KiB BSS); overflow is now COUNTED and reported (gdx3ds_config_overflow), never silent. */
@@ -296,10 +297,46 @@ static Gdx3dsCfgPresetResolver sPresetResolver = NULL;
 static const Gdx3dsCfgPresetEntry* sPreset = NULL;
 static int sPresetCount = 0;
 static unsigned sPresetGen = 0;
+/* n60lead: AUTO. "" = unset (today's behaviour: an absent/"auto" [perf] preset applies no
+ * table). Set by the caller once it knows the console model; see gdx3ds_config_set_auto_preset_name. */
+#define GDX3DS_CFG_AUTO_PRESET_LEN 24
+static char sAutoPresetName[GDX3DS_CFG_AUTO_PRESET_LEN] = {0};
+/* The name actually fed to sPresetResolver this generation (ini literal, or the auto
+ * substitution), for gdx3ds_config_preset_name(). "" = neither. */
+static char sResolvedPresetName[GDX3DS_CFG_AUTO_PRESET_LEN] = {0};
 
 void gdx3ds_config_set_preset_resolver(Gdx3dsCfgPresetResolver resolver) {
     sPresetResolver = resolver;
     sPresetGen = 0; /* re-resolve at the next lookup */
+}
+
+void gdx3ds_config_set_auto_preset_name(const char* name) {
+    size_t n;
+    if (name == NULL) {
+        sAutoPresetName[0] = '\0';
+    } else {
+        n = strlen(name);
+        if (n >= sizeof(sAutoPresetName)) {
+            n = sizeof(sAutoPresetName) - 1;
+        }
+        memcpy(sAutoPresetName, name, n);
+        sAutoPresetName[n] = '\0';
+    }
+    sPresetGen = 0; /* re-resolve at the next lookup, like set_preset_resolver */
+}
+
+static void gdx3ds_cfg_remember_resolved_name(const char* name) {
+    size_t n;
+    if (name == NULL) {
+        sResolvedPresetName[0] = '\0';
+        return;
+    }
+    n = strlen(name);
+    if (n >= sizeof(sResolvedPresetName)) {
+        n = sizeof(sResolvedPresetName) - 1;
+    }
+    memcpy(sResolvedPresetName, name, n);
+    sResolvedPresetName[n] = '\0';
 }
 
 static void gdx3ds_cfg_resolve_preset(void) {
@@ -310,14 +347,28 @@ static void gdx3ds_cfg_resolve_preset(void) {
     sPresetGen = sTableGen;
     sPreset = NULL;
     sPresetCount = 0;
+    gdx3ds_cfg_remember_resolved_name(NULL);
     if (sPresetResolver == NULL) {
         return;
     }
     name = gdx3ds_cfg_find_explicit("perf", "preset");
+    if ((name == NULL || strcasecmp(name, "auto") == 0) && sAutoPresetName[0] != '\0') {
+        name = sAutoPresetName; /* ini leaves it absent/"auto": the model-resolved default */
+    }
     sPreset = sPresetResolver(name, &sPresetCount);
     if (sPreset == NULL) {
         sPresetCount = 0;
+    } else {
+        /* Only remember the name when it actually resolved to a table: gdx3ds_config_preset_name
+         * reports the ACTIVE table, not every name tried (e.g. an explicit "off" is handed to
+         * the resolver too, and must still read back as "no preset", not "off"). */
+        gdx3ds_cfg_remember_resolved_name(name);
     }
+}
+
+const char* gdx3ds_config_preset_name(void) {
+    gdx3ds_cfg_resolve_preset();
+    return sResolvedPresetName[0] != '\0' ? sResolvedPresetName : NULL;
 }
 
 static const char* gdx3ds_cfg_find_preset(const char* wantSection, const char* wantKey) {

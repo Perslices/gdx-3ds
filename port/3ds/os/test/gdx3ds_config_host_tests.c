@@ -146,6 +146,56 @@ int main(void) {
     check(gdx3ds_config_preset_count() == 0 && gdx3ds_config_get_int("native", "nrr_draw", 0) == 0,
           "preset: clearing the resolver drops the layer");
 
+    /* n60lead: AUTO. A no-ini (or [perf] preset = auto) player must resolve the SAME tuned
+     * stack main_3ds.cpp's own model probe would select, not no table at all. */
+    gdx3ds_config_set_preset_resolver(&gdx3ds_preset_resolve);
+    write_ini("[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "auto: load with no [perf] preset key");
+    check(gdx3ds_config_preset_count() == 0, "auto: no auto name set yet = no table (today's old behaviour)");
+    gdx3ds_config_set_auto_preset_name("n60");
+    check(gdx3ds_config_preset_count() > 50, "auto: new3ds auto name applies the n60 table");
+    /* native.nrr is permanently overridden to 0 above (line ~136, a RAM-only override that
+     * gdx3ds_config_load never clears) -- native.interp is untouched by any earlier test. */
+    check(gdx3ds_config_get_int("native", "interp", 0) == 1, "auto: new3ds auto gets interp");
+    check(gdx3ds_config_get_int("debug", "tex_keep_kb", 0) == 4096, "auto: new3ds auto gets the n60 headroom");
+    check(strcmp(gdx3ds_config_preset_name(), "n60") == 0, "auto: preset_name reports n60");
+    check(strcmp(gdx3ds_config_get_string("perf", "preset", "?"), "?") == 0,
+          "auto: get_string on perf.preset itself is untouched by the auto substitution");
+
+    gdx3ds_config_set_auto_preset_name("o3ds-auto");
+    check(gdx3ds_config_preset_count() > 50, "auto: old3ds auto name applies the o3ds-auto table");
+    check(gdx3ds_config_get_int("native", "interp", 0) == 1, "auto: old3ds auto also gets interp (n60's own table)");
+    check(gdx3ds_config_get_int("debug", "audio_stream", 0) == 1, "auto: old3ds auto adds audio_stream");
+    check(gdx3ds_config_get_int("debug", "tex_upload_kb", 0) == 512, "auto: old3ds auto adds tex_upload_kb");
+    check(gdx3ds_config_get_bool("debug", "syscore_pct_safe", 0) == 1, "auto: old3ds auto adds syscore_pct_safe");
+    /* tex_keep_kb's real fallback (port/3ds/gfx/n64/gdx_rt_glue.cpp) is 2048 -- the o3ds-auto
+     * table must leave the key out entirely so that fallback is what a caller sees, not n60's
+     * New-3DS 4096 headroom. Passing that same fallback here, not 0, is the point of the check. */
+    check(gdx3ds_config_get_int("debug", "tex_keep_kb", 2048) == 2048,
+          "auto: old3ds auto does NOT carry n60's New-3DS tex_keep_kb headroom (fallback 2048)");
+    check(strcmp(gdx3ds_config_preset_name(), "o3ds-auto") == 0, "auto: preset_name reports o3ds-auto");
+
+    write_ini("[perf]\npreset = auto\n[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "auto: load with an explicit literal \"auto\"");
+    check(gdx3ds_config_preset_count() > 50 && gdx3ds_config_get_int("debug", "audio_stream", 0) == 1,
+          "auto: a literal \"auto\" value is treated the same as an absent key");
+
+    write_ini("[perf]\npreset = off\n[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "auto: load with an explicit non-auto preset key");
+    check(gdx3ds_config_preset_count() == 0, "auto: an explicit preset=off is never overridden by the auto name");
+    check(gdx3ds_config_preset_name() == NULL, "auto: preset_name is NULL when no table applied");
+
+    write_ini("[perf]\npreset = n60\n[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "auto: load with an explicit n60 (auto name still o3ds-auto)");
+    check(gdx3ds_config_get_int("debug", "audio_stream", 0) == 0,
+          "auto: an explicit preset=n60 is never overridden by the (old3ds) auto name");
+
+    gdx3ds_config_set_auto_preset_name(NULL);
+    write_ini("[debug]\nrenderthread = 2\n");
+    check(gdx3ds_config_load(kPath) == 0, "auto: load with no preset key, auto name cleared");
+    check(gdx3ds_config_preset_count() == 0, "auto: clearing the auto name restores no-table auto");
+    gdx3ds_config_set_preset_resolver(NULL);
+
 
     /* n60lead: capacity 256 and LOUD overflow (no silent drop). */
     {

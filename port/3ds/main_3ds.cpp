@@ -1608,6 +1608,21 @@ int main(int argc, char** argv) {
     logStep("gdx3ds_config_load");
     gdx3ds_config_set_preset_resolver(&gdx3ds_preset_resolve); // n3ds: [perf] preset = n60 (defaults layer)
     gdx3ds_config_load(GDX3DS_CONFIG_DEFAULT_PATH);
+    // n60lead: AUTO per console model, BEFORE any lever is read (same requirement as the
+    // bisect select right below). A no-ini player must land on the SAME tuned stack the
+    // hardware test cards carry an explicit `[perf] preset` key for, not the shipped/untuned
+    // defaults: New 3DS -> n60 (identical to an explicit `preset = n60`); Old 3DS -> the
+    // "o3ds-auto" table (gdx3ds_preset_n60.c: n60's own table plus the Old 3DS memory-fit +
+    // syscore-safety levers it needs). An explicit non-auto `[perf] preset` key is untouched --
+    // this only feeds the layer `[perf] preset` leaves absent/"auto". Model probe failure
+    // leaves it unset (no table), same as before this fix: never degrade a console we cannot
+    // identify.
+    {
+        bool isNew3ds = false;
+        if (R_SUCCEEDED(APT_CheckNew3DS(&isNew3ds))) {
+            gdx3ds_config_set_auto_preset_name(isNew3ds ? "n60" : "o3ds-auto");
+        }
+    }
     gdx3ds_boot_trail_latch_config(); // n60boot: [debug] boot_trail=0 closes it here
     logConfigOverflow("config load");
     bisectSelectAtBoot(); // O3DSHOME3: before ANY lever is read
@@ -1660,12 +1675,17 @@ int main(int argc, char** argv) {
     bisectLogReceipt();
     {
         // n3ds: the preset defaults layer, one line (absent = no preset, every default shipped).
+        // n60lead: gdx3ds_config_preset_name() is the name actually fed to the resolver this
+        // generation -- the ini's own literal text, OR the auto substitution when the ini
+        // leaves `[perf] preset` absent/"auto" -- never gdx3ds_config_get_string's raw ini
+        // value, which auto would print as empty/"auto" even though a real table applied.
         const int presetKeys = gdx3ds_config_preset_count();
         if (presetKeys > 0) {
             char line[160];
+            const char* presetName = gdx3ds_config_preset_name();
             std::snprintf(line, sizeof(line),
                           "[preset] %s: %d lever defaults from the built-in table (explicit ini keys win)",
-                          gdx3ds_config_get_string("perf", "preset", "?"), presetKeys);
+                          presetName != NULL ? presetName : "?", presetKeys);
             gdx3ds_boot_trail(line);
             std::strncat(line, "\n", sizeof(line) - std::strlen(line) - 1);
             gdx3ds_filelog_write(line, std::strlen(line));

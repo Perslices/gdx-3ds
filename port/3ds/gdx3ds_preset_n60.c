@@ -117,6 +117,119 @@ static const Gdx3dsCfgPresetEntry kN60Preset[] = {
     { "menu", "race_quiet", "1" },
 };
 
+/* n60lead: `auto` on an Old 3DS (gdx3ds_config_set_auto_preset_name("o3ds-auto"),
+ * main_3ds.cpp). This is kN60Preset above, which the hardware-verified Old 3DS card (n60-3d15)
+ * matches key for key for every lever BOTH tables name, MINUS the New-3DS-only tex_keep_kb
+ * headroom (Old 3DS wants its compiled-in 2048 KB fallback, not n60's 4096 KB; see
+ * port/3ds/gfx/n64/gdx_rt_glue.cpp), PLUS the three Old-3DS-only levers below. Every other key
+ * n60-3d15's ini carries is diagnostic/telemetry (fps, hitch, spike_ms, receipts, filelog*,
+ * membudget, diag_audio, audiocrk*, c5steal, c5pmu, gputl, verbose, gputrace, mainprof,
+ * ships_census, logic_split -- a read-only receipts pair with ships_census, launch_variants,
+ * pcm_dump_s), a user preference (border_mode, stereo.enabled already matches n60, menu
+ * screen_off, the [input] block, bottom_race -- left to the player on every build, same as
+ * n60), out-of-scope Expansion Kit disk scaffolding (disk_stream; inert without a mounted
+ * .ndd), or already the shipped default with the model it already carries (vram_guard's
+ * default IS VRAM_GUARD_REPAIR=1; audio_simd/audio_ctx_narrow/adpcm_scale_clamp already default
+ * ON for an Old 3DS at their own call sites, texburst/stereo_fold/stereo_xl_early/sky_late
+ * already default to what the card sets) -- none of those belong in a performance preset. Full
+ * key-by-key classification: the commit message that added this table.
+ *
+ *   - audio_stream = 1 / tex_upload_kb = 512: the Old 3DS memory-fit levers kN60Preset's own
+ *     header names as dropped when it built the New 3DS table ("the New 3DS has the RAM").
+ *     Both default to 0 (off) in code; the Old 3DS needs them on.
+ *   - syscore_pct_safe = 1: clamps a core-1 app-CPU-time request to the measured-safe 60%
+ *     ceiling on an Old 3DS specifically (port/3ds/audio/gdx3ds_audio_ndsp.c); defaults to 0
+ *     (off). 80% was measured starving the services the audio/loading pipeline depends on. */
+static const Gdx3dsCfgPresetEntry kO3dsAutoPreset[] = {
+    /* host loop / pacing / frame skip -- identical to kN60Preset */
+    { "debug", "renderthread", "0" },
+    { "debug", "frameskip", "race0" },
+    { "debug", "race0_arm", "1" },
+    { "debug", "race0_dwell", "600" },
+    { "debug", "race0_heavy_mode", "steady" },
+    { "debug", "pace_swapgate", "1" },
+    { "debug", "pace_swapgate_3d", "2" },
+    { "debug", "dl_hollow", "1" },
+    { "debug", "overlap_kick", "1" },
+    { "debug", "swp_lean", "4" },
+    { "debug", "mirror_lazy", "1" },
+    { "debug", "flush_svc", "1" },
+    /* textures -- identical to kN60Preset except tex_keep_kb (omitted: the Old 3DS wants its
+     * own compiled-in 2048 KB fallback, not n60's New-3DS-headroom 4096 KB) */
+    { "debug", "tex_fast", "1" },
+    { "debug", "tex_keep", "1" },
+    { "debug", "tex_keep_floor_kb", "3072" },
+    /* audio + save -- identical to kN60Preset, PLUS the two Old 3DS memory-fit levers and the
+     * syscore safety clamp (see header comment above) */
+    { "debug", "audio_io_unlock", "1" },
+    { "debug", "audio_ctx_narrow", "1" },
+    { "debug", "audio_simd", "1" },
+    { "debug", "audio_rs_align", "1" },
+    { "debug", "sram_async", "1" },
+    { "debug", "filelog_race_quiet", "1" },
+    { "debug", "audio_stream", "1" },
+    { "debug", "tex_upload_kb", "512" },
+    { "debug", "syscore_pct_safe", "1" },
+    /* the native renderer: owned interpreter + C5 retained paths -- identical to kN60Preset */
+    { "native", "all", "1" },
+    { "native", "interp", "1" },
+    { "native", "gpuxf", "1" },
+    { "native", "track_retained", "1" },
+    { "native", "track_resident", "1" },
+    { "native", "track_mattab", "1" },
+    { "native", "track_nearclip", "1" },
+    { "native", "track_opfold", "1" },
+    { "native", "hud_batch", "1" },
+    { "native", "hud_direct", "1" },
+    { "native", "hud_retain", "1" },
+    { "native", "shadow_batch", "1" },
+    { "native", "fx_batch", "1" },
+    { "native", "fxshd_direct", "1" },
+    { "native", "gadget_batch", "1" },
+    { "native", "sky_retain", "1" },
+    { "native", "machines_retained", "1" },
+    { "native", "machines_texskip", "1" },
+    { "native", "machines_mattab", "1" },
+    { "native", "machines_loadmemo", "1" },
+    { "native", "machines_walkfast", "1" },
+    { "native", "machines_mattab_live", "1" },
+    { "native", "c3d_diet", "1" },
+    { "native", "dlmemo", "1" },
+    { "native", "deadsetup", "1" },
+    { "native", "replay", "0" },
+    { "native", "hudsky_emit", "1" },
+    /* NRR -- identical to kN60Preset */
+    { "native", "nrr", "1" },
+    { "native", "nrr_hud", "1" },
+    { "native", "nrr_trk", "1" },
+    { "native", "nrr_mach", "1" },
+    { "native", "nrr_sky", "1" },
+    { "native", "nrr_shd", "1" },
+    { "native", "nrr_fx", "1" },
+    { "native", "nrr_dress", "1" },
+    { "native", "nrr_deco", "1" },
+    { "native", "nrr_direct", "1" },
+    { "native", "nrr_hud_memo", "1" },
+    { "native", "nrr_trk_joins", "1" },
+    { "native", "nrr_hud_late", "7" },
+    { "native", "nrr_trk_merge", "1" },
+    { "native", "nrr_draw", "15" },
+    { "native", "nrr_hud_kept", "1" },
+    { "native", "nrr_hud_rr", "3" },
+    { "native", "finish_mesh", "1" },
+    { "native", "finish_direct", "0" },
+    { "native", "prewarm", "7" },
+    { "native", "prewarm_draws", "256" },
+    { "native", "zclear_elide", "2" },
+    { "native", "lcd_vram", "0" },
+    /* stereo -- identical to kN60Preset */
+    { "native", "stereo_interleave", "1" },
+    { "native", "stereo_noreflush", "1" },
+    { "stereo", "enabled", "1" },
+    /* bottom screen -- identical to kN60Preset */
+    { "menu", "race_quiet", "1" },
+};
+
 int gdx3ds_preset_n60_name(const char* name) {
     if (name == NULL) {
         return 0;
@@ -124,11 +237,22 @@ int gdx3ds_preset_n60_name(const char* name) {
     return strcasecmp(name, "n60") == 0 || strcasecmp(name, "n3ds60") == 0;
 }
 
-const Gdx3dsCfgPresetEntry* gdx3ds_preset_resolve(const char* name, int* count) {
-    if (!gdx3ds_preset_n60_name(name)) {
-        *count = 0;
-        return NULL;
+int gdx3ds_preset_o3ds_auto_name(const char* name) {
+    if (name == NULL) {
+        return 0;
     }
-    *count = (int)(sizeof(kN60Preset) / sizeof(kN60Preset[0]));
-    return kN60Preset;
+    return strcasecmp(name, "o3ds-auto") == 0;
+}
+
+const Gdx3dsCfgPresetEntry* gdx3ds_preset_resolve(const char* name, int* count) {
+    if (gdx3ds_preset_n60_name(name)) {
+        *count = (int)(sizeof(kN60Preset) / sizeof(kN60Preset[0]));
+        return kN60Preset;
+    }
+    if (gdx3ds_preset_o3ds_auto_name(name)) {
+        *count = (int)(sizeof(kO3dsAutoPreset) / sizeof(kO3dsAutoPreset[0]));
+        return kO3dsAutoPreset;
+    }
+    *count = 0;
+    return NULL;
 }

@@ -111,6 +111,18 @@ typedef const Gdx3dsCfgPresetEntry* (*Gdx3dsCfgPresetResolver)(const char* name,
 void gdx3ds_config_set_preset_resolver(Gdx3dsCfgPresetResolver resolver);
 /* Entries of the active preset (0 = none). */
 int gdx3ds_config_preset_count(void);
+/* The name actually handed to the resolver this generation (the ini's literal `[perf] preset`,
+ * or the auto name below when the ini leaves the key absent/"auto"), or NULL when neither
+ * exists. For boot receipts: gdx3ds_config_get_string("perf","preset",fallback) only ever sees
+ * the ini's own literal text, never the auto substitution. */
+const char* gdx3ds_config_preset_name(void);
+/* n60lead: AUTO per console model. When `[perf] preset` is absent or literally "auto", the
+ * preset layer resolves `name` (through the SAME resolver, e.g. "n60" or an Old-3DS table's own
+ * name) instead of applying no table at all. An explicit non-auto ini value is never
+ * overridden. NULL clears it (today's behaviour: auto applies no table). The caller is
+ * responsible for knowing the console model (gdx3ds_config.c stays free of <3ds.h>); see
+ * main_3ds.cpp, right after gdx3ds_config_load and before any lever is read. */
+void gdx3ds_config_set_auto_preset_name(const char* name);
 
 #ifdef __cplusplus
 }

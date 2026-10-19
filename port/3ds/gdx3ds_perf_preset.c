@@ -86,7 +86,11 @@ static int ParsePresetName(const char* name, int modelOld, int* isAuto) {
     *isAuto = 0;
     if (name == NULL || name[0] == '\0' || strcasecmp(name, "auto") == 0) {
         *isAuto = 1;
-        return modelOld ? PERF_PRESET_O3DS : PERF_PRESET_OFF;
+        /* n60lead: a no-ini player gets the SAME tuned stack the hardware test cards carry an
+         * explicit ini key for -- n60 on a New 3DS (gdx3ds_preset_n60.c's "o3ds-auto" table
+         * mirrors this for the native/NRR lever layer, set by main_3ds.cpp). Old 3DS keeps its
+         * existing LOD-only o3ds preset here (unchanged). */
+        return modelOld ? PERF_PRESET_O3DS : PERF_PRESET_N60;
     }
     if (strcasecmp(name, "o3ds") == 0 || strcasecmp(name, "old3ds") == 0) {
         return PERF_PRESET_O3DS;

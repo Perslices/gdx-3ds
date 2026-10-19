@@ -114,7 +114,12 @@ static void CheckStockDefaults(const char* label) {
 int main(void) {
     CfgClear();
     Boot(1);
+    /* n60lead: auto on a New 3DS must resolve to n60 (identical [perf] LOD behaviour to OFF --
+     * the n60 lever table that goes with this lives in the config preset layer, fed by
+     * main_3ds.cpp's own model probe, not here), and the receipt must say so. */
     CheckStockDefaults("new3ds auto");
+    Check(strstr(sLastLine, "preset=n60 (auto: model=new3ds)") != NULL,
+          "new3ds auto must resolve to n60 and the receipt must say why");
 
     CfgClear();
     Boot(0);

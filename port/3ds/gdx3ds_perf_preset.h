@@ -8,9 +8,15 @@
  * "the O3DS preset, but full rival detail", and every preset lever can be A/B'd by writing
  * its key.
  *
- *   [perf] preset = auto   (DEFAULT) -> o3ds on an Old 3DS / 2DS, off on a New 3DS
+ *   [perf] preset = auto   (DEFAULT) -> o3ds (LOD only) on an Old 3DS / 2DS, n60 on a New 3DS --
+ *                                       n60lead: a no-ini player gets the hardware-tested stack,
+ *                                       not the shipped/untuned one; see main_3ds.cpp, right
+ *                                       after gdx3ds_config_load, and gdx3ds_preset_n60.c's
+ *                                       "o3ds-auto" table (the Old 3DS side of the same fix,
+ *                                       carried in the config preset layer, not here)
  *                  off | n3ds        -> every [perf] default is the shipped New 3DS one
- *                  o3ds              -> the Old 3DS preset whatever the console
+ *                  o3ds              -> the Old 3DS LOD preset whatever the console (explicit:
+ *                                       does NOT also carry gdx3ds_preset_n60.c's lever table)
  *                  n60 | n3ds60      -> every [perf] LOD default stock (full detail); the n60 race
  *                                       stack's levers come from the config preset layer
  *                                       (gdx3ds_preset_n60.h, n3ds-progress.md)
