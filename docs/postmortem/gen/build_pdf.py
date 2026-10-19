@@ -1,5 +1,5 @@
 import re, sys, os
-from framework import CSS, FONTS, PAGES
+from framework import CSS, FONTS, PAGES, DATE_RANGE
 SRC = sys.argv[1]; OUT = sys.argv[2]
 PRINT_CSS = """
 .shell { display:block; } nav.rail { display:none; } main { max-width:none; padding:0; }
@@ -31,13 +31,15 @@ for f, title, sub in PAGES:
         body = body.replace(f'href="{pf}"', f'href="https://cruxxxxxx.github.io/gdx-3ds/postmortem/{pf}"')
     body = re.sub(r'<video[^>]*poster="([^"]+)"[^>]*></video>', r'<img src="\1" alt="">', body)
     parts.append(f'<section class="pg">{body}</section>')
-cover = ('<section class="cover"><p class="eyebrow">Post-mortem · 2026-08-11 → 2026-09-03</p>'
-         '<h1>G-Diffuser on New 3DS</h1>'
-         '<p class="lede">F-Zero X, ported from the libultraship PC runtime to the New Nintendo 3DS at a native 60 fps with stereoscopic 3D, '
-         'by one person directing a fleet of Claude agents over 24 days.</p>'
+cover = (f'<section class="cover"><p class="eyebrow">Post-mortem · {DATE_RANGE}</p>'
+         '<h1>G-Diffuser on 3DS</h1>'
+         '<p class="lede">F-Zero X, ported from the libultraship PC runtime to the New Nintendo 3DS, reaching 59–60 fps with stereoscopic 3D, '
+         'by one person directing a fleet of Claude agents over 24 days — then forked to a native renderer that also reached 59–60 fps '
+         'on an Old 3DS development build, brought the 64DD Expansion Kit to both consoles, and added a bottom-screen dashboard, '
+         'shipping as v1.0.0 (stereoscopic 3D ships as not yet a locked 60 fps on either console — see RELEASE-NOTES.md).</p>'
          '<ol class="toc">' + "".join(f'<li><b>{t}</b> — {s}</li>' for _, t, s in PAGES) + '</ol>'
          '<p class="meta">Sources: git history, docs/research, hardware logs, local Claude Code transcripts. Dollar figures use published API list prices. '
          'Generated from docs/postmortem/.</p></section>')
-doc = (f'<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><title>G-Diffuser on New 3DS — Post-mortem</title>'
+doc = (f'<!doctype html><html lang="en" data-theme="light"><head><meta charset="utf-8"><title>G-Diffuser on 3DS — Post-mortem</title>'
        f'{FONTS}<style>{CSS}{PRINT_CSS}</style></head><body><div class="shell"><main>{cover}{"".join(parts)}</main></div></body></html>')
 open(OUT, "w").write(doc); print(OUT, len(doc))

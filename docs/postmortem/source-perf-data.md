@@ -1,6 +1,6 @@
 # G-Diffuser 3DS port — performance history (chart-ready extract)
 
-Generated 2026-09-03T14:23. Primary source: `~/code/gdx-3ds/anchor/docs/research/locked-sixty-report.html` (commit eeb3b56, 2026-09-03). Secondary: docs/research/*.md in the `~/code/gdx-3ds/*` worktrees; hardware logs `/tmp/hw-art-1*/log*.txt`. fps method: `[watchdog]` beat frames / 5 s; median = statistics.median; p10 = sorted[floor(0.1n)]; at-cap = beats >= 59.5 fps (this reproduces every report number exactly).
+Generated 2026-09-03T14:23. Primary source: this project's own `docs/research/locked-sixty-report.html` (commit eeb3b56, 2026-09-03). Secondary: `docs/research/*.md` across this project's working checkouts; hardware logs captured as `hw-art-<id>/log.txt`-style scratch files during the hardware-test rounds. fps method: `[watchdog]` beat frames / 5 s; median = statistics.median; p10 = sorted[floor(0.1n)]; at-cap = beats >= 59.5 fps (this reproduces every report number exactly).
 
 ## 1. Hardware rounds (New 3DS)
 
@@ -20,11 +20,11 @@ Pre-campaign rows: p95/max instead of p10/cap — 2026-08-21: p95 58, max 59, tr
 
 | Round | Log | Beats | Median | p10 | p95 | at cap (>=59.5) | ==60 | Report says |
 |---|---|---|---|---|---|---|---|---|
-| Round 1 | `/tmp/hw-art-1788356870/log.txt` | 756 | 51.2 | 38.8 | 60.0 | 9% | 5% | med 51.4 / p10 39.2 / cap 9% / 754 beats |
-| Round 2 | `/tmp/hw-art-1788357755/log.txt` | 78 | 57.2 | 46.6 | 60.0 | 29% | 17% | med 57.2 / p10 46.6 / cap 29% / 78 beats |
-| Round 3 | `/tmp/hw-art-1788377839/log.txt` | 237 | 56.0 | 48.0 | 60.0 | 32% | 17% | med 56.0 / p10 48.0 / cap 32% / 237 beats |
-| Round 4 | `/tmp/hw-art-1788399103/log.txt` | 58 | 57.6 | 44.6 | 60.0 | 14% | 5% | med 57.6 / p10 44.6 / cap 14% / 58 beats |
-| Round 5 | `/tmp/hw-art-1788441668/log.txt` | 230 | 59.6 | 51.4 | 60.0 | 53% | 38% | med 59.6 / p10 51.4 / cap 53% / 229 beats |
+| Round 1 | `hw-art-1788356870/log.txt` | 756 | 51.2 | 38.8 | 60.0 | 9% | 5% | med 51.4 / p10 39.2 / cap 9% / 754 beats |
+| Round 2 | `hw-art-1788357755/log.txt` | 78 | 57.2 | 46.6 | 60.0 | 29% | 17% | med 57.2 / p10 46.6 / cap 29% / 78 beats |
+| Round 3 | `hw-art-1788377839/log.txt` | 237 | 56.0 | 48.0 | 60.0 | 32% | 17% | med 56.0 / p10 48.0 / cap 32% / 237 beats |
+| Round 4 | `hw-art-1788399103/log.txt` | 58 | 57.6 | 44.6 | 60.0 | 14% | 5% | med 57.6 / p10 44.6 / cap 14% / 58 beats |
+| Round 5 | `hw-art-1788441668/log.txt` | 230 | 59.6 | 51.4 | 60.0 | 53% | 38% | med 59.6 / p10 51.4 / cap 53% / 229 beats |
 
 Round 1 log has 756 beats incl. two trailing 0-fps beats (report trimmed to 754). Round 5 log has 230 beats (report 229).
 
@@ -32,14 +32,14 @@ Round 1 log has 756 beats incl. two trailing 0-fps beats (report trimmed to 754)
 
 | Session | Log | Beats | Median (trace on) | p10 | Crowd CPU ms (vtxN 800-1400, n) | Steady CPU ms (400-800, n) | rt waitMain mean | Doc claim |
 |---|---|---|---|---|---|---|---|---|
-| Round 2 traced A/B (brfast on vs off, gputrace on) | `/tmp/hw-art-1788359627/log.txt` | 47 | 49.8 | 40.6 | 18.8 (91) | 15.6 (41) | - | brfast HW [prof] crowd windows br 6.43 -> 3.73 ms (-42%), all-window mean 5.18 -> 2.83; other buckets unchanged. Watchdog fps floors rose (p10 ~42-48 -> ~47-55). |
-| Round 3 traced A/B — campaign levers OFF (control) | `/tmp/hw-art-1788380826/log.txt` | 31 | 46.0 | 39.0 | 20.2 (42) | 16.4 (55) | - | HW A/B (same course, gputrace on, 3D on): steady race 16.4 -> 14.9 ms CPU/frame, crowd 20.2 -> 18.7; fps median 46 -> 49 (trace tax on), p10 39 -> 42. |
-| Round 3 traced A/B — campaign levers ON | `/tmp/hw-art-1788386194/log.txt` | 28 | 49.2 | 41.6 | 18.8 (45) | 14.9 (52) | - |  |
-| Round 4 traced — render thread pipe (gputrace on) | `/tmp/hw-art-1788396432/log.txt` | 31 | 56.0 | 48.4 | 15.1 (37) | 12.0 (61) | 13.2 ms | render thread on core 2 mode 1 — HW: fps median 49->56 p10 42->48 (trace on) but main still waits 10-15 ms/frame for the renderer |
+| Round 2 traced A/B (brfast on vs off, gputrace on) | `hw-art-1788359627/log.txt` | 47 | 49.8 | 40.6 | 18.8 (91) | 15.6 (41) | - | brfast HW [prof] crowd windows br 6.43 -> 3.73 ms (-42%), all-window mean 5.18 -> 2.83; other buckets unchanged. Watchdog fps floors rose (p10 ~42-48 -> ~47-55). |
+| Round 3 traced A/B — campaign levers OFF (control) | `hw-art-1788380826/log.txt` | 31 | 46.0 | 39.0 | 20.2 (42) | 16.4 (55) | - | HW A/B (same course, gputrace on, 3D on): steady race 16.4 -> 14.9 ms CPU/frame, crowd 20.2 -> 18.7; fps median 46 -> 49 (trace tax on), p10 39 -> 42. |
+| Round 3 traced A/B — campaign levers ON | `hw-art-1788386194/log.txt` | 28 | 49.2 | 41.6 | 18.8 (45) | 14.9 (52) | - |  |
+| Round 4 traced — render thread pipe (gputrace on) | `hw-art-1788396432/log.txt` | 31 | 56.0 | 48.4 | 15.1 (37) | 12.0 (61) | 13.2 ms | render thread on core 2 mode 1 — HW: fps median 49->56 p10 42->48 (trace on) but main still waits 10-15 ms/frame for the renderer |
 
-brfast toggle split in `/tmp/hw-art-1788359627/log.txt` (nD>=100 windows): brfast=0 br=6.43 ms (n=6) vs default-on br=3.73 ms (n=7) — matches RESUME-2026-09-03.md:6 '6.43 -> 3.73'.
+brfast toggle split in `hw-art-1788359627/log.txt` (nD>=100 windows): brfast=0 br=6.43 ms (n=6) vs default-on br=3.73 ms (n=7) — matches RESUME-2026-09-03.md:6 '6.43 -> 3.73'.
 
-Round 2 fps by brfast toggle (`/tmp/hw-art-1788357755/log.txt`): before-any-toggle(default): 17 beats, median 52.6, p10 31.0, cap 18%; brfast=0: 7 beats, median 56.0, p10 42.0, cap 0%; brfast=1: 54 beats, median 58.0, p10 52.8, cap 37%.
+Round 2 fps by brfast toggle (`hw-art-1788357755/log.txt`): before-any-toggle(default): 17 beats, median 52.6, p10 31.0, cap 18%; brfast=0: 7 beats, median 56.0, p10 42.0, cap 0%; brfast=1: 54 beats, median 58.0, p10 52.8, cap 37%.
 
 ## 2. Per-bucket CPU timings (ms/frame)
 
@@ -118,8 +118,8 @@ Round 2 fps by brfast toggle (`/tmp/hw-art-1788357755/log.txt`): before-any-togg
 - Every fps number in the record so far is an Azahar proxy. Azahar quantizes to vblank divisors (60/2 = 30, 60/3 = 20 ...) — _60fps-campaign-plan.md:14-18_
 - Azahar undersells HW + fakes DSP/threading — HW is truth. — _RESUME-2026-08-22.md:61_
 - HW crowd-window selection: use vtxN buckets, not nD (the atlas cuts draws 4x). — _RESUME-2026-09-04.md:32_
-- Hardware fps in the report/logs comes from '[watchdog] beat=N frame=F(+D)' lines: fps = D / 5 (5-second windows). No '[fps]' lines exist in any log. Report stats reproduce as: median = statistics.median(beats), p10 = sorted(beats)[floor(0.1*n)], at-cap = share of beats >= 59.5 fps. — _locked-sixty-report.html ('How to read the numbers'); verified against /tmp/hw-art-1*/log.txt_
-- The Azahar SD folder logs (~/Library/Application Support/Azahar/sdmc/3ds/gdiffuser/*.txt, Aug 21-27) and /tmp/vp-art, /tmp/dynlod-art, /tmp/balance-art, /tmp/bootaudio-art are EMULATOR runs (agent A/B artifacts); only /tmp/hw-art-1*/ are hardware card snapshots. — _directory provenance + docs (locked60-campaign.md lines 34-43 'Snapshot log.txt to /tmp/<task>-art/'; RESUME-2026-09-04.md line 33 hw-art glob)_
+- Hardware fps in the report/logs comes from '[watchdog] beat=N frame=F(+D)' lines: fps = D / 5 (5-second windows). No '[fps]' lines exist in any log. Report stats reproduce as: median = statistics.median(beats), p10 = sorted(beats)[floor(0.1*n)], at-cap = share of beats >= 59.5 fps. — _locked-sixty-report.html ('How to read the numbers'); verified against hw-art-1*/log.txt_
+- The Azahar emulator's own SD-folder logs (`gdiffuser/*.txt`, Aug 21-27) and the `vp-art`, `dynlod-art`, `balance-art`, `bootaudio-art` scratch folders are EMULATOR runs (agent A/B artifacts); only the `hw-art-*` folders are hardware card snapshots. — _directory provenance + docs (locked60-campaign.md lines 34-43 'snapshot log.txt to a scratch folder per task'; RESUME-2026-09-04.md line 33 hw-art glob)_
 
 ## 5. Emulator logs on disk (Azahar — fps NOT hardware-meaningful)
 
@@ -145,83 +145,83 @@ Round 2 fps by brfast toggle (`/tmp/hw-art-1788357755/log.txt`): before-any-togg
 | `SDMC/log-prev-rspolish-runB.txt` | 2026-08-21T20:22 | 39 | 30.0 | 11.8 | 37.0 (3) | gpu |
 | `SDMC/log-prev-transition-base.txt` | 2026-08-27T09:41 | 66 | 45.5 | 28.4 | - |  |
 | `SDMC/log.txt` | 2026-09-03T13:23 | 23 | 45.2 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/anchor-burst-log.txt` | 2026-09-03T13:19 | 40 | 46.0 | 23.2 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/anchor-drive-log.txt` | 2026-09-03T13:10 | 53 | 50.8 | 31.4 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/anchor-fine-log.txt` | 2026-09-03T13:23 | 23 | 45.2 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/anchor-race-log.txt` | 2026-09-03T12:46 | 24 | 22.0 | 21.8 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/anchor-race2-log.txt` | 2026-09-03T12:49 | 25 | 55.4 | 22.0 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/anchor-race3-log.txt` | 2026-09-03T12:53 | 41 | 55.4 | 22.0 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/anchor-race4-log.txt` | 2026-09-03T12:57 | 41 | 57.4 | 23.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/anchor-sbs-log.txt` | 2026-09-03T12:43 | 31 | 22.0 | 22.0 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/anchor-seq-log.txt` | 2026-09-03T13:01 | 35 | 58.4 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/anchor-start-log.txt` | 2026-09-03T13:14 | 32 | 58.5 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
-| `/tmp/vp-art/detail-b0-log.txt` | 2026-09-03T10:33 | 10 | 50.9 | 29.8 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/detail-b1-final-log.txt` | 2026-09-03T11:35 | 31 | 57.2 | 23.8 | - | audioprime,audioprime2,dynlod,rt |
-| `/tmp/vp-art/detail-b1-log.txt` | 2026-09-03T10:40 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/detail-b1-v2-log.txt` | 2026-09-03T11:41 | 31 | 57.6 | 23.4 | - | audioprime,audioprime2,dynlod,rt |
-| `/tmp/vp-art/diag-probe-log.txt` | 2026-09-03T11:07 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/diag-t0-log.txt` | 2026-09-03T11:02 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/diag-t0b-log.txt` | 2026-09-03T11:05 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix-detail-b1-log.txt` | 2026-09-03T10:46 | 15 | 32.2 | 23.6 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix-machsel-b0-log.txt` | 2026-09-03T10:47 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix-machsel-b1-log.txt` | 2026-09-03T10:45 | 15 | 32.4 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix2-machsel-b0-log.txt` | 2026-09-03T10:52 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix3-machsel-b0-log.txt` | 2026-09-03T10:56 | 18 | 23.9 | 23.6 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix4-detail-b1-log.txt` | 2026-09-03T11:17 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix4-machsel-b0-log.txt` | 2026-09-03T11:15 | 18 | 23.9 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix5-detail-b0-log.txt` | 2026-09-03T11:26 | 18 | 41.2 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/fix5-machsel-b1-log.txt` | 2026-09-03T11:25 | 18 | 23.9 | 23.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/machsel-b0-log.txt` | 2026-09-03T10:31 | 10 | 51.3 | 32.4 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/machsel-b1-log.txt` | 2026-09-03T10:38 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
-| `/tmp/vp-art/machsel-b1-v2-log.txt` | 2026-09-03T11:44 | 31 | 23.4 | 23.4 | - | audioprime,audioprime2,dynlod,rt |
-| `/tmp/vp-art/race-check-log.txt` | 2026-09-03T11:32 | 31 | 57.4 | 23.6 | - | audioprime,audioprime2,dynlod,rt |
-| `/tmp/dynlod-art/A-log.txt` | 2026-09-02T22:04 | 79 | 34.2 | 13.2 | 36.4 (8) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/dynlod-art/B-log.txt` | 2026-09-02T22:17 | 77 | 33.4 | 13.0 | 36.8 (9) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/dynlod-art/B2-log.txt` | 2026-09-02T23:08 | 77 | 33.0 | 13.2 | 37.4 (11) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/dynlod-art/C-log.txt` | 2026-09-02T23:14 | 63 | 32.2 | 13.0 | 34.4 (6) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/dynlod-art/D-log.txt` | 2026-09-02T23:34 | 65 | 17.6 | 13.0 | 41.1 (7) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/balance-art/bmA/log.txt` | 2026-09-02T22:23 | 69 | 46.8 | 15.0 | 28.5 (6) | audioprime,bcache-census,brfast,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/balance-art/ctrlB/log.txt` | 2026-09-02T22:28 | 69 | 36.8 | 13.2 | 33.0 (6) | audioprime,bcache-census,brfast,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/balance-art/stormBM/log.txt` | 2026-09-02T22:35 | 73 | 26.0 | 15.0 | 22.1 (29) | audioprime,bcache-census,brfast,gpu,rt,tmem2,trect2,trifast |
-| `/tmp/bootaudio-art/log-displaced-1788362036.txt` | 2026-09-02T11:13 | 84 | 38.2 | 17.4 | 35.1 (7) | bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362102.txt` | 2026-09-02T11:14 | 11 | 37.8 | 25.8 | 25.0 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362167.txt` | 2026-09-02T11:16 | 11 | 45.4 | 27.0 | 26.2 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362232.txt` | 2026-09-02T11:17 | 11 | 46.0 | 27.0 | 25.1 (6) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362297.txt` | 2026-09-02T11:18 | 11 | 45.2 | 26.8 | 22.9 (7) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362363.txt` | 2026-09-02T11:19 | 11 | 40.6 | 26.6 | 24.1 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362428.txt` | 2026-09-02T11:20 | 11 | 37.6 | 26.8 | 25.4 (10) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362493.txt` | 2026-09-02T11:21 | 11 | 39.2 | 26.2 | 25.7 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788362559.txt` | 2026-09-02T11:22 | 11 | 43.2 | 26.8 | 24.9 (7) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/log-displaced-1788363817.txt` | 2026-09-02T11:43 | 84 | 39.0 | 19.0 | 34.6 (7) | bcache-census,brfast,gpu,trifast |
-| `/tmp/bootaudio-art/log-displaced-1788363883.txt` | 2026-09-02T11:44 | 11 | 41.4 | 26.6 | 23.5 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/off1-log-live.txt` | 2026-09-02T11:17 | 7 | 40.4 | 26.2 | 23.5 (6) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/off1-log.txt` | 2026-09-02T11:18 | 11 | 45.2 | 26.8 | 22.9 (7) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/on1-log-live.txt` | 2026-09-02T11:14 | 7 | 37.2 | 25.8 | 26.4 (4) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/on1-log.txt` | 2026-09-02T11:14 | 11 | 37.8 | 25.8 | 25.0 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/on2-log-live.txt` | 2026-09-02T11:15 | 7 | 41.0 | 26.8 | 26.2 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/on2-log.txt` | 2026-09-02T11:16 | 11 | 45.4 | 27.0 | 26.2 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/on3-log-live.txt` | 2026-09-02T11:16 | 7 | 40.6 | 26.8 | 25.1 (6) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/on3-log.txt` | 2026-09-02T11:17 | 11 | 46.0 | 27.0 | 25.1 (6) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/onF-log-live.txt` | 2026-09-02T11:44 | 7 | 38.2 | 25.0 | 24.7 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/onF-log.txt` | 2026-09-02T11:44 | 11 | 41.4 | 26.6 | 23.5 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/raceF-log-live.txt` | 2026-09-02T11:51 | 75 | 46.2 | 14.4 | 29.1 (7) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/raceF-log.txt` | 2026-09-02T11:51 | 79 | 46.0 | 14.4 | 28.2 (8) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/raceon-log-live.txt` | 2026-09-02T11:28 | 75 | 46.4 | 16.8 | 29.2 (7) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/raceon-log.txt` | 2026-09-02T11:29 | 79 | 46.2 | 16.8 | 28.3 (8) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stalloff18-log-live.txt` | 2026-09-02T11:18 | 7 | 38.2 | 26.2 | 25.4 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stalloff18-log.txt` | 2026-09-02T11:19 | 11 | 40.6 | 26.6 | 24.1 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stalloff30-log-live.txt` | 2026-09-02T11:21 | 7 | 34.8 | 26.0 | 26.8 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stalloff30-log.txt` | 2026-09-02T11:21 | 11 | 39.2 | 26.2 | 25.7 (9) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stallon18-log-live.txt` | 2026-09-02T11:20 | 7 | 36.8 | 26.2 | 25.9 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stallon18-log.txt` | 2026-09-02T11:20 | 11 | 37.6 | 26.8 | 25.4 (10) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stallon30-log-live.txt` | 2026-09-02T11:22 | 7 | 38.6 | 26.0 | 24.5 (5) | audioprime,bcache-census,brfast,gpu |
-| `/tmp/bootaudio-art/stallon30-log.txt` | 2026-09-02T11:22 | 11 | 43.2 | 26.8 | 24.9 (7) | audioprime,bcache-census,brfast,gpu |
+| `vp-art/anchor-burst-log.txt` | 2026-09-03T13:19 | 40 | 46.0 | 23.2 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
+| `vp-art/anchor-drive-log.txt` | 2026-09-03T13:10 | 53 | 50.8 | 31.4 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
+| `vp-art/anchor-fine-log.txt` | 2026-09-03T13:23 | 23 | 45.2 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
+| `vp-art/anchor-race-log.txt` | 2026-09-03T12:46 | 24 | 22.0 | 21.8 | - | audioprime,audioprime2,rt |
+| `vp-art/anchor-race2-log.txt` | 2026-09-03T12:49 | 25 | 55.4 | 22.0 | - | audioprime,audioprime2,rt |
+| `vp-art/anchor-race3-log.txt` | 2026-09-03T12:53 | 41 | 55.4 | 22.0 | - | audioprime,audioprime2,rt |
+| `vp-art/anchor-race4-log.txt` | 2026-09-03T12:57 | 41 | 57.4 | 23.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
+| `vp-art/anchor-sbs-log.txt` | 2026-09-03T12:43 | 31 | 22.0 | 22.0 | - | audioprime,audioprime2,rt |
+| `vp-art/anchor-seq-log.txt` | 2026-09-03T13:01 | 35 | 58.4 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
+| `vp-art/anchor-start-log.txt` | 2026-09-03T13:14 | 32 | 58.5 | 22.0 | - | audioprime,audioprime2,bcache-census,brfast,rt,tmem2,trect2,trifast |
+| `vp-art/detail-b0-log.txt` | 2026-09-03T10:33 | 10 | 50.9 | 29.8 | - | audioprime,audioprime2,rt |
+| `vp-art/detail-b1-final-log.txt` | 2026-09-03T11:35 | 31 | 57.2 | 23.8 | - | audioprime,audioprime2,dynlod,rt |
+| `vp-art/detail-b1-log.txt` | 2026-09-03T10:40 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
+| `vp-art/detail-b1-v2-log.txt` | 2026-09-03T11:41 | 31 | 57.6 | 23.4 | - | audioprime,audioprime2,dynlod,rt |
+| `vp-art/diag-probe-log.txt` | 2026-09-03T11:07 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/diag-t0-log.txt` | 2026-09-03T11:02 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/diag-t0b-log.txt` | 2026-09-03T11:05 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/fix-detail-b1-log.txt` | 2026-09-03T10:46 | 15 | 32.2 | 23.6 | - | audioprime,audioprime2,rt |
+| `vp-art/fix-machsel-b0-log.txt` | 2026-09-03T10:47 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
+| `vp-art/fix-machsel-b1-log.txt` | 2026-09-03T10:45 | 15 | 32.4 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/fix2-machsel-b0-log.txt` | 2026-09-03T10:52 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
+| `vp-art/fix3-machsel-b0-log.txt` | 2026-09-03T10:56 | 18 | 23.9 | 23.6 | - | audioprime,audioprime2,rt |
+| `vp-art/fix4-detail-b1-log.txt` | 2026-09-03T11:17 | 18 | 23.8 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/fix4-machsel-b0-log.txt` | 2026-09-03T11:15 | 18 | 23.9 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/fix5-detail-b0-log.txt` | 2026-09-03T11:26 | 18 | 41.2 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/fix5-machsel-b1-log.txt` | 2026-09-03T11:25 | 18 | 23.9 | 23.4 | - | audioprime,audioprime2,rt |
+| `vp-art/machsel-b0-log.txt` | 2026-09-03T10:31 | 10 | 51.3 | 32.4 | - | audioprime,audioprime2,rt |
+| `vp-art/machsel-b1-log.txt` | 2026-09-03T10:38 | 15 | 32.4 | 23.6 | - | audioprime,audioprime2,rt |
+| `vp-art/machsel-b1-v2-log.txt` | 2026-09-03T11:44 | 31 | 23.4 | 23.4 | - | audioprime,audioprime2,dynlod,rt |
+| `vp-art/race-check-log.txt` | 2026-09-03T11:32 | 31 | 57.4 | 23.6 | - | audioprime,audioprime2,dynlod,rt |
+| `dynlod-art/A-log.txt` | 2026-09-02T22:04 | 79 | 34.2 | 13.2 | 36.4 (8) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
+| `dynlod-art/B-log.txt` | 2026-09-02T22:17 | 77 | 33.4 | 13.0 | 36.8 (9) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
+| `dynlod-art/B2-log.txt` | 2026-09-02T23:08 | 77 | 33.0 | 13.2 | 37.4 (11) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
+| `dynlod-art/C-log.txt` | 2026-09-02T23:14 | 63 | 32.2 | 13.0 | 34.4 (6) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
+| `dynlod-art/D-log.txt` | 2026-09-02T23:34 | 65 | 17.6 | 13.0 | 41.1 (7) | audioprime,audioprime2,bcache-census,brfast,dynlod,gpu,rt,tmem2,trect2,trifast |
+| `balance-art/bmA/log.txt` | 2026-09-02T22:23 | 69 | 46.8 | 15.0 | 28.5 (6) | audioprime,bcache-census,brfast,gpu,rt,tmem2,trect2,trifast |
+| `balance-art/ctrlB/log.txt` | 2026-09-02T22:28 | 69 | 36.8 | 13.2 | 33.0 (6) | audioprime,bcache-census,brfast,gpu,rt,tmem2,trect2,trifast |
+| `balance-art/stormBM/log.txt` | 2026-09-02T22:35 | 73 | 26.0 | 15.0 | 22.1 (29) | audioprime,bcache-census,brfast,gpu,rt,tmem2,trect2,trifast |
+| `bootaudio-art/log-displaced-1788362036.txt` | 2026-09-02T11:13 | 84 | 38.2 | 17.4 | 35.1 (7) | bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362102.txt` | 2026-09-02T11:14 | 11 | 37.8 | 25.8 | 25.0 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362167.txt` | 2026-09-02T11:16 | 11 | 45.4 | 27.0 | 26.2 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362232.txt` | 2026-09-02T11:17 | 11 | 46.0 | 27.0 | 25.1 (6) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362297.txt` | 2026-09-02T11:18 | 11 | 45.2 | 26.8 | 22.9 (7) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362363.txt` | 2026-09-02T11:19 | 11 | 40.6 | 26.6 | 24.1 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362428.txt` | 2026-09-02T11:20 | 11 | 37.6 | 26.8 | 25.4 (10) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362493.txt` | 2026-09-02T11:21 | 11 | 39.2 | 26.2 | 25.7 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788362559.txt` | 2026-09-02T11:22 | 11 | 43.2 | 26.8 | 24.9 (7) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/log-displaced-1788363817.txt` | 2026-09-02T11:43 | 84 | 39.0 | 19.0 | 34.6 (7) | bcache-census,brfast,gpu,trifast |
+| `bootaudio-art/log-displaced-1788363883.txt` | 2026-09-02T11:44 | 11 | 41.4 | 26.6 | 23.5 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/off1-log-live.txt` | 2026-09-02T11:17 | 7 | 40.4 | 26.2 | 23.5 (6) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/off1-log.txt` | 2026-09-02T11:18 | 11 | 45.2 | 26.8 | 22.9 (7) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/on1-log-live.txt` | 2026-09-02T11:14 | 7 | 37.2 | 25.8 | 26.4 (4) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/on1-log.txt` | 2026-09-02T11:14 | 11 | 37.8 | 25.8 | 25.0 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/on2-log-live.txt` | 2026-09-02T11:15 | 7 | 41.0 | 26.8 | 26.2 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/on2-log.txt` | 2026-09-02T11:16 | 11 | 45.4 | 27.0 | 26.2 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/on3-log-live.txt` | 2026-09-02T11:16 | 7 | 40.6 | 26.8 | 25.1 (6) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/on3-log.txt` | 2026-09-02T11:17 | 11 | 46.0 | 27.0 | 25.1 (6) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/onF-log-live.txt` | 2026-09-02T11:44 | 7 | 38.2 | 25.0 | 24.7 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/onF-log.txt` | 2026-09-02T11:44 | 11 | 41.4 | 26.6 | 23.5 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/raceF-log-live.txt` | 2026-09-02T11:51 | 75 | 46.2 | 14.4 | 29.1 (7) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/raceF-log.txt` | 2026-09-02T11:51 | 79 | 46.0 | 14.4 | 28.2 (8) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/raceon-log-live.txt` | 2026-09-02T11:28 | 75 | 46.4 | 16.8 | 29.2 (7) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/raceon-log.txt` | 2026-09-02T11:29 | 79 | 46.2 | 16.8 | 28.3 (8) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stalloff18-log-live.txt` | 2026-09-02T11:18 | 7 | 38.2 | 26.2 | 25.4 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stalloff18-log.txt` | 2026-09-02T11:19 | 11 | 40.6 | 26.6 | 24.1 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stalloff30-log-live.txt` | 2026-09-02T11:21 | 7 | 34.8 | 26.0 | 26.8 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stalloff30-log.txt` | 2026-09-02T11:21 | 11 | 39.2 | 26.2 | 25.7 (9) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stallon18-log-live.txt` | 2026-09-02T11:20 | 7 | 36.8 | 26.2 | 25.9 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stallon18-log.txt` | 2026-09-02T11:20 | 11 | 37.6 | 26.8 | 25.4 (10) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stallon30-log-live.txt` | 2026-09-02T11:22 | 7 | 38.6 | 26.0 | 24.5 (5) | audioprime,bcache-census,brfast,gpu |
+| `bootaudio-art/stallon30-log.txt` | 2026-09-02T11:22 | 11 | 43.2 | 26.8 | 24.9 (7) | audioprime,bcache-census,brfast,gpu |
 
 ## 6. Could not find / caveats
 
 - No hardware log files for the 2026-08-21 or 2026-08-28 sessions (only doc summaries in RESUME-2026-08-22.md / RESUME-2026-09-02.md); p10 and at-cap for those sessions are not available.
 - No '[fps]' lines in any log; fps derived from '[watchdog]' beats (documented in the report).
-- Logs carry no build-id/commit header line; Round 1-3 commits are inferred from branch heads and Desktop TEST-PLAN.txt files. Round 5: report says feat/3ds-hwtest4 @ 978f31d, hwtest4 TEST-PLAN says c73f64c.
+- Logs carry no build-id/commit header line; Round 1-3 commits are inferred from branch heads and the hardware test plans kept alongside each round's build. Round 5: report says feat/3ds-hwtest4 @ 978f31d, hwtest4 TEST-PLAN says c73f64c.
 - Round 5 hardware log (hw-art-1788441668, identical copy hw-art-1788452996) has gputrace OFF: no [prof]/[rt] ahead-mode receipts (brMain, tk, waitMain) on hardware; the renderthread=2 vs =1 traced A/B requested in hwtest4 TEST-PLAN is not on disk.
 - hwtest5 (stereo anchor, 35df5e2) has a TEST-PLAN but no hardware log yet.
 - Report ledger puts 'median 46 -> 49' on the brfast row, but RESUME-2026-09-04.md lines 8-9 attribute median 46->49 / p10 39->42 to the campaign-levers OFF/ON traced A/B (logs 1788380826 vs 1788386194, which recompute to 46.0->49.2 / 39.0->41.9). The Round-2 brfast fps toggle segments are small (7 beats off vs 54 on).
@@ -231,3 +231,53 @@ Round 2 fps by brfast toggle (`/tmp/hw-art-1788357755/log.txt`): before-any-togg
 - Triloop packed VBO: no measurement at all (reasoned delta).
 - No per-round GPU time on hardware without trace; '[gpu]' lines exist only in traced sessions (gpu ~5 ms/frame).
 - hw-art-1788376502 directory is empty (no log).
+
+## 7. Addendum: Old 3DS and New 3DS performance, native fork (2026-09-24 → 2026-10-19)
+
+The raw per-session fps samples and the token census that sections 1-6 above were computed from no
+longer exist in this worktree (see the post-mortem build script's own note on this); this addendum's
+numbers instead come from `docs/postmortem/gen/o3ds-data.json` (built from hardware logs and
+`docs/research/native/` in the native-fork worktree) and `docs/research/native/n3ds-cmdbuf-freeze.md`,
+cited per row.
+
+### 7.1 Old 3DS race frame rate, per card (`gen/o3ds-data.json`)
+
+| Date | Card | 2D race fps | 3D race fps |
+|---|---|---|---|
+| 09-29 | First boot (RDRAM 8) | 10.4 | — |
+| 09-29 | O3DS profile, run 1 | 11.3 | — |
+| 09-29 | Narrow audio lock, run 2 | 14.7 | — |
+| 09-30 | REL2 (frame-skip v1) | 15 | — |
+| 09-30 | REL3 (frame-skip v2) | 20 | — |
+| 10-01 | REL4 | 20 | — |
+| 10-02 | Native renderer, card 2 | 57.3 | — |
+| 10-02 | Native renderer, card 3 | 60 | — |
+| 10-03 | Stereo, first pass | 60 | 52 (est.) |
+| 10-07 | Stereo, second pass (Mute City) | — | 60 |
+| 10-08 | Card 4, `lcd_vram` fix | — | 59.5 |
+
+Method per `old-3ds.html`: 1000 / median frame time where a log gives one; the steady-mode rendered
+rate where the game runs an even frame-skip cadence; the hold-1 vblank share for the two 3D cards.
+09-03's/10-03's and 10-07's 3D values are documented-range estimates, flagged as such on the page.
+
+### 7.2 GPU command-buffer high-water marks, by model (`n3ds-cmdbuf-freeze.md` §5)
+
+Same scripted replay (`race-gp-finish`), full `[DEBUG]`/`[NATIVE]`/`[STEREO]` ini, Azahar emulator
+(hardware margin is almost certainly tighter — see the doc's own caveat, repeated here: this table is
+a lower bound, not a ceiling; the New 3DS freeze this fix resolved never reproduced on the emulator at
+all, only on real hardware):
+
+| Model | Buffer | Peak words | Buffer size (words) | % of buffer |
+|---|---|---|---|---|
+| Old 3DS | ×2 (prior) | 91,938 | 131,072 | 70.1% |
+| Old 3DS | ×4 (shipped) | 91,938 | 262,144 | 35.1% |
+| New 3DS | ×4 (shipped) | 21,946 | 262,144 | 8.4% (not comparable — run did not land on the 30-machine burst; see doc §5) |
+
+### 7.3 Could not find / caveats, this addendum
+
+- No raw per-beat fps arrays for the Old 3DS cards survive outside `o3ds-data.json`'s already-reduced
+  numbers; histograms like §1-5's are not reconstructable for this phase from what remains on disk.
+- New 3DS's real-hardware margin for the cmdbuf fix has no numeric readout at all (by design — the
+  receipt added by that fix logs a high-water mark, but the four verification hardware sessions never
+  tripped a new one worth logging past boot); the qualitative result (zero overflows across four full
+  attract-loop sessions through the exact frame that used to freeze) is the hardware evidence, not a number.

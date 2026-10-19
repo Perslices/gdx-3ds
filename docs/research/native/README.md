@@ -1,21 +1,19 @@
-# Native renderer — working notes
+# 3DS port — working notes
 
-The native-renderer fork was developed across a large number of short-lived branches, each of
-which kept its own progress note, evidence directory and run manifests. Those notes are
-**development-local**: they cite branch worktrees, scratch directories, emulator run ids and
-per-session artifacts that mean nothing outside the machine they were written on, and they are
-not published here.
+The development history behind this port kept internal progress notes. This page is not one of
+them — it's a pointer to the docs that carry forward what matters from them. Source comments and
+patch headers may cite internal note names (`<topic>-progress.md`, `<NN>-<topic>-plan.md`,
+`integration-verify-<date>.md`) — read that as a pointer to internal history, not a path
+guaranteed to resolve in this checkout.
 
-Source comments and patch headers in this tree cite them by name
-(`<track>-progress.md`, `<NN>-<track>-plan.md`, `integration-verify-<date>.md`). Read those
-citations as "there is a longer write-up of this decision in the development history", not as a
-path you can open in this repository.
-
-What is published instead:
+What's published, consolidated, here instead:
 
 | document | what it covers |
 |---|---|
+| [`docs/ARCHITECTURE.md`](../../ARCHITECTURE.md) | How the whole 3DS port fits together, with source paths: the decomp/port/libultraship split, the vendored renderer carve, the asset pipeline, segments, and the build flags |
 | [`docs/NATIVE-RENDERER.md`](../../NATIVE-RENDERER.md) | What the native renderer is, the two tiers, every `[native]` ini key, how each lever is verified, and what is measured on hardware |
-| [`docs/NATIVE-RELEASE-NOTES.md`](../../NATIVE-RELEASE-NOTES.md) | The beta release notes: the result, the caveats, and what has not been run |
-| [`docs/3DS-HARDWARE.md`](../../3DS-HARDWARE.md) | Toolchain, build, SD layout, the full ini reference, troubleshooting |
+| [`docs/RELEASE-NOTES.md`](../../RELEASE-NOTES.md) | What changed, the measured result numbers, and the known issues |
+| [`docs/DIAGNOSTICS.md`](../../DIAGNOSTICS.md) | Logs, crash dumps, debug ini keys, and what to attach to a bug report |
+| [`docs/HW-DEV-LOOP.md`](../../HW-DEV-LOOP.md) | The WiFi hardware dev loop and the emulator-driving CLI |
+| [`docs/3DS-HARDWARE.md`](../../3DS-HARDWARE.md) | Toolchain, build, SD layout, troubleshooting |
 | [`docs/postmortem/`](../../postmortem/) | The published account of the port as a whole |

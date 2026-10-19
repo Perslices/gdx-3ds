@@ -3,27 +3,32 @@ from framework import *
 
 def build(D):
     b = []
-    b.append('<p class="eyebrow">06 · Frontier</p><h1>Why this is bold, and where it is new</h1>')
+    b.append('<p class="eyebrow">09 · Frontier</p><h1>Why this is bold, and where it is new</h1>')
     b.append('<p class="lede">The user asked on 08-23 how to explain to an unimpressed friend why this port matters. '
-             'The short version: nobody had run a libultraship game on a handheld this weak, nobody had pushed a '
-             'software N64 display-list interpreter to a native 60 Hz on an ARM11, and nobody had done it with '
-             'stereoscopic 3D, in three and a half weeks, with a fleet of AI agents doing the typing.</p>')
+             'The short version, still true at v1.0.0: nobody had run a libultraship game on a handheld this weak, '
+             'nobody had pushed a software N64 display-list interpreter to a native 60 Hz on an ARM11, and nobody had '
+             'done it with stereoscopic 3D, in three and a half weeks, with a fleet of AI agents doing the typing. A '
+             'second phase then took the same approach to the Old 3DS — a console roughly a third the New 3DS\'s '
+             'clock speed, with no second core — and shipped a 64DD expansion alongside it.</p>')
 
     b.append('<h2>The field before this project</h2>')
     b.append('<p>Two deep-research passes (08-14, 09-01) and a targeted literature check (09-02) mapped the state of the art. '
              'The findings framed every architectural decision:</p>')
     b.append(table(["Precedent", "What it did", "What it means here"], [
-        ["sm64_3ds (the well-known Mario 64 3DS port)", "Native decomp with a hand-written 3DS renderer. Runs its game logic at 30 Hz and interpolates to 60. Plain <code>switch</code> dispatch. Audio on core 2.", "The proven fallback is 30 Hz + interpolation. This project refused that and targeted native 60."],
+        ["sm64_3ds (the well-known Mario 64 3DS port)", "Native decomp with a hand-written 3DS renderer, plain <code>switch</code> dispatch, audio on a second core. Its README describes a naive frame skip below 30 fps and lists a separate 60 FPS patch.", "The proven fallback in this field is some form of 30 Hz, interpolated or not. This project refused that and targeted native 60."],
         ["libultraship ports (Ship of Harkinian, 2Ship, Starship, and this game's own PC port)", "Desktop-only. x86-64 and ARM64 with OpenGL, Metal or DirectX. Never compiled for devkitARM.", "The LUS carve-out spike (08-12) proved LUS builds on devkitARM with a 13-line newlib patch. First time."],
         ["Every N64 port ever shipped", "Walks the display list on the CPU every frame and re-emits it to the GPU.", "The 09-01 research verdict: nobody has shipped beyond the per-frame walk. GPU vertex transform was the field's number-one untried idea, listed as a TODO by the sm64 port's author."],
         ["Cross-core render pipelining on 3DS", "No precedent found in any homebrew title. Core 2 needs a Luma kernel grant; core 3 is the OS's.", "The render thread (09-02 → 09-03) is, as far as the research could find, the first game-logic-ahead render pipeline on the console."],
     ]))
+    b.append('<div class="note">An earlier draft of this table described the sm64_3ds port as 30 Hz logic interpolated to 60; that '
+             'was not accurate. See <a href="boundaries.html">Pushing the boundaries</a> for the correction.</div>')
 
-    b.append('<h2>Six things this project did first, or did differently</h2>')
+    b.append('<h2>Seven things this project did first, or did differently</h2>')
     b.append('<div class="cols2">')
     b.append('<div><h3>1. libultraship on a 3DS</h3><p>The whole runtime, including its Fast3D interpreter, resource manager and archive '
              'loader, compiled and running on ARM11 under devkitARM. The port lives as a stack of pure-delta patches (' + esc(D["patches"]) +
-             ' files) over two untouched upstream submodules, so the upstream projects could take any of it.</p></div>')
+             ' files as of the first phase; 93 files at v1.0.0 — 52 decomp patches plus 41 lus patches, the set <code>tools/ci-3ds.sh</code> '
+             'applies and vendors) over two untouched upstream submodules, so the upstream projects could take any of it.</p></div>')
     b.append('<div><h3>2. Native 60 on a software display-list interpreter</h3><p>The measured position at the end of the project on a full '
              'Grand Prix, trace off: median ' + esc(D["final_median"]) + ' fps, tenth percentile ' + esc(D["final_p10"]) +
              ', ' + esc(D["final_cap"]) + ' of frames at the 60 cap. Menus at 60. Achieved without dropping the logic rate or interpolating.</p></div>')
@@ -43,6 +48,15 @@ def build(D):
     b.append('<div><h3>6. Fixed-function combiner totality</h3><p>Every N64 colour-combiner mode the game uses maps to three or fewer TexEnv '
              'stages; fog is a per-vertex factor blended in a TexEnv stage because the PICA\'s depth LUT cannot resolve the game\'s depth range; '
              'the decal-clamp, environment-colour-flush and CCMUX-11 fixes made the translation total with zero unsupported modes.</p></div>')
+    b.append('<div><h3>7. Skipping the display-list walk, for real, on the hardest target</h3><p>Item 4 of this list shelved a GPU vertex-'
+             'transform shader because it could not fix what actually limited the frame. A second phase (2026-09-07 to 10-19) found a different '
+             'way to the same goal: for the geometry a race actually spends its frame on — the track, the machines, the sky, the HUD, the '
+             'effects — an owned interpreter precomputes and writes the GPU\'s own command words directly, skipping the per-frame CPU walk '
+             'entirely for those categories, with menus and the long tail of one-off screens left on the original interpreter. It shipped '
+             'first on, and matters most for, the Old 3DS. No other N64 decompilation, recompilation or emulator project this project found '
+             'claims a sustained 60 fps on an Old 3DS: a third of the New 3DS\'s clock, no second core, and a cache the original interpreter\'s '
+             'code did not fit in. See <a href="boundaries.html">Pushing the boundaries</a> for the comparison, on our own New 3DS build and '
+             'against the field.</p></div>')
     b.append('</div>')
 
     b.append('<h2>Why bold</h2>')

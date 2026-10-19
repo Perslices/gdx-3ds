@@ -3,17 +3,20 @@ from framework import *
 
 def build(D):
     b = []
-    b.append('<p class="eyebrow">07 · Agentic workflow</p><h1>How the fleet was run, and how the ship was steered</h1>')
-    b.append('<p class="lede">One human, one orchestrating Claude session that lived for the whole project, and '
-             + esc(D["subagents"]) + ' subagents working in ' + esc(D["worktrees"]) + ' git worktrees. The human never opened an editor. '
-             'The human held the only console, the only SD card, and the only pair of eyes that could be trusted.</p>')
+    b.append('<p class="eyebrow">10 · Agentic workflow</p><h1>How the fleet was run, and how the ship was steered</h1>')
+    b.append('<p class="lede">One human, one orchestrating Claude session that lived for the whole project. In the first '
+             'phase (2026-08-11 to 09-03), ' + esc(D["subagents"]) + ' subagents worked in ' + esc(D["worktrees"]) + ' git '
+             'worktrees. A second phase (09-07 to 10-19) ran the same discipline at a larger scale, for longer, with a '
+             'wider toolset — covered in its own section below. Throughout, the human never opened an editor, and held '
+             'the only console, the only SD card, and the only pair of eyes that could be trusted.</p>')
 
     b.append(tiles([
-        (esc(D["prompts"]), "messages typed by the user across the project", True),
-        (esc(D["subagents"]), "subagent transcripts (background agents + workflow agents)", True),
-        (esc(D["worktrees"]), "git worktrees under ~/code/gdx-3ds", False),
-        (esc(D["branches"]), "feat/3ds-* branches", False),
-        (esc(D["workflows"]), "deep-research workflow runs", False),
+        (esc(D["prompts"]), "messages typed by the user in the first phase (08-11 to 09-03)", True),
+        (esc(D["subagents"]), "background subagent transcripts, first phase (the Agent tool only; the 1,103 "
+                               "workflow agents are counted separately, see Cost)", True),
+        (esc(D["worktrees"]), "separate git worktrees, each on its own branch, first phase", False),
+        (esc(D["branches"]), "feat/3ds-* branches, first phase", False),
+        (esc(D["workflows"]), "deep-research workflow runs, first phase", False),
         (esc(D["active_days"]), "active days between 08-11 and 09-03", False),
     ]))
 
@@ -49,7 +52,7 @@ def build(D):
         ["<b>Never re-apply the patch list onto a patched tree.</b> Reset both submodules first.", "A corrupted decomp tree in the final week."],
     ]))
 
-    b.append('<h2>How the ship was steered</h2>')
+    b.append('<h2>Steering from outside the code</h2>')
     b.append('<p>The user\'s messages are short, frequent, and almost entirely about direction, evidence and verdicts. '
              'Reading all ' + esc(D["prompts"]) + ' of them in order, the pattern is a captain, not a programmer: set the goal, '
              'demand parallelism, bring the physical evidence, say yes or no, and protect the budget.</p>')
@@ -60,8 +63,6 @@ def build(D):
     b.append(quote("08-28 04:27", "moonshot! lets go for it"))
     b.append('<h3>Demanding parallelism</h3>')
     b.append(quote("08-14 01:10", "i didnt see any hard crashes right now, so lets see about the visual fixes. any work that can be done in parallel ?"))
-    b.append(quote("08-20 05:38", "definitely run ! run as many subagents on plausible tasks"))
-    b.append(quote("08-21 03:48", "btw are we wasting time in general ? is there work that can be done in tandem ? spawn subagents if so"))
     b.append(quote("09-02 21:59", "lets do /deep-research on whats left, come up with plan, and execute subagents for all parallel work"))
     b.append('<h3>Being the oracle</h3>')
     b.append('<p>The agents could not see the console. The user ran the SD-card loop dozens of times (\"SD in\", \"SD returned\", '
@@ -99,11 +100,41 @@ def build(D):
              'compute the fps distribution, decide merge or revert.</li>')
     b.append('</ul>')
 
+    b.append('<h2>The second phase: longer, wider, with an adversary</h2>')
+    b.append('<p>The first phase was a 24-day sprint to a single target. The second (09-07 to 10-19, 43 calendar days) '
+             'built a different renderer, a second console tier and a second game mode on top of a build that already '
+             'worked, which changed the shape of the work more than its length: many more parallel workstreams, each '
+             'still in its own worktree with its own brief and progress file, left behind 199 internal progress notes '
+             '(docs/research/native/*.md) by the end, far more than the first phase\'s smaller written record. The rules in the table above (patch '
+             'as pure delta, killswitch for everything, receipt for everything, commit early) held and were leaned on '
+             'harder, because more of the work now ran unattended for longer between human checks.</p>')
+    b.append('<p>Three things were added to the loop that the first phase did not have:</p>')
+    b.append('<ul>')
+    b.append('<li><b>A network link to the console.</b> The first phase\'s only path to hardware was ejecting the SD '
+             'card, copying files, and reinserting it. The second phase added a lightweight network link (a '
+             'homebrew-loader push plus a small device-link tool) so a build could reach a development console '
+             'directly over Wi-Fi, cutting the time between a build finishing and a human seeing it run.</li>')
+    b.append('<li><b>An emulator replay lane for proof without hardware.</b> A record-and-replay harness captured '
+             'exact input sequences and per-frame state hashes, so a new render path could be checked frame-for-frame '
+             'against the old one — bit-identical pixels, identical game-state hashes — without needing the console '
+             'or a human at all. This is what let dozens of rendering changes be verified as behaviourally identical '
+             'before ever being staged for a hardware round, the same role the emulator played in the first phase but '
+             'run far more often and more mechanically.</li>')
+    b.append('<li><b>A standing adversarial review.</b> After a window where many parallel branches landed in quick '
+             'succession, a dedicated review pass audited the merged result for what the individual branches\' own '
+             'testing could not catch — not new bugs in any one branch, but damage from combining them: two agents '
+             'measuring the same thing with code that quietly disagreed, a comparison tool whose flag got pasted out '
+             'of existence, a safety wait that had become unreachable. Findings were ranked by severity and marked '
+             'confirmed or suspected, and the practice repeated after later merge windows.</li>')
+    b.append('</ul>')
+    b.append('<p>What stayed the same: one orchestrating session, one human approving every merge into the branch that '
+             'builds toward release, and no agent ever touching the only SD card or the only console directly.</p>')
+
     b.append('<h2>Where the workflow was pioneering</h2>')
     b.append('<p>Multi-agent coding is usually demonstrated on web apps with a test suite. This project ran it against a target '
              'the agents could not observe, with a human-in-the-loop measurement cycle measured in SD-card round trips, on a codebase '
-             'made of three repositories (decomp, runtime, port) with a patch stack instead of a fork. The devices that made that work '
-             '(receipts, killswitches, briefs with measurement protocols, the emulator lock, the morning-status documents, the '
-             'hardware test plans) are the transferable result. They are what let ' + esc(D["subagents"]) + ' agents contribute to one '
-             'binary without a single regression reaching the user\'s console unflagged.</p>')
+             'made of three repositories (decomp, runtime, port) with a patch stack instead of a fork. The <a href="frontier.html">'
+             'Frontier</a> page names the devices that made that work transferable. What this page adds: the second phase runs the same '
+             'argument at a larger scale — the same devices and discipline, held across more than twice the calendar time, more console '
+             'configurations, and a ground-up renderer rewrite.</p>')
     return page("agentic.html", "Agentic Workflow", "".join(b))

@@ -1,8 +1,16 @@
 # G-Diffuser Claude Code usage census
 
+**Scope note (added for the v1.0.0 release, 2026-10-19):** this census covers only the first development
+phase, through v0.9.0 (2026-08-11 to 09-03); it does not include the second phase (2026-09-07 to 10-19,
+Old 3DS support, the native renderer, the Expansion Kit). As of commit `cd83b92` (2026-10-19 21:07 UTC,
+still climbing as release work lands), the second phase had added 1,628 commits, 798 of them touching
+`port/3ds`, over 43 calendar days — see the Cost page's "What the second phase would add" section for why
+this census wasn't re-run over that phase and how to.
+
 Scanned 1265 jsonl files, 81,491 records, across: `<project>` (1264 files), `<project-2>` (1 files)
 
 Date range: **2026-08-11T03:15:08.663Z** to **2026-09-03T19:04:41.247Z** (15 distinct active UTC days).
+All figures below are scoped to this date range only.
 
 ## Pricing assumptions ($/M tokens, input/output)
 

@@ -147,3 +147,18 @@ def build(D, P):
              'are still serialised on core 2), a texture import-lookup memo (imp 0.7 ms, 83 imports per frame), tuning the auto-LOD thresholds '
              'against hardware, and, if ever wanted, GPU vertex transform phase 2 on lit machine geometry with a large-coordinate CPU fallback.</p>')
     return page("road-to-60.html", "The Road to Sixty", "".join(b))
+    # continuation_note() is deliberately NOT appended here: build.py appends it exactly once, after
+    # wrapping this page (for both the live and frozen/reframed paths). Appending it here too would
+    # duplicate it on every build — see framework.reframe()'s docstring.
+
+
+def continuation_note():
+    """A short pointer forward. build.py appends this once, after page()-wrapping, on every build path."""
+    return ('<h2>Where the road went next</h2>'
+            '<p>None of the above levers reached the Old 3DS, which has no second render core, no L2 cache, and a third of the clock. '
+            'Starting 09-24, a second performance campaign rebuilt the race-frame renderer around that console\'s instruction cache instead '
+            'of its instruction count, and an internal development card reached 59–60 fps (245–256 of 256 frames on the first vblank) in '
+            '3D Grand Prix races by 10-08 — not the shipped v1.0.0 Old 3DS configuration, which has no single preset for 3D yet. '
+            'That campaign, card by card, is on '
+            '<a href="old-3ds.html">Old 3DS: the road to a real 60</a>; the renderer work that enabled it is on '
+            '<a href="native.html">The Native Fork</a>.</p>')

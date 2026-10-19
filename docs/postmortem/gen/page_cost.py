@@ -38,8 +38,12 @@ def build(D, C):
         return (a["input"] * i + a["output"] * o + a["cache_creation"] * i * 2 + a["cache_read"] * i * 0.1) / 1e6
 
     b = []
-    b.append('<p class="eyebrow">08 · Cost</p><h1>What it cost to build</h1>')
-    b.append('<p class="lede">Every API call the project made is in the session transcripts on this machine. This page counts them. '
+    b.append('<p class="eyebrow">11 · Cost</p><h1>What it cost to build</h1>')
+    b.append('<div class="note"><b>This page prices the first phase only</b> (2026-08-11 to 09-03, the sprint that reached v0.9.0 on '
+             'the New 3DS). A second phase ran 2026-09-07 to 10-19 and added Old 3DS support, a native renderer and the Expansion '
+             'Kit; it is not priced below. See "What the second phase would add" at the end of this page for why, and for the one '
+             'honest number we do have for it.</div>')
+    b.append('<p class="lede">Every API call the first phase made is in the session transcripts this page counts. '
              'Token counts are exact. Dollar figures apply Anthropic\'s published API list prices to those counts; '
              'cache writes are billed at the 1-hour rate, the cache TTL Claude Code used in these sessions.</p>')
     b.append(tiles([
@@ -49,7 +53,7 @@ def build(D, C):
         (money(tB), "at published API list prices, 1-hour cache writes (the TTL these sessions used)", True),
         (f"{C['subagents']['subagent_transcripts']}", "background subagents launched by the Agent tool", False),
         (f"{C['subagents']['workflow_agent_transcripts']:,}", "agents inside 10 deep-research workflow runs", False),
-        (f"{C['human_prompts']['count_strict']}", "human prompts, 19.7 K characters typed in total", False),
+        (f"{C['human_prompts']['count_strict']}", "human prompts, 19.8 K characters typed in total", False),
     ]))
 
     b.append('<h2>Prices used</h2>')
@@ -63,8 +67,8 @@ def build(D, C):
         ["Claude Haiku 4.5", "$1", "$5", "$2", "$0.10"],
     ], num_cols=(1, 2, 3, 4)))
     b.append('<div class="assume">The user\'s Claude subscription is not billed per token; these figures are what the same usage would have cost '
-             'on the API. Synthetic records (API errors, interrupts) carry zero usage. Web searches inside the deep-research workflows '
-             '($10 per 1,000 on the API) are not included; there were 899 of them, about $9.</div>')
+             'on the API. Synthetic records (API errors, interrupts) carry zero usage. Web searches ($10 per 1,000 on the API) are not '
+             'included; there were 900 of them, about $9.</div>')
 
     b.append('<h2>Where the tokens went</h2>')
     cats = ["Orchestrator|(main session)", "Subagents|(Agent tool)", "Workflow agents|(deep-research)"]
@@ -75,7 +79,7 @@ def build(D, C):
         ("output", "--c1", [grp[k]["output"] / 1e9 for k in keys]),
         ("input (uncached)", "--c2", [grp[k]["input"] / 1e9 for k in keys]),
     ], ylabel="billions of tokens", dec=2)
-    b.append(figure(svg, "<b>Cache reads dominate volume, output dominates cost.</b> Of 3.16 billion tokens, 96% were prompt-cache reads, re-read at a tenth "
+    b.append(figure(svg, "<b>Cache reads dominate volume, output dominates cost.</b> Of 3.17 billion tokens, 96% were prompt-cache reads, re-read at a tenth "
                     "(Fable 5.1: a fortieth) of the input price. The 13.2 million output tokens, the text and code actually written, are the largest line on the bill.",
                     legend([("cache read", "--c8"), ("cache write", "--c6"), ("output", "--c1"), ("input, uncached", "--c2")])))
 
@@ -126,35 +130,34 @@ def build(D, C):
     b.append('<h2>Tool calls</h2>')
     tc = C["tools_combined"]
     rows = sorted(tc.items(), key=lambda kv: -kv[1])[:12]
+    bash_n, edit_n, write_n = tc.get("Bash", 0), tc.get("Edit", 0), tc.get("Write", 0)
+    fetch_n, search_n = tc.get("WebFetch", 0), tc.get("WebSearch", 0)
+    # distinct-files-edited (469) and the git-commit-containing-Bash-call count (334) are not broken out in
+    # tools_combined; they come straight from source-census.md §4/§7, which this paragraph must stay equal to.
     b.append(figure(hbar([(k, v) for k, v in rows], fmt=lambda v: f"{v:,.0f}"),
-                    "<b>15,085 shell commands.</b> The project was driven through Bash: builds, patches, emulator runs, log analysis, SD-card copies. "
-                    "1,282 Edits and 196 Writes touched 462 distinct files. 333 shell commands contained <code>git commit</code>. "
-                    "1,907 web fetches and 899 web searches belong almost entirely to the deep-research workflows."))
+                    f"<b>{bash_n:,} shell commands.</b> The project was driven through Bash: builds, patches, emulator runs, log analysis, SD-card copies. "
+                    f"{edit_n:,} Edits and {write_n:,} Writes touched 469 distinct files. 334 shell commands contained <code>git commit</code>. "
+                    f"{fetch_n:,} web fetches and {search_n:,} web searches belong almost entirely to the deep-research workflows."))
 
     b.append('<h2>Reconciling with what /usage and /stats show</h2>')
     b.append('<p>The user\'s impression was that the project cost more than this page says. Three things explain the gap, and one '
              'real omission was checked and found small.</p>')
     b.append(table(["Check", "Finding"], [
         ["<b>Claude Code\'s own stats file counts every streamed record.</b>", "Each assistant message is written to the transcript once per content block (2 to 5 records with the same message id). "
-         "<code>~/.claude/stats-cache.json</code> sums them all: its 08-13 Fable figure, 1,730,401, equals this census\'s <i>un-deduplicated</i> input+output sum for that day exactly. "
+         "Claude Code\'s own local usage-stats cache sums them all: its 08-13 Fable figure, 1,730,401, equals this census\'s <i>un-deduplicated</i> input+output sum for that day exactly. "
          "Priced that way the project reads as 5.94 B tokens and <b>$7,961</b>. The API bills per request, so the deduplicated 3.17 B tokens and $4,974 is the honest figure."],
         ["<b>/usage shows plan utilisation, not dollars.</b>", "The Fable weekly allowance was exhausted three times (08-14, 08-22, 08-28). Reaching a cap says nothing about the dollar value of the tokens under it."],
         ["<b>Other projects shared the same allowance.</b>", "Between 08-15 and 08-28 the same account ran Opus sessions on five other projects (a Unity game, an image folder, three code repos: 447 prompts in the history file). Their usage sits in the same /usage bars and the same stats file, and none of it is in this census."],
         ["<b>Missing transcripts.</b>", "The prompt history lists nine G-Diffuser sessions; four are on disk. The five absent ones are each a single <code>/resume</code> that went nowhere."],
-        ["<b>Calls the transcript does not log.</b>", "Four context compactions (contexts of 0.5–1.0 M tokens each, about $4 in total at Fable rates), session-title and tool-summary side calls on Haiku (cents), and 899 web searches inside the research workflows (about $9 at API rates). Retries after 529 overloads are not billed."],
+        ["<b>Calls the transcript does not log.</b>", "Four context compactions (contexts of 0.5–1.0 M tokens each, about $4 in total at Fable rates), session-title and tool-summary side calls on Haiku (cents), and 900 web searches, almost all inside the research workflows (about $9 at API rates). Retries after 529 overloads are not billed."],
     ]))
 
     b.append('<h2>What a human team would have cost</h2>')
     b.append('<p>A rough comparison, not a quote. The scope a team would face is the scope this project faced: a new fixed-function GPU '
              'backend, a 32-bit sweep across three codebases, a ROM-side audio driver port, an ARM11 performance grind to native 60 on a '
-             'software display-list interpreter, stereo, a multi-core render pipeline, lifecycle, menus and packaging. About 20,000 lines '
-             'of low-level code plus the research and the hardware loop.</p>')
-    b.append('<h3>Reference points</h3>')
-    b.append('<ul>')
-    b.append('<li><b>sm64 on 3DS.</b> Hobbyists, one core developer plus contributors. Playable in months, 60 fps via 30 Hz logic and interpolation, refined over years.</li>')
-    b.append('<li><b>Ship of Harkinian console ports</b> (Wii U, Switch). One or two skilled volunteers, several months each, on top of an existing PC runtime, with a shader-capable GPU and no stereo.</li>')
-    b.append('<li><b>Professional retro-port studios.</b> Five to eight people for six to twelve months on ports with far more headroom than an 804 MHz ARM11 driving a PICA200.</li>')
-    b.append('</ul>')
+             'software display-list interpreter, stereo, a multi-core render pipeline, lifecycle, menus and packaging. About 25,000 lines '
+             'of low-level code (port plus patches — ' + D["loc_all"] + ' lines exactly, the same figure the "Cost per outcome" table '
+             'below uses) plus the research and the hardware loop.</p>')
     b.append('<h3>Estimate to reach this state</h3>')
     b.append(table(["Team", "Calendar", "Effort", "Cost at US rates"], [
         ["Two senior engineers (graphics/runtime, systems/audio/perf) plus part-time QA on hardware", "5–8 months", "12–18 person-months", "$250k–$450k"],
@@ -162,11 +165,16 @@ def build(D, C):
         ["One skilled hobbyist, evenings and weekends", "12–24 months", "1,000–1,500 hours", "$0 paid, a year of unpaid labour"],
     ], num_cols=(1, 2, 3)))
     b.append('<p>Basis: $150–200 per hour contractor rates or $20–25k per month loaded per senior engineer; low-level port work lands at '
-             '100–200 shipped lines per engineer-day once debugging and hardware loops are counted, which puts 20,000 lines at six or more '
-             'person-months before the performance grind. A human team would spend its time in the same places the agents did (the 32-bit '
+             '100–200 shipped lines per engineer-day once debugging and hardware loops are counted, which puts ' + D["loc_all"] + ' lines at '
+             'roughly 125–250 engineer-days, about six to twelve person-months, before the performance grind. A human team would spend its time in the same places the agents did (the 32-bit '
              'address-space heuristics, the fog LUT, the HUD backstop, the audio driver, then months of profiler-driven grinding), would very '
              'likely have shipped 30 Hz plus interpolation first and deferred stereo, and might never have attempted the core-2 render thread.</p>')
+    b.append('<p>For scale, not as a direct comparison: other N64-on-3DS and libultraship ports take hobbyists or small volunteer teams '
+             'months to years to reach playable, per their own READMEs and press — see <a href="boundaries.html">Pushing the boundaries</a> '
+             'for those projects with sources.</p>')
     b.append('<h3>Side by side</h3>')
+    b.append('<p>The \"human team\" column below is the midpoint of the two-senior-engineers row above ($250k–$450k, 5–8 months): the closest '
+             'match to this project\'s scope.</p>')
     b.append(table(["", "This project", "Human team, mid estimate"], [
         ["Calendar", "24 days, 15 active", "about 6 months"],
         ["Cost", money(tB) + " API-equivalent", "about $350k"],
@@ -182,11 +190,27 @@ def build(D, C):
     b.append(table(["Measure", "Value"], [
         ["Per human prompt", money(per_prompt)],
         ["Per active day (15 days)", money(tB / 15)],
-        ["Per commit touching the 3DS port (" + D["commits_3ds"] + ")", money(tB / int(D["commits_3ds"].replace(",", "")))],
+        ["Per commit touching the 3DS port (" + D["commits_3ds"] + ", frozen 2026-10-08, not re-verified against final history)", money(tB / int(D["commits_3ds"].replace(",", "")))],
         ["Per line of port code, patches included (" + D["loc_all"] + " lines)", f"${tB / int(D['loc_all'].replace(',', '')):.2f}"],
         ["Per fps of median gained on hardware (from ~12–20 in the first emulator race to " + D["final_median"] + ")", money(tB / (float(D["final_median"]) - 16))],
     ], num_cols=(1,)))
     b.append('<div class="note">For scale: a single experienced console-port engineer at a modest contractor rate would bill more than the whole project '
              'in its first week. The point is not that the machine was cheap. It is that the machine was cheap enough to try five ideas '
              'and shelve three of them on evidence.</div>')
+
+    b.append('<h2>What the second phase would add</h2>')
+    b.append('<p>The census above comes from the same per-transcript, per-turn method described above in "Reconciling with what /usage '
+             'and /stats show". That script was not kept in the repository, and re-running it over the second phase\'s transcripts — '
+             '2026-09-07 to 10-19 — was out of scope for this documentation pass: the honest path was to say so clearly rather than '
+             'approximate it.</p>')
+    b.append('<p>What can be said without re-running that method, from the project\'s own git history: as of commit <code>cd83b92</code> '
+             '(2026-10-19 21:07 UTC — the count below was still climbing as release work landed, so treat it as a floor, not a final tally), '
+             'the second phase had added <b>798 commits touching <code>port/3ds</code></b> (1,628 commits in total, not port/3ds-scoped) over '
+             '43 calendar days, versus the ' + D["commits_3ds"] + ' port/3ds commits this page prices for the 15-active-day first phase — '
+             'about 3.2× as many, like for like. Commit count is not a cost measure — the two phases\' commits are not the same size or shape '
+             'of change, and a quiet research day can produce zero commits and a large bill, or the reverse — but it is a real, verifiable '
+             'sense of scale for a phase this page otherwise has nothing priced to say about.</p>')
+    b.append('<div class="note">If this page is revisited: the method above, applied to the second phase\'s transcripts with the same '
+             'de-duplication and pricing rules, is how to extend it. Until then, every dollar and token figure on this page is first-phase '
+             'only, and should be read that way.</div>')
     return page("cost.html", "What It Cost", "".join(b))

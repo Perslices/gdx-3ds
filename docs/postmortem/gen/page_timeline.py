@@ -3,7 +3,7 @@ from framework import *
 
 def build(D, commits_per_day, prompts_per_day):
     b = []
-    b.append('<p class="eyebrow">03 · Every step</p><h1>Twenty-four days, step by step</h1>')
+    b.append('<p class="eyebrow">03 · Every step</p><h1>Step by step: twenty-four days, then forty-three more</h1>')
     b.append('<p class="lede">The project ran in five bursts separated by three credit pauses. Dates are from git and the session '
              'transcripts (local time); quotes are the user\'s own words at that moment.</p>')
 
@@ -12,7 +12,8 @@ def build(D, commits_per_day, prompts_per_day):
                                                ("user messages", "--c2", [prompts_per_day.get(d, 0) for d in days])],
                        ylabel="per day", dec=0, h=260, vals_on=False)
     b.append(figure(svg, "<b>The rhythm of the project.</b> Commits touching the port and messages typed by the user, per day. "
-                    "Gaps are the three Fable-credit pauses (08-15 → 08-19, 08-22 → 08-26, 08-29 → 08-31).",
+                    "Gaps are three pauses when the weekly usage allowance for the project's regular model (the \"Fable\" tier) ran out "
+                    "(08-15 → 08-19, 08-22 → 08-26, 08-29 → 08-31).",
                     legend([("commits", "--c1"), ("user messages", "--c2")])))
 
     b.append('<h2>Burst 1 · Research to first race (08-11 → 08-14)</h2>')
@@ -25,7 +26,7 @@ def build(D, commits_per_day, prompts_per_day):
     b.append(event("08-13 → 08-14", "Race entry", "Race freeze (DMA misroute) at 19:26, then a race-time death exposed as an uncaught bad_alloc (EnqueueList's worst-case reserve), fixed by capping the resource cache. \"crashed again when race tried to load\", \"says fatal error encountered\"."))
     b.append(event("08-14 01:01", "First race", "\"omg it works ! i can race ! it looks messed up and runs at 12 to 20fps but it works!\" Nine minutes later: \"i didnt see any hard crashes right now, so lets see about the visual fixes. any work that can be done in parallel ?\"", "gold big"))
     b.append(event("08-14 04:26", "Hardware prep, CI, docs", "\"lets do 1, 2, and 3. for CI though, no github actions. this will all be local for now.\" SMDH metadata, makerom CIA packaging, the real-hardware runbook, a local ci-3ds.sh, the user guide. Two deep-research runs: 60 fps on New 3DS, and stereoscopic 3D. The stereo foundation and GPU profiling telemetry landed the same night."))
-    b.append(event("08-14 14:06", "Pause 1", "\"we ran out of fable credits until next week, lets capture all the inflight tasks and store state so we can pick up the work later.\" RESUME.md written; the fog blocker (pink road) open; three agents in flight.", "bad"))
+    b.append(event("08-14 14:06", "Pause 1", "\"we ran out of fable credits until next week, lets capture all the inflight tasks and store state so we can pick up the work later.\" A resume note was written for the next session; the fog blocker (pink road) open; three agents in flight.", "bad"))
     b.append(event("08-15", "Opus interlude", "A deep-research pass on Fast3D vs RT64 confirmed the renderer choice; an asset-cost shift (ETC1, decimation) was added to the plan and marked \"done with opus, reconsider with fable\"."))
     b.append('</div>')
 
@@ -57,7 +58,7 @@ def build(D, commits_per_day, prompts_per_day):
 
     b.append('<h2>Burst 4 · Lifecycle and the last big lever (09-01 → 09-02)</h2>')
     b.append('<div class="timeline">')
-    b.append(event("09-01 21:27", "\"lets proceed with the things we were working on. the goal to 60fps\"", "Fable 5.1. Bridge cache agent: census said 87% of commands are host-built per frame, output cache NO-GO; pivot to brfast memos, br 11.5 → 4.9 ms. Deep research on render architectures: nobody has shipped beyond the per-frame walk.", "big"))
+    b.append(event("09-01 21:27", "\"lets proceed with the things we were working on. the goal to 60fps\"", "Back on the next usage tier (\"Fable 5.1\"), the bridge cache agent found: census said 87% of commands are host-built per frame, output cache NO-GO; pivot to brfast memos, br 11.5 → 4.9 ms. Deep research on render architectures: nobody has shipped beyond the per-frame walk.", "big"))
     b.append(event("09-01 23:53", "\"oh! also major bug. the home button crashes the game!\"", "Suspend-path audit, audio park gate. Fixed 20:56 local. Combined test build staged with A/B inis and the first TEST-PLAN.txt."))
     b.append(event("09-02 14:02", "Hardware round 2", "\"i think brfast helped with framerate … home menu came up! i was also able to return to game. but when i tried to 'close' the software it hung.\" Close-from-HOME root cause (sticky park event, hot spinner) fixed 10:18 local. Median 57.2 vs 56.0, p10 47.2 vs 42.0 with brfast on vs off."))
     b.append(event("09-02 14:41", "\"lets start on those projects. divide the work into appropriate subtasks for multiple agents\"", "LOCKED-60 campaign: Task A HUD texrect atlas, B TMEM bookkeeping, C per-triangle cost, D boot audio. All four landed by 13:40 local; staged as hwtest2.", "big"))
@@ -71,17 +72,102 @@ def build(D, commits_per_day, prompts_per_day):
     b.append(event("09-02 18:44 → 21:47 local", "Render thread M2 → M6", "Sync mode, then pipe mode forked at osSpTaskStartGo, then ahead mode (DP-done acked when the game parks). The console filter fixed the bottom-screen tab bar the user reported at 00:05 (\"debug doesnt have tabs anymore\")."))
     b.append(event("09-03 01:39", "\"so median is up +7fps?\"", "Hardware round 3 (pipe mode): median 49 → 56, p10 42 → 48 with the trace on; stable, HOME clean, but not yet overlapping. 01:46: \"got it. can you work on 2, 3, and 4 right now in parallel?\" → Tasks I (bridge on main), J (auto rival detail), E (machine atlas)."))
     b.append(event("09-03 04:49", "\"ok SD in. can you set the render thread?\"", "Round 4 card: ahead mode + bridge on main + auto LOD, full Grand Prix, trace off."))
-    b.append(event("09-03 13:20", "Round 4 verdict: median 59.6, p10 52.2, 53% at cap. And a hard crash.", "\"i did a full GP and then i poked around the menus and there was a hard crash. also, is there any way you could create a webpage with some histograms of the performance\". Crash = texture cache LRU splice on core 2; fixed by render-thread ownership. The performance report page was written as a local HTML file.", "gold big"))
+    b.append(event("09-03 13:20", "Round 5 verdict: median 59.6, p10 51.4, 53% at cap. And a hard crash.", "\"i did a full GP and then i poked around the menus and there was a hard crash. also, is there any way you could create a webpage with some histograms of the performance\". Crash = texture cache LRU splice on core 2; fixed by render-thread ownership. The performance report page was written as a local HTML file.", "gold big"))
     b.append(event("09-03 13:46 → 15:23", "The menu placement bug", "User captured side-by-side screenshots against the real game: machine-select ships 1.6× too large. Viewport fold fix, verified against the references. \"sorry didnt mean to interrupt but its looking good\"."))
     b.append(event("09-03 16:32", "Stereo markers", "\"one thing thats really jarring is the 1P/2P/3P markers during a race. they sit on the most foreground in 3D but the ships are somewhere in the distance\". Anchored at the labeled ship's depth via the game's own prim-depth register; verified in side-by-side stereo; staged as round 5 with the crash and viewport fixes."))
     b.append(event("09-03 18:08", "This post-mortem", "\"lets write up a whole post mortem on this project.\"", "big"))
     b.append('</div>')
 
     b.append('<h2>State at the time of writing</h2>')
-    b.append(table(["Item", "State"], [
-        ["Mainline", "<code>feat/3ds-hwaudio</code> @ eeb3b56: campaign levers, brfast, render thread mode 1, boot audio v2, console filter, HOME fixes, report page"],
-        ["On the user's SD, awaiting verdict", "<code>feat/3ds-hwtest4</code> @ 35df5e2: ahead mode, bridge on main, auto LOD, texture-cache crash fix, viewport fix, stereo anchor"],
-        ["Shelved with reports", "GPU vertex transform (feat/3ds-gputransform), bridge output cache (census), dspfast (default off), machine atlas (default off), double-height stereo target (research)"],
-        ["Known backlog", "tunnel roof (#27, deprioritised), boot-audio underrun at 10.7 s on hardware, auto-LOD thresholds untuned, double command buffers on the render thread"],
-    ]))
+    b.append('<p>Everything staged at this point shipped or was closed out in the chapters below: the pending '
+             'build\'s ahead mode, bridge-on-main and automatic rival detail all merged, along with the texture-cache '
+             'crash fix, the viewport fix and the stereo marker anchor. The GPU vertex transform stayed shelved (see '
+             '<a href="road-to-60.html">Road to Sixty</a>); the tunnel-roof bug (#27) is still open at release.</p>')
+    b.append(native_fork_begins())
+    b.append(old3ds_section())
+    b.append(shipping_it())
     return page("timeline.html", "Every Step", "".join(b))
+
+
+def native_fork_begins():
+    b = []
+    b.append('<h2>Chapter 2 · The native fork begins (09-07 → 09-23)</h2>')
+    b.append('<p>A feasibility pass on 09-07 inventoried what the New 3DS build actually used of libultraship\'s renderer and concluded the '
+             'fix should start with the development loop, not the renderer: no network path to the console, no reliable frame oracle, and '
+             'no desktop reference build on the machine doing the work. Over the next two weeks that loop was rebuilt (a network control '
+             'and log link to the console, input-recorder determinism, a Linux reference render container) and the first renderer tier — an '
+             'owned F3DEX2 interpreter replacing libultraship\'s — landed, along with a native track, machine, sky, HUD and effects path for '
+             'races, and the first pass of the 64DD Expansion Kit on console. That work, and the chapters it enabled below, is told in full '
+             'on <a href="native.html">The Native Fork</a>; this page returns to a day-by-day account once the Old 3DS work opens on 09-24.</p>')
+    # One chart for the whole native-fork window (09-07 → 10-19, chapters 2-4): this period has no
+    # archived session transcripts (source-timeline.md §7), so commits are the only per-day signal
+    # available across its full range, unlike the message-rich New 3DS chapter charted above.
+    cpd = {"09-12": 45, "09-13": 34, "09-17": 42, "09-20": 18, "09-23": 317, "09-24": 122, "09-25": 8,
+           "09-26": 84, "09-27": 31, "09-29": 127, "09-30": 120, "10-01": 163, "10-02": 95, "10-03": 20,
+           "10-07": 78, "10-08": 139, "10-15": 79, "10-16": 31, "10-17": 26, "10-18": 11, "10-19": 9}
+    days = sorted(cpd)
+    svg = grouped_bars(days, [("commits to the native-fork branch", "--c1", [cpd[d] for d in days])],
+                       ylabel="commits per day", dec=0, h=260, vals_on=False)
+    b.append(figure(svg, "<b>The native fork, per day, 09-07 → 10-19.</b> Commits reachable from the native integration branch; "
+                    "this period has no archived session transcripts, so commits are the only per-day signal available, unlike "
+                    "the message-rich New 3DS chapter charted above. Gaps are five rate-limit or session pauses, the longest a "
+                    "full week (10-08 → 10-15, right after the Old 3DS campaign's final hardware card)."))
+    return "".join(b)
+
+
+def shipping_it():
+    b = []
+    b.append('<h2>Chapter 4 · Shipping it (10-08 → 10-19)</h2>')
+    b.append('<p>Card 4 (10-08) ended the Old 3DS performance campaign at 59–60 fps (245–256 of 256 frames on the first vblank) in 3D '
+             'Grand Prix races. The eleven days that '
+             'followed — with a week-long rate-limit pause in the middle — finished the rest of what ships as v1.0.0: the Expansion Kit '
+             'confirmed and packaged for both consoles, the bottom-screen dashboard taken from a debug console to a real HUD, a New 3DS '
+             'freeze root-caused and fixed, and the disk-streaming defaults this release ships with. Dates below are commit dates on the '
+             'native-fork integration branch; this period\'s work is not backed by the session transcripts the earlier chapters quote '
+             'directly, so this account is commit- and document-sourced rather than quoted.</p>')
+    b.append('<div class="timeline">')
+    b.append(event("10-07 → 10-08", "Expansion Kit: save and title separated", "The Expansion Kit gets its own HOME-menu title and its own save file, ending the last blocker to shipping it as a second, side-by-side install. Hardware cards for both consoles staged the same day Old 3DS 3D racing reached 60 fps."))
+    b.append(event("10-08 → 10-15", "Rate-limit pause", "A week-long gap in the commit history, the longest of the project.", "bad"))
+    b.append(event("10-15 → 10-17", "The bottom screen becomes DASH", "The proven minimap-only bottom screen is extended into a full race dashboard: lap, position, energy, splits, best time, composited into the console's own framebuffer at well under a millisecond of CPU time. A fourth, fully custom drag-and-resize layout mode is designed and mocked up."))
+    b.append(event("10-16", "The Old 3DS memory ceiling, reproduced under simulation", "A forced run on the Azahar emulator, under the real 64 MB budget simulation, finds the budget can be exhausted by a single large asset load mid-race under worst-case conditions; traced to the generic archive-file loader, not any one feature. A separate real-hardware capture (heapUsed≈24.2 MB peak) suggests the margin is thin on real hardware too, though the crash itself has not been reproduced there. Left as a known limit rather than a last-minute structural fix.", "bad"))
+    b.append(event("10-16", "An audio-crackle hypothesis, tested and refuted", "The leading theory for Old 3DS audio crackle — a vblank-vs-audio-rate mismatch — is measured and ruled out on both logical and empirical grounds; a separate, smaller audio fix ships instead."))
+    b.append(event("10-18", "A New 3DS froze at the title screen, every time", "The attract-mode demo's one full-field race demo deterministically freezes a real New 3DS, with no crash dump — see <a href=\"native.html\">The Native Fork</a> for the root cause and fix.", "gold big"))
+    b.append(event("10-18 → 10-19", "The custom HUD mode is shelved; the shipped three stay", "The fourth, fully custom dashboard layout is set aside before release; the three fixed placement modes ship. The bottom screen also gets an idle view outside races and a DEBUG-button rename."))
+    b.append(event("10-19", "Disk streaming and Japanese inputs become the default", "The Expansion Kit's 64DD disk image streams from the SD card instead of copying into RAM, and streaming becomes the default for every 3DS build; Japanese-region inputs are accepted by default, since the only retail 64DD disk is Japan-only.", "gold"))
+    b.append(event("10-19", "v1.0.0", "Four console builds — Old 3DS and New 3DS, each with and without the Expansion Kit — from one source tree, replacing the 09-04 (v0.9.0) New-3DS-only release.", "gold big"))
+    b.append('</div>')
+    return "".join(b)
+
+
+def old3ds_section():
+    b = []
+    b.append('<h2>Chapter 3 · The Old 3DS (09-24 → 10-08)</h2>')
+    b.append('<p>Dates and times below are local; quotes are the user\'s messages to the coordinating session. This chapter\'s own '
+             'commit and message rhythm is part of the full native-fork chart above; the per-card performance numbers are on the '
+             '<a href="old-3ds.html">Old 3DS</a> page.</p>')
+    b.append('<div class="timeline">')
+    b.append(event("08-11 (chapter 1)", "\"New 3DS only\"", "The project's first deep-research verdict: the Old 3DS 64 MB region cannot hold the port."))
+    b.append(event("09-24", "The milestone reopens, with a correction", "A stale note had said the user does not own an Old 3DS; they do. Four parallel subagents work under a simulated 64 MB grant: RDRAM arena 18% used, halved to 8 MiB; <code>audio_table</code> streamed.", "big"))
+    b.append(event("09-25", "It fits, in simulation", "The last unattributed heap use is closed; canonical replay 49/49 under the simulated <code>memtype=0</code> grant with 2.65 MiB to spare."))
+    b.append(event("09-28 evening", "The console says <code>memtype=0</code>", "Luma 6.6 / arm9loaderhax means hbmenu will not start, so every build goes as a CIA through FBI. The grant matches the simulation byte for byte; the shipped RDRAM-16 build dies in its boot preload."))
+    b.append(event("09-29 00:10", "\"it ran ! at like 9fps. but it ran! home button crashed it too\"", "RDRAM 8 build: wall p50 96 ms, GPU busy 3.6 ms. 01:00: \"lets just work on this entirely. also is there anything we can do to avoid the display lists and render things in a more traditional way?\"", "gold big"))
+    b.append(event("09-29 day", "The parallel wave", "The audio-lock wait (25.8 ms → 0.2), a single Old 3DS profile flag, the HOME freeze (the bottom-backlight session held open; found by probe apps and a bisect card), ARMv6 SIMD audio synthesis (bit-exact on silicon), the slow-motion discovery, plus flag/LOD/GPU-transform/interpreter follow-ups. 12:19: \"we should working on as many in parallel\"."))
+    b.append(event("09-29 13:09", "\"we want this running at 60fps\"", "13:13: \"lets start the design agent. it can also start up subagents to do different parts. a suborchestrator if you will\". A staged retained renderer design (five research and probe subagents) begins.", "big"))
+    b.append(event("09-29 15:16", "\"playable but nausea inducing\"", "Frame skipping puts logic at 57–60 ticks/s, drawn 19–28 fps; draw-distance pop-in removed from the preset; draw cost measured at 10.9 µs per draw."))
+    b.append(event("09-29 19:39", "First release candidate does not boot", "Deterministic boot crash. A four-title bisect card: cold size-optimised code crashes, stock boots. Code generation reverted to stock; the latent bug was never found.", "bad"))
+    b.append(event("09-30 01:10", "Second release candidate boots", "\"framerate in race was like 15fps ... a lot of awkward hitching\". Root cause: synchronous SD log flushes, 26–270 ms on main."))
+    b.append(event("09-30 02:09", "\"start as many agents as necessary\"", "Plus a research lead with five lenses and an adversarial review. All seven running agents hit the API session limit together and were resumed; later the same day the disk filled (ENOSPC) and stopped everything.", "big"))
+    b.append(event("09-30 → 10-01", "Third release candidate and a hardware profiler", "\"no hitches afaik felt steadier\", but the steady race window barely moved. CPU performance counters: CPI 4.34, fetch stalls 43.6%; a probe found the cliff from CPI 1.06 at 16 KB of hot code to 4.1 at 24 KB.", "gold"))
+    b.append(event("10-01 08:57", "\"we should go for a real 60! i still believe it has to be possible.\"", "A pose-replay shortcut gave 40 images/s with visible artifacts and was set aside. An instruction-cache-first native race renderer starts as its own sub-effort.", "big"))
+    b.append(event("10-01 22:41", "First native-renderer build freezes at race start", "\"it showes mute city and then instant freeze\". A verify mode had rolled back the live GPU command queue; hardware-only.", "bad"))
+    b.append(event("10-02 09:28", "\"time trial was silk 60fps the entire time, no hitching!\"", "Card 2: verify mode checked 199,472 draws, 0 bad; Grand Prix 45–50 fps with log-flush hitches. Then a pre-existing bug surfaced: saves after the first never persisted (the SD rename call returned an undocumented error)."))
+    b.append(event("10-02 23:19", "\"omg it ran amazing! i fixed the 3d slider. i want to try it !\"", "Card 3: race median 16.5 ms, 0 race hitches, save survives a power cycle. 23:22: \"lets focus on 3D at 60fps\".", "gold big"))
+    b.append(event("10-03 09:38", "Black sky", "An interim stereo configuration on the card-3 build: the native sky path consumed its section but could not draw in stereo.", "bad"))
+    b.append(event("10-03 14:36 → 18:38", "3D, first pass", "\"running better! looks good ... just didnt run at 60\"; then \"60fps for 2d for both\", 3D in the 40s and 50s. The right eye is interleaved per chunk."))
+    b.append(event("10-03 → 10-07", "Rate-limit pause", "The weekly limit stopped the fleet; one branch's uncommitted edits were recovered on 10-07. 13:10: \"ok let's proceed with as many subagents as possible for concurrency\".", "bad"))
+    b.append(event("10-07 22:51", "3D, second pass", "Mute City holds ~60 in 3D with end-mode pacing; heavier venues at 16–18 ms. \"battery died on 3ds\"."))
+    b.append(event("10-08 02:08", "\"all 3 crashed\"", "A VRAM-mapping change for the bottom screen put the framebuffer somewhere the CPU could not write to under a real CIA; the emulator does not enforce that mapping.", "bad"))
+    b.append(event("10-08 02:56", "\"did a long play on main, was good!\"", "Same build with the VRAM change reverted: 3D Grand Prix race windows at 59–60 fps; verify mode 0 bad draws.", "gold big"))
+    b.append(event("10-08 03:01", "This chapter, and the next", "\"can you start updating the postmortem doc with these new advancements / branches ?\" — the request this release's post-mortem traces back to.", "big"))
+    b.append('</div>')
+    return "".join(b)
