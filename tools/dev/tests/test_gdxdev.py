@@ -665,8 +665,15 @@ class RetroDryRunTest(unittest.TestCase):
         """The guard against 'fixed --dry-run by making every run a dry run'."""
         from gdxdev import cli
         args = cli.build_parser().parse_args(["retro", "run", self.dsx, "--quiet"])
-        with self.assertRaises(AssertionError):
-            self.retro.do_run(args, self.out, self._ctx())
+        # A real run refuses up front when RetroArch is missing (any non-macOS host, CI
+        # included); point it at a file that exists so the detonators are what stop it.
+        saved_bin = self.retro.RETRO_BIN
+        self.retro.RETRO_BIN = sys.executable
+        try:
+            with self.assertRaises(AssertionError):
+                self.retro.do_run(args, self.out, self._ctx())
+        finally:
+            self.retro.RETRO_BIN = saved_bin
         self.assertTrue(self.tripped, "a real run must still reach the launch path")
 
 

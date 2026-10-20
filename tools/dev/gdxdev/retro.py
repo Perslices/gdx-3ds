@@ -1232,6 +1232,10 @@ def _dry_run(args, out, ctx, threedsx, core, gfx_list, settings, explicit, three
         replay.apply_implied(settings, explicit, kind=replay_block.get("kind"), out=out)
     seconds, seconds_why = resolve_seconds(args, replay_block)
 
+    # No core installed yet (a fresh host, or a Linux CI runner): report where a real run
+    # would download it, and the "core" row below marks it NOT INSTALLED.
+    core = core or os.path.expanduser("~/Library/Application Support/RetroArch/cores/"
+                                      + CORE_NAME)
     cmd = [RETRO_BIN, "-c", inst.cfg, "-L", core, threedsx, "-v", "--log-file", inst.log]
     cmd += list(cmd_extra(args))
     tree = buildmod.tree_info(ctx["root"])
