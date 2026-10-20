@@ -34,10 +34,17 @@ def build(D):
 
     b.append('<h2>On hardware</h2>')
     b.append('<div class="media">'
+             '<figure><a href="../media/v1-menu.jpg" target="_blank" rel="noopener"><img src="../media/v1-menu.jpg" alt="v1.0 on a New 3DS: Select Mode with the Expansion Kit entries, the G-DIFFUSER idle view on the bottom screen" loading="lazy"></a>'
+             '<figcaption>v1.0, New 3DS: the Expansion Kit\'s Select Mode (COURSE EDIT, CREATE MACHINE); the bottom screen is DASH\'s idle view.</figcaption></figure>'
+             '<figure><a href="../media/v1-race.jpg" target="_blank" rel="noopener"><img src="../media/v1-race.jpg" alt="v1.0 on a New 3DS: a race on the top screen, the DASH race dashboard on the bottom" loading="lazy"></a>'
+             '<figcaption>v1.0, New 3DS, mid-race: DASH on the bottom screen with energy, position, lap times and the course map.</figcaption></figure>'
+             '</div>')
+    b.append('<p>The clips and photos below are from v0.9 (2026-09), before DASH replaced the debug console on the bottom screen.</p>')
+    b.append('<div class="media">'
              '<figure class="vid"><video autoplay muted loop playsinline preload="metadata" poster="../media/gameplay-race-poster.jpg" src="../media/gameplay-race.mp4"></video><a class="open" href="../media/gameplay-race.mp4" target="_blank" rel="noopener">open clip</a>'
-             '<figcaption>Grand Prix on a New 3DS, final build. The bottom screen is the port\'s debug menu: 59.8 fps, heap, build id.</figcaption></figure>'
+             '<figcaption>v0.9: Grand Prix on a New 3DS. The bottom screen is the port\'s debug menu: 59.8 fps, heap, build id.</figcaption></figure>'
              '<figure class="vid"><video autoplay muted loop playsinline preload="metadata" poster="../media/gameplay-handheld-poster.jpg" src="../media/gameplay-handheld.mp4"></video><a class="open" href="../media/gameplay-handheld.mp4" target="_blank" rel="noopener">open clip</a>'
-             '<figcaption>Handheld, mid-race. Native 60 Hz pacing; no interpolation.</figcaption></figure>'
+             '<figcaption>v0.9: handheld, mid-race. Native 60 Hz pacing; no interpolation.</figcaption></figure>'
              '</div>')
     b.append('<div class="media four">'
              '<figure><a href="../media/title.jpg" target="_blank" rel="noopener"><img src="../media/title.jpg" alt="F-Zero X title screen on the New 3DS" loading="lazy"></a><figcaption>Title screen, launched from the Homebrew Launcher (.3dsx).</figcaption></figure>'

@@ -65,25 +65,36 @@ Full steps, the complete SD card layout, the DSP firmware dump audio needs, and 
 
 ## On hardware
 
+**v1.0** — New 3DS, with the DASH dashboard on the bottom screen: its idle view on the menus, and
+the race dashboard (energy, position, lap times, course map) during a race.
+
+<table>
+  <tr>
+    <td><a href="docs/media/v1-menu.jpg"><img src="docs/media/v1-menu.jpg" alt="v1.0 on a New 3DS: the Expansion Kit's Select Mode screen with COURSE EDIT and CREATE MACHINE on top, the G-DIFFUSER idle view on the bottom screen"></a></td>
+    <td><a href="docs/media/v1-race.jpg"><img src="docs/media/v1-race.jpg" alt="v1.0 on a New 3DS: a Grand Prix race on the top screen, the DASH race dashboard with energy, position, lap times and course map on the bottom screen"></a></td>
+  </tr>
+</table>
+
+**v0.9** (2026-09) — the first New 3DS release, before DASH: the bottom screen is the debug console.
+
 <p align="center">
-  <img src="docs/media/gameplay-race.gif" width="420" alt="F-Zero X Grand Prix running on a New Nintendo 3DS; the bottom screen shows the DASH race dashboard">
-  <img src="docs/media/gameplay-handheld.gif" width="420" alt="Handheld footage of a race on the New 3DS">
+  <img src="docs/media/gameplay-race.gif" width="420" alt="v0.9: F-Zero X Grand Prix running on a New Nintendo 3DS, the debug console on the bottom screen">
+  <img src="docs/media/gameplay-handheld.gif" width="420" alt="v0.9: handheld footage of a race on the New 3DS">
 </p>
 
 <table>
   <tr>
-    <td><a href="docs/media/title.jpg"><img src="docs/media/title.jpg" alt="F-Zero X title screen on the New 3DS, the DASH idle view on the bottom screen"></a></td>
-    <td><a href="docs/media/menu.jpg"><img src="docs/media/menu.jpg" alt="Select Mode screen on the New 3DS"></a></td>
+    <td><a href="docs/media/title.jpg"><img src="docs/media/title.jpg" alt="v0.9: F-Zero X title screen on the New 3DS, the debug console on the bottom screen"></a></td>
+    <td><a href="docs/media/menu.jpg"><img src="docs/media/menu.jpg" alt="v0.9: Select Mode screen on the New 3DS"></a></td>
   </tr>
   <tr>
-    <td><a href="docs/media/character1.jpg"><img src="docs/media/character1.jpg" alt="Select Machine screen on the New 3DS"></a></td>
-    <td><a href="docs/media/character2.jpg"><img src="docs/media/character2.jpg" alt="Blue Falcon machine stats on the New 3DS"></a></td>
+    <td><a href="docs/media/character1.jpg"><img src="docs/media/character1.jpg" alt="v0.9: Select Machine screen on the New 3DS"></a></td>
+    <td><a href="docs/media/character2.jpg"><img src="docs/media/character2.jpg" alt="v0.9: Blue Falcon machine stats on the New 3DS"></a></td>
   </tr>
 </table>
 
-Full-quality clips: [Grand Prix](https://cruxxxxxx.github.io/gdx-3ds/media/gameplay-race.mp4) ·
-[handheld](https://cruxxxxxx.github.io/gdx-3ds/media/gameplay-handheld.mp4). The bottom screen in
-every shot is the port's own DASH dashboard.
+Full-quality v0.9 clips: [Grand Prix](https://cruxxxxxx.github.io/gdx-3ds/media/gameplay-race.mp4) ·
+[handheld](https://cruxxxxxx.github.io/gdx-3ds/media/gameplay-handheld.mp4).
 
 ## Author's notes
 
