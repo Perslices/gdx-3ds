@@ -238,7 +238,7 @@ for sub in "${SUBMODULES[@]}"; do
     while IFS= read -r line; do fwd+=("$line"); done < <(patches_for_sub "$sub")
     n=${#fwd[@]}
 
-    SNAP="$(mktemp -t gdx-patchgate-snap)"
+    SNAP="$(mktemp "${TMPDIR:-/tmp}/gdx-patchgate-snap.XXXXXX")"
     snap_take "$sub" "$SNAP"
 
     # 1. Clean tree? A real sequential forward apply lands the whole stack.

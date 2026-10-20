@@ -324,7 +324,7 @@ done
 # individual patch that still applies (escape hatch for a knowingly-dirty
 # working tree; leaves the build to catch anything genuinely broken).
 if [ "$PATCHES_OK" -eq 1 ]; then
-    PG_OUT="$(mktemp -t gdx-patch-gate)"
+    PG_OUT="$(mktemp "${TMPDIR:-/tmp}/gdx-patch-gate.XXXXXX")"
     if bash "${ROOT}/tools/patch-gate.sh" "${ROOT}" "${PATCH_DIR}" "${PATCH_LIST[@]}" \
             | tee "${PG_OUT}"; then
         ALREADY="$(sed -n 's/^PATCHGATE: already=\([0-9]*\) applied=\([0-9]*\)$/\1/p' "${PG_OUT}" | tail -1)"
