@@ -121,7 +121,7 @@ def shipping_it():
     b.append('<p>Card 4 (10-08) ended the Old 3DS performance campaign at 59–60 fps (245–256 of 256 frames on the first vblank) in 3D '
              'Grand Prix races. The eleven days that '
              'followed — with a week-long rate-limit pause in the middle — finished the rest of what ships as v1.0.0: the Expansion Kit '
-             'confirmed and packaged for both consoles, the bottom-screen dashboard taken from a debug console to a real HUD, a New 3DS '
+             'confirmed and packaged for the New 3DS (the Old 3DS build ran, too slowly to ship), the bottom-screen dashboard taken from a debug console to a real HUD, a New 3DS '
              'freeze root-caused and fixed, and the disk-streaming defaults this release ships with. Dates below are commit dates on the '
              'native-fork integration branch; this period\'s work is not backed by the session transcripts the earlier chapters quote '
              'directly, so this account is commit- and document-sourced rather than quoted.</p>')

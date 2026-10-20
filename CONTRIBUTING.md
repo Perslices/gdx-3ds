@@ -11,11 +11,12 @@ Two things here are unusual, and will cost you time if you don't know them going
 - **`decomp/` is a matching decompilation.** Your change has to work on PC *and* leave the retail
   build byte-identical. The PC build cannot tell you when you have broken the second one.
 - **A PR gets a 3DS build check, but nothing checks the PC/decomp side.**
-  [`release-3ds.yml`](.github/workflows/release-3ds.yml) builds and host-tests all four 3DS
-  console targets on every push and pull request to `main` — it shows green/red per target, but
-  it's a status check, not a merge gate, and attaches nothing. For a PC or `decomp/` change, your
-  local build is the only check that runs. See [Releases](#releases) for what the same workflow
-  does on a tagged release; `decomp/` has its own CI too, and it checks something different.
+  [`release-3ds.yml`](.github/workflows/release-3ds.yml) builds and host-tests the three released
+  3DS console targets on every push and pull request to `main` — it shows green/red per target,
+  but it's a status check, not a merge gate, and attaches nothing. For a PC or `decomp/` change,
+  your local build is the only check that runs. See [Releases](#releases) for what the same
+  workflow does on a tagged release; `decomp/` has its own CI too, and it checks something
+  different.
 
 Read [Things that will bite you](#things-that-will-bite-you) before you touch `decomp/`.
 
@@ -333,12 +334,13 @@ bump lands last.
 ## Releases
 
 **3DS releases are built by CI too** — the same [`release-3ds.yml`](.github/workflows/release-3ds.yml)
-workflow mentioned above. On every push or PR to `main` it builds all four console targets as a
-build-only check (nothing attached, doesn't gate merging). On a `v*` tag, or a manual dispatch
-naming an existing release tag, it does the full job: builds all four targets, zips each one, and
-attaches the zips, the loose `.3dsx`/`.cia`/`.elf` files, and one `SHA256SUMS` to the GitHub
-release, plus a "Which file do I need?" table in the release notes. Manual dispatch also takes a
-`targets` input to build only some of the four, for a quick one-off.
+workflow mentioned above. On every push or PR to `main` it builds the three released console
+targets (`o3ds`, `n3ds`, `n3ds-ek`) as a build-only check (nothing attached, doesn't gate
+merging). On a `v*` tag, or a manual dispatch naming an existing release tag, it does the full
+job for those same three targets: builds each one, zips it, and attaches the zips, the loose
+`.3dsx`/`.cia`/`.elf` files, and one `SHA256SUMS` to the GitHub release, plus a "Which file do I
+need?" table in the release notes. `o3ds-ek` is experimental and not released — it's excluded
+from `all` and only builds when a manual dispatch's `targets` input names it explicitly.
 
 **Linux releases are built by CI, not by hand.** Push a `v*` tag, or run the
 *Release (Linux)* workflow manually, then download the tarball from the workflow artifacts and
@@ -370,7 +372,7 @@ workflow above, not a hand-built, hand-packaged process.
 ## Reporting a bug
 
 Bug reports do not need any of the above. Each platform's README has its own checklist:
-[3DS](README.md#reporting-a-bug) (which of the four builds, your console model, `log.txt` /
+[3DS](README.md#reporting-a-bug) (which build, your console model, `log.txt` /
 `log-EK.txt`, `crash*.txt`) or [PC](README-G-Diffuser.md#reporting-a-bug) (platform and renderer,
 ROM region, repro steps, `gdiffuser-run.log`, and `gdiffuser-crash.txt` if the game crashed).
 

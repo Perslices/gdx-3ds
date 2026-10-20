@@ -17,15 +17,14 @@ Pick the file that matches your console from the
 |---|---|---|---|
 | `O3DS` | Old 3DS / 2DS | F-Zero X | `G-Diffuser-3DS-O3DS.3dsx` / `.cia` |
 | `N3DS` | New 3DS / New 2DS XL | F-Zero X | `G-Diffuser-3DS-N3DS.3dsx` / `.cia` |
-| `O3DS-EK` | Old 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-O3DS-EK.3dsx` / `.cia` |
 | `N3DS-EK` | New 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-N3DS-EK.3dsx` / `.cia` |
 
 Easiest: grab the zip for your build, e.g. `G-Diffuser-3DS-O3DS-v1.0.0.zip`. It is laid out like
 an SD card (`3ds/…3dsx`, the `.cia` at the top, a short README.txt), so you unzip it onto the SD
 card's root.
 
-Use the build for your console — an `N3DS` build does not fit an Old 3DS's memory budget. The two
-`-EK` builds additionally need your own 64DD disk dump — see [Expansion Kit](#expansion-kit)
+Use the build for your console — an `N3DS` build does not fit an Old 3DS's memory budget. The
+`N3DS-EK` build additionally needs your own 64DD disk dump — see [Expansion Kit](#expansion-kit)
 below for what happens without one. `.3dsx` runs from the Homebrew Launcher, `.cia` installs to
 the HOME menu (needs Luma3DS and sigpatches) — both come from the same build and share saves,
 settings and logs.
@@ -178,21 +177,25 @@ See [`docs/RELEASE-NOTES.md`](docs/RELEASE-NOTES.md#performance) for the measure
 
 ## Expansion Kit
 
-The `-EK` builds add the 64DD Expansion Kit — Course Edit, Create Machine, and the DD cups — on
-top of the normal game. They need:
+The `N3DS-EK` build adds the 64DD Expansion Kit — Course Edit, Create Machine, and the DD cups —
+on top of the normal game. The Expansion Kit is New 3DS only in this release — see
+[Known issues](#known-issues). It needs:
 
-- **Your own 64DD disk dump.** Place it at `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` (Japanese
-  retail — the only retail release of the disk) or `baserom.translated.ek.ndd` (a fan English
-  translation). It should be about 64.9 MB; anything under 60 MB is rejected as truncated. If your
-  dump came from a MAME DD romset rather than a raw `.ndd` image, convert it first with
-  `tools/dev/mame2ndd.py`.
+- **Your own 64DD disk dump, the retail Japanese one.** Place it at
+  `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` — the only retail release of the disk, and the
+  only one supported in v1.0.0. It should be about 64.9 MB; anything under 60 MB is rejected as
+  truncated. If your dump came from a MAME DD romset rather than a raw `.ndd` image, convert it
+  first with `tools/dev/mame2ndd.py`. A fan English translation of this disk exists (Zoinkity's
+  translation, adapted to disk form by LuigiBlood) but isn't supported yet — see
+  [Known issues](#known-issues).
 - **Nothing else.** Japanese button and text input is accepted by default on 3DS builds, so the
-  retail Japanese disk works without extra setup.
+  retail Japanese disk works without extra setup. Menus inside the Expansion Kit modes are
+  Japanese.
 
 The image is streamed from the SD card — there's no large RAM copy. First boot runs a roughly
 one-minute whole-image integrity check and caches the result, so later boots skip it.
 
-Without a disk image, an `-EK` build still boots and plays the normal game; the EK-only menu
+Without a disk image, the `N3DS-EK` build still boots and plays the normal game; the EK-only menu
 entries just don't open.
 
 An EK build installs as its own HOME-menu title ("G-Diffuser EK", separate from "G-Diffuser") with
@@ -204,17 +207,18 @@ folder for settings, archives and media.
 (For the file and architecture layout first, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).)
 
 The build wizard sets up the CMake flags for you — pass a target and it configures, builds, and
-collects the result. Targets are lowercase; the release filenames above are the same four builds,
-uppercase.
+collects the result. Targets are lowercase; the three released builds above are the same names,
+uppercase. `o3ds-ek` is a fourth target the wizard can still build — **experimental, not
+released** — see [Known issues](#known-issues).
 
 ```sh
 export DEVKITPRO=/opt/devkitpro
 tools/build-3ds.sh <o3ds|n3ds|o3ds-ek|n3ds-ek|all>
 ```
 
-Output lands in `dist/3ds/` named the same as the release downloads, with a `SHA256SUMS` file.
-Useful flags: `--list` (show the targets), `--jobs N`, `--out DIR`, `--no-cia` (skip the `.cia`,
-build only the `.3dsx`).
+`all` builds all four, including `o3ds-ek`. Output lands in `dist/3ds/` named the same as the
+release downloads, with a `SHA256SUMS` file. Useful flags: `--list` (show the targets), `--jobs N`,
+`--out DIR`, `--no-cia` (skip the `.cia`, build only the `.3dsx`).
 
 The targets map to these CMake options (plus `-DGDX_PLATFORM_3DS=ON`, `Release`, the devkitPro
 toolchain), if you'd rather configure by hand:
@@ -223,7 +227,7 @@ toolchain), if you'd rather configure by hand:
 |---|---|
 | `o3ds` | `-DGDX_3DS_O3DS=ON` |
 | `n3ds` | *(none — the default)* |
-| `o3ds-ek` | `-DGDX_3DS_O3DS=ON -DGDX_3DS_EXPANSION_KIT=ON` |
+| `o3ds-ek` | `-DGDX_3DS_O3DS=ON -DGDX_3DS_EXPANSION_KIT=ON` (experimental, not released — runs poorly on Old 3DS hardware) |
 | `n3ds-ek` | `-DGDX_3DS_EXPANSION_KIT=ON` |
 
 Requires devkitPro (`devkitARM` + `libctru` + `citro3d`), CMake, and the `decomp` / `torch`
@@ -281,7 +285,8 @@ Open an issue at [github.com/cruxxxxxx/gdx-3ds/issues](https://github.com/cruxxx
 and include `sdmc:/3ds/gdiffuser/log.txt` (`log-EK.txt` for an EK build; if it's missing, add
 `[debug]` / `filelog = 1` to `gdiffuser.ini` and reproduce again — there's no in-game toggle for
 this; see [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md)) and `crash*.txt` if the game crashed, plus
-which of the four builds you're on and your console model.
+which build you're on (O3DS, N3DS, N3DS-EK, or the experimental o3ds-ek if you built it yourself)
+and your console model.
 
 ## Legal
 

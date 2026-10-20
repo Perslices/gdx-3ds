@@ -20,14 +20,17 @@ work with the Azahar emulator; running Azahar itself isn't covered in this relea
 
 ## 2. Pick a build
 
-G-Diffuser 3DS ships as four builds:
+G-Diffuser 3DS ships as three builds:
 
 | Build | Console | Content | File names |
 |---|---|---|---|
 | **O3DS** | Old 3DS / 2DS | F-Zero X | `G-Diffuser-3DS-O3DS.3dsx` / `.cia` |
 | **N3DS** | New 3DS / New 2DS XL | F-Zero X | `G-Diffuser-3DS-N3DS.3dsx` / `.cia` |
-| **O3DS-EK** | Old 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-O3DS-EK.3dsx` / `.cia` |
 | **N3DS-EK** | New 3DS | F-Zero X + Expansion Kit | `G-Diffuser-3DS-N3DS-EK.3dsx` / `.cia` |
+
+A fourth target, **O3DS-EK**, builds from source (§14) but is not part of this release: on real
+Old 3DS hardware it boots and mounts the disk, but 64DD courses are jittery, the disk music
+breaks up, and the course editor/machine creator/menus are laggy — see §11.
 
 A few things worth knowing before you pick:
 
@@ -38,20 +41,20 @@ A few things worth knowing before you pick:
   after launch (see §12).
 - The Expansion Kit (EK) adds the 64DD course editor (COURSE EDIT) and machine creator (CREATE
   MACHINE), using the retail F-Zero X 64DD disk. It's a separate build of the whole game, not an
-  add-on — see §6 for what you need to supply and what happens if you don't.
+  add-on, and in this release it's New 3DS only (see above) — see §6 for what you need to supply
+  and what happens if you don't.
 - Vanilla and Expansion Kit builds install side by side (different HOME-menu titles, different
-  save files) and share one SD-card folder for everything else — so if you're unsure, download
-  both builds for your console; they share settings and don't conflict.
+  save files) and share one SD-card folder for everything else.
 
 If a build isn't available as a ready download, anyone with the devkitPro toolchain can build
-all four from source instead (§14).
+it (or the experimental O3DS-EK) from source instead (§14).
 
 ## 3. Prebake the game's assets on a PC (required, every build)
 
 The 3DS never reads your ROM directly, and nothing in the repository or the release download
 contains game data. Instead, you convert your own legally-owned F-Zero X ROM into two archive
 files **once, on a PC**, and copy them to the SD card. The same two archives work for every one
-of the four builds above. You'll also need the `gdx-extract` tool for your PC's OS — download it
+of the three builds above. You'll also need the `gdx-extract` tool for your PC's OS — download it
 from the project's latest release page (see `tools/prebake/README.md` step 2) and pass its path
 as `--extractor`:
 
@@ -74,7 +77,7 @@ sdmc:/
 │       │                                  the game still boots but engine/UI assets are missing)
 │       ├── gdiffuser.ini                 (optional settings — §9-§10; the game writes this itself)
 │       ├── media/
-│       │   └── baserom.jp.ek.ndd         (Expansion Kit builds only — §6; or baserom.translated.ek.ndd)
+│       │   └── baserom.jp.ek.ndd         (Expansion Kit builds only — §6)
 │       ├── saves/                        (created by the game; back this up)
 │       │   ├── fzerox.sav
 │       │   ├── fzerox-ek.sav             (Expansion Kit builds)
@@ -85,7 +88,7 @@ sdmc:/
 │       └── crash.txt / crash-EK.txt      (only if `[debug] crashdump = 1`, default off — §10)
 ```
 
-`<BUILD>` is whichever of O3DS / N3DS / O3DS-EK / N3DS-EK you downloaded. The vanilla and
+`<BUILD>` is whichever of O3DS / N3DS / N3DS-EK you downloaded. The vanilla and
 Expansion Kit builds read and write the same `gdiffuser/` folder, so there's only ever one of
 each shared file even if you have both builds installed. The `.gdd`/`.dcrc` sidecar names above
 are exact examples for the Japanese retail disk — they always take your disk image's full
@@ -116,23 +119,28 @@ install and run like a normal title. It will not install on a stock (non-CFW) co
 
 No prebake step for this one — copy your disk image to the SD card as-is.
 
-The O3DS-EK and N3DS-EK builds need a 64DD F-Zero X disk image to unlock the course editor and
-machine creator. You supply your own; nothing in the repository or the download contains one.
+The N3DS-EK build needs a 64DD F-Zero X disk image to unlock the course editor and machine
+creator. You supply your own; nothing in the repository or the download contains one.
 
-Rename your dump to exactly one of these two names and put it at the matching path — the game
-looks for both and prefers the English one:
+Rename your dump to exactly this name and put it at this path:
 
-- `sdmc:/3ds/gdiffuser/media/baserom.translated.ek.ndd` — the fan English translation (preferred
-  when found)
 - `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` — the Japanese retail disk (the only retail
-  version of this disk) — it works out of the box, no setting to change.
+  version of this disk) — it works out of the box, no setting to change. Menus inside the
+  Expansion Kit modes are Japanese.
+
+**Fan-translated disk images aren't supported in v1.0.0.** A fan English translation of this
+disk exists (Zoinkity's translation, adapted to disk form by LuigiBlood — announced at
+<https://64dd.org/news/2020-05-24-fzxeng.html>), but the game identifies the disk by an exact
+whole-image checksum, and a translation patched onto a different dump doesn't match that
+checksum — on hardware, a translated image froze at boot instead of reaching the menu. Use the
+retail Japanese dump above for now; English support is planned for a later release. See §11.
 
 **Playing without a disk image works fine.** The Expansion Kit build still boots and plays the
 normal game — COURSE EDIT and CREATE MACHINE on the main menu just don't open. The log records
 `[leo] no disk image found; Expansion Kit modes stay disabled`, which is expected, not an error,
 if you haven't supplied a disk yet.
 
-Either must be the full, untrimmed 64DD image, about 64.9 MB. A smaller file (anything under
+It must be the full, untrimmed 64DD image, about 64.9 MB. A smaller file (anything under
 60 MB) is rejected outright as truncated — that usually means a bad or partial download/dump.
 
 **Streamed, not loaded into RAM.** The disk is read directly off the SD card as you play, not
@@ -321,6 +329,11 @@ to set one.
   something crashes only on Old 3DS and not New 3DS, that's the most likely reason.
 - Hardware testing has covered the normal range of play, but not every mode on every console
   model yet — if you hit something that looks wrong, see §12.
+- **The Expansion Kit is New 3DS only for now.** An Old 3DS Expansion Kit build boots and mounts
+  the disk, but 64DD courses stutter, the disk music breaks up, and the course editor, machine
+  creator, and menus are very slow — it's not part of this release (§2).
+- **Fan-translated Expansion Kit disk images can hang at boot.** Only the retail Japanese
+  `baserom.jp.ek.ndd` is supported in this release — see §6.
 
 ## 12. Troubleshooting
 
@@ -330,10 +343,11 @@ to set one.
 | Boots but completely silent | no DSP firmware dump, or Luma3DS older than 10.1.1 (see §1) | §7 — DSP1, press B; update Luma3DS if it's old. |
 | `.cia` won't install in FBI | stock console, or Luma not installed | Luma3DS is required — §1. |
 | EK build's COURSE EDIT / CREATE MACHINE won't open | no Expansion Kit disk image found | §6 — check the path and exact file name; look for `[leo] no disk image found` in the log. |
-| Disk image present but still not detected | wrong filename | §6 — rename it to exactly `baserom.jp.ek.ndd` or `baserom.translated.ek.ndd`. |
+| Disk image present but still not detected | wrong filename | §6 — rename it to exactly `baserom.jp.ek.ndd`. |
 | First boot of an EK disk is slow (~1 min) | expected — the one-time disk fingerprint pass | Nothing to fix; later boots are fast. |
 | EK disk image rejected as truncated | the `.ndd` is incomplete (under 60 MB) | Re-dump/re-download it; it should be about 64.9 MB. |
-| Crashes / black screen right after launch | wrong build for the console (ran the New 3DS build on an Old 3DS) | Use the O3DS/O3DS-EK build instead — its memory layout assumes more RAM than an Old 3DS has — §2. |
+| Freeze at boot with an EK disk mounted | a fan-translated disk image — not supported in this release | Use the retail Japanese `baserom.jp.ek.ndd` instead — §6. |
+| Crashes / black screen right after launch | wrong build for the console (ran the New 3DS build on an Old 3DS) | Use the O3DS build instead — its memory layout assumes more RAM than an Old 3DS has — §2. |
 | No 3D even with the slider up | 3D is off by default and needs an ini edit | Set `[stereo] enabled = 1` in `gdiffuser.ini` (§10) and relaunch — there's no in-game toggle for this one. |
 | Blank/frozen screen, or a hang | — | Set `[debug] filelog = 1`, reproduce, then pull `log.txt` (or `log-EK.txt`) — §13. |
 | Luma shows its red/pink exception screen | a crash in the game or port code | Photograph the screen (it shows the PC/LR registers), then follow §13 for a bug report. |
@@ -348,7 +362,8 @@ overwritten fresh each boot.
 If you're filing a bug report, please include:
 
 1. **Console + firmware**: model (Old 3DS/2DS, New 3DS/New 2DS XL), Luma version.
-2. **Which build**: O3DS / N3DS / O3DS-EK / N3DS-EK, and `.3dsx` or `.cia`.
+2. **Which build**: O3DS / N3DS / N3DS-EK (or the experimental, from-source-only O3DS-EK), and
+   `.3dsx` or `.cia`.
 3. **How far it got**: menus, a race, a specific mode — and the last line of `log.txt` if it
    stopped partway.
 4. **The whole log file** (`log.txt` or `log-EK.txt`) — it's small enough to attach in full.
@@ -367,5 +382,8 @@ like a downloaded release:
 ```sh
 tools/build-3ds.sh <o3ds|n3ds|o3ds-ek|n3ds-ek|all>
 ```
+
+`o3ds-ek` is experimental and not released (§2/§11) — it builds and runs, just poorly on real
+Old 3DS hardware.
 
 Full toolchain setup and step-by-step instructions: `docs/BUILDING.md`.

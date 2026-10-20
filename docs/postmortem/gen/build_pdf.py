@@ -35,7 +35,7 @@ cover = (f'<section class="cover"><p class="eyebrow">Post-mortem · {DATE_RANGE}
          '<h1>G-Diffuser on 3DS</h1>'
          '<p class="lede">F-Zero X, ported from the libultraship PC runtime to the New Nintendo 3DS, reaching 59–60 fps with stereoscopic 3D, '
          'by one person directing a fleet of Claude agents over 24 days — then forked to a native renderer that also reached 59–60 fps '
-         'on an Old 3DS development build, brought the 64DD Expansion Kit to both consoles, and added a bottom-screen dashboard, '
+         'on an Old 3DS development build, brought the 64DD Expansion Kit to the New 3DS, and added a bottom-screen dashboard, '
          'shipping as v1.0.0 (stereoscopic 3D ships as not yet a locked 60 fps on either console — see RELEASE-NOTES.md).</p>'
          '<ol class="toc">' + "".join(f'<li><b>{t}</b> — {s}</li>' for _, t, s in PAGES) + '</ol>'
          '<p class="meta">Sources: git history, docs/research, hardware logs, local Claude Code transcripts. Dollar figures use published API list prices. '

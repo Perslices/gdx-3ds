@@ -2,14 +2,14 @@ name: Release (3DS, native renderer)
 
 # Builds everything a player needs without a compiler:
 #   * gdx-extract, the PC-side asset extractor tools/prebake drives, for Windows, macOS and Linux;
-#   * all four console targets -- Old 3DS, New 3DS, and their Expansion Kit titles -- as
-#     .3dsx/.cia/.elf from a clean checkout via tools/ci-3ds.sh plus the matching cmake flags,
+#   * the three released console targets -- Old 3DS, New 3DS and the New 3DS Expansion Kit
+#     title -- as .3dsx/.cia/.elf from a clean checkout via tools/ci-3ds.sh plus the matching cmake flags,
 #     each also packaged as a ready-to-drop-on-an-SD-card zip.
 #
 # Runs on every push and pull request against `main` (artifacts only, nothing attached, so a PR
 # shows green/red per console target) and on a `v*` tag or a manual dispatch naming an existing
 # release tag (builds AND attaches/updates the release). `workflow_dispatch` also takes an
-# optional `targets` input to build only some of the four, for a quick one-off.
+# optional `targets` input to build only some targets (or the unreleased o3ds-ek), for a one-off.
 #
 #   * submodules are initialised BY NAME. The O3DS/N3DS targets need `decomp` and `torch` (for
 #     libmio0) -- the slice of libultraship the console compiles is vendored in-tree at
@@ -32,7 +32,7 @@ name: Release (3DS, native renderer)
 #   * makerom and bannertool are built from source once, inside the same devkitARM container
 #     image the console jobs run in (the prebuilt Linux binaries need a newer glibc than that
 #     image has, and a binary built on a *different* image is not guaranteed to match), then
-#     handed to the four console jobs as a build artifact instead of each job rebuilding them.
+#     handed to the console jobs as a build artifact instead of each job rebuilding them.
 
 on:
   push:
@@ -47,7 +47,7 @@ on:
         required: false
         default: ''
       targets:
-        description: 'Which console targets to build: "all" or a comma/space list of o3ds, n3ds, o3ds-ek, n3ds-ek'
+        description: 'Which console targets to build: "all" (the released three) or a comma/space list of o3ds, n3ds, n3ds-ek, o3ds-ek (experimental, never released)'
         required: false
         default: 'all'
 
@@ -130,10 +130,14 @@ jobs:
               {"name": "n3ds-ek", "suffix": "N3DS-EK"},
           ]
           by_name = {t["name"]: t for t in all_targets}
+          # Old 3DS + Expansion Kit boots, but its 64DD courses, music and editors are
+          # not playable yet on that console: it is built only when asked for by name
+          # and is never part of "all" or a tagged release.
+          released = [t for t in all_targets if t["name"] != "o3ds-ek"]
 
           requested = os.environ.get("INPUT_TARGETS", "all").strip()
           if not requested or requested.lower() == "all":
-              chosen = all_targets
+              chosen = released
           else:
               names = [n.strip().lower() for n in re.split(r"[,\s]+", requested) if n.strip()]
               unknown = [n for n in names if n not in by_name]
@@ -142,7 +146,7 @@ jobs:
                       f"workflow_dispatch targets: unknown target(s) {unknown}; "
                       f"choose from {sorted(by_name)} or 'all'"
                   )
-              chosen = [by_name[n] for n in names] or all_targets
+              chosen = [by_name[n] for n in names] or released
 
           ref_name = os.environ.get("GITHUB_REF_NAME", "")
           ref_type = os.environ.get("GITHUB_REF_TYPE", "")
@@ -253,7 +257,7 @@ jobs:
           restore-keys: |
             ccache-3ds-native-${{ matrix.target.name }}-
 
-      - name: Fetch makerom + bannertool (built once, shared by all four targets)
+      - name: Fetch makerom + bannertool (built once, shared by every target)
         uses: actions/download-artifact@v4
         with:
           name: 3ds-bin
@@ -289,7 +293,7 @@ jobs:
       # SHA256SUMS and BUILD-INFO.txt are fixed names -- rename per target before upload so
       # the `combine` job's merge-multiple download doesn't let one target's file silently
       # overwrite the other three's.
-      - name: Rename the per-run manifest files so four targets' artifacts can coexist
+      - name: Rename the per-run manifest files so every target's artifacts can coexist
         run: |
           set -e
           mv "dist/3ds/SHA256SUMS" "dist/3ds/SHA256SUMS-${{ matrix.target.suffix }}"
@@ -314,7 +318,7 @@ jobs:
           if-no-files-found: error
 
   combine:
-    name: Combine the four targets into one manifest
+    name: Combine the targets into one manifest
     needs: [setup, console]
     runs-on: ubuntu-22.04
     steps:
@@ -360,8 +364,10 @@ jobs:
             '|---|---|' \
             '| Old 3DS / Old 2DS | `G-Diffuser-3DS-O3DS-v<ver>.zip` |' \
             '| New 3DS / New 2DS XL | `G-Diffuser-3DS-N3DS-v<ver>.zip` |' \
-            '| Old 3DS / Old 2DS, with the Expansion Kit disk | `G-Diffuser-3DS-O3DS-EK-v<ver>.zip` |' \
             '| New 3DS / New 2DS XL, with the Expansion Kit disk | `G-Diffuser-3DS-N3DS-EK-v<ver>.zip` |' \
+            '' \
+            'The Expansion Kit build is New 3DS only for now, and needs the retail Japanese' \
+            '64DD disk image (`baserom.jp.ek.ndd`).' \
             '' \
             'Each zip contains the `.3dsx` (Homebrew Launcher), the `.cia` (HOME menu install) and a' \
             'README on where your own extracted game data goes. The loose `.3dsx`/`.cia`/`.elf`' \

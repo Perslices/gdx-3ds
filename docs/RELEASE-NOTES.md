@@ -9,9 +9,10 @@ The first release to support the **Old 3DS / 2DS** family, and the first to incl
 
 - **Old 3DS / 2DS support.** The previous release required a New 3DS. This one runs on
   the original Old 3DS and 2DS too, with its own memory and performance tuning.
-- **64DD Expansion Kit on console**, for players who own their own Japanese 64DD disk
-  dump (or a fan translation of one). Streamed from the SD card — there is no room to
-  hold the whole ~65 MB disk in memory on either console.
+- **64DD Expansion Kit on console**, for New 3DS players who own their own Japanese 64DD
+  disk dump. Streamed from the SD card — there is no room to hold the whole ~65 MB disk
+  in memory on either console. Old 3DS Expansion Kit support and fan-translated disk
+  images are not part of this release; see [Known issues](#known-issues).
 - **A new bottom-screen dashboard ("DASH")** during races, with three HUD layouts and an
   idle screen between races.
 - **A native 3DS renderer** that redraws part of each frame itself instead of going
@@ -34,11 +35,11 @@ Each build also comes as a ready-to-unzip `G-Diffuser-3DS-<BUILD>-v1.0.0.zip`, l
 |---|---|---|---|
 | `G-Diffuser-3DS-O3DS.3dsx` / `.cia` | Old 3DS, Old 2DS | F-Zero X | Old-3DS-family owners who just want the game |
 | `G-Diffuser-3DS-N3DS.3dsx` / `.cia` | New 3DS, New 2DS XL | F-Zero X | New-3DS-family owners who just want the game |
-| `G-Diffuser-3DS-O3DS-EK.3dsx` / `.cia` | Old 3DS, Old 2DS | F-Zero X + Expansion Kit | Old-3DS owners with their own 64DD disk dump |
 | `G-Diffuser-3DS-N3DS-EK.3dsx` / `.cia` | New 3DS, New 2DS XL | F-Zero X + Expansion Kit | New-3DS owners with their own 64DD disk dump |
 
 Pick the build for your console; add `-EK` only if you have your own 64DD F-Zero X
-Expansion Kit disk dump and want the course editor, machine creator, and DD cups. An
+Expansion Kit disk dump and want the course editor, machine creator, and DD cups — the
+Expansion Kit is New 3DS only in this release (see [Known issues](#known-issues)). An
 Old 3DS build also runs on a New 3DS, but a New 3DS build does **not** fit an Old
 3DS's memory — don't install it there. Vanilla and `-EK` builds can both be installed
 side by side; they share one ini, archives, and saves folder on the SD card.
@@ -48,9 +49,10 @@ side by side; they share one ini, archives, and saves folder on the SD card.
 First time installing? See `docs/3DS-HARDWARE.md` for the full setup walkthrough.
 
 **Using the Expansion Kit build (new install or upgrade)?** It needs its own 64DD disk
-image, placed at `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` (or
-`baserom.translated.ek.ndd` for the fan translation) — see `docs/3DS-HARDWARE.md` §6 for
-the full layout. Not sure which disk-image layout your dump is in? Check the file size:
+image, placed at `sdmc:/3ds/gdiffuser/media/baserom.jp.ek.ndd` — the retail Japanese
+dump; a fan-translated image is not supported in this release (see
+[Known issues](#known-issues)) — see `docs/3DS-HARDWARE.md` §6 for the full layout. Not
+sure which disk-image layout your dump is in? Check the file size:
 about 71 MB (70,627,520 bytes) is MAME's layout — convert it first with
 `tools/dev/mame2ndd.py tondd yourfile.mame baserom.jp.ek.ndd` (needs Python 3 on your PC;
 no 3DS build toolchain needed — see Tooling below). About 65 MB (64,931,840 bytes) is
@@ -137,12 +139,15 @@ preset = off    # bare stock defaults; no native renderer
   Expansion-Kit-only menu signs draw, confirmed on real hardware. The course editor, machine
   creator, and the Expansion Kit's own cups have been verified with a mounted disk image in
   the emulator; a hardware pass with an actual disk image mounted hasn't been done yet for
-  this release (see `docs/STATUS.md`).
+  this release (see `docs/STATUS.md`). **Only the New 3DS Expansion Kit build (`N3DS-EK`) is
+  released in v1.0.0** — on Old 3DS, 64DD courses are jittery, the disk music breaks up, and
+  the editors are very slow, so the Old 3DS Expansion Kit build isn't shipped this time; see
+  [Known issues](#known-issues).
 - The ~65 MB disk image is streamed from the SD card rather than held in memory — neither
   console has room to hold it whole.
 - Source builds can now bake in an optional English text pack for the Expansion Kit's
   Japanese-only menus, generated from your own fan-translated disk dump with
-  `tools/gen_ek_text_pack.py` before building. This is **not** in any of the four
+  `tools/gen_ek_text_pack.py` before building. This is **not** in any of the three
   standard downloads above — it needs a translated image you supply and a from-source
   build. Your own disk dump stays the authority for everything except the on-screen
   words.
@@ -187,6 +192,15 @@ preset = off    # bare stock defaults; no native renderer
 - A small amount of audio crackle can still occur on Old 3DS in some sessions, even with
   the resampler fix above. The underlying cause of the fix is confirmed; a second source,
   worse on Expansion Kit builds, is still being tracked down.
+- **The Expansion Kit is New 3DS only for now.** An Old 3DS Expansion Kit build boots, but
+  64DD courses are jittery, the disk music breaks up, and the course editor, machine
+  creator, and menus are very slow — so it isn't released this time (`tools/build-3ds.sh
+  o3ds-ek` still builds it from source, as an experimental, unsupported target).
+- **Fan-translated Expansion Kit disk images (`baserom.translated.ek.ndd`) are not
+  supported.** The game identifies the disk by an exact whole-image checksum, and a
+  translation patched onto a different dump doesn't match it; on hardware, a translated
+  image froze at boot instead of reaching the menu. Use the retail Japanese
+  `baserom.jp.ek.ndd` dump for now — English support is planned for a later release.
 - Stereoscopic 3D plays but isn't yet a locked 60 fps on either console; see
   `docs/STATUS.md` for the current state.
 

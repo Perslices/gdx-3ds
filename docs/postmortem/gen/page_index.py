@@ -23,7 +23,7 @@ def build(D):
     ]))
     b.append('<h2>What v1.0.0 added</h2>')
     b.append(tiles([
-        ("4", "console builds from one source tree: Old 3DS, New 3DS, and each with the Expansion Kit", True),
+        ("3", "released console builds from one source tree: Old 3DS, New 3DS, and New 3DS with the Expansion Kit", True),
         ("199", "internal progress notes written during the second phase", False),
         ("43<small>days</small>", "calendar span of the second phase, 2026-09-07 to 10-19 inclusive", False),
     ]))
@@ -46,8 +46,8 @@ def build(D):
              '<figure><a href="../media/character2.jpg" target="_blank" rel="noopener"><img src="../media/character2.jpg" alt="Blue Falcon stats" loading="lazy"></a><figcaption>Blue Falcon.</figcaption></figure>'
              '</div>')
     b.append('<h2>What was built</h2>')
-    b.append('<p>Four console builds from one source tree, all booting from the HOME menu (.cia) or the homebrew '
-             'launcher (.3dsx): Old 3DS / 2DS and New 3DS / New 2DS XL, each either the base game or with the 64DD '
+    b.append('<p>Three released console builds from one source tree, all booting from the HOME menu (.cia) or the homebrew '
+             'launcher (.3dsx): the base game for Old 3DS / 2DS and for New 3DS / New 2DS XL, and a New 3DS build with the 64DD '
              'Expansion Kit (course editor and machine creator, playable with a user-supplied disk image). Every build '
              'reads prebaked asset archives from the SD card — no ROM or disk image ever ships with the game.</p>')
     b.append('<p>They play the whole game: Grand Prix, Time Trial, Practice, Death Race, and the machine editor screens, '
@@ -98,8 +98,8 @@ def build(D):
              'in 3D on most Grand Prix courses; the heaviest courses (Silence, Sand Ocean) can still trip the frame-skip safety net to a '
              'steady 30 fps mid-race.</li>')
     b.append('<li><b>10-08 → 10-19: the Expansion Kit, a dashboard, and release.</b> The 64DD Expansion Kit verified tick-for-tick '
-             'identical under the native renderer and was brought to the Old 3DS; the bottom-screen DASH shipped; a standing '
-             'adversarial review audited the merged result before the four-way v1.0.0 release.</li>')
+             'identical under the native renderer and booted on the Old 3DS, which then proved too slow to release it on; the '
+             'bottom-screen DASH shipped; a standing adversarial review audited the merged result before the v1.0.0 release.</li>')
     b.append('</ol>')
     b.append('<p>See <a href="agentic.html">Agentic workflow</a> for how the second phase was run and '
              '<a href="old-3ds.html">Old 3DS</a> for the full campaign, card by card.</p>')

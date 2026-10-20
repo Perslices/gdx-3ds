@@ -152,8 +152,10 @@ def build(D):
              'whether it could reach the Old 3DS, measurement in the emulator under the Old 3DS profile found it fits with about 6 MB of heap '
              'to spare, and that gameplay under the native renderer is identical tick for tick on a ROM course (6,002/6,002) and a 64DD course '
              '(8,601/8,601). Two EK-only rendering defects (sky during the race intro, gadget and dirt-patch dressing) were found and fixed, '
-             'with the shipped binary byte-identical before and after. The Expansion Kit ships as its own HOME-menu title with its own save '
-             '(<code>saves/fzerox-ek.sav</code>) and its own logs, installable side by side with the main game on both Old and New 3DS — see '
-             '<a href="native.html">The native fork</a> for the shipped release shape. As with the rest of this release, it is hardware-tested '
-             'but not every mode on every model has been exercised as thoroughly as the main game.</p>')
+             'with the shipped binary byte-identical before and after.</p>')
+    b.append('<p>Fitting is not the same as playing. On release day the Old 3DS Expansion Kit build booted on hardware with the retail '
+             'disk image streaming from the SD card, but the 64DD courses stuttered, the disk-streamed music broke up into static, and the '
+             'course editor and menus, which still run through the general-purpose drawing path rather than the native race renderer, were '
+             'very slow. The owner held it back: v1.0.0 ships the Expansion Kit for the New 3DS only, and the Old 3DS build stays a '
+             'from-source experiment — see <a href="native.html">The native fork</a> for the shipped release shape.</p>')
     return page("old-3ds.html", "Old 3DS: The Road to a Real 60", "".join(b))

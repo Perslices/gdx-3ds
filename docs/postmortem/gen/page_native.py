@@ -10,7 +10,7 @@ def build(D):
              'triangle translated and lit on the CPU, one display-list command at a time. Starting 09-07, that path was replaced, piece by '
              'piece, with code that talks to the PICA200 GPU directly — not because the interpreter was slow in the abstract, but because it '
              'was the only way to also reach the Old 3DS. This page is that fork: why it started, what it replaced, and the four features it '
-             'shipped with by 10-19: Old 3DS support, the 64DD Expansion Kit on console, a bottom-screen dashboard, and a fixed New 3DS freeze.</p>')
+             'shipped with by 10-19: Old 3DS support, the 64DD Expansion Kit on the New 3DS, a bottom-screen dashboard, and a fixed New 3DS freeze.</p>')
 
     b.append(tiles([
         ("~1,600", "commits reachable from the native integration branch, 09-07 → the morning of 10-19", True),
@@ -79,11 +79,11 @@ def build(D):
              'explained why emulator wins did not transfer, and the race-by-race hardware numbers — is its own page: '
              '<a href="old-3ds.html">Old 3DS: the road to a real 60</a>.</p>')
 
-    b.append('<h2>The Expansion Kit, shipped on both consoles</h2>')
+    b.append('<h2>The Expansion Kit, shipped on the New 3DS</h2>')
     b.append('<p>The 64DD Expansion Kit — the course editor, the machine creator, and the extra 64DD disk content — runs as its own build, '
              '"G-Diffuser EK", with its own HOME-menu title and its own save file (<code>saves/fzerox-ek.sav</code>) and logs '
              '(<code>log-EK.txt</code>), so it installs side by side with the plain build on the same SD card without either one touching the '
-             'other\'s save. It needs the user\'s own 64DD disk image (Japanese retail or the fan English translation); without one, the '
+             'other\'s save. It needs the user\'s own retail Japanese 64DD disk image (a fan-translated English image froze at boot in release testing, so it is a known issue); without one, the '
              'game boots and plays normally and the EK-only menu entries simply don\'t open.</p>')
     b.append('<p>Two things changed late for this release, both in the disk path: the disk image streams from the SD card instead of being '
              'copied into RAM (a 62 MB saving), and <code>disk_stream</code> now defaults to its full-streaming mode (2) for every 3DS build '
@@ -91,7 +91,8 @@ def build(D):
              'Japan-only. A first boot with a disk image does a roughly one-minute whole-image integrity pass once and remembers the result '
              'for next time.</p>')
     b.append('<p>The Expansion Kit was verified against the plain game under the native renderer and found to fit the Old 3DS\'s tighter '
-             'memory budget with a comparable margin; see <a href="old-3ds.html">Old 3DS: the road to a real 60</a> for the tick-exact '
+             'memory budget with a comparable margin, but on Old 3DS hardware it ran too slowly to release (64DD courses stutter, disk music '
+             'breaks up, the editors crawl), so it ships for the New 3DS only; see <a href="old-3ds.html">Old 3DS: the road to a real 60</a> for the tick-exact '
              'verification numbers and the two drawing defects found and fixed along the way.</p>')
 
     b.append('<h2>The bottom screen: DASH</h2>')
@@ -125,10 +126,10 @@ def build(D):
              'case had just shown an emulator reading can understate a real console\'s margin.</p>')
 
     b.append('<h2>Release: v1.0.0</h2>')
-    b.append('<p>The native fork\'s work ships as four console builds from one source tree: a plain build and an Expansion Kit build, each '
-             'for Old 3DS and New 3DS. Which performance profile runs is decided at startup by asking the console what it is, not by which '
+    b.append('<p>The native fork\'s work ships as three console builds from one source tree: the plain game for Old 3DS and for New 3DS, and '
+             'an Expansion Kit build for New 3DS (an Old 3DS Expansion Kit build compiles but is not released). Which performance profile runs is decided at startup by asking the console what it is, not by which '
              'binary was installed — an Old 3DS build on a New 3DS still gets the New 3DS settings, but the reverse does not fit the memory '
-             'budget and is not supported. All four share one SD-card folder for settings, save data and media. The native race renderer '
+             'budget and is not supported. All of them share one SD-card folder for settings, save data and media. The native race renderer '
              'ships on by default on both consoles — a no-ini <code>[perf] preset = auto</code> resolves to each console\'s own tuned lever '
              'table, so a player does not need to write any ini lines for performance. Verification depth still differs by console and by '
              'feature: the native draw paths themselves are extensively hardware-tested on Old 3DS; on New 3DS they are verified in the '

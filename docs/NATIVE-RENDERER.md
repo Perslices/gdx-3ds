@@ -345,7 +345,10 @@ It goes through the same renderer: `interp` and every lever in §2–§4 apply t
 main-menu frames are byte-identical between an Expansion Kit build and the shipped build except
 for the two extra signs. It now also fits the Old 3DS's 8 MiB RDRAM arena (an `o3ds-ek` build
 boots, reaches the menus, and loads the course editor and machine creator with a streamed disk) —
-see `ARCHITECTURE.md` §4.1 for the four console builds.
+but fitting in memory isn't the same as running well: on real Old 3DS hardware 64DD courses are
+jittery, the disk music breaks up, and the editors are laggy, so `o3ds-ek` is experimental and not
+released in v1.0.0 — see `ARCHITECTURE.md` §4.1 for the four console builds and
+[`RELEASE-NOTES.md`](RELEASE-NOTES.md) Known issues.
 
 What it costs and what is still wrong with it is in [`RELEASE-NOTES.md`](RELEASE-NOTES.md). The
 disk-streaming levers are in §2.6 above.
