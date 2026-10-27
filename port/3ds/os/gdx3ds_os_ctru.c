@@ -55,6 +55,7 @@
 #include "gdx3ds_gfx_split.h"  /* n60boot: per-screen LCD memory */
 #include "gdx3ds_vram_guard.h" /* n60boot */
 #include "gdx3ds_input_map.h"
+#include "gdx3ds_motion.h" /* MOTION: tilt/gyro steering (<- INPUT tab row 23) */
 
 #include <stdio.h>
 #include <string.h>
@@ -408,6 +409,7 @@ int gdx3ds_os_window_init(int* outWidth, int* outHeight) {
                      sFakePads, sFakePads - 1);
     }
     gdx3ds_input_load_binds(); /* MENU: compiled defaults + persisted bind_* overrides */
+    gdx3ds_motion_init();      /* MOTION: [input] motion* keys, before the first poll */
 
     InitLcdFramebuffers();
     /* Top screen: double-buffered so the game never draws into the scanout buffer.
@@ -585,6 +587,10 @@ void gdx3ds_os_poll_input(Gdx3dsPadState* outPads, int maxPads) {
     }
 
     hidScanInput();
+    /* MOTION: same frame, same service -- one shared-memory read each for the accelerometer
+     * and gyroscope. This is the only per-frame sampling point the module gets; the steering
+     * math itself runs later, in gdx3ds_input_glue.c, once the game mode is known. */
+    gdx3ds_motion_poll();
     held = hidKeysHeld();
 
     for (i = 0; i < GDX_INPUT_ACTION_COUNT; i++) {

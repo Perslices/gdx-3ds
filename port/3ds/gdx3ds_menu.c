@@ -38,6 +38,7 @@
 
 #include "gdx3ds_config.h"     /* gdx3ds_os PUBLIC include dir */
 #include "gdx3ds_input_map.h"
+#include "gdx3ds_motion.h"     /* MOTION: INPUT tab rows 23..28 */
 #include "gdx3ds_vram_guard.h" /* n60boot */
 #include "gfx/gdx3ds_gpu_prof.h"
 
@@ -184,6 +185,8 @@ static char sPendingShot[40];
 static int sShotArmed = 0;
 static int sCaptureAction = -1; /* INPUT tab: action awaiting a key, -1 = none */
 static u32 sReadoutPainted = 0;  /* INPUT tab: raw pad values last painted (live readout) */
+static int sMotionPainted = 0;   /* INPUT tab: last motion steer painted, quantised (see below) */
+static int sMotionCalPainted = 0; /* INPUT tab: TILT calibration state last painted (row 27) */
 static u64 sReadoutTick = 0;
 static int sLogSkip = 0;        /* LOG tab scroll offset (lines back from live) */
 static int sDispMode = 0;       /* mirrors gdx3ds_disp mode for the radio UI */
@@ -419,6 +422,45 @@ static const char* InputDisplayName(int i) {
     return gdx3ds_input_action_name(i);
 }
 
+/* MOTION block (gdx3ds_motion.h): tilt input, rows 23..27, with the RECENT/RESET pair on row 28.
+ * The mode/angle/deadzone/invert rows are live -- they persist to [input] on the tap, exactly
+ * like the pad-tuning rows above -- but nothing is applied unless the player enables the mode AND
+ * a race is running (gdx3ds_input_glue.c does that gating). Row 26 is the one two-target row: the
+ * left half flips the roll (stickX) sign, the right half the pitch (stickY) sign, because a
+ * handset can make one right and the other wrong. Row 27 is the verification surface: it is how a
+ * player checks the sensor exists and which way it points before turning tilt on. */
+static void PaintMotionRows(void) {
+    static const char* kMode[] = { "OFF", "TILT" };
+    Gdx3dsMotionReadout ro;
+    const int mode = gdx3ds_motion_get_mode();
+
+    gdx3ds_motion_readout(&ro);
+
+    PaintRow(23, "MOTION   [-]  %-5s [+]  off/tilt", kMode[mode]);
+    PaintRow(24, "ANGLE    [-]  %3d   [+]  deg to full lock", gdx3ds_motion_get_angle());
+    PaintRow(25, "DEADZON  [-]  %2d    [+]  deg ignore", gdx3ds_motion_get_deadzone());
+    PaintRow(26, "INVERT  X %-3s        Y %-3s", gdx3ds_motion_get_invert() ? "YES" : "NO",
+             gdx3ds_motion_get_invert_pitch() ? "YES" : "NO");
+    if (mode == GDX3DS_MOTION_OFF) {
+        PaintRow(27, "tilt off: pad only, sensor disabled");
+    } else if (!ro.sensorOk) {
+        PaintRow(27, "tilt on but sensor refused: see log");
+    } else if (!ro.calibrated) {
+        PaintRow(27, "hold the console still: calibrating");
+    } else {
+        PaintRow(27, "accel %5d %5d  X%+3d Y%+3d", ro.accelX, ro.accelY, ro.steer, ro.pitch);
+    }
+    /* Quantised: the raw contribution moves every frame by a unit or two from sensor noise, and
+     * comparing it unquantised would repaint the whole page at the 10 Hz readout rate forever.
+     * 1/8 of the 160-unit range is below what a player can read off a text row anyway. The
+     * calibration flag is tracked separately: row 27 swaps between "hold still" and the readout
+     * without the contributions necessarily moving at all (they are pinned to 0 while capturing),
+     * so leaving it out of the repaint test kept the "hold still" text on screen long after the
+     * capture had finished. */
+    sMotionPainted = (ro.steer >> 3) ^ ((ro.pitch >> 3) << 8);
+    sMotionCalPainted = ro.calibrated | (ro.sensorOk << 1);
+}
+
 static void PaintInput(void) {
     char keys[24];
     PaintRow(3, "tap an action, then press its key");
@@ -445,8 +487,9 @@ static void PaintInput(void) {
         PaintRow(22, "pad %4d %4d  -> stick %4d %4d", rx, ry, sx, sy);
         sReadoutPainted = (u32) ((rx & 0xffff) | ((ry & 0xffff) << 16));
     }
-    PaintRow(24, "RESET DEFAULTS");
-    PaintRow(26, "capture: ABXY LR ZL ZR START SEL DPAD CS");
+    PaintMotionRows();
+    PaintRow(28, "[RECENT]      [RESET]");
+    PaintRow(29, "capture: ABXY LR ZL ZR START SEL DPAD CS");
 }
 
 static void PaintLog(void) {
@@ -829,7 +872,6 @@ static void MenuPersistBind(int action) {
 }
 
 static void TouchInput(int row, int col) {
-    (void)col;
     int count = gdx3ds_input_action_count();
     for (int i = 0; i < count && i < 7; i++) {
         if (row == 4 + i * 2 || row == 5 + i * 2) {
@@ -869,23 +911,84 @@ static void TouchInput(int row, int col) {
                 gdx3ds_input_get_range(), gdx3ds_input_get_curve(), gdx3ds_input_get_dpad_steer());
         return;
     }
-    if (row == 24 || row == 25) {
-        gdx3ds_input_reset_defaults();
-        for (int i = 0; i < count; i++) {
-            MenuPersistBind(i);
+    /* MOTION steppers (rows 23..25) and the INVERT toggle (row 26). Same "tap = adjust and
+     * persist" contract as the pad-tuning rows above; the values are latched by
+     * gdx3ds_motion.c, so nothing here needs a reboot. */
+    if (row >= 23 && row <= 25) {
+        const int d = StepperDelta(col);
+        if (d == 0) {
+            return;
         }
-        gdx3ds_input_set_deadzone(16);
-        gdx3ds_input_set_range(145);
-        gdx3ds_input_set_curve(0);
-        gdx3ds_input_set_dpad_steer(0);
-        gdx3ds_config_set_int("input", "deadzone", 16);
-        gdx3ds_config_set_int("input", "range", 145);
-        gdx3ds_config_set_int("input", "curve", 0);
-        gdx3ds_config_set_int("input", "dpad_steer", 0);
+        if (row == 23) {
+            gdx3ds_motion_set_mode((gdx3ds_motion_get_mode() + d + GDX3DS_MOTION_MODE_COUNT) %
+                                   GDX3DS_MOTION_MODE_COUNT);
+            gdx3ds_config_set_int("input", "motion", gdx3ds_motion_get_mode());
+        } else if (row == 24) {
+            gdx3ds_motion_set_angle(gdx3ds_motion_get_angle() + d * 5);
+            gdx3ds_config_set_int("input", "motion_angle", gdx3ds_motion_get_angle());
+        } else {
+            gdx3ds_motion_set_deadzone(gdx3ds_motion_get_deadzone() + d);
+            gdx3ds_config_set_int("input", "motion_deadzone", gdx3ds_motion_get_deadzone());
+        }
         MenuSaveCfg();
-        sCaptureAction = -1;
         sDirty = 1;
-        MenuLog("[menu] input reset defaults");
+        MenuLog("[menu] input motion=%d angle=%d dz=%d", gdx3ds_motion_get_mode(),
+                gdx3ds_motion_get_angle(), gdx3ds_motion_get_deadzone());
+        return;
+    }
+    if (row == 26) {
+        /* Two targets on one row, split down the middle: the left half is the roll (stickX)
+         * sign, the right half the pitch (stickY) sign. Same "tap = toggle and persist"
+         * contract as the rows above; no stepper, so both fit on one 40-column line. */
+        if (col < 20) {
+            gdx3ds_motion_set_invert(!gdx3ds_motion_get_invert());
+            gdx3ds_config_set_int("input", "motion_invert", gdx3ds_motion_get_invert());
+            MenuLog("[menu] input motion_invert=%d", gdx3ds_motion_get_invert());
+        } else {
+            gdx3ds_motion_set_invert_pitch(!gdx3ds_motion_get_invert_pitch());
+            gdx3ds_config_set_int("input", "motion_invert_pitch", gdx3ds_motion_get_invert_pitch());
+            MenuLog("[menu] input motion_invert_pitch=%d", gdx3ds_motion_get_invert_pitch());
+        }
+        MenuSaveCfg();
+        sDirty = 1;
+        return;
+    }
+    if (row == 27) {
+        return; /* MOTION live readout: not a control */
+    }
+    if (row == 28) {
+        if (col >= 15) { /* [RESET] */
+            gdx3ds_input_reset_defaults();
+            for (int i = 0; i < count; i++) {
+                MenuPersistBind(i);
+            }
+            gdx3ds_input_set_deadzone(16);
+            gdx3ds_input_set_range(145);
+            gdx3ds_input_set_curve(0);
+            gdx3ds_input_set_dpad_steer(0);
+            gdx3ds_config_set_int("input", "deadzone", 16);
+            gdx3ds_config_set_int("input", "range", 145);
+            gdx3ds_config_set_int("input", "curve", 0);
+            gdx3ds_config_set_int("input", "dpad_steer", 0);
+            gdx3ds_motion_set_mode(GDX3DS_MOTION_DEFAULT_MODE);
+            gdx3ds_motion_set_angle(GDX3DS_MOTION_DEFAULT_ANGLE);
+            gdx3ds_motion_set_deadzone(GDX3DS_MOTION_DEFAULT_DEADZONE);
+            gdx3ds_motion_set_invert(GDX3DS_MOTION_DEFAULT_INVERT);
+            gdx3ds_motion_set_invert_pitch(GDX3DS_MOTION_DEFAULT_INVERT_PITCH);
+            gdx3ds_config_set_int("input", "motion_invert_pitch", GDX3DS_MOTION_DEFAULT_INVERT_PITCH);
+            gdx3ds_config_set_int("input", "motion", GDX3DS_MOTION_DEFAULT_MODE);
+            gdx3ds_config_set_int("input", "motion_angle", GDX3DS_MOTION_DEFAULT_ANGLE);
+            gdx3ds_config_set_int("input", "motion_deadzone", GDX3DS_MOTION_DEFAULT_DEADZONE);
+            gdx3ds_config_set_int("input", "motion_invert", GDX3DS_MOTION_DEFAULT_INVERT);
+            MenuSaveCfg();
+            sCaptureAction = -1;
+            sDirty = 1;
+            MenuLog("[menu] input reset defaults");
+        } else if (col <= 9) { /* [RECENT]: forget the TILT neutral pose, capture a new one */
+            gdx3ds_motion_recenter();
+            sDirty = 1;
+            MenuLog("[menu] input motion recenter");
+        }
     }
 }
 
@@ -1469,13 +1572,19 @@ static void gdx3ds_menu_tick_body(void) {
     sPrevHeld = held;
 
     const u64 now = svcGetSystemTick();
-    /* INPUT tab live pad readout: repaint at <= 10 Hz while the pad moves, so tuning the
-     * deadzone/range can be done by eye without paying a per-frame console repaint. */
+    /* INPUT tab live readouts: repaint at <= 10 Hz while the pad or the motion contribution
+     * moves, so tuning the deadzone/range (or the motion ANGLE) can be done by eye without
+     * paying a per-frame console repaint. The motion value is compared already quantised by
+     * PaintMotionRows, so sensor noise alone does not keep the 10 Hz repaint running. */
     if (sTab == TAB_INPUT && !sDirty &&
         (now - sReadoutTick) >= (u64)(100.0 * CPU_TICKS_PER_MSEC)) {
         int rx, ry;
+        Gdx3dsMotionReadout mro;
         gdx3ds_input_stick_readout(&rx, &ry, NULL, NULL);
-        if ((u32) ((rx & 0xffff) | ((ry & 0xffff) << 16)) != sReadoutPainted) {
+        gdx3ds_motion_readout(&mro);
+        if ((u32) ((rx & 0xffff) | ((ry & 0xffff) << 16)) != sReadoutPainted ||
+            ((mro.steer >> 3) ^ ((mro.pitch >> 3) << 8)) != sMotionPainted ||
+            (mro.calibrated | (mro.sensorOk << 1)) != sMotionCalPainted) {
             sDirty = 1;
         }
         sReadoutTick = now;

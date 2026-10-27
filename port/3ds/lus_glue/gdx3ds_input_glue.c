@@ -10,10 +10,30 @@
  */
 
 #include "gdx3ds_os.h"
+#include "gdx3ds_motion.h"
 
 #include <string.h>
 
 #define GDX3DS_MAXCONTROLLERS 4
+
+/* MOTION gating. Both live in the decomp side of the link; declared weak so a build that
+ * stages this glue without the game (and the host stub) still links, and treats "absent" as
+ * "no gameplay" -- i.e. motion never fires rather than firing everywhere. */
+extern int gdx_input_in_gameplay(void) __attribute__((weak)); /* port/input_bridge.c */
+extern signed char gGamePaused __attribute__((weak));         /* decomp: game state latch */
+
+/* 1 only while the player is actually driving: a live race and not the pause overlay. Tilt or
+ * gyro steering on a menu tick would move the same stick the MENU and the pause menu read to
+ * walk their cursors, so both are excluded here rather than deeper in the pipeline. */
+static int MotionAllowed(void) {
+    if (&gdx_input_in_gameplay == NULL || !gdx_input_in_gameplay()) {
+        return 0;
+    }
+    if (&gGamePaused != NULL && gGamePaused) {
+        return 0;
+    }
+    return 1;
+}
 
 int gdx_lus_read_pads(int capacity, unsigned short* outButtons, signed char* outStickX, signed char* outStickY,
                       unsigned char* outConnected) {
@@ -41,6 +61,24 @@ int gdx_lus_read_pads(int capacity, unsigned short* outButtons, signed char* out
 
     memset(pads, 0, sizeof(pads));
     gdx3ds_os_poll_input(pads, ports);
+
+    /* MOTION: tilt is an ADDITIVE second input on port 0 only -- the circle pad keeps working
+     * exactly as before, which is why this runs on the finished -80..80 stick instead of
+     * replacing it. Roll adds to stickX (steering); pitch adds to stickY, which the decomp feeds
+     * to racer->tiltUpInput (decomp/src/game/racer.c:3451). set_active() is called every frame
+     * (not just when allowed) so the module sees the edge that ends a race and drops its
+     * latched contribution and stale neutral pose. */
+    {
+        const int motion = MotionAllowed();
+        gdx3ds_motion_set_active(motion);
+        if (motion) {
+            int sx = pads[0].stickX;
+            int sy = pads[0].stickY;
+            gdx3ds_motion_apply(&sx, &sy);
+            pads[0].stickX = (signed char) sx;
+            pads[0].stickY = (signed char) sy;
+        }
+    }
 
     for (i = 0; i < ports; i++) {
         if (outButtons != NULL) {

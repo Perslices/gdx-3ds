@@ -12,6 +12,7 @@ if(NINTENDO_3DS)
     add_library(gdx3ds_os STATIC
         gdx3ds_os_ctru.c
         gdx_fiber_3ds.c
+        gdx3ds_motion.c
         gdx3ds_config.c
     )
     # gdx_fiber_3ds.c implements the existing desktop contract port/gdx_fiber.h verbatim.

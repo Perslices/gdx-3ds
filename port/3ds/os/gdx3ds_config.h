@@ -12,6 +12,17 @@
  *     deadzone = 16      ; circle-pad units ignored around center (raw range ~±156)
  *     range = 145        ; circle-pad units for full N64 deflection (±80)
  *     y_maps_to_b = 1    ; 3DS Y acts as N64 B (see mapping table in gdx3ds_os_ctru.c)
+ *     motion = 0         ; accelerometer tilt input (port/3ds/os/gdx3ds_motion.h): 0 off
+ *                        ; (default), 1 tilt. Roll tilts stickX (steering) and pitch tilts
+ *                        ; stickY (the machine's nose-up/down, decomp racer.c:3451). ADDED on
+ *                        ; top of the circle pad, and only while a race is live (never in menus
+ *                        ; or the pause overlay). OFF also leaves the accelerometer DISABLED, so
+ *                        ; the feature costs nothing when it is not used. Live row on the menu
+ *                        ; INPUT tab.
+ *     motion_angle = 45  ; degrees of tilt for full deflection, 10..90
+ *     motion_deadzone = 3; degrees ignored around centre, 0..20
+ *     motion_invert = 0  ; 1 flips the roll (stickX) sign
+ *     motion_invert_pitch = 0 ; 1 flips the pitch (stickY) sign; independent of motion_invert
  *     [audio]
  *     lle = 0            ; 1 routes audio tasks through the cxd4 RSP LLE (TEST ONLY;
  *                        ; HLE is the 3DS default -- see port/gdx_audio_lle.c)
